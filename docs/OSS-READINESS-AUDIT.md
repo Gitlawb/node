@@ -95,7 +95,7 @@ Live-network blockers to prioritize:
 - GraphQL POST is still open for compatibility; GraphQL mutations should get mutation-aware auth before it becomes a public write API surface.
 - Push authorization is still not capability-complete. A valid DID signature is authentication, not authorization. Owner checks are now enforced on every branch, protected or not (`GITLAWB_ENFORCE_OWNER_PUSH`, on by default); what remains is that a UCAN `git/push` capability is not yet honored, so a delegated or CI key cannot push.
 - UCAN chain validation is incomplete and UCAN revocation/blocklisting is not implemented as an operator feature.
-- Private repository reads are not enforced. `is_public` and `GITLAWB_PUBLIC_READ` exist, but per-repository private-read behavior is not wired.
+- Private repository reads are enforced per repository through `is_public` and path-scoped visibility rules. `GITLAWB_PUBLIC_READ` remains reserved and inert.
 - Peer URLs are self-asserted by DIDs. Signatures prove control of the DID key when present, not ownership/safety of the announced URL.
 - Outbound peer fetch/ping/sync paths should be reviewed for SSRF protections before accepting arbitrary public peer registrations.
 
@@ -146,7 +146,7 @@ Risks:
 ## Obvious live-network priorities
 
 1. Implement repo write authorization: owner checks, UCAN capability checks, and clear delegation semantics for push/PR/issue/bounty operations.
-2. Implement private-read enforcement or remove private repo affordances until it exists.
+2. Private reads are already enforced per repository (`is_public` plus path-scoped rules); retire the reserved and inert `GITLAWB_PUBLIC_READ` flag or document it as permanently reserved.
 3. Add UCAN revocation/blocklisting and operator docs for emergency key compromise.
 4. Harden peer registration and outbound fetch behavior against SSRF and peer-list poisoning.
 5. Add Docker/installer/release smoke tests to CI.

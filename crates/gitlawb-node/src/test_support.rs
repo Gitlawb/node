@@ -207,6 +207,136 @@ mod tests {
         }
     }
 
+    /// `list_refs` must resolve both owner-DID forms to the SAME refs.
+    /// `branch_cids.repo` is written as `{normalize_owner_key(owner_did)}/{name}`
+    /// (`api/repos.rs:2643` -> `:2754`), and `get_repo` resolves `did:key:zX` and
+    /// bare `zX` to one repo, so both path forms authorize. Reading the table with
+    /// the raw path segments instead of the canonical slug returns an empty page
+    /// with a 200, which is a denial rendered as success. The second repo pins the
+    /// other direction: the filter must not widen to another owner's refs.
+    #[sqlx::test]
+    async fn list_refs_resolves_both_owner_did_forms_to_the_canonical_slug(pool: PgPool) {
+        let owner_did = "did:key:zREFSCANON";
+        let other_did = "did:key:zREFSOTHER";
+        let state = test_state(pool).await;
+
+        for did in [owner_did, other_did] {
+            let mut repo = seed_repo(did, "refs-canon");
+            repo.is_public = true;
+            // Same repo name under two owners, so the name-derived disk_path
+            // from the helper would collide on its unique constraint.
+            repo.disk_path = format!("/tmp/refs-canon-{}", crate::db::normalize_owner_key(did));
+            state.db.create_repo(&repo).await.expect("seed repo");
+            // Exactly the slug the production push path writes.
+            let slug = format!("{}/{}", crate::db::normalize_owner_key(did), "refs-canon");
+            let cid = format!("bafy{}", crate::db::normalize_owner_key(did));
+            state
+                .db
+                .upsert_branch_cid(
+                    &slug,
+                    "refs/heads/main",
+                    &"1".repeat(64),
+                    &cid,
+                    "did:key:zNODE",
+                )
+                .await
+                .expect("seed branch cid");
+        }
+
+        async fn body_for(state: &crate::state::AppState, owner: &str) -> String {
+            let router = crate::server::build_router(state.clone());
+            let resp = router
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(format!("/api/v1/repos/{owner}/refs-canon/refs"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "both owner-DID forms resolve to the same repo, so both must authorize"
+            );
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+
+        for owner in ["zREFSCANON", "did:key:zREFSCANON"] {
+            let body = body_for(&state, owner).await;
+            assert!(
+                body.contains("bafyzREFSCANON"),
+                "?owner={owner} must return the ref written under the canonical slug, \
+                 not an empty page with a 200. body was: {body}"
+            );
+            assert!(
+                !body.contains("bafyzREFSOTHER"),
+                "?owner={owner} must not return another owner's refs. body was: {body}"
+            );
+        }
+    }
+
+    /// The read gate on `list_refs`, driven in the deny direction. Without this
+    /// the slug regression above proves only that the query key is right: every
+    /// repo it seeds is public, so deleting `authorize_repo_read` outright leaves
+    /// it green. A private repo must answer an anonymous caller with the same 404
+    /// a missing repo gets, and must not put a CID in the body on the way out.
+    #[sqlx::test]
+    async fn list_refs_denies_an_anonymous_caller_on_a_private_repo(pool: PgPool) {
+        let owner_did = "did:key:zREFSPRIV";
+        let state = test_state(pool).await;
+
+        let mut repo = seed_repo(owner_did, "refs-private");
+        repo.is_public = false;
+        state.db.create_repo(&repo).await.expect("seed repo");
+        state
+            .db
+            .upsert_branch_cid(
+                &format!(
+                    "{}/{}",
+                    crate::db::normalize_owner_key(owner_did),
+                    "refs-private"
+                ),
+                "refs/heads/main",
+                &"1".repeat(64),
+                "bafyzREFSPRIVSECRET",
+                "did:key:zNODE",
+            )
+            .await
+            .expect("seed branch cid");
+
+        for owner in ["zREFSPRIV", "did:key:zREFSPRIV"] {
+            let router = crate::server::build_router(state.clone());
+            let resp = router
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(format!("/api/v1/repos/{owner}/refs-private/refs"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "anonymous read of a private repo must 404, not disclose it (owner form {owner})"
+            );
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8_lossy(&bytes);
+            assert!(
+                !body.contains("bafyzREFSPRIVSECRET"),
+                "the deny body must not carry a pinned CID. body was: {body}"
+            );
+        }
+    }
+
     /// Proves the harness end to end: a migrated DB, a seeded repo, and the
     /// owner gate on an ALREADY-gated endpoint (`PUT /visibility`, gated by
     /// `require_owner`). Non-owner is rejected; owner succeeds. Mounts the
@@ -3605,6 +3735,300 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND, "absent repo → 404");
     }
 
+    /// #435: register_replica / unregister_replica apply the same read-visibility
+    /// gate as list_replicas. Both mutate caller-bound replica metadata and their
+    /// responses disclose the replica count, so a non-reader of a private repo
+    /// gets the same 404 as a missing repo and nothing is written. Authorized
+    /// readers keep self-registering and self-removing.
+    #[sqlx::test]
+    async fn replica_register_unregister_are_read_visibility_gated(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        let owner = "did:key:zREPMUTOWNERRRRRRRRRRRRRRRRRRRRRRRRRR";
+        let reader = "did:key:zREPMUTREADERRRRRRRRRRRRRRRRRRRRRRRRR";
+        let stranger = "did:key:zREPMUTSTRGRRRRRRRRRRRRRRRRRRRRRRRRR";
+        let state = test_state(pool).await;
+
+        let mut priv_repo = seed_repo(owner, "repmut-priv");
+        priv_repo.is_public = false;
+        state
+            .db
+            .create_repo(&priv_repo)
+            .await
+            .expect("seed private repo");
+        let pub_repo = seed_repo(owner, "repmut-pub");
+        state
+            .db
+            .create_repo(&pub_repo)
+            .await
+            .expect("seed public repo");
+        // A listed reader of the private repo keeps mutation rights.
+        state
+            .db
+            .set_visibility_rule(
+                &priv_repo.id,
+                "/",
+                VisibilityMode::B,
+                &[reader.to_string()],
+                owner,
+            )
+            .await
+            .expect("seed reader rule");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/replicas",
+                    axum::routing::put(crate::api::replicas::register_replica)
+                        .delete(crate::api::replicas::unregister_replica),
+                )
+                .with_state(state.clone())
+        };
+        let replica_url = "https://replica.example.com/me";
+        let body = || Body::from(format!(r#"{{"url":"{replica_url}"}}"#));
+        let leaks = |bytes: &[u8]| {
+            let text = String::from_utf8_lossy(bytes);
+            text.contains(replica_url) || text.contains(&priv_repo.id)
+        };
+
+        // Private repo, non-reader stranger: register → 404, nothing written.
+        let resp = router()
+            .oneshot(signed_request_as(
+                stranger,
+                Method::PUT,
+                &format!("/api/v1/repos/{owner}/repmut-priv/replicas"),
+                body(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a non-reader must not register on a private repo"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !leaks(&bytes),
+            "a denied register body must not leak the replica url or repo data"
+        );
+        assert!(
+            state
+                .db
+                .list_replicas(&priv_repo.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a denied register must not create a replica row"
+        );
+
+        // Private repo, non-reader stranger: unregister → 404.
+        let resp = router()
+            .oneshot(signed_request_as(
+                stranger,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner}/repmut-priv/replicas"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a non-reader must not unregister on a private repo"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !leaks(&bytes),
+            "a denied unregister body must not leak the replica url or repo data"
+        );
+
+        // Private repo, listed reader: register → 201, unregister → 200.
+        let resp = router()
+            .oneshot(signed_request_as(
+                reader,
+                Method::PUT,
+                &format!("/api/v1/repos/{owner}/repmut-priv/replicas"),
+                body(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "a listed reader keeps self-registration on a private repo"
+        );
+        let resp = router()
+            .oneshot(signed_request_as(
+                reader,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner}/repmut-priv/replicas"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a listed reader keeps self-removal on a private repo"
+        );
+
+        // Public repo, authenticated stranger: register → 201.
+        let resp = router()
+            .oneshot(signed_request_as(
+                stranger,
+                Method::PUT,
+                &format!("/api/v1/repos/{owner}/repmut-pub/replicas"),
+                body(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "public-repo registration stays open to any authenticated replica"
+        );
+
+        // Owner self-registration is still refused.
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::PUT,
+                &format!("/api/v1/repos/{owner}/repmut-pub/replicas"),
+                body(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "the owner still cannot register as their own replica"
+        );
+    }
+
+    /// #435 end-to-end: drive the replica mutations through the PRODUCTION
+    /// router (`app` → require_signature → handler) with real RFC-9421
+    /// signatures, so the whole verify-then-authorize stack is exercised, not
+    /// just the handler with an injected DID. A stranger on a private repo
+    /// gets the same 404 as a missing repo with nothing written; a listed
+    /// reader registers and removes itself.
+    #[sqlx::test]
+    async fn replica_mutations_enforce_visibility_through_real_signature_e2e(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+
+        let owner_kp = Keypair::generate();
+        let owner_did = owner_kp.did().to_string();
+        // Short owner form in the path keeps the signed @path byte-identical
+        // to what the node sees (no colons) while did_matches still resolves.
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let stranger_kp = Keypair::generate();
+        let reader_kp = Keypair::generate();
+        let reader_did = reader_kp.did().to_string();
+
+        let state = test_state(pool.clone()).await;
+        let mut repo = seed_repo(&owner_did, "sig-repl-priv");
+        repo.is_public = false;
+        state
+            .db
+            .create_repo(&repo)
+            .await
+            .expect("seed private repo");
+        state
+            .db
+            .set_visibility_rule(&repo.id, "/", VisibilityMode::B, &[reader_did], &owner_did)
+            .await
+            .expect("seed reader rule");
+
+        let router = app(pool).await;
+        let path = format!("/api/v1/repos/{short}/sig-repl-priv/replicas");
+        let replica_url = "https://replica.example.com/e2e";
+        let reg_body: &[u8] = br#"{"url":"https://replica.example.com/e2e"}"#;
+        let leaks = |bytes: &[u8]| {
+            let text = String::from_utf8_lossy(bytes);
+            text.contains(replica_url) || text.contains(&repo.id)
+        };
+        let signed_req = |kp: &Keypair, method: &str, body: &'static [u8]| {
+            let signed = sign_request(kp, method, &path, body);
+            Request::builder()
+                .method(method)
+                .uri(&path)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header("content-digest", signed.content_digest)
+                .header("signature-input", signed.signature_input)
+                .header("signature", signed.signature)
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        // Stranger (verified signature, not a reader) → 404, no row written.
+        let resp = router
+            .clone()
+            .oneshot(signed_req(&stranger_kp, "PUT", reg_body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a verified non-reader must not register on a private repo"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !leaks(&bytes),
+            "a denied register body must not leak the replica url or repo data"
+        );
+        assert!(
+            state.db.list_replicas(&repo.id).await.unwrap().is_empty(),
+            "a denied register must not create a replica row"
+        );
+
+        // Stranger DELETE → 404.
+        let resp = router
+            .clone()
+            .oneshot(signed_req(&stranger_kp, "DELETE", b""))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a verified non-reader must not unregister on a private repo"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !leaks(&bytes),
+            "a denied unregister body must not leak the replica url or repo data"
+        );
+
+        // Listed reader: PUT → 201, DELETE → 200.
+        let resp = router
+            .clone()
+            .oneshot(signed_req(&reader_kp, "PUT", reg_body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "a listed reader registers through the real middleware"
+        );
+        let resp = router
+            .clone()
+            .oneshot(signed_req(&reader_kp, "DELETE", b""))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a listed reader unregisters through the real middleware"
+        );
+    }
+
     /// #94 sibling: list_labels is read-visibility-gated. A public repo's labels
     /// stay anonymously listable; a private repo's label names must not leak to a
     /// non-reader (404). A listed reader of the private repo reads the label; the
@@ -5950,7 +6374,7 @@ mod tests {
         let m = server
             .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
             .with_status(200)
-            .with_body(r#"{"Hash":"bafyshouldnothappen"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .expect(0)
             .create_async()
             .await;
@@ -6076,7 +6500,7 @@ mod tests {
         let m = server
             .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
             .with_status(200)
-            .with_body(r#"{"Hash":"bafyshouldnothappen"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .expect(0)
             .create_async()
             .await;
@@ -6266,7 +6690,7 @@ mod tests {
         let m = server
             .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
             .with_status(200)
-            .with_body(r#"{"Hash":"bafyshouldnothappen"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .expect(0)
             .create_async()
             .await;
@@ -8086,7 +8510,7 @@ mod tests {
         let m = server
             .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
             .with_status(200)
-            .with_body(r#"{"Hash":"bafyprovtest"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .expect_at_least(1)
             .create_async()
             .await;
@@ -8146,7 +8570,7 @@ mod tests {
         let m = server
             .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
             .with_status(200)
-            .with_body(r#"{"Hash":"bafyproviderhash"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .expect(2)
             .create_async()
             .await;
@@ -8405,7 +8829,7 @@ mod tests {
         let m = server
             .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
             .with_status(200)
-            .with_body(r#"{"Hash":"bafyshouldnothappen"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .expect(0)
             .create_async()
             .await;
@@ -8528,7 +8952,7 @@ mod tests {
         let m = server
             .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
             .with_status(200)
-            .with_body(r#"{"Hash":"bafyshouldnothappen"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .expect(0)
             .create_async()
             .await;
@@ -8630,7 +9054,7 @@ mod tests {
         let m = server
             .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
             .with_status(200)
-            .with_body(r#"{"Hash":"x"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .expect(0)
             .create_async()
             .await;
@@ -8694,7 +9118,7 @@ mod tests {
         server
             .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
             .with_status(200)
-            .with_body(r#"{"Hash":"x"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .expect(0)
             .create_async()
             .await;
@@ -16729,6 +17153,236 @@ mod tests {
         assert!(resp.status().is_success());
     }
 
+    /// #344: `remove_label` must canonicalize the path segment the same way
+    /// `add_label` does, so a label stored as `bug` is matched by `DELETE
+    /// .../labels/Bug`. A delete that matched nothing must be reported as 404
+    /// rather than as `removed:true` — the no-op-rendered-as-success shape the
+    /// rest of the API already rejects on the client side.
+    #[sqlx::test]
+    async fn remove_label_canonicalizes_and_404s_on_no_match(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zLBLREMOVEO0000000000000000000000000000000000";
+        let owner_short = "zLBLREMOVEO0000000000000000000000000000000000";
+        let repo_name = "lbl-remove";
+        state
+            .db
+            .create_repo(&seed_repo(owner, repo_name))
+            .await
+            .expect("seed repo");
+        state
+            .db
+            .add_label(
+                &state
+                    .db
+                    .get_repo(owner_short, repo_name)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                "bug",
+            )
+            .await
+            .expect("seed label");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/labels/{label}",
+                    axum::routing::delete(crate::api::labels::remove_label),
+                )
+                .with_state(state.clone())
+        };
+
+        // Mixed-case path segment matches the lowercased stored label.
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner_short}/{repo_name}/labels/Bug"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "canonicalized delete succeeds"
+        );
+        let body = json_body(resp).await;
+        assert_eq!(body["label"], "bug");
+        assert_eq!(body["removed"], true);
+
+        // Second delete with the same form → no row, must 404 not 200/removed:true.
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner_short}/{repo_name}/labels/Bug"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "no-op delete must report 404, not removed:true"
+        );
+
+        // Path with surrounding whitespace still canonicalizes to a valid label.
+        state
+            .db
+            .add_label(
+                &state
+                    .db
+                    .get_repo(owner_short, repo_name)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                "feature",
+            )
+            .await
+            .expect("seed feature label");
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner_short}/{repo_name}/labels/%20feature%20"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "trimmed path segment matches the stored label"
+        );
+
+        // Path segment that canonicalizes to an invalid (empty) label → 400.
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner_short}/{repo_name}/labels/%20%20"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a label that canonicalizes to empty is a client error"
+        );
+
+        // Disallowed charset → 400 (validation lives in the shared path now).
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner_short}/{repo_name}/labels/bad%20label"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "spaces are rejected by canonicalize_label"
+        );
+
+        // Length arm: 51 chars → 400, 50 chars decouples the no-match 404 from
+        // the double-delete above so the helper's len>50 branch is pinned
+        // even if the earlier 404 assertion is ever reworked.
+        let too_long = "a".repeat(51);
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner_short}/{repo_name}/labels/{too_long}"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "51-char label is rejected by canonicalize_label"
+        );
+
+        let exactly_50 = "a".repeat(50);
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner_short}/{repo_name}/labels/{exactly_50}"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "50-char label passes validation but still 404s when absent"
+        );
+    }
+
+    /// #344: `remove_label` stays owner-gated. A non-owner with a real signed
+    /// request against a label that does exist gets 403, never 404 — the
+    /// owner-gated write keeps the existence-leak shape separate from the
+    /// not-found shape (matches `add_label` and the AGENTS.md gate rules).
+    #[sqlx::test]
+    async fn remove_label_denies_non_owner(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zLBLRMOwnr0000000000000000000000000000000000";
+        let owner_short = "zLBLRMOwnr0000000000000000000000000000000000";
+        let stranger = "did:key:zLBLRMStrn0000000000000000000000000000000000";
+        let repo_name = "lbl-rm-priv";
+        state
+            .db
+            .create_repo(&seed_repo(owner, repo_name))
+            .await
+            .expect("seed repo");
+        let repo_id = state
+            .db
+            .get_repo(owner_short, repo_name)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        state
+            .db
+            .add_label(&repo_id, "bug")
+            .await
+            .expect("seed label");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/labels/{label}",
+                    axum::routing::delete(crate::api::labels::remove_label),
+                )
+                .with_state(state.clone())
+        };
+        let resp = router()
+            .oneshot(signed_request_as(
+                stranger,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner_short}/{repo_name}/labels/bug"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "non-owner gets 403, the owner-gated mutation shape"
+        );
+
+        // Label is still there.
+        let labels = state.db.list_labels(&repo_id).await.unwrap();
+        assert!(labels.contains(&"bug".to_string()));
+    }
+
     #[sqlx::test]
     async fn list_repo_bounties_gate_denies_anon_on_private(pool: PgPool) {
         let state = test_state(pool).await;
@@ -17102,6 +17756,204 @@ mod tests {
         assert!(resp.status().is_success());
     }
 
+    // ── #341: the id-keyed bounty mutations must gate on repo read before the
+    // status and participant checks, so a caller holding an opaque id cannot
+    // distinguish an existing private-repo bounty from an absent one. The deny
+    // shape is 404 with a "not found" body, identical to the absent-id case.
+
+    fn seed_bounty(
+        id: &str,
+        owner: &str,
+        repo: &str,
+        status: &str,
+        claimant: Option<&str>,
+    ) -> crate::db::BountyRecord {
+        crate::db::BountyRecord {
+            id: id.into(),
+            repo_owner: owner.into(),
+            repo_name: repo.into(),
+            issue_id: None,
+            title: "Bounty".into(),
+            amount: 100,
+            creator_did: owner.into(),
+            claimant_did: claimant.map(str::to_string),
+            claimant_wallet: None,
+            pr_id: None,
+            status: status.into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            claimed_at: claimant.map(|_| "2026-01-02T00:00:00Z".into()),
+            submitted_at: None,
+            completed_at: None,
+            deadline_secs: 86400,
+            tx_hash: None,
+        }
+    }
+
+    fn signed_bounty_post(kp: &Keypair, uri: &str, body: &[u8]) -> Request<Body> {
+        let signed = gitlawb_core::http_sig::sign_request(kp, "POST", uri, body);
+        Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("content-digest", signed.content_digest)
+            .header("signature-input", signed.signature_input)
+            .header("signature", signed.signature)
+            .body(Body::from(body.to_vec()))
+            .unwrap()
+    }
+
+    /// Drives one bounty mutation route as a stranger against a private repo and
+    /// asserts the denial is indistinguishable from the absent-id case: same
+    /// 404 status, same "not found" body shape, no status or participant detail.
+    /// `bounty_status` is whichever lifecycle state reaches the route's
+    /// participant check today, so the assertion exercises the deepest leak.
+    async fn assert_bounty_mutation_denies_stranger_on_private(
+        pool: PgPool,
+        route: &str,
+        bounty_status: &str,
+        body: &[u8],
+    ) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zB341PRIVOWNERAAAAAAAAAAAAAAAAAAAAAAAA";
+        let claimant = "did:key:zB341PRIVCLAIMANTAAAAAAAAAAAAAAAAAAAAA";
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "secret-bounty-repo"))
+            .await
+            .unwrap();
+        state
+            .db
+            .create_bounty(&seed_bounty(
+                "b341-held-id",
+                owner,
+                "secret-bounty-repo",
+                bounty_status,
+                Some(claimant),
+            ))
+            .await
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let stranger = Keypair::generate();
+
+        // Held id: the stranger knows the bounty id but cannot read the repo.
+        let held_uri = format!("/api/v1/bounties/b341-held-id/{route}");
+        let resp = router
+            .clone()
+            .oneshot(signed_bounty_post(&stranger, &held_uri, body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "{route} on a held private-repo bounty id must deny as 404, not a \
+             distinguishable status/participant error"
+        );
+        let held_body = json_body(resp).await;
+
+        // Absent id: the control case. The body must carry the same not_found
+        // shape so a denial discloses nothing beyond the caller-supplied id.
+        let absent_uri = format!("/api/v1/bounties/b341-no-such-id/{route}");
+        let resp = router
+            .oneshot(signed_bounty_post(&stranger, &absent_uri, body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let absent_body = json_body(resp).await;
+
+        for (id, got) in [
+            ("b341-held-id", &held_body),
+            ("b341-no-such-id", &absent_body),
+        ] {
+            assert_eq!(
+                *got,
+                serde_json::json!({
+                    "error": "not_found",
+                    "message": format!("bounty {id} not found"),
+                }),
+                "{route} denial body for {id} must be the bare not-found shape, got {got}"
+            );
+        }
+    }
+
+    #[sqlx::test]
+    async fn submit_bounty_gate_denies_stranger_on_private(pool: PgPool) {
+        assert_bounty_mutation_denies_stranger_on_private(
+            pool,
+            "submit",
+            "claimed",
+            br#"{"pr_id":"owner/repo#1"}"#,
+        )
+        .await;
+    }
+
+    #[sqlx::test]
+    async fn approve_bounty_gate_denies_stranger_on_private(pool: PgPool) {
+        assert_bounty_mutation_denies_stranger_on_private(pool, "approve", "submitted", b"{}")
+            .await;
+    }
+
+    #[sqlx::test]
+    async fn cancel_bounty_gate_denies_stranger_on_private(pool: PgPool) {
+        assert_bounty_mutation_denies_stranger_on_private(pool, "cancel", "open", b"").await;
+    }
+
+    #[sqlx::test]
+    async fn dispute_bounty_gate_denies_stranger_on_private(pool: PgPool) {
+        assert_bounty_mutation_denies_stranger_on_private(pool, "dispute", "claimed", b"").await;
+    }
+
+    /// The read gate must admit readable repos: on a PUBLIC repo a stranger
+    /// still reaches the participant checks, so the four routes answer 403
+    /// rather than the gated 404.
+    #[sqlx::test]
+    async fn bounty_mutation_gates_still_reach_participant_check_on_public(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zB341PUBOWNERAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let claimant = "did:key:zB341PUBCLAIMANTAAAAAAAAAAAAAAAAAAAAAA";
+        let mut repo = seed_private_repo(owner, "public-bounty-repo");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.unwrap();
+
+        let cases: [(&str, &str, &[u8]); 4] = [
+            ("submit", "claimed", br#"{"pr_id":"owner/repo#1"}"#),
+            ("approve", "submitted", b"{}"),
+            ("cancel", "open", b""),
+            ("dispute", "claimed", b""),
+        ];
+        for (i, (_, status, _)) in cases.iter().enumerate() {
+            let id = format!("b341-pub-{i}");
+            state
+                .db
+                .create_bounty(&seed_bounty(
+                    &id,
+                    owner,
+                    "public-bounty-repo",
+                    status,
+                    Some(claimant),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let router = crate::server::build_router(state);
+        let stranger = Keypair::generate();
+        for (i, (route, _, body)) in cases.iter().enumerate() {
+            let id = format!("b341-pub-{i}");
+            let uri = format!("/api/v1/bounties/{id}/{route}");
+            let resp = router
+                .clone()
+                .oneshot(signed_bounty_post(&stranger, &uri, body))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "{route} on a public repo must still reach the participant check"
+            );
+        }
+    }
+
     #[sqlx::test]
     async fn list_all_bounties_filters_private_repos_for_anon(pool: PgPool) {
         let state = test_state(pool).await;
@@ -17220,6 +18072,626 @@ mod tests {
             bounties.len(),
             0,
             "anon should see 0 bounties from private repo even with 2 entries"
+        );
+    }
+
+    // ── #477: bounty stats aggregates ignore repo visibility ──────────────────
+
+    #[sqlx::test]
+    async fn bounty_stats_filters_private_repos_for_anon(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zSTATSBOUNTYOWNERAAAAAAAAAAAAAAAAAAAA";
+        let agent_private = "did:key:zSTATSPRIVATECLAIMANT00000000000";
+        let agent_public = "did:key:zSTATSPUBLICCLAIMANT000000000000";
+
+        // Private repo with 1 open and 1 completed bounty
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "private-repo"))
+            .await
+            .unwrap();
+        state
+            .db
+            .create_bounty(&crate::db::BountyRecord {
+                id: "bounty-priv-open".into(),
+                repo_owner: owner.into(),
+                repo_name: "private-repo".into(),
+                issue_id: None,
+                title: "Private Open".into(),
+                amount: 100,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            })
+            .await
+            .unwrap();
+        // Drive the private completed bounty through the real claim/approve path
+        // so `claimant_did` and `completed_at` are actually persisted (#477 P1).
+        state
+            .db
+            .create_bounty(&crate::db::BountyRecord {
+                id: "bounty-priv-comp".into(),
+                repo_owner: owner.into(),
+                repo_name: "private-repo".into(),
+                issue_id: None,
+                title: "Private Completed".into(),
+                amount: 500,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: "2026-01-02T00:00:00Z".into(),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            })
+            .await
+            .unwrap();
+        state
+            .db
+            .claim_bounty(
+                "bounty-priv-comp",
+                agent_private,
+                None,
+                "2026-01-02T01:00:00Z",
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .submit_bounty("bounty-priv-comp", "pr-priv-1", "2026-01-02T02:00:00Z")
+            .await
+            .unwrap();
+        state
+            .db
+            .approve_bounty("bounty-priv-comp", "2026-01-03T00:00:00Z", None)
+            .await
+            .unwrap();
+
+        // Public repo with 1 open and 1 completed bounty
+        let mut public_repo = seed_private_repo(owner, "public-repo");
+        public_repo.is_public = true;
+        state.db.create_repo(&public_repo).await.unwrap();
+        state
+            .db
+            .create_bounty(&crate::db::BountyRecord {
+                id: "bounty-pub-open".into(),
+                repo_owner: owner.into(),
+                repo_name: "public-repo".into(),
+                issue_id: None,
+                title: "Public Open".into(),
+                amount: 200,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: "2026-01-04T00:00:00Z".into(),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            })
+            .await
+            .unwrap();
+        // Drive the public completed bounty through claim→submit→approve.
+        state
+            .db
+            .create_bounty(&crate::db::BountyRecord {
+                id: "bounty-pub-comp".into(),
+                repo_owner: owner.into(),
+                repo_name: "public-repo".into(),
+                issue_id: None,
+                title: "Public Completed".into(),
+                amount: 300,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: "2026-01-05T00:00:00Z".into(),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            })
+            .await
+            .unwrap();
+        state
+            .db
+            .claim_bounty(
+                "bounty-pub-comp",
+                agent_public,
+                None,
+                "2026-01-05T01:00:00Z",
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .submit_bounty("bounty-pub-comp", "pr-pub-1", "2026-01-05T02:00:00Z")
+            .await
+            .unwrap();
+        state
+            .db
+            .approve_bounty("bounty-pub-comp", "2026-01-06T00:00:00Z", None)
+            .await
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(anon_get("/api/v1/bounties/stats"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+
+        // Anonymous observer must only see counts from the public repo (#477)
+        assert_eq!(
+            body["open"], 1,
+            "only 1 public open bounty should be counted"
+        );
+        assert_eq!(
+            body["completed"], 1,
+            "only 1 public completed bounty should be counted"
+        );
+        let leaders = body["leaderboard"].as_array().unwrap();
+        assert_eq!(
+            leaders.len(),
+            1,
+            "leaderboard must exclude private earnings"
+        );
+        assert_eq!(leaders[0]["did"], agent_public);
+        assert_eq!(leaders[0]["completed"], 1);
+        assert_eq!(leaders[0]["total_earned"], 300);
+    }
+
+    #[sqlx::test]
+    async fn agent_bounty_stats_filters_private_repos_for_anon(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zAGNTSTATSBOWNERAAAAAAAAAAAAAAAAAAAA";
+        let agent = "did:key:zAGNTSTATSAAGENT000000000000000000";
+
+        // Private repo where agent earned a bounty
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "agent-secret-repo"))
+            .await
+            .unwrap();
+        // Drive through the real claim path so claimant_did persists.
+        state
+            .db
+            .create_bounty(&crate::db::BountyRecord {
+                id: "bounty-secret-agent".into(),
+                repo_owner: owner.into(),
+                repo_name: "agent-secret-repo".into(),
+                issue_id: None,
+                title: "Secret Task".into(),
+                amount: 750,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            })
+            .await
+            .unwrap();
+        state
+            .db
+            .claim_bounty("bounty-secret-agent", agent, None, "2026-01-01T01:00:00Z")
+            .await
+            .unwrap();
+        state
+            .db
+            .submit_bounty("bounty-secret-agent", "pr-secret-1", "2026-01-01T02:00:00Z")
+            .await
+            .unwrap();
+        state
+            .db
+            .approve_bounty("bounty-secret-agent", "2026-01-02T00:00:00Z", None)
+            .await
+            .unwrap();
+
+        // Public repo where the SAME agent also earned a bounty: proves the
+        // filter admits public earnings rather than always returning zero.
+        let mut public_repo = seed_private_repo(owner, "agent-public-repo");
+        public_repo.is_public = true;
+        state.db.create_repo(&public_repo).await.unwrap();
+        state
+            .db
+            .create_bounty(&crate::db::BountyRecord {
+                id: "bounty-public-agent".into(),
+                repo_owner: owner.into(),
+                repo_name: "agent-public-repo".into(),
+                issue_id: None,
+                title: "Public Task".into(),
+                amount: 250,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: "2026-01-03T00:00:00Z".into(),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            })
+            .await
+            .unwrap();
+        state
+            .db
+            .claim_bounty("bounty-public-agent", agent, None, "2026-01-03T01:00:00Z")
+            .await
+            .unwrap();
+        state
+            .db
+            .submit_bounty("bounty-public-agent", "pr-pub-1", "2026-01-03T02:00:00Z")
+            .await
+            .unwrap();
+        state
+            .db
+            .approve_bounty("bounty-public-agent", "2026-01-04T00:00:00Z", None)
+            .await
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let uri = format!("/api/v1/agents/{agent}/bounties");
+        let resp = router.oneshot(anon_get(&uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+
+        // Anonymous query must not leak private earnings, but must still admit
+        // the agent's public earnings (not an always-zero over-denial).
+        assert_eq!(
+            body["completed_bounties"], 1,
+            "only the public completed bounty must be counted"
+        );
+        assert_eq!(
+            body["total_earned"], 250,
+            "only the public bounty's earnings must be counted, not the private 750"
+        );
+    }
+
+    fn open_bounty_on(id: &str, owner: &str, repo: &str, amount: i64) -> crate::db::BountyRecord {
+        crate::db::BountyRecord {
+            id: id.into(),
+            repo_owner: owner.into(),
+            repo_name: repo.into(),
+            issue_id: None,
+            title: id.into(),
+            amount,
+            creator_did: owner.into(),
+            claimant_did: None,
+            claimant_wallet: None,
+            pr_id: None,
+            status: "open".into(),
+            created_at: "2026-03-01T00:00:00Z".into(),
+            claimed_at: None,
+            submitted_at: None,
+            completed_at: None,
+            deadline_secs: 86400,
+            tx_hash: None,
+        }
+    }
+
+    /// `claimant_did` is stored in whatever form the claimer sent, so the
+    /// per-agent lookup must match both `did:key:<key>` and the bare key for
+    /// either spelling of the request path.
+    #[sqlx::test]
+    async fn agent_bounty_stats_matches_full_and_bare_claimant_forms(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zCLAIMFORMOWNERAAAAAAAAAAAAAAAAAAAA";
+        let bare = "zCLAIMFORMAGENT0000000000000000000";
+        let full = format!("did:key:{bare}");
+
+        let mut repo = seed_private_repo(owner, "claim-form-repo");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.unwrap();
+
+        for (id, claimant, amount) in [("cf-full", full.as_str(), 100), ("cf-bare", bare, 30)] {
+            state
+                .db
+                .create_bounty(&open_bounty_on(id, owner, "claim-form-repo", amount))
+                .await
+                .unwrap();
+            state
+                .db
+                .claim_bounty(id, claimant, None, "2026-03-01T01:00:00Z")
+                .await
+                .unwrap();
+            state
+                .db
+                .submit_bounty(id, "pr-cf", "2026-03-01T02:00:00Z")
+                .await
+                .unwrap();
+            state
+                .db
+                .approve_bounty(id, "2026-03-02T00:00:00Z", None)
+                .await
+                .unwrap();
+        }
+
+        let router = crate::server::build_router(state);
+        for path_did in [full.as_str(), bare] {
+            let uri = format!("/api/v1/agents/{path_did}/bounties");
+            let resp = router.clone().oneshot(anon_get(&uri)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = json_body(resp).await;
+            assert_eq!(
+                body["completed_bounties"], 2,
+                "both claimant spellings must count for path {path_did}"
+            );
+            assert_eq!(
+                body["total_earned"], 130,
+                "both claimant spellings must be summed for path {path_did}"
+            );
+        }
+    }
+
+    /// A database failure must surface as an error status, never as a 200
+    /// carrying zero counts that read as confirmed absence of activity.
+    #[sqlx::test]
+    async fn bounty_stats_db_failure_is_not_reported_as_zero(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        let router = crate::server::build_router(state);
+        pool.close().await;
+
+        for uri in [
+            "/api/v1/bounties/stats",
+            "/api/v1/agents/did:key:zDBFAILAGENTAAAAAAAAAAAAAAAAAAAAA/bounties",
+        ] {
+            let resp = router.clone().oneshot(anon_get(uri)).await.unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::OK,
+                "{uri} must not report zero counts when the database is down"
+            );
+            assert!(resp.status().is_server_error(), "{uri}: {}", resp.status());
+        }
+    }
+
+    /// Mirror rows are written with `is_public = true` and no replicated rules,
+    /// so a mirror alone says nothing about the origin's visibility. The
+    /// aggregates must (a) hide bounties of a repo whose canonical twin is
+    /// private (the dedup keeps the canonical row and its rules), and (b) count
+    /// bounties of a mirror-only repo, which is how `authorize_repo_read` and
+    /// `/stats` already treat it. Both classes are pinned here.
+    #[sqlx::test]
+    async fn bounty_stats_mirror_rows_follow_canonical_twin_or_count_when_alone(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zMIRRORTWINOWNERAAAAAAAAAAAAAAAAAAA";
+        let short = owner.strip_prefix("did:key:").unwrap();
+        let remote = "did:key:zMIRRORONLYOWNERAAAAAAAAAAAAAAAAAAA";
+        let remote_short = remote.strip_prefix("did:key:").unwrap();
+
+        // Canonical private repo plus a mirror row for the same (owner, name).
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "twinned"))
+            .await
+            .unwrap();
+        state
+            .db
+            .upsert_mirror_repo(short, "twinned", "/tmp/mirror-twinned", None, false)
+            .await
+            .unwrap();
+        state
+            .db
+            .create_bounty(&open_bounty_on("bounty-twinned", owner, "twinned", 10))
+            .await
+            .unwrap();
+
+        // Mirror-only repo: no canonical twin on this node.
+        state
+            .db
+            .upsert_mirror_repo(remote_short, "alone", "/tmp/mirror-alone", None, false)
+            .await
+            .unwrap();
+        state
+            .db
+            .create_bounty(&open_bounty_on("bounty-alone", remote, "alone", 20))
+            .await
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(anon_get("/api/v1/bounties/stats"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(
+            body["open"], 1,
+            "only the mirror-only repo's bounty counts; the private canonical twin's must not"
+        );
+    }
+
+    /// Exercises the root-rule branch of `listable_at_root`: a repo with
+    /// `is_public = true` plus a root visibility rule (`path_glob = "/"`)
+    /// whose `reader_dids` does NOT include the anonymous caller.  The rule
+    /// takes precedence over `is_public`, so the repo's bounties must be
+    /// excluded from anonymous aggregates.
+    #[sqlx::test]
+    async fn bounty_stats_root_rule_overrides_is_public(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zROOTRULEOWNERAAAAAAAAAAAAAAAAAAAAA";
+        let insider = "did:key:zROOTRULEINSIDERAAAAAAAAAAAAAAAAA";
+        let agent = "did:key:zROOTRULEAGENT0AAAAAAAAAAAAAAAAAAA";
+
+        // Public repo with a root rule that restricts to `insider` only.
+        // `is_public = true`, but the root rule makes it anonymous-invisible.
+        let mut repo = seed_private_repo(owner, "restricted-public");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.unwrap();
+        state
+            .db
+            .set_visibility_rule(
+                &repo.id,
+                "/",
+                crate::db::VisibilityMode::A,
+                &[insider.to_string()],
+                owner,
+            )
+            .await
+            .unwrap();
+
+        // Open bounty on the root-rule-restricted repo.
+        state
+            .db
+            .create_bounty(&crate::db::BountyRecord {
+                id: "bounty-rootrule-open".into(),
+                repo_owner: owner.into(),
+                repo_name: "restricted-public".into(),
+                issue_id: None,
+                title: "Root Rule Open".into(),
+                amount: 400,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: "2026-02-01T00:00:00Z".into(),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            })
+            .await
+            .unwrap();
+
+        // Completed bounty, driven through claim→submit→approve.
+        state
+            .db
+            .create_bounty(&crate::db::BountyRecord {
+                id: "bounty-rootrule-comp".into(),
+                repo_owner: owner.into(),
+                repo_name: "restricted-public".into(),
+                issue_id: None,
+                title: "Root Rule Completed".into(),
+                amount: 600,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: "2026-02-02T00:00:00Z".into(),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            })
+            .await
+            .unwrap();
+        state
+            .db
+            .claim_bounty("bounty-rootrule-comp", agent, None, "2026-02-02T01:00:00Z")
+            .await
+            .unwrap();
+        state
+            .db
+            .submit_bounty(
+                "bounty-rootrule-comp",
+                "pr-rootrule-1",
+                "2026-02-02T02:00:00Z",
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .approve_bounty("bounty-rootrule-comp", "2026-02-03T00:00:00Z", None)
+            .await
+            .unwrap();
+
+        // Truly public repo (no root rule) as a control.
+        let mut control = seed_private_repo(owner, "truly-public");
+        control.is_public = true;
+        state.db.create_repo(&control).await.unwrap();
+        state
+            .db
+            .create_bounty(&crate::db::BountyRecord {
+                id: "bounty-control-open".into(),
+                repo_owner: owner.into(),
+                repo_name: "truly-public".into(),
+                issue_id: None,
+                title: "Control Open".into(),
+                amount: 100,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: "2026-02-04T00:00:00Z".into(),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            })
+            .await
+            .unwrap();
+
+        let router = crate::server::build_router(state.clone());
+        let resp = router
+            .oneshot(anon_get("/api/v1/bounties/stats"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+
+        // Anonymous caller must see only the control repo's bounty, not the
+        // root-rule-restricted repo's bounties — even though is_public = true.
+        assert_eq!(
+            body["open"], 1,
+            "root-rule-restricted repo's open bounty must be excluded"
+        );
+        assert_eq!(
+            body["completed"], 0,
+            "root-rule-restricted repo's completed bounty must be excluded"
+        );
+        let leaders = body["leaderboard"].as_array().unwrap();
+        assert!(
+            leaders.is_empty(),
+            "leaderboard must not show earnings from root-rule-restricted repo"
+        );
+
+        // Also verify agent bounty stats for the root-rule-restricted repo's claimant
+        let router = crate::server::build_router(state);
+        let resp_agent = router
+            .oneshot(anon_get(&format!("/api/v1/agents/{agent}/bounties")))
+            .await
+            .unwrap();
+        assert_eq!(resp_agent.status(), StatusCode::OK);
+        let body_agent = json_body(resp_agent).await;
+        assert_eq!(
+            body_agent["completed_bounties"], 0,
+            "root-rule-restricted repo's completed bounty must not count for agent"
+        );
+        assert_eq!(
+            body_agent["total_earned"], 0,
+            "root-rule-restricted repo's earnings must not count for agent"
         );
     }
 
@@ -18059,7 +19531,9 @@ mod tests {
             let _m = server
                 .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
                 .with_status(200)
-                .with_body(r#"{"Hash":"bafyprovider"}"#)
+                .with_body(
+                    r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#,
+                )
                 .expect_at_least(1)
                 .create_async()
                 .await;
@@ -18127,7 +19601,9 @@ mod tests {
             let _m = server
                 .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
                 .with_status(200)
-                .with_body(r#"{"Hash":"bafyprovider"}"#)
+                .with_body(
+                    r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#,
+                )
                 .expect_at_least(1)
                 .create_async()
                 .await;
@@ -18195,7 +19671,9 @@ mod tests {
             let _m = server
                 .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
                 .with_status(200)
-                .with_body(r#"{"Hash":"bafyprovider"}"#)
+                .with_body(
+                    r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#,
+                )
                 .expect_at_least(1)
                 .create_async()
                 .await;
@@ -18265,7 +19743,9 @@ mod tests {
             let _m = server
                 .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
                 .with_status(200)
-                .with_body(r#"{"Hash":"bafyprovider"}"#)
+                .with_body(
+                    r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#,
+                )
                 .expect_at_least(1)
                 .create_async()
                 .await;
@@ -18329,7 +19809,9 @@ mod tests {
                 let _m = server
                     .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
                     .with_status(200)
-                    .with_body(r#"{"Hash":"bafyprovider"}"#)
+                    .with_body(
+                        r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#,
+                    )
                     .expect_at_least(1)
                     .create_async()
                     .await;
@@ -18391,7 +19873,9 @@ mod tests {
                 let _m = server
                     .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
                     .with_status(200)
-                    .with_body(r#"{"Hash":"bafyprovider"}"#)
+                    .with_body(
+                        r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#,
+                    )
                     .expect_at_least(1)
                     .create_async()
                     .await;
@@ -18527,7 +20011,9 @@ mod tests {
                 let _m = server
                     .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
                     .with_status(200)
-                    .with_body(r#"{"Hash":"bafyprovider"}"#)
+                    .with_body(
+                        r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#,
+                    )
                     .expect_at_least(1)
                     .create_async()
                     .await;
@@ -18606,7 +20092,9 @@ mod tests {
                 let _m = server
                     .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
                     .with_status(200)
-                    .with_body(r#"{"Hash":"bafyprovider"}"#)
+                    .with_body(
+                        r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#,
+                    )
                     .expect_at_least(1)
                     .create_async()
                     .await;
@@ -18667,7 +20155,9 @@ mod tests {
                 let _m = server
                     .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
                     .with_status(200)
-                    .with_body(r#"{"Hash":"bafyprovider"}"#)
+                    .with_body(
+                        r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#,
+                    )
                     .expect_at_least(1)
                     .create_async()
                     .await;
@@ -18766,7 +20256,9 @@ mod tests {
                 let _m = server
                     .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
                     .with_status(200)
-                    .with_body(r#"{"Hash":"bafyprovider"}"#)
+                    .with_body(
+                        r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#,
+                    )
                     .expect_at_least(1)
                     .create_async()
                     .await;
@@ -18852,7 +20344,9 @@ mod tests {
                 let _m = server
                     .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
                     .with_status(200)
-                    .with_body(r#"{"Hash":"bafyprovider"}"#)
+                    .with_body(
+                        r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#,
+                    )
                     .expect_at_least(1)
                     .create_async()
                     .await;

@@ -76,9 +76,221 @@ jobs:
             // line after horizontal whitespace, covering bare, cfg(test), namespaced,
             // optional leading ::, and raw-identifier (r#test) forms. No head-file fetch
             // or lexer: needs-tests is advisory, not a merge gate.
-            const addsInlineTest = files.some(f =>
-              f.filename.endsWith(".rs") && f.patch &&
-              /^\+[ \t]*#\[[ \t]*(?:cfg[ \t]*\([ \t]*test[ \t]*\)|(?:::[ \t]*)?(?:[\w-]+[ \t]*::[ \t]*)*(?:r#)?test\b)/m.test(f.patch));
+            //
+            // The final path component may also carry `test` as an underscore-delimited
+            // segment, so third-party harnesses land without enumerating them one by one
+            // (#[test_case(1)], #[wasm_bindgen_test]). It is deliberately a segment and
+            // not a substring: a substring would also match #[contest] / #[latest], and a
+            // false positive here SUPPRESSES needs-tests rather than adding it. This
+            // heuristic has to fail loud, because a wrongly labeled PR gets corrected by
+            // the author while a wrongly cleared one is invisible. That trade costs the
+            // no-underscore harness names (#[rstest]), which stay unmatched on purpose.
+            //
+            // The segment classes are [A-Za-z0-9]+ rather than \w+ on purpose, so that `_`
+            // is only ever the literal delimiter. \w+ contains `_`, which makes the repeat
+            // ambiguous and backtracks exponentially: on this workflow's pull_request_target
+            // trigger f.patch is fork-controlled, so `#[test` followed by a long `_a` run is
+            // a permissionless stall of the triage job.
+            // Rust allows whitespace, line breaks, and comments between the
+            // attribute path and ] or (. A flat regex cannot decide that
+            // boundary: `//` runs to end of line, and block comments NEST, which
+            // is beyond regular languages — every enumeration of comment
+            // spellings so far has either dropped a legal separator (regressing
+            // real tests into needs-tests) or let unrelated patch records
+            // complete each other (clearing needs-tests from a testless PR, the
+            // invisible direction). So the closer is found by a token-aware
+            // scan instead: it consumes horizontal whitespace, `//`-to-newline,
+            // and depth-counted `/* */` runs, and accepts only when the first
+            // real token after the attribute path is `]` or `(`.
+            //
+            // Association is positional: the scan starts on the attribute's own
+            // added line and may continue ONLY through the immediately following
+            // added lines (a context line, hunk header, or removal breaks the
+            // chain). Unrelated `]`/`(` lines elsewhere in the patch can never
+            // complete a path they do not adjoin. The continuation is bounded;
+            // past the bound the scan gives up and reports NO inline test, which
+            // fails toward the loud label rather than the silent clearance.
+            //
+            // The detector body is fenced by the TRIAGE_DETECTOR markers so
+            // scripts/test-pr-triage-detect.mjs can extract and run it against
+            // the committed case matrix. Keep the fenced block self-contained.
+            // TRIAGE_DETECTOR_BEGIN
+            const TEST_ATTR_PATH =
+              "(?:cfg[ \\t]*\\([ \\t]*test[ \\t]*\\)|(?:::[ \\t]*)?(?:[\\w-]+[ \\t]*::[ \\t]*)*(?:r#)?(?:[A-Za-z0-9]+_)*test(?:_[A-Za-z0-9]+)*)";
+            // Anchored to the start of one added line; group 1 is whatever
+            // follows the path on that line, handed to the separator scan.
+            const TEST_ATTR_LINE = new RegExp(
+              "^[ \\t]*#\\[[ \\t]*" + TEST_ATTR_PATH + "([\\s\\S]*)$"
+            );
+            // An attribute split across more added lines than this is not a
+            // spelling anyone writes; refusing to scan further keeps the walk
+            // linear in the patch and fails toward the loud label.
+            const MAX_ATTR_CONTINUATION_LINES = 16;
+            // segs[0] is the remainder of the attribute's own line; each later
+            // entry is the text of one immediately following added line. True
+            // only when the first non-separator token across them is ] or (.
+            // Single forward pass, no backtracking: fork-controlled input.
+            function attrCloserFollows(segs) {
+              let depth = 0; // open block-comment nesting carried across lines
+              for (const seg of segs) {
+                let i = 0;
+                while (i < seg.length) {
+                  if (depth > 0) {
+                    if (seg.startsWith("/*", i)) { depth += 1; i += 2; }
+                    else if (seg.startsWith("*/", i)) { depth -= 1; i += 2; }
+                    else { i += 1; }
+                    continue;
+                  }
+                  const c = seg[i];
+                  if (c === " " || c === "\t") { i += 1; continue; }
+                  if (seg.startsWith("//", i)) break; // comment to end of line
+                  if (seg.startsWith("/*", i)) { depth = 1; i += 2; continue; }
+                  return c === "]" || c === "(";
+                }
+                // Line exhausted inside separators; the newline is itself a
+                // separator, so continue on the next added line.
+              }
+              return false; // out of adjoined lines (or bound hit): stay loud
+            }
+            // Before the candidate scan, a pre-pass walks added patch lines
+            // tracking Rust lexical state: raw strings (r#*", br#*", cr#*"),
+            // block comments (/* */ with nesting), regular strings ("...",
+            // which can span newlines), and line comments (//). An added line
+            // that starts inside any of these is skipped as a candidate,
+            // because a #[test_case] appearing there is lexical non-code, not
+            // a real test attribute. State is only tracked across consecutive
+            // added lines and reset at any break (context line, removal,
+            // hunk header): context lines carry a partial view of the file,
+            // so a " or r#" or /* there might be inside a string that opened
+            // before the hunk's visible window, and treating it as an opener
+            // would mark every later added line as non-code (a false negative
+            // on a real #[test]). The tradeoff is that a non-code region
+            // opened by a context line is invisible: an added #[test] inside
+            // an existing raw string or block comment is scanned as code and
+            // may match (a false positive, silent direction). This is accepted
+            // because (1) the old detector had the same behavior, (2) the
+            // pattern is rare, and (3) needs-tests is advisory, not a merge
+            // gate. Scanning context lines to close this gap would re-introduce
+            // the false negative, which affects the far more common case of a
+            // context line carrying a stray " from a string that opened before
+            // the visible window. Single forward pass, O(n) in patch length.
+            function patchAddsInlineTest(patch) {
+              const lines = patch.split("\n");
+              const nonCodeStart = new Set();
+              let rawHashes = -1; // -1 = not in raw string; >=0 = # count
+              let blockDepth = 0;
+              let inString = false;
+              for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                if (!line) continue;
+                const prefix = line[0];
+                // Only scan added lines. Context and removal lines carry
+                // a partial view of the file: a " or r#" or /* on a context
+                // line might be inside a string that opened before the
+                // hunk's visible window, and treating it as an opener would
+                // mark every later added line as non-code (a false negative
+                // on a real #[test]). So lexical state is only tracked across
+                // consecutive added lines and reset at any break. A non-code
+                // region opened by a context line is invisible; the candidate
+                // is still scanned, which fails toward the loud label.
+                if (prefix !== "+") {
+                  rawHashes = -1; blockDepth = 0; inString = false;
+                  continue;
+                }
+                const text = line.slice(1);
+                if (rawHashes >= 0 || blockDepth > 0 || inString)
+                  nonCodeStart.add(i);
+                let j = 0;
+                while (j < text.length) {
+                  if (rawHashes >= 0) {
+                    if (text[j] === '"') {
+                      let h = 1;
+                      while (h <= rawHashes && text[j + h] === "#") h++;
+                      if (h > rawHashes) { rawHashes = -1; j += h; continue; }
+                    }
+                    j += 1; continue;
+                  }
+                  if (blockDepth > 0) {
+                    if (text.startsWith("/*", j)) { blockDepth += 1; j += 2; }
+                    else if (text.startsWith("*/", j)) { blockDepth -= 1; j += 2; }
+                    else { j += 1; }
+                    continue;
+                  }
+                  if (inString) {
+                    if (text[j] === "\\") { j += 2; continue; }
+                    if (text[j] === '"') { inString = false; j += 1; continue; }
+                    j += 1; continue;
+                  }
+                  // Recognize Rust char and byte-char literals ('X', '\X',
+                  // '\u{...}', b'X') so their contents never open string or
+                  // comment state. A char literal has a closing ' within a
+                  // bounded distance; a lifetime or label ('a, 'static,
+                  // 'label:) does not, so it falls through as a regular char.
+                  // This is not a skip-to-next-' rule: the lookahead is 2-4
+                  // chars, or bounded to 20 for \u escapes (at most 6 hex
+                  // digits), never unbounded.
+                  if (text[j] === "'") {
+                    let k = j + 1;
+                    if (text[k] === "\\") {
+                      k += 1;
+                      if (text[k] === "u" && text[k + 1] === "{") {
+                        const uBound = k + 20;
+                        while (k < uBound && text[k] && text[k] !== "}") k++;
+                        if (text[k] === "}") k++;
+                      } else {
+                        k += 1;
+                      }
+                    } else {
+                      k += 1;
+                    }
+                    if (text[k] === "'") { j = k + 1; continue; }
+                    // lifetime or label: just skip the apostrophe
+                  }
+                  if (text[j] === '"') { inString = true; j += 1; continue; }
+                  if (text.startsWith("//", j)) break;
+                  if (text.startsWith("/*", j)) { blockDepth = 1; j += 2; continue; }
+                  const prev = j > 0 ? text[j - 1] : "";
+                  const isIdent = /[A-Za-z0-9_]/.test(prev);
+                  if (!isIdent && text[j] === "r") {
+                    let k = j + 1, h = 0;
+                    while (text[k + h] === "#") h++;
+                    if (text[k + h] === '"') {
+                      rawHashes = h; j = k + h + 1; continue;
+                    }
+                  }
+                  if (!isIdent && (text[j] === "b" || text[j] === "c") && text[j + 1] === "r") {
+                    let k = j + 2, h = 0;
+                    while (text[k + h] === "#") h++;
+                    if (text[k + h] === '"') {
+                      rawHashes = h; j = k + h + 1; continue;
+                    }
+                  }
+                  j += 1;
+                }
+              }
+              for (let i = 0; i < lines.length; i++) {
+                if (lines[i][0] !== "+") continue;
+                if (nonCodeStart.has(i)) continue;
+                const m = TEST_ATTR_LINE.exec(lines[i].slice(1));
+                if (m === null) continue;
+                const segs = [m[1]];
+                for (
+                  let j = i + 1;
+                  j < lines.length &&
+                  lines[j][0] === "+" &&
+                  segs.length <= MAX_ATTR_CONTINUATION_LINES;
+                  j++
+                ) {
+                  segs.push(lines[j].slice(1));
+                }
+                if (attrCloserFollows(segs)) return true;
+              }
+              return false;
+            }
+            // TRIAGE_DETECTOR_END
+            const addsInlineTest = files.some(
+              f => f.filename.endsWith(".rs") && !!f.patch && patchAddsInlineTest(f.patch)
+            );
             const touchedTests =
               names.some(n => n.includes("/tests/") || n.endsWith("_test.rs")) || addsInlineTest;
             if (changedRust && !touchedTests) want.add("needs-tests");

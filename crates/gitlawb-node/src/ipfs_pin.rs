@@ -1508,9 +1508,6 @@ pub async fn pin_git_object(
         return Ok(String::new());
     }
 
-    // Compute the expected CIDv1 from the content bytes
-    let expected_cid = Cid::from_git_object_bytes(data).to_string();
-
     let url = format!(
         "{}/api/v0/add?cid-version=1&raw-leaves=true&pin=true",
         ipfs_api.trim_end_matches('/')
@@ -1557,6 +1554,10 @@ pub async fn pin_git_object(
         .text()
         .await
         .map_err(|e| anyhow::anyhow!("IPFS add response body read failed: {e}"))?;
+    // A 200 without a parseable Hash is not a successful pin. Fabricating the
+    // caller-computed CID would record an address the backend never confirmed;
+    // above its chunk threshold that raw CID is not even a stored block, so
+    // every later cat fails permanently.
     let cid = body
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -1565,7 +1566,17 @@ pub async fn pin_git_object(
             v["Hash"].as_str().map(|s| s.to_string())
         })
         .next_back()
-        .unwrap_or(expected_cid.clone());
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "IPFS /api/v0/add returned 200 without a usable Hash: {:.200}",
+                body
+            )
+        })?;
+    // The string still has to be a CID. A garbage Hash would be recorded and
+    // later cat-ed the same way a missing one was, so reject it here.
+    Cid::from_str(&cid).map_err(|e| {
+        anyhow::anyhow!("IPFS /api/v0/add returned a Hash that is not a CID ({cid:.200}): {e}")
+    })?;
 
     tracing::debug!(sha256 = %sha256_hex, %cid, "pinned git object to IPFS");
     Ok(cid)
@@ -2223,16 +2234,16 @@ mod tests {
         endpoint
     }
 
-    /// A sleeping-but-live endpoint. Answers `200` with an empty body after
-    /// `delays[i]` for the i-th request it accepts (the last entry repeats), so
-    /// a test can make one add slow and the next fast. Drains the full request,
-    /// headers plus the declared `Content-Length` body, before sleeping: exactly
-    /// as in `rejecting_endpoint`, answering early and closing would surface as
-    /// a write failure on the client and turn a slow-but-healthy add into a
-    /// different failure shape.
+    /// A sleeping-but-live endpoint. Answers `200` with a conformant NDJSON add
+    /// response after `delays[i]` for the i-th request it accepts (the last
+    /// entry repeats), so a test can make one add slow and the next fast.
+    /// Drains the full request, headers plus the declared `Content-Length`
+    /// body, before sleeping: exactly as in `rejecting_endpoint`, answering
+    /// early and closing would surface as a write failure on the client and
+    /// turn a slow-but-healthy add into a different failure shape.
     ///
-    /// An empty body is a successful pin: `pin_git_object` falls back to the CID
-    /// it computed from the bytes when the response carries no `Hash`.
+    /// The Hash is a fixed, real CID: the timing tests assert on pin counts,
+    /// not on the recorded address.
     async fn delaying_endpoint(delays: Vec<Duration>) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2269,9 +2280,14 @@ mod tests {
                         }
                     }
                     tokio::time::sleep(delay).await;
-                    let _ = sock
-                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-                        .await;
+                    let body = br#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4","Size":"12"}
+"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.write_all(body).await;
                     let _ = sock.flush().await;
                 });
             }
@@ -2370,6 +2386,71 @@ mod tests {
         assert!(
             inner.is_err(),
             "a silent endpoint must surface as a transport error, not successful bytes"
+        );
+    }
+
+    /// A 200 add response with no parseable Hash must surface as an add
+    /// failure. Falling back to the caller-computed CID records an
+    /// unverifiable address: above the backend's chunk threshold that raw
+    /// CID is not a stored block, so every later cat 500s.
+    #[tokio::test]
+    async fn pin_git_object_rejects_a_200_without_a_hash() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+            .with_status(200)
+            .with_body(r#"{"Name":"object","Size":"19"}"#)
+            .create_async()
+            .await;
+        let result = pin_git_object(&server.url(), "deadbeef", b"some object bytes\n", None).await;
+        assert!(
+            result.is_err(),
+            "a 200 without a Hash must be an add failure, not a fabricated CID: {result:?}"
+        );
+    }
+
+    /// A Hash that is a string but not a CID must also fail. It would be
+    /// recorded into `encrypted_blobs.cid` and every later cat would miss.
+    #[tokio::test]
+    async fn pin_git_object_rejects_a_malformed_hash() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+            .with_status(200)
+            .with_body(r#"{"Hash":"not-a-cid","Size":"19"}"#)
+            .create_async()
+            .await;
+        let result = pin_git_object(&server.url(), "deadbeef", b"some object bytes\n", None).await;
+        assert!(
+            result.is_err(),
+            "a Hash that is not a CID must be an add failure: {result:?}"
+        );
+    }
+
+    /// The Hash text goes into the error and `encrypted_pin` logs that error,
+    /// so a backend answering with a huge invalid Hash must not produce an
+    /// unbounded log entry.
+    #[tokio::test]
+    async fn pin_git_object_bounds_an_oversized_invalid_hash_in_the_error() {
+        let long = "x".repeat(5000);
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+            .with_status(200)
+            .with_body(format!(r#"{{"Hash":"{long}","Size":"19"}}"#))
+            .create_async()
+            .await;
+        let result = pin_git_object(&server.url(), "deadbeef", b"some object bytes\n", None).await;
+        let err = result.expect_err("an invalid Hash must be an add failure");
+        let msg = err.to_string();
+        assert!(
+            msg.len() < 1000,
+            "the error must bound the echoed Hash, got {} bytes",
+            msg.len()
+        );
+        assert!(
+            !msg.contains(&long),
+            "the error must not carry the full invalid Hash"
         );
     }
 

@@ -1184,6 +1184,16 @@ const OWNER_KEY_CASE_SQL: &str = "CASE WHEN owner_did LIKE 'did:key:%' AND posit
 /// named `did` (like in agent_profiles) instead of `owner_did`.
 const PROFILE_DID_CASE_SQL: &str = "CASE WHEN did LIKE 'did:key:%' AND position(':' in substr(did, 9)) = 0 THEN substr(did, 9) ELSE did END";
 
+/// SQL CASE expression byte-identical to `normalize_owner_key`, but for columns
+/// named `repo_owner` (bounties table).  The bounties `repo_owner` is stored
+/// verbatim from the URL segment, so it may be either the full `did:key:` form
+/// or the bare key.
+const BOUNTY_OWNER_CASE_SQL: &str = "CASE WHEN repo_owner LIKE 'did:key:%' AND position(':' in substr(repo_owner, 9)) = 0 THEN substr(repo_owner, 9) ELSE repo_owner END";
+
+/// SQL CASE expression byte-identical to `normalize_owner_key`, but for columns
+/// named `claimant_did` (bounties table).
+const BOUNTY_CLAIMANT_CASE_SQL: &str = "CASE WHEN claimant_did LIKE 'did:key:%' AND position(':' in substr(claimant_did, 9)) = 0 THEN substr(claimant_did, 9) ELSE claimant_did END";
+
 #[cfg(test)]
 mod normalize_owner_key_tests {
     use super::normalize_owner_key;
@@ -2251,13 +2261,13 @@ impl Db {
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn remove_label(&self, repo_id: &str, label: &str) -> Result<()> {
-        sqlx::query("DELETE FROM repo_labels WHERE repo_id = $1 AND label = $2")
+    pub async fn remove_label(&self, repo_id: &str, label: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM repo_labels WHERE repo_id = $1 AND label = $2")
             .bind(repo_id)
             .bind(label)
             .execute(&self.pool)
             .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn list_labels(&self, repo_id: &str) -> Result<Vec<String>> {
@@ -4569,31 +4579,110 @@ impl Db {
         Ok(())
     }
 
-    pub async fn count_bounties_by_status(&self, status: &str) -> Result<i64> {
-        let row = sqlx::query("SELECT COUNT(*) as c FROM bounties WHERE status = $1")
+    // ── Visibility-filtered bounty aggregates (#477) ─────────────────────
+
+    /// Count bounties by status, restricted to repos whose `(owner_did, name)`
+    /// pairs are in `visible`.  Owner keys are normalized on both sides so
+    /// `did:key:` and bare-key forms match.  An empty set returns 0.
+    pub async fn count_bounties_by_status_visible(
+        &self,
+        status: &str,
+        visible: &[(String, String)],
+    ) -> Result<i64> {
+        if visible.is_empty() {
+            return Ok(0);
+        }
+        let owners: Vec<String> = visible.iter().map(|(o, _)| o.clone()).collect();
+        let names: Vec<String> = visible.iter().map(|(_, n)| n.clone()).collect();
+        let sql = format!(
+            "SELECT COUNT(*) as c FROM bounties b \
+             WHERE b.status = $1 \
+             AND EXISTS ( \
+                 SELECT 1 FROM unnest($2::text[], $3::text[]) AS v(o, n) \
+                 WHERE ({bounty_owner}) = v.o AND b.repo_name = v.n \
+             )",
+            bounty_owner = BOUNTY_OWNER_CASE_SQL,
+        );
+        let row = sqlx::query(&sql)
             .bind(status)
+            .bind(&owners)
+            .bind(&names)
             .fetch_one(&self.pool)
             .await?;
         Ok(row.get::<i64, _>("c"))
     }
 
-    pub async fn agent_bounty_stats(&self, agent_did: &str) -> Result<(i64, i64)> {
-        let row = sqlx::query(
-            "SELECT COUNT(*) as cnt, COALESCE(SUM(amount),0) as total FROM bounties WHERE claimant_did = $1 AND status = 'completed'",
-        )
-        .bind(agent_did)
-        .fetch_one(&self.pool)
-        .await?;
+    /// Per-agent bounty stats restricted to visible repos.  `b.repo_owner` is
+    /// normalized and `b.claimant_did` is matched against both spellings of the
+    /// agent key, so `did:key:` and bare-key forms match.
+    pub async fn agent_bounty_stats_visible(
+        &self,
+        agent_did: &str,
+        visible: &[(String, String)],
+    ) -> Result<(i64, i64)> {
+        if visible.is_empty() {
+            return Ok((0, 0));
+        }
+        // Index-friendly form of `normalize(claimant_did) = N`: a claimant
+        // normalizes to N only when stored as N or as `did:key:N` (the latter
+        // only when N has no ':', else the prefix is not stripped). Matching
+        // the raw column keeps `idx_bounties_claimant` usable.
+        let normalized_agent = normalize_owner_key(agent_did);
+        let mut claimants: Vec<String> = vec![normalized_agent.to_string()];
+        if !normalized_agent.contains(':') {
+            claimants.push(format!("did:key:{normalized_agent}"));
+        }
+        let owners: Vec<String> = visible.iter().map(|(o, _)| o.clone()).collect();
+        let names: Vec<String> = visible.iter().map(|(_, n)| n.clone()).collect();
+        let sql = format!(
+            "SELECT COUNT(*) as cnt, COALESCE(SUM(amount), 0)::BIGINT as total FROM bounties b \
+             WHERE b.claimant_did = ANY($1::text[]) \
+             AND b.status = 'completed' \
+             AND EXISTS ( \
+                 SELECT 1 FROM unnest($2::text[], $3::text[]) AS v(o, n) \
+                 WHERE ({bounty_owner}) = v.o AND b.repo_name = v.n \
+             )",
+            bounty_owner = BOUNTY_OWNER_CASE_SQL,
+        );
+        let row = sqlx::query(&sql)
+            .bind(&claimants)
+            .bind(&owners)
+            .bind(&names)
+            .fetch_one(&self.pool)
+            .await?;
         Ok((row.get::<i64, _>("cnt"), row.get::<i64, _>("total")))
     }
 
-    pub async fn bounty_leaderboard(&self, limit: i64) -> Result<Vec<(String, i64, i64)>> {
-        let rows = sqlx::query(
-            "SELECT claimant_did, COUNT(*) as cnt, COALESCE(SUM(amount),0) as total FROM bounties WHERE status='completed' AND claimant_did IS NOT NULL GROUP BY claimant_did ORDER BY total DESC LIMIT $1",
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+    /// Leaderboard restricted to visible repos.  Owner and claimant keys are
+    /// normalized so `did:key:` and bare-key forms match and group together.
+    pub async fn bounty_leaderboard_visible(
+        &self,
+        limit: i64,
+        visible: &[(String, String)],
+    ) -> Result<Vec<(String, i64, i64)>> {
+        if visible.is_empty() {
+            return Ok(Vec::new());
+        }
+        let owners: Vec<String> = visible.iter().map(|(o, _)| o.clone()).collect();
+        let names: Vec<String> = visible.iter().map(|(_, n)| n.clone()).collect();
+        let sql = format!(
+            "SELECT MIN(claimant_did) as claimant_did, COUNT(*) as cnt, COALESCE(SUM(amount), 0)::BIGINT as total \
+             FROM bounties b \
+             WHERE b.status = 'completed' AND b.claimant_did IS NOT NULL \
+             AND EXISTS ( \
+                 SELECT 1 FROM unnest($1::text[], $2::text[]) AS v(o, n) \
+                 WHERE ({bounty_owner}) = v.o AND b.repo_name = v.n \
+             ) \
+             GROUP BY ({claimant_case}) ORDER BY total DESC LIMIT $3",
+            claimant_case = BOUNTY_CLAIMANT_CASE_SQL,
+            bounty_owner = BOUNTY_OWNER_CASE_SQL,
+        );
+        let rows = sqlx::query(&sql)
+            .bind(&owners)
+            .bind(&names)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows
             .iter()
             .map(|r| {
