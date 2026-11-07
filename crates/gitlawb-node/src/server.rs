@@ -274,7 +274,10 @@ pub fn build_router(state: AppState) -> Router {
         .layer(axum::Extension(ipfs_limiter));
     let ipfs_pins_routes = Router::new()
         .route("/api/v1/ipfs/pins", get(ipfs::list_pins))
-        .layer(middleware::from_fn(auth::optional_signature));
+        .layer(middleware::from_fn_with_state(
+            auth::SignatureBodyLimit(SIGNED_BODY_LIMIT),
+            auth::optional_signature,
+        ));
     let ipfs_routes = ipfs_cid_routes.merge(ipfs_pins_routes);
 
     // ── Arweave permanent anchors ──────────────────────────────────────────
@@ -286,7 +289,10 @@ pub fn build_router(state: AppState) -> Router {
     // a real provider contract.
     let arweave_routes = Router::new()
         .route("/api/v1/arweave/anchors", get(arweave::list_anchors))
-        .layer(middleware::from_fn(auth::optional_signature));
+        .layer(middleware::from_fn_with_state(
+            auth::SignatureBodyLimit(SIGNED_BODY_LIMIT),
+            auth::optional_signature,
+        ));
 
     // ── Bounty routes (write — require HTTP Signature) ─────────────────
     let bounty_write_routes = add_auth_layers(
