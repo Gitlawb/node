@@ -54,9 +54,9 @@ We will acknowledge receipt within 48 hours and aim to release a fix within 14 d
 These are documented limitations of the current live release. They should be prioritized without breaking existing nodes during rolling upgrades.
 
 ### Repository write authorization defaults
-- `git-receive-pack` verifies HTTP Signatures, but `GITLAWB_ENFORCE_OWNER_PUSH` defaults to `false` for compatibility during rollout.
-- **Impact:** With the default setting, a valid signature authenticates the pusher but does not require that DID to be the repository owner.
-- **Mitigation:** Set `GITLAWB_ENFORCE_OWNER_PUSH=true` on nodes where owner-only pushes are required. Confirm that every legitimate pusher uses the owner DID before enabling it.
+- `git-receive-pack` verifies HTTP Signatures and, with the default configuration, also requires the pusher DID to be the repository owner: `GITLAWB_ENFORCE_OWNER_PUSH` defaults to `true`.
+- **Impact:** With the default setting, a valid signature authenticates the pusher *and* the pusher must be the repository owner. Authentication is not authorization on its own — anyone can mint a `did:key` and sign — so owner enforcement is the only thing that prevents every signed caller from pushing to every repository, including private ones.
+- **Mitigation:** `GITLAWB_ENFORCE_OWNER_PUSH=false` is the explicit rolling-upgrade compatibility override. Disable it only for the duration of an upgrade whose pushers are not yet the repo owner, then turn it back on. Delegated and CI keys count as non-owners: a UCAN `git/push` capability is verified but not yet honored for authorization, so they cannot push while this is on.
 
 ### UCAN delegation and revocation
 - The middleware validates a supplied UCAN's complete proof chain, but a root token is accepted without an independently trusted issuer anchor. `Ucan::can` is not yet used by write handlers, so a UCAN does not grant scoped repository access.
