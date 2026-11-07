@@ -1,6 +1,6 @@
 [package]
 name = "gitlawb-core"
-description = "Core cryptographic primitives for the gitlawb network: DIDs, CIDs, UCAN, HTTP Signatures, ref-update certificates"
+description = "Core cryptographic primitives for the Twigpine network: DIDs, CIDs, UCAN, HTTP Signatures, ref-update certificates"
 version = "0.7.1" # x-release-please-version
 edition.workspace = true
 rust-version.workspace = true
