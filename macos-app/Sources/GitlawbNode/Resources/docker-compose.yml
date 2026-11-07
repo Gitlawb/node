@@ -1,4 +1,4 @@
-# Run a gitlawb node + Postgres locally. For on-chain PoS operation, supply
+# Run a Twigpine node + Postgres locally. For on-chain PoS operation, supply
 # the operator key + contract addresses via a .env file or shell environment.
 
 services:
