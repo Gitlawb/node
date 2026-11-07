@@ -39,7 +39,11 @@ pub enum TaskCmd {
         /// ISO-8601 deadline for the task
         #[arg(long)]
         deadline: Option<String>,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -58,7 +62,11 @@ pub enum TaskCmd {
         /// same --status/--assignee-did filter that produced it.
         #[arg(long)]
         cursor: Option<String>,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -66,7 +74,11 @@ pub enum TaskCmd {
     /// View a specific task
     View {
         id: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -74,7 +86,11 @@ pub enum TaskCmd {
     /// Claim a pending task
     Claim {
         id: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -84,7 +100,11 @@ pub enum TaskCmd {
         id: String,
         #[arg(long)]
         result: Option<String>,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -94,7 +114,11 @@ pub enum TaskCmd {
         id: String,
         #[arg(long)]
         reason: Option<String>,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -179,15 +203,15 @@ async fn cmd_create(
         "delegator_did": delegator_did,
     }))?;
 
-    let resp: Value = client
-        .post("/api/v1/tasks", &body)
-        .await
-        .context("failed to create task")?
-        .error_for_status()
-        .context("failed to create task")?
-        .json()
-        .await
-        .context("invalid JSON response")?;
+    let resp = crate::http::read_json(
+        client
+            .post("/api/v1/tasks", &body)
+            .await
+            .context("failed to create task")?,
+        "create task",
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("failed to create task: {e}"))?;
     print_json(&resp);
     Ok(())
 }
@@ -584,9 +608,14 @@ async fn cmd_view(id: String, node: String, dir: Option<PathBuf>) -> Result<()> 
     let resp = client
         .get_maybe_signed(&format!("/api/v1/tasks/{}", id))
         .await
-        .context("failed to get task")?
-        .error_for_status()
         .context("failed to get task")?;
+    // A non-2xx answer must surface the node's status and message (the
+    // `read_json` contract from main), not render as a task; the success
+    // path keeps this PR's byte-budgeted page reader.
+    if !resp.status().is_success() {
+        let e = crate::http::read_json(resp, "view task").await.unwrap_err();
+        anyhow::bail!("failed to get task: {e}");
+    }
     let resp_json: Value = read_task_page_json(resp).await?;
     print_json(&resp_json);
     Ok(())
@@ -598,15 +627,14 @@ async fn cmd_claim(id: String, node: String, dir: Option<PathBuf>) -> Result<()>
     let client = NodeClient::new(&node, Some(keypair));
 
     let body = serde_json::to_vec(&json!({ "assignee_did": assignee_did }))?;
-    let resp: Value = client
-        .post(&format!("/api/v1/tasks/{}/claim", id), &body)
-        .await
-        .context("failed to claim task")?
-        .error_for_status()
-        .context("claim request rejected")?
-        .json()
-        .await
-        .context("invalid JSON response")?;
+    let resp = crate::http::read_json(
+        client
+            .post(&format!("/api/v1/tasks/{}/claim", id), &body)
+            .await
+            .context("failed to claim task")?,
+        "claim task",
+    )
+    .await?;
     print_json(&resp);
     Ok(())
 }
@@ -622,15 +650,14 @@ async fn cmd_complete(
     let client = NodeClient::new(&node, Some(keypair));
 
     let body = serde_json::to_vec(&json!({ "result": result, "by_did": by_did }))?;
-    let resp: Value = client
-        .post(&format!("/api/v1/tasks/{}/complete", id), &body)
-        .await
-        .context("failed to complete task")?
-        .error_for_status()
-        .context("complete request rejected")?
-        .json()
-        .await
-        .context("invalid JSON response")?;
+    let resp = crate::http::read_json(
+        client
+            .post(&format!("/api/v1/tasks/{}/complete", id), &body)
+            .await
+            .context("failed to complete task")?,
+        "complete task",
+    )
+    .await?;
     print_json(&resp);
     Ok(())
 }
@@ -646,15 +673,14 @@ async fn cmd_fail(
     let client = NodeClient::new(&node, Some(keypair));
 
     let body = serde_json::to_vec(&json!({ "reason": reason, "by_did": by_did }))?;
-    let resp: Value = client
-        .post(&format!("/api/v1/tasks/{}/fail", id), &body)
-        .await
-        .context("failed to fail task")?
-        .error_for_status()
-        .context("fail request rejected")?
-        .json()
-        .await
-        .context("invalid JSON response")?;
+    let resp = crate::http::read_json(
+        client
+            .post(&format!("/api/v1/tasks/{}/fail", id), &body)
+            .await
+            .context("failed to fail task")?,
+        "fail task",
+    )
+    .await?;
     print_json(&resp);
     Ok(())
 }
@@ -738,9 +764,11 @@ mod tests {
             .with_status(500)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"internal error"}"#)
+            .expect(1)
             .create_async()
             .await;
 
+        // A node 5xx must surface as an Err, not be printed as if it were a task.
         let err = cmd_create(
             "deploy".to_string(),
             "agent:task".to_string(),
@@ -755,6 +783,8 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("failed to create task"));
+        assert!(err.to_string().contains("500"), "got: {err}");
+        _m.assert_async().await;
     }
 
     // ── list ─────────────────────────────────────────────────────────
@@ -1560,13 +1590,17 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"not found"}"#)
+            .expect(1)
             .create_async()
             .await;
 
+        // A 404 must surface as an Err, not be printed as if it were a task.
         let err = cmd_view("nope".to_string(), server.url(), None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("failed to get task"));
+        assert!(err.to_string().contains("404"), "got: {err}");
+        _m.assert_async().await;
     }
 
     // ── claim ────────────────────────────────────────────────────────
@@ -1929,5 +1963,125 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no identity found"));
+    }
+
+    // ── denial surfaces: a node 4xx/5xx must Err, not render as success ──
+
+    #[tokio::test]
+    async fn test_list_tasks_surfaces_denial() {
+        let mut server = mockito::Server::new_async().await;
+
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/api/v1/tasks\?".to_string()),
+            )
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"boom"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let err = cmd_list(None, None, 50, None, server.url(), None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("500"), "got: {err}");
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_claim_task_surfaces_denial() {
+        let mut server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+
+        let _m = server
+            .mock("POST", "/api/v1/tasks/task-x/claim")
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"forbidden"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let err = cmd_claim(
+            "task-x".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("403"), "got: {err}");
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_complete_task_surfaces_denial() {
+        let mut server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+
+        let _m = server
+            .mock("POST", "/api/v1/tasks/task-x/complete")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let err = cmd_complete(
+            "task-x".to_string(),
+            None,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("404"), "got: {err}");
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fail_task_surfaces_denial() {
+        let mut server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+
+        let _m = server
+            .mock("POST", "/api/v1/tasks/task-x/fail")
+            .with_status(409)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"already terminal"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let err = cmd_fail(
+            "task-x".to_string(),
+            None,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("409"), "got: {err}");
+        _m.assert_async().await;
     }
 }
