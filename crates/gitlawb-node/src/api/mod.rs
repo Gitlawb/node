@@ -351,7 +351,11 @@ mod authz_guard {
             (
                 "create_task",
                 "createTask",
-                &["require_signer(ctx)?", "did_matches("],
+                &[
+                    "require_signer(ctx)?",
+                    "did_matches(",
+                    "require_repo_owner(",
+                ],
             ),
             (
                 "claim_task",
