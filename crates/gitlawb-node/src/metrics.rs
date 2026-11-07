@@ -314,7 +314,9 @@ pub fn record_sync_processed(status: &str) {
 }
 
 /// Record one webhook delivery attempt outcome. `result` ∈
-/// {ok, http_error, network_error, skipped}.
+/// {ok, http_error, network_error, skipped, invalid_url}.
+/// `invalid_url` is a policy skip: the stored hook URL failed the public-URL
+/// check at delivery time and the POST was never sent.
 pub fn record_webhook_delivery(result: &str) {
     if let Some(c) = WEBHOOK_DELIVERIES.get() {
         c.with_label_values(&[result]).inc();

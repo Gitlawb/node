@@ -79,6 +79,9 @@ async fn fire_event_async(
         let delivery_id = uuid::Uuid::new_v4().to_string();
 
         tokio::spawn(async move {
+            // Policy skip, not a delivery failure: the stored URL predates the
+            // create-time gate. The "invalid_url" label is documented on
+            // record_webhook_delivery in metrics.rs.
             if !crate::api::peers::is_public_http_url(&hook.url) {
                 crate::metrics::record_webhook_delivery("invalid_url");
                 tracing::warn!(
