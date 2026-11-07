@@ -66,7 +66,7 @@ variable "snapshot_retain_count" {
 variable "image_repo" {
   description = "Container image repository for the node. Ignored when create_ecr_repo is true (the module-managed ECR repo is used instead)."
   type        = string
-  default     = "ghcr.io/gitlawb/node"
+  default     = "ghcr.io/twigpine/node"
 }
 
 variable "create_ecr_repo" {
@@ -86,7 +86,7 @@ variable "image_tag" {
 # ---------------------------------------------------------------------------
 
 variable "icaptcha_mode" {
-  description = "iCaptcha gate mode: off | shadow | enforce. The live gitlawb network enforces."
+  description = "iCaptcha gate mode: off | shadow | enforce. The live Twigpine network enforces."
   type        = string
   default     = "enforce"
 }

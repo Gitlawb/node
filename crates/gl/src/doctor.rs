@@ -1,10 +1,10 @@
-//! `gl doctor` — check your gitlawb installation and connectivity.
+//! `gl doctor` — check your Twigpine installation and connectivity.
 //!
 //! Checks:
 //!   1. Identity        — ~/.gitlawb/identity.pem exists, DID parseable
 //!   2. Registration    — ~/.gitlawb/ucan.json exists (registered with a node)
 //!   3. GITLAWB_NODE    — env var is set to a non-localhost URL
-//!   4. Node            — GITLAWB_NODE is reachable (default: https://node.gitlawb.com)
+//!   4. Node            — GITLAWB_NODE is reachable (default: https://node.twigpine.com)
 //!   5. git helper      — git-remote-gitlawb is in PATH
 //!   6. git             — git is installed
 //!   7. version         — gl is up to date with latest GitHub release
@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use crate::http::NodeClient;
 
-const PUBLIC_NODE: &str = "https://node.gitlawb.com";
+const PUBLIC_NODE: &str = "https://node.twigpine.com";
 const GITHUB_API_BASE: &str = "https://api.github.com";
 
 #[derive(Args)]
@@ -70,7 +70,7 @@ impl Check {
 }
 
 pub async fn run(args: DoctorArgs) -> Result<()> {
-    println!("gl doctor — checking your gitlawb setup");
+    println!("gl doctor — checking your Twigpine setup");
     println!();
 
     let dir = args.dir.unwrap_or_else(|| {
@@ -160,7 +160,7 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
             checks.push(Check::fail(
                 "GITLAWB_NODE",
                 "not set — git-remote-gitlawb will fall back to http://127.0.0.1:7545",
-                "export GITLAWB_NODE=https://node.gitlawb.com",
+                "export GITLAWB_NODE=https://node.twigpine.com",
             ));
         }
     }
@@ -187,7 +187,7 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
                         "node is v{version} but gl is v{gl_ver} — your CLI may be missing \
                          features (signing / iCaptcha) this node requires"
                     ),
-                    "upgrade gl: curl -sSf https://gitlawb.com/install.sh | sh",
+                    "upgrade gl: curl -sSf https://twigpine.com/install.sh | sh",
                 ));
             }
         }
@@ -241,7 +241,7 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
         checks.push(Check::fail(
             "git-remote-gitlawb",
             "not found in PATH — gitlawb:// clone/push will not work",
-            "curl -sSf https://gitlawb.com/install.sh | sh",
+            "curl -sSf https://twigpine.com/install.sh | sh",
         ));
     }
 
@@ -408,7 +408,7 @@ fn which_in_path(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Fetch the latest release tag from Gitlawb/node (the actual release repo — see install.sh's
+/// Fetch the latest release tag from Twigpine/node (the actual release repo — see install.sh's
 /// `GITLAWB_RELEASE_REPO` default) and compare to current version.
 async fn check_version(current: &'static str, github_api_base: &str) -> Check {
     let client = match reqwest::Client::builder()
@@ -422,7 +422,7 @@ async fn check_version(current: &'static str, github_api_base: &str) -> Check {
 
     let resp = match client
         .get(format!(
-            "{github_api_base}/repos/Gitlawb/node/releases/latest"
+            "{github_api_base}/repos/Twigpine/node/releases/latest"
         ))
         .send()
         .await
@@ -457,7 +457,7 @@ async fn check_version(current: &'static str, github_api_base: &str) -> Check {
         Check::warn(
             "version",
             format!("v{current} → v{tag} available"),
-            "curl -sSf https://gitlawb.com/install.sh | sh",
+            "curl -sSf https://twigpine.com/install.sh | sh",
         )
     } else {
         Check::pass("version", format!("v{current} (up to date)"))
@@ -550,7 +550,7 @@ mod tests {
         assert!(is_loopback_url("http://localhost:7545"));
         assert!(is_loopback_url("http://[::1]:7545"));
         assert!(!is_loopback_url("https://localhost.example"));
-        assert!(!is_loopback_url("https://node.gitlawb.com/localhost"));
+        assert!(!is_loopback_url("https://node.twigpine.com/localhost"));
         assert!(!is_loopback_url("not a url"));
     }
 
@@ -603,7 +603,7 @@ mod tests {
     async fn test_check_version_queries_gitlawb_node_releases() {
         let mut server = mockito::Server::new_async().await;
         let _m = server
-            .mock("GET", "/repos/Gitlawb/node/releases/latest")
+            .mock("GET", "/repos/Twigpine/node/releases/latest")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"tag_name":"v9.9.9"}"#)
@@ -619,7 +619,7 @@ mod tests {
     async fn test_check_version_up_to_date() {
         let mut server = mockito::Server::new_async().await;
         let _m = server
-            .mock("GET", "/repos/Gitlawb/node/releases/latest")
+            .mock("GET", "/repos/Twigpine/node/releases/latest")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"tag_name":"v0.1.0"}"#)
@@ -635,7 +635,7 @@ mod tests {
     async fn test_check_version_http_error() {
         let mut server = mockito::Server::new_async().await;
         let _m = server
-            .mock("GET", "/repos/Gitlawb/node/releases/latest")
+            .mock("GET", "/repos/Twigpine/node/releases/latest")
             .with_status(403)
             .create_async()
             .await;

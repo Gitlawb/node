@@ -3,7 +3,7 @@
 //! Flow:
 //!   1. Parse source URL → derive repo name (or use --repo override)
 //!   2. `git clone --mirror <source>` into a temp dir
-//!   3. Create the repo on the gitlawb node (authenticated)
+//!   3. Create the repo on the Twigpine node (authenticated)
 //!   4. `git push --mirror gitlawb://<did>/<name>`
 //!   5. Clean up temp dir
 
@@ -22,15 +22,19 @@ pub struct MirrorArgs {
     /// Source repository URL (https://github.com/owner/repo, GitLab, or any public git URL)
     pub source: String,
 
-    /// Name to use on gitlawb (default: last path segment of source URL, .git suffix stripped)
+    /// Name to use on Twigpine (default: last path segment of source URL, .git suffix stripped)
     #[arg(long)]
     pub repo: Option<String>,
 
-    /// Optional description for the gitlawb repo
+    /// Optional description for the Twigpine repo
     #[arg(long, short)]
     pub description: Option<String>,
 
-    #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+    #[arg(
+        long,
+        default_value = "https://node.twigpine.com",
+        env = "GITLAWB_NODE"
+    )]
     pub node: String,
 
     #[arg(long)]
@@ -44,8 +48,8 @@ pub struct MirrorArgs {
 /// through real git by a test. The production call keeps `.status()` rather than
 /// `.output()`: a mirror clone of a large repo streams git's progress to the
 /// user's terminal, and capturing it to assert on stderr here would swallow that.
-fn mirror_clone_args<'a>(source: &'a str, dest: &'a str) -> [&'a str; 5] {
-    ["clone", "--mirror", "--", source, dest]
+fn mirror_clone_args<'a>(source: &'a str) -> [&'a str; 4] {
+    ["clone", "--mirror", "--", source]
 }
 
 pub async fn run(args: MirrorArgs) -> Result<()> {
@@ -73,7 +77,7 @@ pub async fn run(args: MirrorArgs) -> Result<()> {
     let owner_did = kp.did().to_string();
 
     println!("Mirroring {source}");
-    println!("  → gitlawb repo: {name}");
+    println!("  → Twigpine repo: {name}");
     println!();
 
     // ── 3. git clone --mirror into a temp dir ─────────────────────────────
@@ -91,17 +95,10 @@ pub async fn run(args: MirrorArgs) -> Result<()> {
     let _guard = TmpGuard(tmp_root);
 
     println!("Cloning source (this may take a while for large repos)...");
-    let clone_status = Command::new("git")
-        .args(mirror_clone_args(&source, mirror_path.to_str().unwrap()))
-        .status()
-        .context("failed to run git clone — is git installed?")?;
+    clone_mirror(&source, &mirror_path)?;
 
-    if !clone_status.success() {
-        bail!("git clone --mirror failed\nCheck that the source URL is accessible: {source}");
-    }
-
-    // ── 4. Create the repo on gitlawb ─────────────────────────────────────
-    println!("Creating repo on gitlawb node...");
+    // ── 4. Create the repo on Twigpine ─────────────────────────────────────
+    println!("Creating repo on Twigpine node...");
     let client = NodeClient::new(&args.node, Some(kp));
 
     let body = serde_json::to_vec(&json!({
@@ -124,7 +121,7 @@ pub async fn run(args: MirrorArgs) -> Result<()> {
         bail!("failed to create repo ({status}): {msg}");
     }
 
-    // ── 5. git push --mirror to gitlawb ───────────────────────────────────
+    // ── 5. git push --mirror to Twigpine ───────────────────────────────────
     let gitlawb_url = format!("gitlawb://{owner_did}/{name}");
     println!("Pushing to {gitlawb_url}...");
 
@@ -136,7 +133,7 @@ pub async fn run(args: MirrorArgs) -> Result<()> {
         .context("failed to run git push")?;
 
     if !push_status.success() {
-        bail!("git push --mirror failed\nThe repo was created on gitlawb but the push did not complete.\nYou can retry with:\n  cd {path} && git push --mirror {gitlawb_url}",
+        bail!("git push --mirror failed\nThe repo was created on Twigpine but the push did not complete.\nYou can retry with:\n  cd {path} && git push --mirror {gitlawb_url}",
             path = mirror_path.display());
     }
 
@@ -145,8 +142,27 @@ pub async fn run(args: MirrorArgs) -> Result<()> {
     println!();
     println!("✓ Mirror complete: {name}");
     println!("  Clone:  git clone {gitlawb_url}");
-    println!("  View:   https://gitlawb.com/{owner_short}/{name}");
+    println!("  View:   https://twigpine.com/{owner_short}/{name}");
 
+    Ok(())
+}
+
+/// `git clone --mirror <source> <dest>`. The destination is passed as an
+/// OS-native path so a non-UTF-8 temp dir (e.g. a TMPDIR with non-UTF-8 bytes)
+/// does not panic on a `to_str()` conversion.
+fn clone_mirror(source: &str, dest: &std::path::Path) -> Result<()> {
+    // allow-unbounded-git: gl is the client CLI; this clone runs in the user's
+    // terminal with no server-side permit or disconnect to survive. The
+    // bounded-runner rule governs node request handlers. Same spawn as before,
+    // only relocated into this helper.
+    let status = Command::new("git")
+        .args(mirror_clone_args(source))
+        .arg(dest)
+        .status()
+        .context("failed to run git clone — is git installed?")?;
+    if !status.success() {
+        bail!("git clone --mirror failed\nCheck that the source URL is accessible: {source}");
+    }
     Ok(())
 }
 
@@ -201,7 +217,8 @@ mod tests {
         let injected = "--upload-pack=false";
 
         let out = Command::new("git")
-            .args(mirror_clone_args(injected, dest.to_str().unwrap()))
+            .args(mirror_clone_args(injected))
+            .arg(&dest)
             .output()
             .unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -265,6 +282,80 @@ mod tests {
     fn test_extract_dot_git_only_returns_none() {
         // edge case: URL ending in just ".git" with no name
         assert_eq!(extract_repo_name("https://example.com/.git"), None);
+    }
+
+    // #417: a non-UTF-8 destination path must reach git as an OS-native arg, not
+    // panic on a `to_str()` conversion.
+    #[cfg(unix)]
+    #[test]
+    fn test_clone_mirror_non_utf8_dest() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let src = tmp.path().join("src.git");
+        let st = Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&src)
+            .status()
+            .unwrap();
+        assert!(st.success());
+
+        let dest = tmp.path().join(OsStr::from_bytes(b"mirror-\xffdest"));
+        clone_mirror(src.to_str().unwrap(), &dest).unwrap();
+        assert!(dest.join("HEAD").exists());
+    }
+
+    // #417 end-to-end: the real trigger is `std::env::temp_dir()` itself
+    // returning a non-UTF-8 path (a TMPDIR with non-UTF-8 bytes), because the
+    // mirror dest is built from it. Env is process-global, so this test
+    // re-execs the test binary in a child with a non-UTF-8 TMPDIR rather than
+    // mutating this process's env.
+    #[cfg(unix)]
+    #[test]
+    fn test_clone_mirror_under_non_utf8_tmpdir() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        if std::env::var_os("GL_MIRROR_NONUTF8_TMPDIR").is_none() {
+            // Parent: a source repo under a normal path, a TMPDIR whose name
+            // is not UTF-8, and a child run of this same test under that env.
+            let parent = tempfile::TempDir::new().unwrap();
+            let src = parent.path().join("src.git");
+            let st = Command::new("git")
+                .args(["init", "--bare"])
+                .arg(&src)
+                .status()
+                .unwrap();
+            assert!(st.success());
+            let bad_tmp = parent.path().join(OsStr::from_bytes(b"tmp-\xff"));
+            std::fs::create_dir_all(&bad_tmp).unwrap();
+
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "mirror::tests::test_clone_mirror_under_non_utf8_tmpdir",
+                    "--exact",
+                ])
+                .env("GL_MIRROR_NONUTF8_TMPDIR", "1")
+                .env("GL_MIRROR_SRC", &src)
+                .env("TMPDIR", &bad_tmp)
+                .status()
+                .unwrap();
+            assert!(status.success(), "child failed under non-UTF-8 TMPDIR");
+            return;
+        }
+
+        // Child: the same path shape run() computes — temp_dir() joined with
+        // the mirror dest. It must be non-UTF-8 or the test proves nothing.
+        let src = std::env::var("GL_MIRROR_SRC").unwrap();
+        let tmp_root = std::env::temp_dir().join("gl-mirror-child");
+        let dest = tmp_root.join("repo");
+        assert!(
+            dest.to_str().is_none(),
+            "fixture broken: dest under a non-UTF-8 TMPDIR must be non-UTF-8"
+        );
+        clone_mirror(&src, &dest).unwrap();
+        assert!(dest.join("HEAD").exists());
     }
 
     #[tokio::test]
