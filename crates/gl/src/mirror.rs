@@ -48,7 +48,7 @@ pub struct MirrorArgs {
 /// through real git by a test. The production call keeps `.status()` rather than
 /// `.output()`: a mirror clone of a large repo streams git's progress to the
 /// user's terminal, and capturing it to assert on stderr here would swallow that.
-fn mirror_clone_args<'a>(source: &'a str) -> [&'a str; 4] {
+fn mirror_clone_args(source: &str) -> [&str; 4] {
     ["clone", "--mirror", "--", source]
 }
 
