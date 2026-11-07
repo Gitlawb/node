@@ -1036,6 +1036,345 @@ mod tests {
         );
     }
 
+    /// #496: create_task must reject a caller-supplied repo_id that names a
+    /// hosted repo the caller does not own. A stranger naming the victim's repo
+    /// gets 403, leaking nothing about the repo and persisting nothing; the
+    /// owner files (201). Repo-less tasks stay allowed; an id naming no hosted
+    /// repo (unknown, or quarantined, hidden as if it did not exist) is stored
+    /// verbatim as an opaque label, and the 403-vs-201 split between a hosted
+    /// id and an unknown one is itself a one-bit oracle. This is a write gate:
+    /// task reads are caller-independent and not repo-scoped on this base.
+    #[sqlx::test]
+    async fn create_task_rejects_foreign_repo_id(pool: PgPool) {
+        let owner = "did:key:zTASKREPOOWNERAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let stranger = "did:key:zTASKREPOSTRANGERBBBBBBBBBBBBBBBBBBBBBB";
+        let state = test_state(pool).await;
+        let repo = seed_repo(owner, "task-gate-repo");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/tasks",
+                    axum::routing::post(crate::api::tasks::create_task),
+                )
+                .with_state(state.clone())
+        };
+        let post_as = |signer: &str, body: String| {
+            router().oneshot(signed_request_as(
+                signer,
+                Method::POST,
+                "/api/v1/tasks",
+                Body::from(body),
+            ))
+        };
+        let body_with = |signer: &str, repo_id: Option<&str>| {
+            let repo_field = repo_id
+                .map(|id| format!(r#","repo_id":"{id}""#))
+                .unwrap_or_default();
+            format!(
+                r#"{{"kind":"build","capability":"repo:write","delegator_did":"{signer}"{repo_field}}}"#
+            )
+        };
+        let created_id = |bytes: &[u8]| -> String {
+            let v: serde_json::Value = serde_json::from_slice(bytes).expect("task json");
+            v["id"].as_str().expect("task id").to_string()
+        };
+
+        // Stranger filing under the victim's repo id → exact 403.
+        let resp = post_as(stranger, body_with(stranger, Some(&repo.id)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a non-owner must not file tasks against a foreign repo id"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains(r#""error":"forbidden""#),
+            "denial must keep the forbidden envelope: {text}"
+        );
+        assert!(
+            text.contains(crate::api::REPO_OWNER_ONLY_MESSAGE),
+            "denial must carry the shared owner-denial text (same as GraphQL): {text}"
+        );
+
+        // The denial must not persist: no task row may carry the victim's
+        // repo id afterwards — a 403 that still writes is the injection.
+        let stored = state
+            .db
+            .list_tasks(None, None, 50)
+            .await
+            .expect("list tasks");
+        assert!(
+            stored
+                .iter()
+                .all(|t| t.repo_id.as_deref() != Some(repo.id.as_str())),
+            "a denied write must not leave a task under the foreign repo id"
+        );
+
+        // Owner filing under their own repo id → 201.
+        let resp = post_as(owner, body_with(owner, Some(&repo.id)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "the owner must be able to file tasks against their repo"
+        );
+
+        // Repo-less task → 201 (unaffected).
+        let resp = post_as(stranger, body_with(stranger, None)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "repo-less task creation must keep working"
+        );
+
+        // Unknown repo id → 201 as an opaque label.
+        let resp = post_as(stranger, body_with(stranger, Some("no-such-repo-id")))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "an id naming no hosted repo stays an opaque label"
+        );
+        // Read back the row: the unresolved id must be stored verbatim, not
+        // dropped or rewritten to a repo it never named.
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let task = state
+            .db
+            .get_task(&created_id(&bytes))
+            .await
+            .expect("get task")
+            .expect("task must be stored");
+        assert_eq!(
+            task.repo_id.as_deref(),
+            Some("no-such-repo-id"),
+            "an unresolved id must be stored verbatim as a label"
+        );
+
+        // Quarantined repo id → treated as unknown (201), never a 403 that
+        // would confirm the id names a real repo.
+        state
+            .db
+            .set_repo_quarantine(&repo.id, true)
+            .await
+            .expect("quarantine");
+        let resp = post_as(stranger, body_with(stranger, Some(&repo.id)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "a quarantined repo id must not 403 (existence oracle)"
+        );
+        // Read back the row: the quarantined id is stored verbatim as a label
+        // too, so the accepted write is not silently dropped.
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let task = state
+            .db
+            .get_task(&created_id(&bytes))
+            .await
+            .expect("get task")
+            .expect("task must be stored");
+        assert_eq!(
+            task.repo_id.as_deref(),
+            Some(repo.id.as_str()),
+            "a quarantined id must be stored verbatim as a label"
+        );
+    }
+
+    /// #496 (REST): a repo-lookup fault in the create_task gate must render the
+    /// module's opaque `db_error` envelope, not the raw sqlx text. Dropping a
+    /// column `get_repo_by_id` selects faults that first lookup; the 500 body
+    /// stays fixed and names no column (#250/#226).
+    #[sqlx::test]
+    async fn create_task_gate_repo_lookup_fault_is_opaque(pool: PgPool) {
+        let owner = "did:key:zTASKFAULTOWNERAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool.clone()).await;
+        let repo = seed_repo(owner, "task-gate-fault-repo");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/tasks",
+                    axum::routing::post(crate::api::tasks::create_task),
+                )
+                .with_state(state.clone())
+        };
+        let body = format!(
+            r#"{{"kind":"build","capability":"repo:write","delegator_did":"{owner}","repo_id":"{}"}}"#,
+            repo.id
+        );
+
+        // Drop a column the lookup's SELECT names so get_repo_by_id faults.
+        sqlx::query("ALTER TABLE repos DROP COLUMN machine_id")
+            .execute(&pool)
+            .await
+            .expect("drop machine_id");
+
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::POST,
+                "/api/v1/tasks",
+                Body::from(body),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a faulted repo lookup must be a 500"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains(r#""error":"db_error""#),
+            "gate DB fault must keep the opaque envelope: {text}"
+        );
+        assert!(
+            text.contains(crate::error::DB_ERROR_MESSAGE),
+            "gate DB fault must carry the fixed message: {text}"
+        );
+        assert!(
+            !text.contains("machine_id") && !text.contains("column"),
+            "schema text leaked through the gate: {text}"
+        );
+    }
+
+    /// #496 (REST): the gate's second lookup (`is_repo_quarantined`) runs through
+    /// the same opaque helper. Dropping the column only it selects leaves
+    /// `get_repo_by_id` succeeding, so this pins that second call site too.
+    #[sqlx::test]
+    async fn create_task_gate_quarantine_lookup_fault_is_opaque(pool: PgPool) {
+        let owner = "did:key:zTASKFAULT2OWNERAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool.clone()).await;
+        let repo = seed_repo(owner, "task-gate-fault2-repo");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/tasks",
+                    axum::routing::post(crate::api::tasks::create_task),
+                )
+                .with_state(state.clone())
+        };
+        let body = format!(
+            r#"{{"kind":"build","capability":"repo:write","delegator_did":"{owner}","repo_id":"{}"}}"#,
+            repo.id
+        );
+
+        // `quarantined` is not in get_repo_by_id's SELECT, so that lookup still
+        // succeeds and the fault lands on is_repo_quarantined.
+        sqlx::query("ALTER TABLE repos DROP COLUMN quarantined")
+            .execute(&pool)
+            .await
+            .expect("drop quarantined");
+
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::POST,
+                "/api/v1/tasks",
+                Body::from(body),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a faulted quarantine lookup must be a 500"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains(r#""error":"db_error""#),
+            "quarantine DB fault must keep the opaque envelope: {text}"
+        );
+        assert!(
+            text.contains(crate::error::DB_ERROR_MESSAGE),
+            "quarantine DB fault must carry the fixed message: {text}"
+        );
+        assert!(
+            !text.contains("quarantined") && !text.contains("column"),
+            "schema text leaked through the gate: {text}"
+        );
+    }
+
+    /// #496 (REST): the create_task INSERT goes through the same opaque helper,
+    /// so a write fault must not serialize sqlx text either. A repo-less task
+    /// reaches the INSERT without a gate lookup; dropping a column the INSERT
+    /// names faults it.
+    #[sqlx::test]
+    async fn create_task_insert_fault_is_opaque(pool: PgPool) {
+        let signer = "did:key:zTASKINSERTFAULTAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool.clone()).await;
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/tasks",
+                    axum::routing::post(crate::api::tasks::create_task),
+                )
+                .with_state(state.clone())
+        };
+        let body =
+            format!(r#"{{"kind":"build","capability":"repo:write","delegator_did":"{signer}"}}"#);
+
+        sqlx::query("ALTER TABLE agent_tasks DROP COLUMN status")
+            .execute(&pool)
+            .await
+            .expect("drop status");
+
+        let resp = router()
+            .oneshot(signed_request_as(
+                signer,
+                Method::POST,
+                "/api/v1/tasks",
+                Body::from(body),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a faulted INSERT must be a 500"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains(r#""error":"db_error""#),
+            "INSERT fault must keep the opaque envelope: {text}"
+        );
+        assert!(
+            text.contains(crate::error::DB_ERROR_MESSAGE),
+            "INSERT fault must carry the fixed message: {text}"
+        );
+        assert!(
+            !text.contains("status") && !text.contains("column"),
+            "schema text leaked through the INSERT: {text}"
+        );
+    }
+
     /// N3: get_tree gates on the REQUESTED subtree, not the repo root. A caller
     /// denied a withheld subtree is rejected there (404) but passes the gate on a
     /// non-withheld path (so the rejection is path-scoped, not repo-wide).
