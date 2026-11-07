@@ -624,11 +624,14 @@ mod tests {
     #[test]
     fn rejects_repeated_trailing_root_dots() {
         // Stripping a single root dot leaves `localhost.`, which matches
-        // neither the equality nor the suffix check. The subdomain form
-        // (`node.localhost..`) is not asserted here: `.localhost` is not yet a
-        // rejected suffix on this base, so that case belongs to whichever
-        // change adds it rather than to this one.
-        for bad in ["http://localhost../", "http://localhost...:7545"] {
+        // neither the equality nor the suffix check. The subdomain form now
+        // exercises the `.localhost` suffix rejection together with the extra
+        // trailing dot.
+        for bad in [
+            "http://localhost../",
+            "http://localhost...:7545",
+            "http://node.localhost../",
+        ] {
             assert!(!is_public_http_url(bad), "{bad:?} must be rejected");
         }
     }

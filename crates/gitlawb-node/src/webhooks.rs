@@ -79,6 +79,16 @@ async fn fire_event_async(
         let delivery_id = uuid::Uuid::new_v4().to_string();
 
         tokio::spawn(async move {
+            if !crate::api::peers::is_public_http_url(&hook.url) {
+                crate::metrics::record_webhook_delivery("invalid_url");
+                tracing::warn!(
+                    url = %hook.url,
+                    event = %event_name,
+                    "webhook delivery skipped: stored URL is not a public http(s) target"
+                );
+                return;
+            }
+
             let signature = hook.secret.as_deref().map(|s| sign_payload(s, &bytes));
 
             let mut req = client
