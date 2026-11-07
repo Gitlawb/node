@@ -217,6 +217,7 @@ mod tests {
         let injected = "--upload-pack=false";
 
         let out = Command::new("git")
+            .env("LC_ALL", "C")
             .args(mirror_clone_args(injected))
             .arg(&dest)
             .output()
