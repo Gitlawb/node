@@ -715,6 +715,34 @@ mod tests {
     #[sqlx::test]
     async fn unsigned_get_pins_and_anchors_is_401_through_build_router(pool: PgPool) {
         let state = test_state(pool).await;
+
+        // Seed identifiable rows so the denial oracle proves the 401 body omits
+        // them: a status-only check would stay green if a later change served
+        // the listing before the auth layer rejected.
+        state
+            .db
+            .record_pinned_cid("seeded-pin-oid", "bafyPIN-SECRET-DO-NOT-LEAK", None)
+            .await
+            .expect("seed pin");
+        let owner_did = "did:key:zSEEDOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let repo = seed_repo_inline(owner_did, "seeded-repo");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        state
+            .db
+            .record_arweave_anchor(&crate::db::RecordAnchorInput {
+                repo: "zSEEDOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/seeded-repo",
+                owner_did,
+                ref_name: "refs/heads/secret",
+                old_sha: "0".repeat(64).as_str(),
+                new_sha: "1".repeat(64).as_str(),
+                cid: Some("bafytest"),
+                irys_tx_id: "irys-secret-tx-DO-NOT-LEAK",
+                arweave_url: "https://arweave.net/secret-tx",
+                node_did: "did:key:zNODE",
+            })
+            .await
+            .expect("seed anchor");
+
         let router = build_router(state);
 
         let pins = Request::builder()
@@ -728,6 +756,14 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "anonymous pin listing must be rejected"
         );
+        let bytes = axum::body::to_bytes(pins_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            !body.contains("bafyPIN-SECRET-DO-NOT-LEAK"),
+            "the 401 body must not leak the seeded pin cid; body was: {body}"
+        );
 
         let anchors = Request::builder()
             .method("GET")
@@ -739,6 +775,14 @@ mod tests {
             anchors_resp.status(),
             StatusCode::UNAUTHORIZED,
             "anonymous anchors listing must be rejected"
+        );
+        let bytes = axum::body::to_bytes(anchors_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            !body.contains("irys-secret-tx-DO-NOT-LEAK"),
+            "the 401 body must not leak the anchor's irys tx id; body was: {body}"
         );
     }
 
@@ -841,6 +885,47 @@ mod tests {
         );
     }
 
+    /// The same malformed-signature rejection must hold on the anchors route,
+    /// which carries its own `optional_signature` layer beside pins: a later
+    /// edit that dropped the layer here (but not on pins) would otherwise stay
+    /// green.
+    #[sqlx::test]
+    async fn malformed_signature_on_anchors_is_401_through_build_router(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+
+        let state = test_state(pool).await;
+        let router = build_router(state);
+
+        let kp = Keypair::generate();
+        let path = "/api/v1/arweave/anchors";
+        let mut signed = sign_request(&kp, "GET", path, b"");
+        let mut tampered = signed.signature.clone();
+        let mid = tampered.len() / 2;
+        let flipped = if tampered.as_bytes()[mid] == b'A' {
+            'B'
+        } else {
+            'A'
+        };
+        tampered.replace_range(mid..mid + 1, &flipped.to_string());
+        signed.signature = tampered;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(path)
+            .header("content-digest", signed.content_digest)
+            .header("signature-input", signed.signature_input)
+            .header("signature", signed.signature)
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a malformed signature must be rejected by the auth layer, not silently accepted"
+        );
+    }
+
     // ── Scoped anchor contract (P1 follow-up: ?repo= must authorize_repo_read) ──
     //
     // The follow-up review (after the auth-layer wiring landed) found that a
@@ -877,6 +962,29 @@ mod tests {
     #[sqlx::test]
     async fn unsigned_scoped_anchors_is_401_through_build_router(pool: PgPool) {
         let state = test_state(pool).await;
+
+        // Seed an anchor under a repo the request claims to scope to, so the
+        // denial oracle proves the 401 body omits it rather than merely
+        // returning the right status over an empty table.
+        let owner_did = "did:key:zSCOPEDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let repo = seed_repo_inline(owner_did, "priv");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        state
+            .db
+            .record_arweave_anchor(&crate::db::RecordAnchorInput {
+                repo: "zSCOPEDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/priv",
+                owner_did,
+                ref_name: "refs/heads/secret",
+                old_sha: "0".repeat(64).as_str(),
+                new_sha: "1".repeat(64).as_str(),
+                cid: Some("bafytest"),
+                irys_tx_id: "irys-scoped-secret-DO-NOT-LEAK",
+                arweave_url: "https://arweave.net/scoped-secret",
+                node_did: "did:key:zNODE",
+            })
+            .await
+            .expect("seed anchor");
+
         let router = build_router(state);
 
         let resp = router
@@ -893,6 +1001,14 @@ mod tests {
             resp.status(),
             StatusCode::UNAUTHORIZED,
             "unsigned scoped anchor request must be 401, before any scope lookup"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            !body.contains("irys-scoped-secret-DO-NOT-LEAK"),
+            "the 401 body must not leak the anchor's irys tx id; body was: {body}"
         );
     }
 
@@ -1156,6 +1272,11 @@ mod tests {
         assert!(
             !body.contains("refs/heads/secret"),
             "the 404 body must not leak the ref name; body was: {body}"
+        );
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(
+            v["error"], "repo_not_found",
+            "non-reader denial must carry the same error code as a missing repo"
         );
     }
 
