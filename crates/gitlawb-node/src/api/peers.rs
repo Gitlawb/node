@@ -70,6 +70,8 @@ pub struct PeerResponse {
     pub reachable: bool,
 }
 
+pub(crate) const PUBLIC_HTTP_URL_REQUIREMENT: &str = "must be a public http(s) URL (no loopback, private, localhost, .localhost, .internal, or .local hosts)";
+
 /// Extract an IPv4 address embedded in an IPv6 literal across the transition
 /// formats that carry one: IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible
 /// (`::a.b.c.d`), 6to4 (`2002:WWXX:YYZZ::/16`), and the NAT64 well-known prefix
@@ -104,8 +106,8 @@ fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
 
 /// Whether a peer `http_url` is a public http(s) endpoint safe to register.
 /// Rejects non-http(s) schemes, loopback/unspecified/private/link-local IPs,
-/// and `localhost` / `.local` / `.internal` hostnames. Used at announce time
-/// and by the boot-time prune of already-poisoned rows.
+/// and `localhost` / `.localhost` / `.local` / `.internal` hostnames. Used at
+/// announce time and by the boot-time prune of already-poisoned rows.
 pub fn is_public_http_url(raw: &str) -> bool {
     let url = match reqwest::Url::parse(raw) {
         Ok(u) => u,
@@ -125,6 +127,7 @@ pub fn is_public_http_url(raw: &str) -> bool {
     host.truncate(host.trim_end_matches('.').len());
     if host.is_empty()
         || host == "localhost"
+        || host.ends_with(".localhost")
         || host.ends_with(".local")
         || host.ends_with(".internal")
     {
@@ -260,9 +263,9 @@ pub async fn announce(
     // and turn our outbound sync-notify fan-out into an SSRF probe — and bury
     // the real peers under junk so node-origin repos stop replicating.
     if !is_public_http_url(&req.http_url) {
-        return Err(AppError::BadRequest(
-            "http_url must be a public http(s) URL (no loopback, private, or .internal/.local hosts)".into(),
-        ));
+        return Err(AppError::BadRequest(format!(
+            "http_url {PUBLIC_HTTP_URL_REQUIREMENT}"
+        )));
     }
 
     // Reject self-announcements: a peer row whose http_url is our own public
@@ -541,6 +544,7 @@ mod tests {
     fn rejects_loopback_private_and_internal() {
         for bad in [
             "http://localhost:7545",
+            "http://node.localhost:7545",
             "http://127.0.0.1:5432/",
             "http://localhost:22/",
             "http://0.0.0.0:7545",
@@ -620,11 +624,14 @@ mod tests {
     #[test]
     fn rejects_repeated_trailing_root_dots() {
         // Stripping a single root dot leaves `localhost.`, which matches
-        // neither the equality nor the suffix check. The subdomain form
-        // (`node.localhost..`) is not asserted here: `.localhost` is not yet a
-        // rejected suffix on this base, so that case belongs to whichever
-        // change adds it rather than to this one.
-        for bad in ["http://localhost../", "http://localhost...:7545"] {
+        // neither the equality nor the suffix check. The subdomain form now
+        // exercises the `.localhost` suffix rejection together with the extra
+        // trailing dot.
+        for bad in [
+            "http://localhost../",
+            "http://localhost...:7545",
+            "http://node.localhost../",
+        ] {
             assert!(!is_public_http_url(bad), "{bad:?} must be rejected");
         }
     }
@@ -1580,6 +1587,31 @@ mod tests {
             "/api/v1/peers/announce",
             Body::from(body.to_string()),
         )
+    }
+
+    #[sqlx::test]
+    async fn announce_rejects_localhost_subdomains_with_an_accurate_error(pool: PgPool) {
+        let state = test_state(pool).await;
+        let did = Keypair::generate().did().to_string();
+        let resp = announce_only(state.clone())
+            .oneshot(announce_as(
+                &did,
+                &announce_body(&did, "https://node.localhost:7545"),
+            ))
+            .await
+            .unwrap();
+
+        let (status, error, message) = status_and_error(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error, "bad_request");
+        assert_eq!(
+            message,
+            "http_url must be a public http(s) URL (no loopback, private, localhost, .localhost, .internal, or .local hosts)"
+        );
+        assert!(
+            snapshot(&state.db, &did).await.is_none(),
+            "a rejected .localhost announce must leave no row behind"
+        );
     }
 
     /// U4 scenario 1, and the first test the keyid branch has ever had: a caller
