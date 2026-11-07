@@ -434,7 +434,7 @@ mod tests {
         let err = cert.satisfies_threshold(&[], 0).unwrap_err();
         assert!(
             err.to_string().contains("threshold must be at least 1"),
-            "zero must be refused as an invalid threshold: {err}"
+            "zero must be refused as an invalid threshold"
         );
     }
 
@@ -460,7 +460,7 @@ mod tests {
         let err = cert.satisfies_threshold(&[kp.did()], 0).unwrap_err();
         assert!(
             err.to_string().contains("threshold must be at least 1"),
-            "the invalid threshold must win over the invalid signature: {err}"
+            "the invalid threshold must win over the invalid signature"
         );
     }
 
@@ -530,7 +530,7 @@ mod tests {
             .expect_err("a non-canonical did:key spelling must not resolve");
         assert!(
             err.to_string().contains("base58btc"),
-            "rejection must come from the canonical-prefix rule, not the length guard: {err}"
+            "rejection must come from the canonical-prefix rule, not the length guard"
         );
         assert!(
             !matches!(
