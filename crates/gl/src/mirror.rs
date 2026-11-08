@@ -142,7 +142,11 @@ pub async fn run(args: MirrorArgs) -> Result<()> {
     println!();
     println!("✓ Mirror complete: {name}");
     println!("  Clone:  git clone {gitlawb_url}");
-    println!("  View:   https://twigpine.com/{owner_short}/{name}");
+    // Only print View: when the node advertises a web_url — self-hosted nodes
+    // without a web front-end would otherwise produce a 404 link (#370).
+    if let Some(web_url) = crate::repo::fetch_node_web_url(&args.node).await {
+        println!("  View:   {web_url}/{owner_short}/{name}");
+    }
 
     Ok(())
 }
