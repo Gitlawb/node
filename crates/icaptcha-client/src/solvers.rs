@@ -30,8 +30,8 @@ fn solve_arithmetic(prompt: &str) -> Option<i64> {
     while let Some(op) = tokens.next() {
         let n: i64 = tokens.next()?.parse().ok()?;
         match op {
-            "+" => acc += n,
-            "-" => acc -= n,
+            "+" => acc = acc.checked_add(n)?,
+            "-" => acc = acc.checked_sub(n)?,
             _ => return None,
         }
     }
@@ -45,15 +45,15 @@ fn solve_algebra(prompt: &str) -> Option<i64> {
     let (lhs, rhs) = eq.split_once('=')?;
     let (al, cl) = parse_linear(lhs.trim())?;
     let (ar, cr) = parse_linear(rhs.trim())?;
-    let denom = al - ar;
+    let denom = al.checked_sub(ar)?;
     if denom == 0 {
         return None;
     }
-    let num = cr - cl;
-    if num % denom != 0 {
+    let num = cr.checked_sub(cl)?;
+    if num.checked_rem(denom)? != 0 {
         return None;
     }
-    Some(num / denom)
+    num.checked_div(denom)
 }
 
 /// Parse a linear expression in `x` into `(coeff_of_x, constant)`.
@@ -76,12 +76,12 @@ fn parse_linear(s: &str) -> Option<(i64, i64)> {
                 let m: i64 = it.next()?.parse().ok()?;
                 match op {
                     "+" => (1, m),
-                    "-" => (1, -m),
+                    "-" => (1, m.checked_neg()?),
                     _ => return None,
                 }
             }
         };
-        return Some((a * coeff_inner, a * const_inner));
+        return Some((a.checked_mul(coeff_inner)?, a.checked_mul(const_inner)?));
     }
 
     // Sum of `±`-separated terms.
@@ -99,10 +99,10 @@ fn parse_linear(s: &str) -> Option<(i64, i64)> {
                         "-" => -1,
                         _ => cpart.parse().ok()?,
                     };
-                    coeff += sign * c;
+                    coeff = coeff.checked_add(sign.checked_mul(c)?)?;
                 } else {
                     let n: i64 = t.parse().ok()?;
-                    konst += sign * n;
+                    konst = konst.checked_add(sign.checked_mul(n)?)?;
                 }
                 sign = 1;
             }
@@ -127,23 +127,26 @@ fn solve_sequence(prompt: &str) -> Option<i64> {
 fn next_in_sequence(n: &[i64]) -> Option<i64> {
     let last = *n.last()?;
 
-    // Arithmetic: constant first difference.
-    let d = n[1] - n[0];
-    if n.windows(2).all(|w| w[1] - w[0] == d) {
-        return Some(last + d);
+    // Arithmetic: constant first difference. An overflowing difference means
+    // the pattern doesn't fit, not that the answer wraps.
+    if let Some(d) = n[1].checked_sub(n[0]) {
+        if n.windows(2).all(|w| w[1].checked_sub(w[0]) == Some(d)) {
+            return last.checked_add(d);
+        }
     }
 
     // Geometric: constant integer ratio.
-    if n.iter().all(|&v| v != 0) && n[0] != 0 && n[1] % n[0] == 0 {
-        let r = n[1] / n[0];
-        if r != 0 && n.windows(2).all(|w| w[1] == w[0] * r) {
-            return Some(last * r);
+    if n.iter().all(|&v| v != 0) && n[1].checked_rem(n[0]) == Some(0) {
+        if let Some(r) = n[1].checked_div(n[0]) {
+            if r != 0 && n.windows(2).all(|w| w[0].checked_mul(r) == Some(w[1])) {
+                return last.checked_mul(r);
+            }
         }
     }
 
     // Fibonacci-like: each term is the sum of the two before it.
-    if n.len() >= 3 && (2..n.len()).all(|i| n[i] == n[i - 1] + n[i - 2]) {
-        return Some(n[n.len() - 1] + n[n.len() - 2]);
+    if n.len() >= 3 && (2..n.len()).all(|i| n[i - 1].checked_add(n[i - 2]) == Some(n[i])) {
+        return n[n.len() - 1].checked_add(n[n.len() - 2]);
     }
 
     // Squares: all perfect squares with consecutive roots.
@@ -151,7 +154,7 @@ fn next_in_sequence(n: &[i64]) -> Option<i64> {
     if let Some(roots) = roots {
         if roots.windows(2).all(|w| w[1] == w[0] + 1) {
             let nr = roots[roots.len() - 1] + 1;
-            return Some(nr * nr);
+            return nr.checked_mul(nr);
         }
     }
 
@@ -160,12 +163,16 @@ fn next_in_sequence(n: &[i64]) -> Option<i64> {
         .iter()
         .enumerate()
         .all(|(i, &v)| if i % 2 == 0 { v >= 0 } else { v < 0 });
-    let mags: Vec<i64> = n.iter().map(|v| v.abs()).collect();
-    let md = mags[1] - mags[0];
-    if signs_alternate && mags.windows(2).all(|w| w[1] - w[0] == md) {
-        let next_mag = mags[mags.len() - 1] + md;
-        let next_sign = if last >= 0 { -1 } else { 1 };
-        return Some(next_sign * next_mag);
+    let mags: Option<Vec<i64>> = n.iter().map(|v| v.checked_abs()).collect();
+    if signs_alternate {
+        if let Some(mags) = mags {
+            if let Some(md) = mags[1].checked_sub(mags[0]) {
+                if mags.windows(2).all(|w| w[1].checked_sub(w[0]) == Some(md)) {
+                    let next_sign: i64 = if last >= 0 { -1 } else { 1 };
+                    return next_sign.checked_mul(mags[mags.len() - 1].checked_add(md)?);
+                }
+            }
+        }
     }
 
     None
@@ -179,7 +186,7 @@ fn isqrt_exact(v: i64) -> Option<i64> {
     let r = (v as f64).sqrt().round() as i64;
     [r - 1, r, r + 1]
         .into_iter()
-        .find(|&cand| cand >= 0 && cand * cand == v)
+        .find(|&cand| cand >= 0 && cand.checked_mul(cand) == Some(v))
 }
 
 #[cfg(test)]
@@ -266,5 +273,81 @@ mod tests {
     fn unsupported_types_return_none() {
         assert_eq!(solve("anagram", "Unscramble: tca"), None);
         assert_eq!(solve("riddle", "What has keys but no locks?"), None);
+    }
+
+    // #345: prompts are attacker/service-controlled and every literal can be a
+    // valid i64 while the evaluation still overflows. Overflow must return
+    // None (unsolvable), never a debug panic or a wrapped wrong answer.
+
+    #[test]
+    fn arithmetic_overflow_returns_none() {
+        assert_eq!(
+            solve("arithmetic", "What is 9223372036854775807 + 1?"),
+            None
+        );
+        assert_eq!(
+            solve("arithmetic", "What is -9223372036854775808 - 1?"),
+            None
+        );
+        // Boundary-adjacent values still solve.
+        assert_eq!(
+            solve("arithmetic", "What is 9223372036854775806 + 1?").as_deref(),
+            Some("9223372036854775807")
+        );
+    }
+
+    #[test]
+    fn algebra_overflow_returns_none() {
+        // num = i64::MIN, denom = -1: the quotient overflows.
+        assert_eq!(
+            solve("algebra", "Solve for x: x + 1 = 2x + -9223372036854775807"),
+            None
+        );
+        // sign * coefficient overflows at i64::MIN.
+        assert_eq!(
+            solve("algebra", "Solve for x: x - -9223372036854775808x = 1"),
+            None
+        );
+        // A large but solvable equation still solves.
+        assert_eq!(
+            solve("algebra", "Solve for x: 4611686018427387904x + 0 = 0").as_deref(),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn sequence_overflow_returns_none() {
+        // First difference overflows (1 - i64::MIN).
+        assert_eq!(
+            solve(
+                "sequence",
+                "What is the next number in this sequence? -9223372036854775808, 1, 9223372036854775806, ?"
+            ),
+            None
+        );
+        // i64::MIN in an alternating-sign candidate: abs() overflows.
+        assert_eq!(
+            solve(
+                "sequence",
+                "What is the next number in this sequence? 1, -9223372036854775808, 3, ?"
+            ),
+            None
+        );
+        // Perfect-square check near i64::MAX: candidate root squared overflows.
+        assert_eq!(
+            solve(
+                "sequence",
+                "What is the next number in this sequence? 9223372036854775807, 9223372036854775800, 9223372036854775801, ?"
+            ),
+            None
+        );
+        // Geometric next term overflows (r = 2, last * 2 > i64::MAX).
+        assert_eq!(
+            solve(
+                "sequence",
+                "What is the next number in this sequence? 2305843009213693951, 4611686018427387902, 9223372036854775804, ?"
+            ),
+            None
+        );
     }
 }
