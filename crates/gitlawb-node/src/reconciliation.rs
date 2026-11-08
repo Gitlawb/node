@@ -306,6 +306,20 @@ pub fn spawn(
                 }
             }
 
+            // run_pass advances the in-memory cursor before its repo loop so
+            // pages within one pass continue, and persists only once the batch
+            // completes. On Err, or when the persist write itself fails (logged
+            // there, not propagated), the in-memory value runs ahead of
+            // node_state and the interrupted batch's tail is skipped in-process
+            // until restart. The persisted cursor is authoritative between
+            // passes: reload it before the next tick so the tail is re-walked.
+            match db.get_node_state(CURSOR_KEY).await {
+                Ok(v) => cursor = v,
+                Err(load_err) => {
+                    tracing::warn!(err = %load_err, "failed to reload reconciliation sweep cursor between passes; keeping in-memory value");
+                }
+            }
+
             if *shutdown_rx.borrow() {
                 tracing::info!("reconciliation sweep: shutdown signal received, exiting");
                 return;
@@ -1565,7 +1579,7 @@ async fn run_pass(
                         .save_reconciliation_offset(&repo.id, "IPFS", next.as_deref())
                         .await
                     {
-                        tracing::warn!(repo = %repo_slug, err = %e, "save_reconciliation_offset(IPFS) failed, next pass will start from head");
+                        tracing::warn!(repo = %repo_slug, err = %e, "save_reconciliation_offset(IPFS) failed, continuation offset unchanged; next pass resumes from the previously persisted offset");
                     }
                 } else {
                     tracing::debug!(repo = %repo_slug, "IPFS dispatched nothing this pass, continuation offset left unchanged");
@@ -6797,5 +6811,103 @@ mod tests {
             None,
             "shutdown creates no discovery progress"
         );
+    }
+
+    /// Review P2 (re-home head 4a7033b): run_pass advances the in-memory repo
+    /// cursor before the batch loop but persists only once the batch
+    /// completes. An Err after the advance — here a closed pin semaphore
+    /// failing `acquire_owned` — must not leave the next pass paging past the
+    /// interrupted batch in-process: the persisted cursor is authoritative
+    /// between passes, so spawn reloads it before the next tick.
+    #[sqlx::test]
+    async fn run_pass_err_after_advance_recovers_batch_tail(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        let repo_on_disk = Repo::new();
+        repo_on_disk.commit_file("a.txt", "public blob\n");
+
+        let rec = seed_repo(
+            "did:key:zSweepOwner",
+            "sweep-repo",
+            &repo_on_disk.path.display().to_string(),
+        );
+        db.create_repo(&rec).await.unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
+            .expect_at_least(1)
+            .with_status(200)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
+            .create_async()
+            .await;
+
+        let config = <crate::config::Config as clap::Parser>::parse_from([
+            "gitlawb-node-test",
+            "--ipfs-api",
+            &server.url(),
+        ]);
+
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did();
+        let node_seed = *kp.to_seed();
+        let http = reqwest::Client::new();
+        let (_tx, mut rx) = watch::channel(false);
+        let mut cursor = None;
+
+        // Closed semaphore makes every acquire_owned fail: run_pass Errors
+        // after the in-memory advance but before the persist site.
+        let pin_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        pin_sem.close();
+        let res = super::run_pass(
+            &db,
+            &config,
+            &http,
+            &node_seed,
+            &node_did,
+            &pin_sem,
+            super::REPO_SCAN_DEADLINE,
+            &mut cursor,
+            &mut rx,
+            None,
+        )
+        .await;
+        assert!(res.is_err(), "closed pin semaphore must fail the pass");
+        assert_eq!(
+            cursor.as_deref(),
+            Some(rec.id.as_str()),
+            "in-memory cursor advanced past the interrupted batch"
+        );
+        assert_eq!(
+            db.get_node_state(super::CURSOR_KEY).await.unwrap(),
+            None,
+            "persisted cursor must not move on Err"
+        );
+
+        // Spawn's recovery: reload the persisted cursor before the next tick.
+        let mut cursor = db.get_node_state(super::CURSOR_KEY).await.unwrap();
+        assert_eq!(cursor, None, "reload must restore the persisted value");
+
+        // Next pass with a working semaphore must re-cover the batch tail.
+        // (A fresh semaphore stands in for the next tick's acquire
+        // succeeding; Semaphore::close is permanent, so the first cannot
+        // reopen.)
+        let pin_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        let (scanned, _, _) = super::run_pass(
+            &db,
+            &config,
+            &http,
+            &node_seed,
+            &node_did,
+            &pin_sem,
+            super::REPO_SCAN_DEADLINE,
+            &mut cursor,
+            &mut rx,
+            None,
+        )
+        .await
+        .expect("next pass succeeds");
+        assert_eq!(scanned, 1, "next pass must re-walk the interrupted batch");
     }
 }

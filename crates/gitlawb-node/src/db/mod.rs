@@ -4335,8 +4335,10 @@ impl Db {
     /// Every pinned object this node ADVERTISES (`GET /api/v1/ipfs/pins`).
     ///
     /// #218: the contract is "every row that has something to advertise". A
-    /// row with `cid` set (any format, including legacy Qm… dag-pb) is
-    /// surfaced as a local pin; a row with `cid IS NULL` and `pinata_cid` set
+    /// row is surfaced as a local pin only when `local_ipfs_provenance` is
+    /// set AND the stored `cid` parses as a raw CIDv1; legacy rows (v35
+    /// left them unproven) and non-CIDv1 `cid` values stay hidden until the
+    /// sweep re-derives them. A row with `cid IS NULL` and `pinata_cid` set
     /// is surfaced as a Pinata-only pin so the handler can project
     /// `effective_cid = pinata_cid`. A row with both columns NULL has
     /// nothing to serve and is dropped. A corrupt `cid` column surfaces as
@@ -7340,9 +7342,11 @@ mod migration_tests {
     /// `cid IS NOT NULL` to a dedicated `local_ipfs_provenance` column set
     /// by the writer (#218 review P1 — provenance is now established at
     /// the writer boundary, never inferred from CID shape). Migration v35
-    /// (round-3 renumber from v30) backfills the column for existing rows
-    /// under the same heuristic v32 uses to identify "real local pin"
-    /// rows, and `has_ipfs_cid` / `filter_ipfs_pinned_oids` key on the
+    /// (round-3 renumber from v30) does NOT backfill: legacy rows are left
+    /// `local_ipfs_provenance = FALSE` and stay unproven until the
+    /// reconciliation sweep re-derives each one through
+    /// `record_pinned_cid_with_source`; `has_ipfs_cid` /
+    /// `filter_ipfs_pinned_oids` key on the
     /// new column. This test exercises the full chain: pre-v35 schema,
     /// the four row shapes, the v35 migration, the post-migration
     /// column values, and the post-migration `has_ipfs_cid` /
