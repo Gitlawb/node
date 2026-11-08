@@ -21,14 +21,11 @@ ignore = [
     # the build, at which point it becomes a real reachable advisory.
     "RUSTSEC-2023-0071", # rsa Marvin attack (no fix; not linked in our build)
 
-    # lru 0.12.5 (use-after-free in pop()). Reachable via aws-sdk-s3
-    # (reverted from the upgrade that pulled in lru 0.12.5). The
-    # lockfile currently has 0.12.5 (via aws-sdk-s3) AND 0.16.3 (via
-    # alloy). The RUSTSEC-2026-0253 advisory covers both ranges, and
-    # this ignore is still load-bearing for 0.12.5 — a future alloy
-    # release that bumps 0.16.x to a fixed version would let this
-    # ignore retire for the 0.16 range. REMOVE only when BOTH
-    # lockfile versions are fixed (or removed).
+    # lru 0.16.3 (use-after-free in pop()). Reachable via alloy. The
+    # lockfile holds only 0.16.3 — the aws-sdk-s3 path that once pulled
+    # 0.12.5 no longer does. The RUSTSEC-2026-0253 advisory covers this
+    # range, so the ignore stays load-bearing until a fixed 0.16.x lands;
+    # REMOVE when the locked version is fixed or lru leaves the tree.
     # Retirement owner: node maintainers, enforced by the weekly
     # audit-schedule drift guard ("Fail if lru moved while its ignore
     # remains"), which fails if either locked version moves or lru

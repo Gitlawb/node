@@ -567,7 +567,13 @@ mod tests {
         att.sig = B64U.encode(sig);
 
         let err = att.verify_signature(cert_hash).unwrap_err();
-        assert!(matches!(err, Error::Signature(_)));
+        match err {
+            Error::Did(msg) => assert!(
+                msg.contains("small-order"),
+                "identity-point signer must be refused as a small-order key, got: {msg}"
+            ),
+            other => panic!("expected Error::Did for an identity-point signer, got {other:?}"),
+        }
     }
 
     /// A payload that happens to contain a `cert_hash` field of its own does

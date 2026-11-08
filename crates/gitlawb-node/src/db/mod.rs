@@ -4346,9 +4346,11 @@ impl Db {
     /// pinata_cid set) keeps `local_ipfs_provenance = FALSE`, so the
     /// sweep's gap filter does not trust it as a real local pin and
     /// will re-derive by re-pinning if IPFS is enabled later. A
-    /// pre-v30 row is backfilled by migration v30 (rows where cid IS
-    /// NOT NULL and pinata_cid is NULL OR cid != pinata_cid — the same
-    /// shape v27 left as the "real local pin" set).
+    /// Legacy rows written before the provenance flag existed are NOT
+    /// backfilled: migration v35 deliberately leaves them
+    /// `local_ipfs_provenance = FALSE`, so this predicate reports them as
+    /// unproven until the reconciliation sweep re-derives each one by
+    /// re-pinning through `record_pinned_cid_with_source`.
     #[allow(dead_code)]
     pub async fn has_ipfs_cid(&self, sha256_hex: &str) -> Result<bool> {
         let row = sqlx::query(
