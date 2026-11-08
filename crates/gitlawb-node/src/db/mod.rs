@@ -279,11 +279,12 @@ pub struct RefCertificate {
     pub signature: String,
     pub issued_at: String,
     /// #26 Split PR 3 — the wire-format version of this cert. v1 is
-    /// the pre-versioning 7-field payload; v2+ will add optional
-    /// fields without breaking the v1 signature path. An old
-    /// client that ignores this field verifies v1 certs; a new
-    /// client that reads a v1 cert reconstructs the v1 payload
-    /// and verifies normally.
+    /// the pre-versioning 7-field payload (no `version` key in the
+    /// signed bytes). v2+ is reserved for a new signed payload shape
+    /// that carries the version inside the signed bytes; it is not
+    /// v1 plus unsigned fields, because flipping this column must
+    /// invalidate the signature. Clients refuse to verify versions
+    /// they cannot represent rather than guessing.
     pub version: u32,
 }
 
