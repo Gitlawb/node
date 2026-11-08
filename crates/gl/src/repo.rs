@@ -305,16 +305,38 @@ pub(crate) async fn fetch_node_web_url(node: &str) -> Option<String> {
     // An info reply is a DID, a few URLs and counts — 8 KiB is well past what
     // the shape needs; anything longer is hostile or broken (peer.rs precedent).
     let raw_body = crate::http::read_body_capped(info_resp, 8 * 1024).await;
+    match web_url_from_info_body(&raw_body) {
+        Ok(url) => url,
+        Err(reason) => {
+            eprintln!("warning: {reason}; skipping View link");
+            None
+        }
+    }
+}
+
+/// Classify a capped `GET /` body for the `View:` advertisement. Split out of
+/// `fetch_node_web_url` so tests can pin the classification contract directly:
+/// a truncated or half-read body is indistinguishable from a node that
+/// advertised nothing, so it must warn rather than silently omit the link.
+fn web_url_from_info_body(
+    raw_body: &crate::http::CappedBody,
+) -> std::result::Result<Option<String>, String> {
+    if raw_body.truncated || raw_body.read_failed {
+        return Err("node info body was oversized or could not be read in full".to_string());
+    }
     let info: Value = match serde_json::from_str(&raw_body.text) {
         Ok(json) => json,
-        Err(_) => return None,
+        Err(_) => return Err("node info body was not valid JSON".to_string()),
     };
     // Missing field / non-string degrade to None without warning — same contract
     // as before; only transport- and advertisement-level failures warn there.
-    let raw = info["web_url"].as_str()?;
+    let raw = match info["web_url"].as_str() {
+        Some(v) => v,
+        None => return Ok(None),
+    };
     let trimmed = raw.trim().trim_end_matches('/');
     if trimmed.is_empty() {
-        return None;
+        return Ok(None);
     }
     // A present-but-malformed value means the node is misconfigured; say so
     // instead of quietly dropping the link. Mirrors the node-side boot
@@ -322,39 +344,54 @@ pub(crate) async fn fetch_node_web_url(node: &str) -> Option<String> {
     // the link is built by string-appending `/{owner}/{repo}` to it. Control
     // and bidi-format bytes are rejected outright (not stripped): they have no
     // legitimate place in a base URL and would reach the terminal through the
-    // View: line.
-    let malformed_reason: Option<&str> = if trimmed
+    // View: line — including when they arrive percent-encoded (INV-6).
+    let malformed_reason: Option<String> = if trimmed
         .chars()
         .any(|c| c.is_control() || gitlawb_core::sanitize::is_bidi_format(c))
     {
-        Some("contains control or bidi characters")
+        Some("contains control or bidi characters".to_string())
     } else {
         match trimmed.parse::<url::Url>() {
-            Err(_) => Some("not an absolute URL"),
-            Ok(parsed) if !matches!(parsed.scheme(), "http" | "https") => Some("not http(s)"),
+            Err(_) => Some("not an absolute URL".to_string()),
+            Ok(parsed) if !matches!(parsed.scheme(), "http" | "https") => {
+                Some("not http(s)".to_string())
+            }
             Ok(parsed) if parsed.query().is_some() || parsed.fragment().is_some() => {
-                Some("contains a query or fragment")
+                Some("contains a query or fragment".to_string())
             }
             // userinfo is rejected because the `View:` line prints the
             // value verbatim; a remote advertisement carrying
             // `user:pass@host` would land that credential in terminal
             // scrollback and CI logs.
             Ok(parsed) if !parsed.username().is_empty() || parsed.password().is_some() => {
-                Some("contains a username or password")
+                Some("contains a username or password".to_string())
+            }
+            Ok(parsed)
+                if parsed
+                    .host_str()
+                    .unwrap_or("")
+                    .chars()
+                    .chain(
+                        percent_encoding::percent_decode_str(parsed.path())
+                            .decode_utf8_lossy()
+                            .chars(),
+                    )
+                    .any(|c| c.is_control() || gitlawb_core::sanitize::is_bidi_format(c)) =>
+            {
+                Some("contains control or bidi characters, even percent-encoded".to_string())
             }
             Ok(_) => None,
         }
     };
-    if let Some(reason) = malformed_reason {
+    match malformed_reason {
         // The reason string is ours; the advertised value is not — defang it
         // exactly as it would have been defanged had it been accepted.
-        let shown = sanitize_node_msg(trimmed);
-        eprintln!(
-            "warning: node advertised a malformed web_url ({shown:?}, {reason}); skipping View link"
-        );
-        return None;
+        Some(reason) => Err(format!(
+            "node advertised a malformed web_url ({:?}, {reason})",
+            sanitize_node_msg(trimmed)
+        )),
+        None => Ok(Some(trimmed.to_string())),
     }
-    Some(trimmed.to_string())
 }
 
 async fn cmd_create(
@@ -1081,7 +1118,10 @@ mod tests {
                 .mock("GET", "/")
                 .with_status(200)
                 .with_header("content-type", "application/json")
-                .with_body(format!(r#"{{"web_url":"{}"}}"#, bad.replace('"', "\\\"")))
+                // serde_json escapes the control bytes so the body is VALID
+                // JSON — a raw literal would make parse fail and the test
+                // would pass without reaching the control check at all.
+                .with_body(serde_json::json!({"web_url": bad}).to_string())
                 .create_async()
                 .await;
 
@@ -1091,6 +1131,62 @@ mod tests {
                 "web_url with control bytes {bad:?} must be rejected"
             );
         }
+    }
+
+    /// An oversized or half-read `GET /` body must warn, not silently
+    /// classify as "no web front-end": a cut body fails JSON parse, which is
+    /// indistinguishable from a node that advertised nothing without the
+    /// truncated flag. Removing the flag check makes this test pass
+    /// vacuously through the parse-fail arm.
+    #[test]
+    fn web_url_from_info_body_warns_on_truncated_reads() {
+        for (body, label) in [
+            (
+                crate::http::CappedBody {
+                    text: r#"{"web_url":"https://x"#.repeat(2000),
+                    truncated: true,
+                    read_failed: false,
+                },
+                "truncated",
+            ),
+            (
+                crate::http::CappedBody {
+                    text: r#"{"web_url":"https://x"#.to_string(),
+                    truncated: false,
+                    read_failed: true,
+                },
+                "read_failed",
+            ),
+        ] {
+            let err = web_url_from_info_body(&body)
+                .expect_err(&format!("{label} body must warn, not silently classify"));
+            assert!(
+                err.contains("oversized or could not be read"),
+                "{label}: got {err}"
+            );
+        }
+        // A clean body missing web_url still classifies as a silent None.
+        let clean = crate::http::CappedBody {
+            text: r#"{"did":"did:key:x"}"#.to_string(),
+            truncated: false,
+            read_failed: false,
+        };
+        assert_eq!(web_url_from_info_body(&clean).unwrap(), None);
+    }
+
+    /// Percent-encoded bidi must not slip past the literal scan: a node
+    /// advertising `https://example.com/%E2%80%AE` serves wire bytes with no
+    /// Cf code point, but a browser decodes it into a reordering character
+    /// on the rendered View: link (INV-6).
+    #[test]
+    fn web_url_from_info_body_rejects_percent_encoded_bidi() {
+        let body = crate::http::CappedBody {
+            text: r#"{"web_url":"https://example.com/%E2%80%AE"}"#.to_string(),
+            truncated: false,
+            read_failed: false,
+        };
+        let err = web_url_from_info_body(&body).expect_err("percent-encoded bidi must be rejected");
+        assert!(err.contains("bidi"), "got {err}");
     }
 
     #[tokio::test]

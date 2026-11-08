@@ -1008,6 +1008,22 @@ pub(crate) fn validate_web_url(raw: &str) -> Result<(), String> {
                 .into(),
         );
     }
+    // Bidi/control bytes can hide behind percent-encoding: a literal scan of
+    // the wire form misses `.../%E2%80%AE` even though a browser decodes it
+    // into a reordering character on the rendered View: link. Check the
+    // decoded host and path before the value is advertised on GET / (INV-6).
+    let host = parsed.host_str().unwrap_or("");
+    let decoded_path = percent_encoding::percent_decode_str(parsed.path()).decode_utf8_lossy();
+    if host
+        .chars()
+        .chain(decoded_path.chars())
+        .any(|c| c.is_control() || gitlawb_core::sanitize::is_bidi_format(c))
+    {
+        return Err(
+            "must not contain control or bidi characters, even percent-encoded — the View: line is terminal output"
+                .into(),
+        );
+    }
     Ok(())
 }
 
@@ -1766,6 +1782,23 @@ mod tests {
             cfg.validate().is_ok(),
             "padded-but-valid web_url must validate"
         );
+
+        // Percent-encoded bidi must not boot: the wire form carries no Cf
+        // code point, but a browser decodes %E2%80%AE into a reordering
+        // character on the rendered View: link (INV-6). Literal bidi and
+        // control bytes are rejected the same way.
+        for bad in [
+            "https://example.com/%E2%80%AE",
+            "https://example.com/\u{202e}spoof",
+            "https://example.com/%1b[31m",
+        ] {
+            let mut cfg = Config::parse_from(["gitlawb-node"]);
+            cfg.web_url = Some(bad.into());
+            assert!(
+                cfg.validate().is_err(),
+                "web_url {bad:?} (control or bidi, even encoded) must be rejected"
+            );
+        }
 
         // Non-default ports and paths are fine.
         let mut cfg = Config::parse_from(["gitlawb-node"]);
