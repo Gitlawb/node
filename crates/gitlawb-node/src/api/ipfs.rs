@@ -2156,7 +2156,15 @@ async fn gate_and_serve(
 /// #218 review P2: the response surfaces writer-owned provenance so a
 /// `gl` consumer can distinguish local-only, remote-only, and dual rows
 /// without re-inferring semantics from nullability.
-pub async fn list_pins(State(state): State<AppState>) -> Result<Json<serde_json::Value>> {
+pub async fn list_pins(
+    State(state): State<AppState>,
+    auth: Option<Extension<crate::auth::AuthenticatedDid>>,
+) -> Result<Json<serde_json::Value>> {
+    if auth.is_none() {
+        return Err(crate::error::AppError::Unauthorized(
+            "authentication required for pin listing".into(),
+        ));
+    }
     // Bare `?` so connection-class sqlx failures downcast to `AppError::Db` and
     // map to 503 `db_unavailable` (not 500 via `.map_err(AppError::Internal)`) (#251).
     let pins = state.db.list_pinned_cids().await?;
@@ -2481,6 +2489,7 @@ mod closed_pool_tests {
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/ipfs/pins")
+                    .extension(crate::auth::AuthenticatedDid("did:key:test".into()))
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -2699,6 +2708,9 @@ mod closed_pool_tests {
         // (not a unit test on PinnedCidRecord fields).
         let resp = Router::new()
             .route("/api/v1/ipfs/pins", axum::routing::get(list_pins))
+            .layer(axum::Extension(crate::auth::AuthenticatedDid(
+                "did:key:zPinListTest".to_string(),
+            )))
             .with_state(state.clone())
             .oneshot(
                 axum::http::Request::builder()
@@ -2935,7 +2947,10 @@ mod tests {
                 "/ipfs/{cid}",
                 axum::routing::get(crate::api::ipfs::get_by_cid),
             )
-            .layer(axum::middleware::from_fn(crate::auth::optional_signature))
+            .layer(axum::middleware::from_fn_with_state(
+                crate::auth::SignatureBodyLimit(crate::server::SIGNED_BODY_LIMIT),
+                crate::auth::optional_signature,
+            ))
             .with_state(state)
     }
 
@@ -4173,9 +4188,13 @@ mod tests {
         // deterministically.
         let endpoint = crate::test_support::silent_http_endpoint().await;
         let tigris =
-            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint)
-                .await;
-        state.repo_store = crate::git::repo_store::RepoStore::new(repos_dir, Some(tigris), pool);
+            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint);
+        state.repo_store = crate::git::repo_store::RepoStore::new(
+            repos_dir,
+            Some(tigris),
+            pool,
+            std::time::Duration::from_secs(300),
+        );
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
         let mut cfg = (*state.config).clone();
         cfg.git_acquire_timeout_secs = 1;
@@ -4246,9 +4265,13 @@ mod tests {
         // (endpoint-pinned test client, no AWS_* env reads).
         let endpoint = crate::test_support::silent_http_endpoint().await;
         let tigris =
-            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint)
-                .await;
-        state.repo_store = crate::git::repo_store::RepoStore::new(repos_dir, Some(tigris), pool);
+            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint);
+        state.repo_store = crate::git::repo_store::RepoStore::new(
+            repos_dir,
+            Some(tigris),
+            pool,
+            std::time::Duration::from_secs(300),
+        );
         let mut cfg = (*state.config).clone();
         cfg.git_acquire_timeout_secs = 1;
         state.config = Arc::new(cfg);
@@ -8371,9 +8394,18 @@ mod tests {
         // (endpoint-pinned test client, no AWS_* env reads).
         let endpoint = crate::test_support::silent_http_endpoint().await;
         let tigris =
-            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint)
-                .await;
-        state.repo_store = crate::git::repo_store::RepoStore::new(repos_dir, Some(tigris), pool);
+            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint);
+        state.repo_store = crate::git::repo_store::RepoStore::new(
+            repos_dir,
+            Some(tigris),
+            pool,
+            std::time::Duration::from_secs(300),
+        );
+        state
+            .db
+            .upsert_mirror_repo("z6f3budget", "ghost", "/unused-ghost", None, false)
+            .await
+            .unwrap();
         let mut cfg = (*state.config).clone();
         cfg.ipfs_request_budget_secs = 1;
         cfg.git_acquire_timeout_secs = 2;

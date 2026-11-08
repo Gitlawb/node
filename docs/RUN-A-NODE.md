@@ -1,4 +1,4 @@
-# Running a gitlawb node
+# Running a Twigpine node
 
 Step-by-step guide to staking $GITLAWB, registering your node on-chain, and earning protocol fees as a PoS operator.
 
@@ -15,12 +15,12 @@ Step-by-step guide to staking $GITLAWB, registering your node on-chain, and earn
 ## 1. Install the CLI
 
 ```bash
-curl -fsSL https://gitlawb.com/install.sh | sh
+curl -fsSL https://twigpine.com/install.sh | sh
 # or build from source:
 cargo install --path crates/gl
 ```
 
-## 2. Create a gitlawb identity
+## 2. Create a Twigpine identity
 
 Every node is identified by an Ed25519 DID keypair:
 
@@ -69,7 +69,7 @@ docker run -d \
   -e GITLAWB_CONTRACT_NODE_STAKING=$GITLAWB_CONTRACT_NODE_STAKING \
   -e GITLAWB_CHAIN_RPC_URL=$GITLAWB_CHAIN_RPC_URL \
   -e GITLAWB_OPERATOR_STRICT_MODE=true \
-  ghcr.io/gitlawb/node:latest
+  ghcr.io/twigpine/node:latest
 ```
 
 ### Option B — docker-compose

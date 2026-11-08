@@ -72,7 +72,7 @@ pub enum NameCmd {
         /// Name registry contract address
         #[arg(long, env = "GITLAWB_CONTRACT_NAME_REGISTRY", default_value = DEFAULT_NAME_REGISTRY)]
         contract: String,
-        /// gitlawb identity directory (reads your DID)
+        /// Twigpine identity directory (reads your DID)
         #[arg(long)]
         dir: Option<PathBuf>,
     },

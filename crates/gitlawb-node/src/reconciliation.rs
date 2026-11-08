@@ -2275,7 +2275,7 @@ mod tests {
             .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
             .expect_at_least(1)
             .with_status(200)
-            .with_body(r#"{"Hash":"QmSweepMockCid"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .create_async()
             .await;
 
@@ -2463,7 +2463,7 @@ mod tests {
             )
             .expect(0)
             .with_status(200)
-            .with_body(r#"{"Hash":"QmMustNotBeCalled"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .create_async()
             .await;
 
@@ -2545,7 +2545,7 @@ mod tests {
             )
             .expect(0)
             .with_status(200)
-            .with_body(r#"{"Hash":"QmMustNotBeCalled"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .create_async()
             .await;
 
@@ -2640,7 +2640,7 @@ mod tests {
         let _m = server
             .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
             .with_status(200)
-            .with_body(r#"{"Hash":"QmWithheldMockCid"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .create_async()
             .await;
 
@@ -2788,7 +2788,7 @@ mod tests {
             .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
             .expect(1)
             .with_status(200)
-            .with_body(r#"{"Hash":"QmEmptyPublicMockCid"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .create_async()
             .await;
 
@@ -2991,7 +2991,7 @@ mod tests {
             .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
             .expect(9)
             .with_status(200)
-            .with_body(r#"{"Hash":"QmDirectRefMockCid"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .create_async()
             .await;
 
@@ -3080,7 +3080,7 @@ mod tests {
             .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
             .expect(8)
             .with_status(200)
-            .with_body(r#"{"Hash":"QmDirectRefMockCid"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .create_async()
             .await;
         let (scanned2, gaps2, filled2) = super::run_pass(
@@ -3154,7 +3154,7 @@ mod tests {
                         }
                     }
                     bodies.lock().unwrap().push(acc);
-                    let body = br#"{"Hash":"QmStoredMockCid"}"#;
+                    let body = br#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#;
                     let head = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
                         body.len()
@@ -3439,7 +3439,7 @@ mod tests {
             .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
             .expect_at_least(1)
             .with_status(200)
-            .with_body(r#"{"Hash":"QmPrivHistMockCid"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .create_async()
             .await;
 
@@ -3743,7 +3743,7 @@ mod tests {
             .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
             .expect_at_least(1000)
             .with_status(200)
-            .with_body(r#"{"Hash":"QmBigHistMockCid"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .create_async()
             .await;
 
@@ -4163,7 +4163,7 @@ mod tests {
             .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
             .expect(1)
             .with_status(200)
-            .with_body(r#"{"Hash":"QmScanFailMockCid"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .create_async()
             .await;
 
@@ -4260,7 +4260,7 @@ mod tests {
             .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
             .expect_at_least(1)
             .with_status(200)
-            .with_body(r#"{"Hash":"QmPoolOneMockCid"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .create_async()
             .await;
 
@@ -4386,7 +4386,7 @@ mod tests {
                     if this == 0 {
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     }
-                    let body = br#"{"Hash":"QmAbortCursorMockCid"}"#;
+                    let body = br#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#;
                     let head = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
                         body.len()
@@ -4595,7 +4595,7 @@ mod tests {
             .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
             .expect_at_least(1)
             .with_status(200)
-            .with_body(r#"{"Hash":"QmWiringMockCid"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .create_async()
             .await;
 
@@ -4697,7 +4697,7 @@ mod tests {
         // provider's response.
         let sha = "sha_pinata_only_then_local";
         let raw_cid = "bafkreirawcontentcidv1sverifierkey";
-        let pinata_cid = "QmPinataProviderCidForThisBlob";
+        let pinata_cid = "bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4";
         assert_ne!(
             raw_cid, pinata_cid,
             "the test fixture must use distinct raw and provider CIDs"
@@ -4833,7 +4833,9 @@ mod tests {
             .mock("POST", mockito::Matcher::Any)
             .expect_at_least(1)
             .with_status(200)
-            .with_body(r#"{"data":{"cid":"QmLifecycleProviderCid"}}"#)
+            .with_body(
+                r#"{"data":{"cid":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}}"#,
+            )
             .create_async()
             .await;
 
@@ -4991,8 +4993,8 @@ mod tests {
         }
         let raw_legacy = raw_cid_for(b"legacy unknown row\n");
         let raw_dual = raw_cid_for(b"dual control\n");
-        let prov_ponly = "QmLegacyUnknownPinataOnly";
-        let prov_dual = "QmLegacyUnknownDualProvider";
+        let prov_ponly = "bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4";
+        let prov_dual = "bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4";
 
         let owner = "did:key:zLegacyUnknownOwner";
         let rec = seed_repo(
@@ -5038,7 +5040,7 @@ mod tests {
             .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
             .expect_at_least(3)
             .with_status(200)
-            .with_body(r#"{"Hash":"QmLegacyRederiveMockCid"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .create_async()
             .await;
 
@@ -5129,7 +5131,7 @@ mod tests {
             .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
             .expect_at_least(1)
             .with_status(200)
-            .with_body(r#"{"Hash":"QmOffsetMockCid"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .create_async()
             .await;
 
@@ -5248,7 +5250,7 @@ mod tests {
         let _m = server
             .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
             .with_status(200)
-            .with_body(r#"{"Hash":"QmNoDispatchMockCid"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .create_async()
             .await;
 
@@ -5378,7 +5380,7 @@ mod tests {
             .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
             .expect_at_least(1)
             .with_status(200)
-            .with_body(r#"{"Hash":"QmDrainPruneMockCid"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .create_async()
             .await;
 
@@ -5602,7 +5604,7 @@ mod tests {
             .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
             .expect_at_least(1)
             .with_status(200)
-            .with_body(r#"{"Hash":"QmGapFailMockCid"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .create_async()
             .await;
         let mut pinata_server = mockito::Server::new_async().await;
@@ -5610,7 +5612,9 @@ mod tests {
             .mock("POST", mockito::Matcher::Any)
             .expect_at_least(1)
             .with_status(200)
-            .with_body(r#"{"data":{"cid":"QmGapFailPinataCid"}}"#)
+            .with_body(
+                r#"{"data":{"cid":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}}"#,
+            )
             .create_async()
             .await;
 
@@ -5844,7 +5848,7 @@ mod tests {
             .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
             .expect_at_least(1)
             .with_status(200)
-            .with_body(r#"{"Hash":"QmMultiPassMockCid"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .create_async()
             .await;
 
@@ -5986,7 +5990,7 @@ mod tests {
             .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
             .expect_at_least(1)
             .with_status(200)
-            .with_body(r#"{"Hash":"QmWithheldSubtreeMockCid"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .create_async()
             .await;
 
@@ -6120,7 +6124,7 @@ mod tests {
             .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
             .expect_at_least(1)
             .with_status(200)
-            .with_body(r#"{"Hash":"QmNestedWithheldMockCid"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .create_async()
             .await;
 
@@ -6270,7 +6274,7 @@ mod tests {
             .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
             .expect_at_least(1)
             .with_status(200)
-            .with_body(r#"{"Hash":"QmTagOfTreeMockCid"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .create_async()
             .await;
 
@@ -6366,7 +6370,7 @@ mod tests {
             .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
             .expect_at_least(3)
             .with_status(200)
-            .with_body(r#"{"Hash":"QmNestedTagMockCid"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .create_async()
             .await;
 
@@ -6583,8 +6587,7 @@ mod tests {
             Default::default();
         let endpoint = fake_s3_endpoint(objects.clone()).await;
         let client =
-            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint)
-                .await;
+            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint);
         // Owner DID → slug mirrors `RepoStore::local_path`.
         let owner = "did:key:zTigOwner";
         let slug = owner.replace([':', '/'], "_");
@@ -6596,8 +6599,12 @@ mod tests {
 
         let store_dir = tmp.path().join("store");
         std::fs::create_dir_all(&store_dir).unwrap();
-        let store =
-            crate::git::repo_store::RepoStore::new(store_dir.clone(), Some(client), pool.clone());
+        let store = crate::git::repo_store::RepoStore::new(
+            store_dir.clone(),
+            Some(client),
+            pool.clone(),
+            std::time::Duration::from_secs(300),
+        );
 
         // Repo A: archive remote, nothing local, STALE disk_path. The
         // sweep must resolve through the store (restoring), never the
@@ -6617,7 +6624,7 @@ mod tests {
             .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
             .expect_at_least(1)
             .with_status(200)
-            .with_body(r#"{"Hash":"QmTigMockCid"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .create_async()
             .await;
         let config = <crate::config::Config as clap::Parser>::parse_from([
@@ -6721,13 +6728,13 @@ mod tests {
             }
         });
         let client =
-            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint)
-                .await;
+            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint);
         let store_dir = tempfile::TempDir::new().unwrap();
         let store = crate::git::repo_store::RepoStore::new(
             store_dir.path().to_path_buf(),
             Some(client),
             pool.clone(),
+            std::time::Duration::from_secs(300),
         );
 
         let config = <crate::config::Config as clap::Parser>::parse_from([

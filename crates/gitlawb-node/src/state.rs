@@ -79,6 +79,10 @@ pub struct AppState {
     /// brake a push flood from a DID farm (one throwaway DID per repo), so the
     /// push path throttles on the resolved client IP instead.
     pub push_rate_limiter: RateLimiter,
+    /// Per-client-IP rate limiter for `close_issue`'s pre-lock snapshot path.
+    /// Distinct from `push_rate_limiter` so a flood of close attempts cannot
+    /// drain the receive-pack budget for the same source IP.
+    pub close_issue_rate_limiter: RateLimiter,
     /// Per-client-IP ROUTE brake for `GET /ipfs/{cid}`: charged ONCE per request by the
     /// `rate_limit_by_ip` middleware (server.rs), never inside the handler. It bounds
     /// request RATE (the "requests per hour" contract of `GITLAWB_IPFS_RATE_LIMIT`) on
@@ -186,6 +190,9 @@ pub struct AppState {
     /// sink as trigger and accepts unsigned requests from known peers, so it is
     /// braked too; each peer's distinct IP gets its own bucket.
     pub peer_write_rate_limiter: RateLimiter,
+    /// Per-client-IP federation budget: 12 requests per minute, with at most
+    /// 10,000 tracked source keys. Shared by router instances and swept below.
+    pub federated_rate_limiter: RateLimiter,
     /// Process-wide graceful-shutdown signal. Sending `true` causes every
     /// task that holds a `watch::Receiver` to exit at its next await point.
     /// Used by:
@@ -342,10 +349,12 @@ impl AppState {
         self.rate_limiter.cleanup().await;
         self.create_ip_rate_limiter.cleanup().await;
         self.push_rate_limiter.cleanup().await;
+        self.close_issue_rate_limiter.cleanup().await;
         self.ipfs_rate_limiter.cleanup().await;
         self.ipfs_work_rate_limiter.cleanup().await;
         self.sync_trigger_rate_limiter.cleanup().await;
         self.peer_write_rate_limiter.cleanup().await;
+        self.federated_rate_limiter.cleanup().await;
     }
 
     /// Trigger graceful shutdown. Idempotent — calling more than once

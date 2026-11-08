@@ -1,4 +1,4 @@
-//! Pluggable provenance attachments for gitlawb ref-update certs.
+//! Pluggable provenance attachments for Twigpine ref-update certs.
 //!
 //! A `gitlawb/ref-update/v1` cert proves who pushed and where a ref moved to.
 //! It does not say how the commit was produced. This crate adds an optional
