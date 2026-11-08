@@ -3,7 +3,7 @@
 //! Checks:
 //!   1. Identity        — ~/.gitlawb/identity.pem exists, DID parseable
 //!   2. Registration    — ~/.gitlawb/ucan.json exists (registered with a node)
-//!   3. GITLAWB_NODE    — env var is set to a non-localhost URL
+//!   3. GITLAWB_NODE    — env var points at a public node (unset is advisory)
 //!   4. Node            — GITLAWB_NODE is reachable (default: https://node.twigpine.com)
 //!   5. git helper      — git-remote-gitlawb is in PATH
 //!   6. git             — git is installed
@@ -308,7 +308,7 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
 
 /// Classify the `GITLAWB_NODE` env var for `gl doctor`. Extracted so unit
 /// tests can pin the Warn tier directly (#357): an unset env is advisory, not
-/// a failure, because `--node` defaults to `https://node.gitlawb.com` and the
+/// a failure, because `--node` defaults to `https://node.twigpine.com` and the
 /// CLI works without it. Flipping this back to `Check::fail` must break a
 /// test, not just change prose.
 fn gitlawb_node_env_check(env_val: Option<&str>) -> Check {
@@ -323,7 +323,7 @@ fn gitlawb_node_env_check(env_val: Option<&str>) -> Check {
             ),
         ),
         Some(v) if !v.is_empty() => Check::pass("GITLAWB_NODE", v.to_string()),
-        // `--node` defaults to `https://node.gitlawb.com` and the CLI works
+        // `--node` defaults to `https://node.twigpine.com` and the CLI works
         // fine without the variable, so an unset env is advisory, not a
         // failure. Warn-class keeps the exit code 0 for a stock working
         // install; this used to be Fail, which the obvious "return non-zero
@@ -332,7 +332,7 @@ fn gitlawb_node_env_check(env_val: Option<&str>) -> Check {
         _ => Check::warn(
             "GITLAWB_NODE",
             "not set — git-remote-gitlawb will fall back to http://127.0.0.1:7545",
-            "export GITLAWB_NODE=https://node.gitlawb.com",
+            format!("export GITLAWB_NODE={PUBLIC_NODE}"),
         ),
     }
 }
@@ -738,9 +738,9 @@ mod tests {
 
     #[test]
     fn gitlawb_node_env_set_is_pass() {
-        let check = gitlawb_node_env_check(Some("https://node.gitlawb.com"));
+        let check = gitlawb_node_env_check(Some("https://node.twigpine.com"));
         assert!(matches!(check.state, CheckState::Ok));
-        assert!(check.detail.contains("https://node.gitlawb.com"));
+        assert!(check.detail.contains("https://node.twigpine.com"));
     }
 
     #[test]
