@@ -2638,6 +2638,7 @@ mod tests {
     /// type probe carries its oid on stdin rather than in argv, so an oid appears in
     /// the log only once an object has already got past its probe, and a healthy
     /// object costs two invocations to a faulting one's one.
+    #[cfg(unix)]
     fn objects_attempted(log: &std::path::Path) -> usize {
         std::fs::read_to_string(log)
             .unwrap_or_default()

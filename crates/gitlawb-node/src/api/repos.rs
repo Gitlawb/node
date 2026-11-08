@@ -247,6 +247,40 @@ pub struct InfoRefsQuery {
 
 // ── Handlers ──────────────────────────────────────────────────────────────
 
+/// Validate a repository name at the create/fork write paths. The charset is
+/// restricted, and the length is bounded so every cursor the server emits
+/// parses back: `repo_cursor` embeds the name in a base64(JSON) cursor that
+/// `parse_repo_cursor` rejects over 4096 bytes (#465 4th round).
+///
+/// This is the API-side validator, and it deliberately differs from the
+/// stricter disk-side `validate_repo_name` in `git/repo_store.rs`: this one
+/// admits names the store rejects (empty, leading `-`, non-ASCII
+/// alphanumeric) and rejects `.`, which the store allows. The divergence
+/// predates this bound (#412 owns the fork half), so a store-rejected name
+/// still fails later at `repo_store.init` after the proof is spent. Do not
+/// "fix" the divergence here; the length bound below is the one that keeps
+/// emitted cursors parseable, and it is shared via `MAX_REPO_NAME_LEN` so the
+/// two validators cannot drift apart on length.
+fn validate_repo_name(name: &str) -> Result<()> {
+    // Sanitize name: alphanumeric, hyphens, underscores only
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(AppError::BadRequest(
+            "repo name must contain only alphanumeric characters, hyphens, and underscores".into(),
+        ));
+    }
+    // Byte length, not char count: the cursor budget is measured in bytes.
+    if name.len() > crate::db::MAX_REPO_NAME_LEN {
+        return Err(AppError::BadRequest(format!(
+            "repo name must be at most {} bytes",
+            crate::db::MAX_REPO_NAME_LEN
+        )));
+    }
+    Ok(())
+}
+
 /// POST /api/v1/repos
 /// Create a new repository. Requires HTTP Signature auth.
 pub async fn create_repo(
@@ -261,16 +295,7 @@ pub async fn create_repo(
     // rejected request (bad name, already exists) never burns a valid proof.
     let proof = crate::icaptcha::verify_request(&headers, &auth.0)?;
 
-    // Sanitize name: alphanumeric, hyphens, underscores only
-    if !req
-        .name
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err(AppError::BadRequest(
-            "repo name must contain only alphanumeric characters, hyphens, and underscores".into(),
-        ));
-    }
+    validate_repo_name(&req.name)?;
 
     // default_branch is caller-supplied and becomes a PR's target_branch when the
     // PR omits one, which is interpolated into a git revision argument. Validate
@@ -3774,15 +3799,7 @@ pub async fn fork_repo(
     let fork_name = req.name.unwrap_or_else(|| source.name.clone());
     let forker_did = auth.0;
 
-    // Validate fork name
-    if !fork_name
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err(AppError::BadRequest(
-            "repo name must contain only alphanumeric characters, hyphens, and underscores".into(),
-        ));
-    }
+    validate_repo_name(&fork_name)?;
 
     // Same barrier every other repo-creation route goes through. The character
     // allowlist above is vacuously true on an empty name, and `repo_disk_path`
@@ -5047,6 +5064,50 @@ mod tests {
         assert_eq!(repo["node_did"].as_str(), Some("did:key:peer1"));
         assert_eq!(repo["local"].as_bool(), Some(false));
         peer_mock.assert_async().await;
+    }
+
+    #[test]
+    fn repo_name_validation_rejects_bad_charset_and_overlong_names() {
+        assert!(validate_repo_name("ok-name_123").is_ok());
+        assert!(validate_repo_name(&"a".repeat(crate::db::MAX_REPO_NAME_LEN)).is_ok());
+        // The bound is in bytes: the cursor budget is measured in bytes.
+        let overlong = "a".repeat(crate::db::MAX_REPO_NAME_LEN + 1);
+        let err = validate_repo_name(&overlong).unwrap_err();
+        assert!(
+            matches!(err, AppError::BadRequest(_)),
+            "overlong name must be a 400, got: {err:?}"
+        );
+        assert!(validate_repo_name("bad name!").is_err());
+        // Empty names were already admissible before the length bound; the
+        // bound does not change that.
+        assert!(validate_repo_name("").is_ok());
+    }
+
+    #[tokio::test]
+    async fn create_repo_rejects_overlong_name_through_handler() {
+        // Pins the wiring: `create_repo` must call `validate_repo_name`
+        // before any database access. The lazy state never connects, so
+        // deleting the call site would let the handler proceed to `get_repo`
+        // and fail with a connection error instead of BadRequest.
+        let state = crate::test_support::test_state_lazy();
+        let overlong = "a".repeat(crate::db::MAX_REPO_NAME_LEN + 1);
+        let err = create_repo(
+            State(state),
+            Extension(AuthenticatedDid(OWNER_DID.to_owned())),
+            axum::http::HeaderMap::new(),
+            Json(CreateRepoRequest {
+                name: overlong,
+                description: None,
+                is_public: true,
+                default_branch: "main".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::BadRequest(ref msg) if msg.contains("at most")),
+            "overlong name through create_repo must be a 400, got: {err:?}"
+        );
     }
 
     #[test]
@@ -9179,6 +9240,7 @@ mod tests {
     /// A pkt-line receive-pack body carrying one branch-create ref update, so the
     /// handler's post-receive tail resolves a non-empty new-tip set (the delta
     /// scan's git stages run).
+    #[cfg(unix)]
     fn ref_update_body(new_sha: &str) -> axum::body::Bytes {
         let line = format!("{ZERO_SHA} {new_sha} refs/heads/main");
         axum::body::Bytes::from(format!("{:04x}{}0000", line.len() + 4, line))
@@ -11636,6 +11698,7 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
     fn f2a_log(log: &std::path::Path) -> String {
         std::fs::read_to_string(log).unwrap_or_default()
     }
@@ -11643,6 +11706,7 @@ mod tests {
     /// Withheld-walk children run so far. `ls-tree` is the walk's signature child
     /// (`blob_paths` lists every reachable commit's tree); the delta scan and the
     /// full-scan fallback use `rev-list` / `cat-file` instead.
+    #[cfg(unix)]
     fn f2a_walks(log: &std::path::Path) -> usize {
         f2a_log(log)
             .lines()
@@ -11654,6 +11718,7 @@ mod tests {
     /// the withheld walk actually runs rather than taking the no-rule shortcut).
     /// The repo's on-disk path is passed to the tail directly, so no repo_store or
     /// receive-pack plumbing is involved.
+    #[cfg(unix)]
     async fn f2a_state(
         pool: sqlx::PgPool,
         git_bin: &str,
@@ -11685,6 +11750,7 @@ mod tests {
         (state, rec)
     }
 
+    #[cfg(unix)]
     fn f2a_update(ref_name: &str, new_sha: &str) -> Vec<RefUpdate> {
         vec![RefUpdate {
             old_sha: ZERO_SHA.to_string(),
@@ -11693,6 +11759,7 @@ mod tests {
         }]
     }
 
+    #[cfg(unix)]
     const F2A_PUSHER: &str = "did:key:z6MkF2aPusherAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
     /// When publish durability is fenced, the tail must not run walks or take
@@ -11805,6 +11872,7 @@ mod tests {
     }
     /// Poll `cond` until it holds, with a bound so a regression fails the test
     /// rather than hanging the suite.
+    #[cfg(unix)]
     async fn f2a_wait_for(mut cond: impl FnMut() -> bool, what: &str) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while !cond() {
@@ -11819,6 +11887,7 @@ mod tests {
     /// A `rev-list --objects` line names the tips a DELTA scan was asked to resolve,
     /// so it attributes that scan to one push's tips. The withheld walk's own
     /// `rev-list --all` / `ls-tree` lines never carry a tip as an argument this way.
+    #[cfg(unix)]
     fn f2a_delta_scanned(log: &std::path::Path, tip: &str) -> bool {
         f2a_log(log)
             .lines()
@@ -11967,6 +12036,7 @@ mod tests {
 
     /// Mount a Pinata upload endpoint that assigns every object the same CID, and
     /// point the state at it. Returns the server (kept alive by the caller) and CID.
+    #[cfg(unix)]
     async fn f2a_pinata(state: &mut AppState) -> (mockito::ServerGuard, String) {
         let cid = "bafyf2acoalescedmapping".to_string();
         let mut server = mockito::Server::new_async().await;
@@ -11986,6 +12056,7 @@ mod tests {
 
     /// Poll the branch to CID table until the push's mapping lands (the Pinata
     /// worker is detached), bounded so a regression fails rather than hangs.
+    #[cfg(unix)]
     async fn f2a_wait_for_branch_cid(
         db: &crate::db::Db,
         slug: &str,
@@ -12005,6 +12076,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn f2a_slug(rec: &crate::db::RepoRecord) -> String {
         format!(
             "{}/{}",
@@ -12139,6 +12211,7 @@ mod tests {
     // and `z6p2fail`), and owner-only push is on by default, so the identity has to
     // follow the repo each push targets rather than being fixed for both.
 
+    #[cfg(unix)]
     fn p2_push(
         state: &AppState,
         owner: &str,
@@ -12157,6 +12230,7 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
     fn p2_logged(log: &std::path::Path, prefix: &str) -> bool {
         f2a_log(log).lines().any(|l| l.starts_with(prefix))
     }
@@ -13152,6 +13226,7 @@ exit 0
     /// runs exactly one `rev-list --all`, so this counts the walks that were attempted
     /// (the `ls-tree` counter above cannot: a walk whose enumeration fails never gets
     /// to `ls-tree`).
+    #[cfg(unix)]
     fn f2b_walk_attempts(log: &std::path::Path) -> usize {
         f2a_log(log)
             .lines()
