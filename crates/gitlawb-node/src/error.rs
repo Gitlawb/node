@@ -104,7 +104,7 @@ pub const DB_ERROR_MESSAGE: &str = "a database error occurred";
 
 /// Connection-level sqlx failures that mean the database is unreachable right
 /// now (retryable, 503), as opposed to server-reported query errors.
-fn db_unavailable(e: &sqlx::Error) -> bool {
+pub(crate) fn db_unavailable(e: &sqlx::Error) -> bool {
     matches!(
         e,
         sqlx::Error::PoolTimedOut

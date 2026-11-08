@@ -43,6 +43,33 @@ pub(crate) fn task_write_conflict(err: anyhow::Error, message: &str) -> AppError
     }
 }
 
+/// This module's error shape with an opaque body: the real error is logged
+/// server-side and never serialized (#250), matching the envelope
+/// `AppError::Db` renders. Also mirrors its status split: pool-class failures
+/// are a retryable 503 `db_unavailable`, everything else the opaque 500
+/// `db_error`, so a transient outage is not reported as permanent.
+fn db_error(e: anyhow::Error) -> (StatusCode, Json<Value>) {
+    tracing::error!(error = %format!("{e:#}"), "task database error");
+    if let Some(sql) = e.chain().find_map(|c| c.downcast_ref::<sqlx::Error>()) {
+        if crate::error::db_unavailable(sql) {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": crate::error::DB_UNAVAILABLE_CODE,
+                    "message": crate::error::DB_UNAVAILABLE_MESSAGE,
+                })),
+            );
+        }
+    }
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "error": "db_error",
+            "message": crate::error::DB_ERROR_MESSAGE,
+        })),
+    )
+}
+
 // ── Request / response types ──────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -197,6 +224,8 @@ pub(crate) fn task_visible(
         .get(&record.id)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
+    // mirror-rows-handled: slash-form mirror ids return false above, before
+    // this pair is ever consulted.
     crate::visibility::listable_at_root(rules, record.is_public, &record.owner_did, caller)
 }
 
@@ -412,10 +441,18 @@ pub(crate) async fn get_visible_task(
                 quarantined.insert(repo_id.to_string());
                 return Ok(None);
             }
+            // Slash-form ids are mirror rows: is_public is hardcoded and rules
+            // are never replicated, so their own pair is vacuous. Match
+            // get_claimable_task and fail closed on the same opaque None.
+            if repo_id.contains('/') {
+                return Ok(None);
+            }
             let ids = [repo_id.to_string()];
             let repos = db.list_repos_deduped_by_ids(&ids).await?;
             match repos.into_iter().find(|r| r.id == repo_id) {
                 Some(record) => {
+                    // mirror-rows-handled: slash-form ids return Ok(None)
+                    // above, so this record is never a vacuous mirror row.
                     let rules = db.list_visibility_rules(&record.id).await?;
                     (
                         HashMap::from([(record.id.clone(), record)]),
@@ -475,6 +512,9 @@ pub(crate) fn task_claimable(
         .get(&record.id)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
+    // mirror-rows-handled: callers never put a slash-form row in
+    // repos_by_id (get_claimable_task rejects them), so this pair is
+    // always a canonical row's real rules.
     crate::visibility::listable_at_root(rules, record.is_public, &record.owner_did, Some(caller))
 }
 
@@ -499,6 +539,8 @@ pub(crate) async fn get_claimable_task(
                 let repos = db.list_repos_deduped_by_ids(&ids).await?;
                 match repos.into_iter().find(|r| r.id == repo_id) {
                     Some(record) => {
+                        // mirror-rows-handled: slash-form ids take the
+                        // empty-maps branch, so this is a canonical row.
                         let rules = db.list_visibility_rules(&record.id).await?;
                         (
                             HashMap::from([(record.id.clone(), record)]),
@@ -547,6 +589,37 @@ pub async fn create_task(
     if !crate::api::did_matches(&auth.0, &body.delegator_did) {
         return Err(forbidden("delegator_did must be the authenticated signer"));
     }
+    // #496: a caller-supplied repo_id must name a repo the caller owns. Without
+    // this, any signed caller can plant a task — payload and UCAN included —
+    // under a foreign repo id, where the named assignee can claim it. Resolve
+    // the id against hosted repos: a hosted, non-quarantined repo admits tasks
+    // only from its owner (403 otherwise). An id naming no hosted repo
+    // (unknown, or quarantined — which is hidden as if it did not exist, so
+    // 403ing it would confirm a real id) is stored verbatim as an opaque
+    // label: this is a write gate and does not bind an unresolved id to a
+    // repo. Task reads are caller-independent on this base (the list endpoints
+    // are not repo-scoped), before and after this change. The 403-vs-201 split
+    // between a hosted repo id and an unknown one is itself a one-bit oracle —
+    // a stranger holding a private repo's id learns it is hosted here — but
+    // denying foreign repos requires drawing exactly that line, and repo ids
+    // already surface via the task list on this base. Repo-less tasks are
+    // unaffected.
+    if let Some(repo_id) = body.repo_id.as_deref() {
+        let record = state.db.get_repo_by_id(repo_id).await.map_err(db_error)?;
+        if let Some(record) = record {
+            let quarantined = state
+                .db
+                .is_repo_quarantined(&record.id)
+                .await
+                .map_err(db_error)?;
+            if !quarantined && crate::api::require_repo_owner(&record, &auth.0).is_err() {
+                // Same denial text the GraphQL copy relays from
+                // `require_repo_owner`, so the two copies of this gate do not
+                // disagree in observable output.
+                return Err(forbidden(crate::api::REPO_OWNER_ONLY_MESSAGE));
+            }
+        }
+    }
     let now = Utc::now().to_rfc3339();
     let task = AgentTask {
         id: Uuid::new_v4().to_string(),
@@ -563,12 +636,7 @@ pub async fn create_task(
         updated_at: now,
         deadline: body.deadline,
     };
-    state.db.create_task(&task).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-    })?;
+    let task = state.db.create_task(&task).await.map_err(db_error)?;
     Ok((StatusCode::CREATED, Json(task_to_json(&task))))
 }
 
@@ -652,15 +720,24 @@ pub async fn claim_task(
             "assignee_did must be the authenticated signer".into(),
         ));
     }
-    // Claim eligibility gate: invisible/ineligible tasks are 404 so
-    // existence is not leaked via a successful claim or a leaking 409.
     get_claimable_task(&state.db, &id, &auth.0)
         .await?
         .ok_or_else(|| AppError::NotFound("task not found".into()))?;
-    let task =
-        state.db.claim_task(&id, &auth.0).await.map_err(|e| {
-            task_write_conflict(e, "task not claimable: not found or already claimed")
-        })?;
+    let task = state.db.claim_task(&id, &auth.0).await.map_err(|e| {
+        if e.downcast_ref::<crate::db::TaskReservedForOtherAssignee>()
+            .is_some()
+        {
+            return AppError::Forbidden("task not claimable: reserved for another assignee".into());
+        }
+        task_write_conflict(e, "task not claimable: not found or already claimed")
+    })?;
+    let by_did = task
+        .assignee_did
+        .as_deref()
+        .map(crate::db::trim_assignee_did)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| auth.0.clone());
     announce_task_event(
         &state.db,
         &state.task_event_tx,
@@ -668,7 +745,7 @@ pub async fn claim_task(
             task_id: id,
             old_status: "pending".to_string(),
             new_status: "claimed".to_string(),
-            by_did: auth.0,
+            by_did,
             at: Utc::now().to_rfc3339(),
         },
     )
@@ -691,7 +768,7 @@ pub async fn complete_task(
         .ok_or_else(|| AppError::NotFound("task not found".into()))?;
     if !crate::api::did_matches(
         &auth.0,
-        existing.assignee_did.as_deref().unwrap_or_default(),
+        crate::db::trim_assignee_did(existing.assignee_did.as_deref().unwrap_or_default()),
     ) {
         return Err(AppError::Forbidden(
             "only the task assignee can complete it".into(),
@@ -700,9 +777,16 @@ pub async fn complete_task(
     let by_did = auth.0;
     let task = state
         .db
-        .finish_task(&id, "completed", body.result.as_deref())
+        .finish_task(&id, "completed", body.result.as_deref(), &by_did)
         .await
         .map_err(|e| task_write_conflict(e, "task not found or not in claimed state"))?;
+    let by_did = task
+        .assignee_did
+        .as_deref()
+        .map(crate::db::trim_assignee_did)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or(by_did);
     announce_task_event(
         &state.db,
         &state.task_event_tx,
@@ -733,7 +817,7 @@ pub async fn fail_task(
         .ok_or_else(|| AppError::NotFound("task not found".into()))?;
     if !crate::api::did_matches(
         &auth.0,
-        existing.assignee_did.as_deref().unwrap_or_default(),
+        crate::db::trim_assignee_did(existing.assignee_did.as_deref().unwrap_or_default()),
     ) {
         return Err(AppError::Forbidden(
             "only the task assignee can fail it".into(),
@@ -743,9 +827,16 @@ pub async fn fail_task(
     let reason = body.reason.unwrap_or_default();
     let task = state
         .db
-        .finish_task(&id, "failed", Some(&reason))
+        .finish_task(&id, "failed", Some(&reason), &by_did)
         .await
         .map_err(|e| task_write_conflict(e, "task not found or not in claimed state"))?;
+    let by_did = task
+        .assignee_did
+        .as_deref()
+        .map(crate::db::trim_assignee_did)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or(by_did);
     announce_task_event(
         &state.db,
         &state.task_event_tx,
@@ -2828,5 +2919,38 @@ mod visible_tasks_tests {
             Some(&async_graphql::Value::Null),
             "quarantined-repo task must read as null in GraphQL query"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The gate's DB helper must mirror `AppError::Db`: a pool-level failure is
+    /// the retryable 503 `db_unavailable`, a query fault the opaque 500.
+    #[test]
+    fn db_error_matches_app_error_status_split() {
+        let unavailable = db_error(anyhow::Error::from(sqlx::Error::PoolTimedOut));
+        assert_eq!(unavailable.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable.1 .0["error"], crate::error::DB_UNAVAILABLE_CODE);
+        assert_eq!(
+            unavailable.1 .0["message"],
+            crate::error::DB_UNAVAILABLE_MESSAGE
+        );
+
+        let query = db_error(anyhow::Error::from(sqlx::Error::Protocol(
+            "column \"machine_id\" does not exist".into(),
+        )));
+        assert_eq!(query.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(query.1 .0["error"], "db_error");
+        assert_eq!(query.1 .0["message"], crate::error::DB_ERROR_MESSAGE);
+        assert!(!query.1 .0.to_string().contains("machine_id"));
+    }
+
+    /// `.context()` layers must not hide the sqlx error from the status split.
+    #[test]
+    fn db_error_sees_sqlx_through_context() {
+        let wrapped = anyhow::Error::from(sqlx::Error::PoolClosed).context("repo lookup failed");
+        assert_eq!(db_error(wrapped).0, StatusCode::SERVICE_UNAVAILABLE);
     }
 }
