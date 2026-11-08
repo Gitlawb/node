@@ -1,6 +1,6 @@
 //! Keypair generation, storage, and signing.
 //!
-//! A gitlawb identity is an Ed25519 keypair. The public key encodes into a
+//! A Twigpine identity is an Ed25519 keypair. The public key encodes into a
 //! `did:key` DID. The private key is stored as PKCS#8 PEM on disk.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -11,7 +11,7 @@ use zeroize::Zeroizing;
 use crate::did::Did;
 use crate::{Error, Result};
 
-/// An Ed25519 keypair that is the root identity for a gitlawb actor.
+/// An Ed25519 keypair that is the root identity for a Twigpine actor.
 #[derive(Clone)]
 pub struct Keypair {
     signing_key: SigningKey,

@@ -18,14 +18,14 @@ function getPlatformKey() {
 
   if (arch !== "arm64" && arch !== "x64") {
     throw new Error(
-      `Unsupported architecture: ${arch}. Gitlawb CLI supports x64 and arm64.`
+      `Unsupported architecture: ${arch}. Twigpine CLI supports x64 and arm64.`
     );
   }
 
   if (platform !== "darwin" && platform !== "linux") {
     throw new Error(
-      `Unsupported platform: ${platform}. Gitlawb CLI supports macOS and Linux.\n` +
-        `For Windows, use WSL or the installer: https://gitlawb.com/install.ps1`
+      `Unsupported platform: ${platform}. Twigpine CLI supports macOS and Linux.\n` +
+        `For Windows, use WSL or the installer: https://twigpine.com/install.ps1`
     );
   }
 
@@ -58,7 +58,7 @@ function install() {
     console.error(
       `@gitlawb/gl: Platform package ${packageName} not found.\n` +
         `This can happen if optional dependencies were skipped.\n` +
-        `Install manually: curl -sSf https://gitlawb.com/install.sh | sh`
+        `Install manually: curl -sSf https://twigpine.com/install.sh | sh`
     );
     process.exit(1);
   }
@@ -78,7 +78,7 @@ function install() {
     chmodSync(dest, 0o755);
   }
 
-  console.log(`@gitlawb/gl: Installed gitlawb CLI for ${platformKey}`);
+  console.log(`@gitlawb/gl: Installed Twigpine CLI for ${platformKey}`);
 }
 
 try {
