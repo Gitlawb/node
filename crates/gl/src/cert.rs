@@ -37,11 +37,10 @@ pub enum CertCmd {
     },
     /// Show a specific ref certificate and verify its signature.
     ///
-    /// `--verify` requires `--expect-node <did>` since v2 cert
-    /// compat (Round 2): the queried node's self-reported DID is no
-    /// longer accepted as a trust anchor, so callers must name the
-    /// issuer they trust. See the `BREAKING CHANGE:` note on the
-    /// commit that introduced this requirement.
+    /// `--verify` requires `--expect-node <did>`: the queried node's
+    /// self-reported DID is not a trust anchor, because a node serving a
+    /// forged certificate also controls its own self-report. Callers
+    /// must name the issuer they trust.
     Show {
         /// Repository in <owner>/<repo> or <repo> format
         repo: String,
@@ -220,7 +219,7 @@ async fn cmd_show(
         Ok(_) => verify_signature(
             repo_id, ref_name, old_sha, new_sha, pusher, node_did, issued_at, signature,
         ),
-        Err(reason) => Err(format!(
+        Err(ref reason) => Err(format!(
             "cert declared a version this client cannot represent ({reason}); refusing to verify"
         )),
     };
@@ -233,7 +232,11 @@ async fn cmd_show(
             );
         }
         Err(reason) => {
-            println!("  INVALID — {reason}");
+            // A version refusal means no cryptographic check ran, so it must
+            // not print as an INVALID signature: operators and log scrapers
+            // would read that as a failed Ed25519 verification. INVALID is
+            // reserved for failures out of verify_signature itself.
+            println!("  {} — {reason}", signature_verdict_label(&parsed_version));
         }
     }
 
@@ -327,6 +330,18 @@ fn did_check_report(current: &std::result::Result<String, String>, node_did: &st
             "  To verify offline, use the node's Ed25519 public key derived from:".to_string(),
             format!("    did:key → {node_did}"),
         ],
+    }
+}
+
+/// The stdout label for a failed verification verdict. A `parsed_version`
+/// error means `verify_signature` never ran, so the refusal must print as
+/// UNSUPPORTED VERSION rather than INVALID, which operators and log
+/// scrapers would read as a failed Ed25519 check.
+fn signature_verdict_label(parsed_version: &std::result::Result<u32, String>) -> &'static str {
+    if parsed_version.is_err() {
+        "UNSUPPORTED VERSION"
+    } else {
+        "INVALID"
     }
 }
 
@@ -1279,6 +1294,19 @@ mod tests {
                 "non-integer version {bad} must not collapse to v1"
             );
         }
+    }
+
+    /// A version refusal must not print as INVALID — no cryptographic
+    /// check ran, so labelling it INVALID would tell operators an Ed25519
+    /// verification failed when the payload shape was the disqualifier.
+    /// Removing the label branch fails this test.
+    #[test]
+    fn signature_verdict_label_distinguishes_refusal_from_bad_signature() {
+        assert_eq!(
+            signature_verdict_label(&Err("version 2 not supported".to_string())),
+            "UNSUPPORTED VERSION"
+        );
+        assert_eq!(signature_verdict_label(&Ok(1)), "INVALID");
     }
 
     /// #26 Split PR 3, round 2: a `version: 2` certificate must fail
