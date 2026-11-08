@@ -279,6 +279,14 @@ pub struct RefCertificate {
     pub node_did: String,
     pub signature: String,
     pub issued_at: String,
+    /// #26 Split PR 3 — the wire-format version of this cert. v1 is
+    /// the pre-versioning 7-field payload (no `version` key in the
+    /// signed bytes). v2+ is reserved for a new signed payload shape
+    /// that carries the version inside the signed bytes; it is not
+    /// v1 plus unsigned fields, because flipping this column must
+    /// invalidate the signature. Clients refuse to verify versions
+    /// they cannot represent rather than guessing.
+    pub version: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1551,6 +1559,32 @@ const MIGRATIONS: &[Migration] = &[
                  updated_at TEXT NOT NULL,
                  PRIMARY KEY (repo_id, backend)
              )",
+        ],
+    },
+    Migration {
+        version: 37,
+        name: "ref_certificates_version",
+        stmts: &[
+            // #26 Split PR 3 — certificate / CLI compatibility. The
+            // ref-cert wire format is versioned so future fields can
+            // be added without breaking old clients (which ignore
+            // the field) or old servers (which default the column
+            // to 1). New certificates are currently issued as v1,
+            // which is byte-for-byte identical to the pre-versioning
+            // shape: an old client reading a v1 cert from a new
+            // server sees the same payload, the same signature, and
+            // the same Ed25519 verify path. A new client reading an
+            // old server sees `version` defaulted to 1 and verifies
+            // against the v1 payload shape. v2 is reserved for a
+            // future shape that carries the version inside the
+            // signed bytes; it must not be stamped until a v2
+            // verifier ships.
+            //
+            // DEFAULT 1 so an existing row reads as v1 without a
+            // backfill migration. NOT NULL so a missing value is a
+            // hard error at insert time rather than a silent v0 that
+            // an old client would interpret as "no version field."
+            "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1",
         ],
     },
 ];
@@ -2886,8 +2920,8 @@ impl Db {
     pub async fn insert_ref_certificate(&self, cert: &RefCertificate) -> Result<RefCertificate> {
         let row = sqlx::query(
             "INSERT INTO ref_certificates
-             (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, version)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              ON CONFLICT (repo_id, ref_name) DO UPDATE SET
                 old_sha   = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
                                  THEN EXCLUDED.old_sha   ELSE ref_certificates.old_sha   END,
@@ -2900,8 +2934,10 @@ impl Db {
                 signature = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
                                  THEN EXCLUDED.signature ELSE ref_certificates.signature END,
                 issued_at = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
-                                 THEN EXCLUDED.issued_at ELSE ref_certificates.issued_at END
-             RETURNING id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at",
+                                 THEN EXCLUDED.issued_at ELSE ref_certificates.issued_at END,
+                version   = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
+                                 THEN EXCLUDED.version   ELSE ref_certificates.version   END
+             RETURNING id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, version",
         )
         .bind(&cert.id)
         .bind(&cert.repo_id)
@@ -2912,6 +2948,7 @@ impl Db {
         .bind(&cert.node_did)
         .bind(&cert.signature)
         .bind(&cert.issued_at)
+        .bind(cert.version as i32)
         .fetch_one(&self.pool)
         .await?;
         Ok(row_to_cert(row))
@@ -2926,7 +2963,7 @@ impl Db {
         // bounded even if a raw/negative value slips through the handler layer.
         let limit = limit.max(1);
         let rows = sqlx::query(
-            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, version
              FROM ref_certificates WHERE repo_id = $1 ORDER BY issued_at DESC LIMIT $2",
         )
         .bind(repo_id)
@@ -2965,7 +3002,7 @@ impl Db {
         let pattern = format!("{}%", escaped_prefix);
 
         let rows = sqlx::query(
-            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, version
              FROM ref_certificates WHERE repo_id = $1 AND id LIKE $2 ESCAPE '!' ORDER BY issued_at DESC LIMIT $3",
         )
         .bind(repo_id)
@@ -2978,7 +3015,7 @@ impl Db {
 
     pub async fn get_ref_certificate(&self, id: &str) -> Result<Option<RefCertificate>> {
         let row = sqlx::query(
-            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, version
              FROM ref_certificates WHERE id = $1",
         )
         .bind(id)
@@ -4800,28 +4837,54 @@ impl Db {
 
 // ── Agent Tasks ───────────────────────────────────────────────────────────────
 
+/// Permanent authorization denial: the task is reserved for a different assignee.
+/// Handlers downcast this to return 403 (vs 409 for a lost claim race).
+#[derive(Debug, thiserror::Error)]
+#[error("task not claimable: reserved for another assignee")]
+pub struct TaskReservedForOtherAssignee;
+
+/// ASCII whitespace treated as blank for assignee slots — must stay in sync with
+/// `BTRIM(assignee_did, E' \t\n\r')` in `claim_task`'s SQL open-slot check.
+const ASSIGNEE_BLANK: &[char] = &[' ', '\t', '\n', '\r'];
+
+fn assignee_slot_blank(s: &str) -> bool {
+    s.trim_matches(ASSIGNEE_BLANK).is_empty()
+}
+
+/// Trim assignee DIDs for auth matching (same ASCII blank set as SQL/open checks).
+pub fn trim_assignee_did(s: &str) -> &str {
+    s.trim_matches(ASSIGNEE_BLANK)
+}
+
 impl Db {
-    pub async fn create_task(&self, task: &AgentTask) -> Result<()> {
+    /// Persist a task. Whitespace-only `assignee_did` is stored as `NULL` (open).
+    /// Returns the normalized row shape so REST/GraphQL create responses match GET.
+    pub async fn create_task(&self, task: &AgentTask) -> Result<AgentTask> {
+        let mut stored = task.clone();
+        stored.assignee_did = stored
+            .assignee_did
+            .take()
+            .filter(|s| !assignee_slot_blank(s));
         sqlx::query(
             "INSERT INTO agent_tasks (id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
         )
-        .bind(&task.id)
-        .bind(&task.repo_id)
-        .bind(&task.kind)
-        .bind(&task.status)
-        .bind(&task.delegator_did)
-        .bind(&task.assignee_did)
-        .bind(&task.capability)
-        .bind(&task.ucan_token)
-        .bind(&task.payload)
-        .bind(&task.result)
-        .bind(&task.created_at)
-        .bind(&task.updated_at)
-        .bind(&task.deadline)
+        .bind(&stored.id)
+        .bind(&stored.repo_id)
+        .bind(&stored.kind)
+        .bind(&stored.status)
+        .bind(&stored.delegator_did)
+        .bind(&stored.assignee_did)
+        .bind(&stored.capability)
+        .bind(&stored.ucan_token)
+        .bind(&stored.payload)
+        .bind(&stored.result)
+        .bind(&stored.created_at)
+        .bind(&stored.updated_at)
+        .bind(&stored.deadline)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(stored)
     }
 
     pub async fn get_task(&self, id: &str) -> Result<Option<AgentTask>> {
@@ -4878,38 +4941,102 @@ impl Db {
         Ok(rows.into_iter().map(row_to_task).collect())
     }
 
+    /// Claim a pending task for `assignee_did`.
+    ///
+    /// If the task was created with a non-blank pre-set `assignee_did`, only that
+    /// agent (DID-normalized via [`crate::api::did_matches`]) may claim it. Open
+    /// tasks (`NULL` / blank) remain first-claimer-wins. A reserved claim keeps
+    /// the **exact** stored DID form via `COALESCE($4, $2)` (no BTRIM rewrite) so
+    /// exact-match list filters still work. The UPDATE also re-checks the
+    /// assignee slot as defense-in-depth against a future writer racing the
+    /// pre-check.
     pub async fn claim_task(&self, id: &str, assignee_did: &str) -> Result<AgentTask> {
         let now = Utc::now().to_rfc3339();
+        // Denial path only needs status + assignee — do not load payload/UCAN
+        // for a permissionless caller who will be rejected.
+        let row = sqlx::query("SELECT status, assignee_did FROM agent_tasks WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("task not claimable: not found or already claimed"))?;
+        let status: String = row.get("status");
+        if status != "pending" {
+            return Err(anyhow::anyhow!(
+                "task not claimable: not found or already claimed"
+            ));
+        }
+        let stored: Option<String> = row.get("assignee_did");
+        // Blank reservations are treated as open. Keep the exact stored string
+        // for the UPDATE equality check and SET (do not BTRIM the reserved form).
+        // Blank definition matches SQL `BTRIM(..., E' \t\n\r')` (not space-only).
+        let reserved_exact = stored.as_deref().filter(|r| !assignee_slot_blank(r));
+        if let Some(reserved) = reserved_exact {
+            if !crate::api::did_matches(assignee_did, trim_assignee_did(reserved)) {
+                return Err(TaskReservedForOtherAssignee.into());
+            }
+        }
+        // Keep the exact reserved form ($4); only fill assignee on open claims ($2).
+        // Treat blank stored values as open for the SQL slot check.
         let row = sqlx::query(
-            "UPDATE agent_tasks SET status='claimed', assignee_did=$2, updated_at=$3
+            "UPDATE agent_tasks SET status='claimed',
+                 assignee_did = COALESCE($4, $2),
+                 updated_at=$3
              WHERE id=$1 AND status='pending'
+               AND (
+                 ($4::text IS NULL AND (assignee_did IS NULL OR BTRIM(assignee_did, E' \t\n\r') = ''))
+                 OR assignee_did = $4
+               )
              RETURNING id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline",
         )
         .bind(id)
         .bind(assignee_did)
         .bind(&now)
+        .bind(reserved_exact)
         .fetch_optional(&self.pool)
         .await?;
         row.map(row_to_task)
             .ok_or_else(|| anyhow::anyhow!("task not claimable: not found or already claimed"))
     }
 
+    /// Transition a claimed task to `new_status` (`completed` / `failed`).
+    ///
+    /// `actor_did` must be the task's assignee (DID-normalized). The UPDATE
+    /// binds the exact stored `assignee_did` so a concurrent reassignment /
+    /// re-claim cannot finish under a check-then-act race in the handler.
     pub async fn finish_task(
         &self,
         id: &str,
         new_status: &str,
         result: Option<&str>,
+        actor_did: &str,
     ) -> Result<AgentTask> {
         let now = Utc::now().to_rfc3339();
+        let existing = self
+            .get_task(id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("task not found or not in claimed state"))?;
+        if existing.status != "claimed" {
+            return Err(anyhow::anyhow!("task not found or not in claimed state"));
+        }
+        let Some(ref assigned) = existing.assignee_did else {
+            return Err(anyhow::anyhow!("task not found or not in claimed state"));
+        };
+        // Trim matches claim_task so tab-padded stored values can finish.
+        if !crate::api::did_matches(actor_did, trim_assignee_did(assigned)) {
+            return Err(anyhow::anyhow!(
+                "task not finishable: only the assignee may finish it"
+            ));
+        }
         let row = sqlx::query(
             "UPDATE agent_tasks SET status=$2, result=$3, updated_at=$4
-             WHERE id=$1 AND status='claimed'
+             WHERE id=$1 AND status='claimed' AND assignee_did=$5
              RETURNING id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline",
         )
         .bind(id)
         .bind(new_status)
         .bind(result)
         .bind(&now)
+        .bind(assigned.as_str())
         .fetch_optional(&self.pool)
         .await?;
         row.map(row_to_task)
@@ -5653,6 +5780,7 @@ fn row_to_cert(r: sqlx::postgres::PgRow) -> RefCertificate {
         node_did: r.get("node_did"),
         signature: r.get("signature"),
         issued_at: r.get("issued_at"),
+        version: r.get::<i32, _>("version") as u32,
     }
 }
 
@@ -9204,6 +9332,7 @@ mod ref_certificate_tests {
             node_did: "did:key:zNODE".to_string(),
             signature: "sig".to_string(),
             issued_at: issued_at.to_string(),
+            version: 1,
         }
     }
 
@@ -9874,6 +10003,130 @@ mod ref_certificate_tests {
             "ff00",
             "the update arm touches only the continuation columns, so an in-progress \
              table walk is never rewound by a window rotation"
+        );
+    }
+
+    /// #26 Split PR 3 (INV-7): an existing node past v1 gets the
+    /// `ref_certificates.version` column from its OWN v37 entry, proven
+    /// by dropping the column plus its `schema_migrations` row and
+    /// re-running the real migration code. The migration is the only
+    /// place the column is added (v37 — the v1 bundle no longer
+    /// carries it), so a deletion of v37 must be visible as a missing
+    /// column on a v27 node.
+    ///
+    /// DEFAULT 1 is what makes an existing pre-v37 cert row read as
+    /// v1 without a backfill migration. An upgraded node reads
+    /// every legacy row as version 1 — the same payload the old
+    /// code signed — so a v1 verify path on a new client still
+    /// works against an upgraded database.
+    ///
+    /// MUTATION (RED): delete the v37 entry from `MIGRATIONS` and the
+    /// upgrade path leaves the column missing.
+    #[sqlx::test]
+    async fn v37_ref_certificates_version_applies_on_upgrade(pool: PgPool) {
+        async fn version_column_default(pool: &PgPool) -> Option<String> {
+            // fetch_optional (not fetch_one) so a missing column
+            // returns Ok(None) instead of RowNotFound. The whole
+            // point of the precondition assertion below is to
+            // detect a missing column, and RowNotFound would mask
+            // the difference between "the helper is wrong" and
+            // "the migration is wrong".
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT column_default
+                   FROM information_schema.columns
+                  WHERE table_name = 'ref_certificates'
+                    AND column_name = 'version'",
+            )
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+            .flatten()
+        }
+
+        async fn seed_pre_v37_cert(pool: &PgPool) {
+            // The pre-v37 schema has no `version` column, so a raw
+            // INSERT omitting it is the legacy code path. The node
+            // did not write a version value on v1..v27 — the field
+            // did not exist.
+            sqlx::query(
+                "INSERT INTO ref_certificates
+                 (id, repo_id, ref_name, old_sha, new_sha,
+                  pusher_did, node_did, signature, issued_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 ON CONFLICT (repo_id, ref_name) DO NOTHING",
+            )
+            .bind("legacy-cert-1")
+            .bind("legacy-repo")
+            .bind("refs/heads/main")
+            .bind("0000")
+            .bind("1111")
+            .bind("did:key:zLEGACYPUSHER")
+            .bind("did:key:zLEGACYNODE")
+            .bind("legacy-sig")
+            .bind("2026-07-01T10:00:00+00:00")
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        async fn legacy_row_reads_as_v1(pool: &PgPool) -> i32 {
+            // After v37 the legacy row (inserted without an explicit
+            // version) reads back as 1 via the DEFAULT, not as 0 or
+            // NULL — the latter would be a hard insert error under
+            // NOT NULL DEFAULT, but the read-back is the actual
+            // forward-compat property the v1 verify path relies on.
+            sqlx::query_scalar::<_, i32>(
+                "SELECT version FROM ref_certificates WHERE id = 'legacy-cert-1'",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+
+        // 1. Fresh chain: v37 has run, the column exists with DEFAULT 1.
+        let db = Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+        assert_eq!(
+            version_column_default(&pool).await.as_deref(),
+            Some("1"),
+            "v37 must declare the version column with DEFAULT 1"
+        );
+
+        // 2. Roll back to pre-v37: drop the column AND the v37 record.
+        //    The rollback is split into two statements because ALTER
+        //    TABLE ... DROP COLUMN and DELETE run in the same DDL
+        //    surface but the column drop must complete before the
+        //    next step reads schema_migrations.
+        sqlx::query("ALTER TABLE ref_certificates DROP COLUMN version")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 37")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            version_column_default(&pool).await.is_none(),
+            "precondition: column removed and its migration record removed"
+        );
+
+        // 3. Seed a legacy cert on the pre-v37 schema (no version
+        //    column ⇒ the INSERT must omit it).
+        seed_pre_v37_cert(&pool).await;
+
+        // 4. Re-run migrations: v37 must re-add the column with
+        //    DEFAULT 1, and the legacy row must read back as 1.
+        db.run_migrations().await.unwrap();
+        assert_eq!(
+            version_column_default(&pool).await.as_deref(),
+            Some("1"),
+            "v37 must recreate the version column with DEFAULT 1 on an upgrading node"
+        );
+        assert_eq!(
+            legacy_row_reads_as_v1(&pool).await,
+            1,
+            "a pre-v37 cert row reads as version 1 after v37 runs, so the \
+             v1 verify path on a new client still works against an upgraded database"
         );
     }
 

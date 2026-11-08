@@ -79,10 +79,14 @@ impl MutationRoot {
             updated_at: now,
             deadline: input.deadline,
         };
-        db.create_task(&task)
+        // Return the stored row, not the pre-insert input: create_task
+        // normalizes the assignee (whitespace-only becomes NULL/open), and a
+        // response that shows the raw input lies about the reservation.
+        let stored = db
+            .create_task(&task)
             .await
             .map_err(crate::graphql::graphql_db_err)?;
-        Ok(AgentTaskType::from(task))
+        Ok(AgentTaskType::from(stored))
     }
 
     async fn claim_task(
@@ -104,11 +108,19 @@ impl MutationRoot {
             .claim_task(&id, &assignee_did)
             .await
             .map_err(crate::graphql::graphql_db_err)?;
+        // Report the stored assignee form like REST, so subscribers see the
+        // same identity whichever API surface ran the transition.
+        let by_did = task
+            .assignee_did
+            .as_deref()
+            .map(crate::db::trim_assignee_did)
+            .unwrap_or(assignee_did.as_str())
+            .to_string();
         let _ = tx.send(TaskEventBroadcast {
             task_id: id,
             old_status: "pending".to_string(),
             new_status: "claimed".to_string(),
-            by_did: assignee_did,
+            by_did,
             at: Utc::now().to_rfc3339(),
         });
         Ok(AgentTaskType::from(task))
@@ -137,15 +149,24 @@ impl MutationRoot {
             .await
             .map_err(crate::graphql::graphql_db_err)?
             .ok_or_else(|| async_graphql::Error::new("task not found"))?;
-        if !crate::api::did_matches(caller, existing.assignee_did.as_deref().unwrap_or_default()) {
+        if !crate::api::did_matches(
+            caller,
+            crate::db::trim_assignee_did(existing.assignee_did.as_deref().unwrap_or_default()),
+        ) {
             return Err(async_graphql::Error::new(
                 "only the task assignee can complete it",
             ));
         }
         let task = db
-            .finish_task(&id, "completed", input.result.as_deref())
+            .finish_task(&id, "completed", input.result.as_deref(), caller)
             .await
             .map_err(crate::graphql::graphql_db_err)?;
+        let by_did = task
+            .assignee_did
+            .as_deref()
+            .map(crate::db::trim_assignee_did)
+            .unwrap_or(by_did.as_str())
+            .to_string();
         let _ = tx.send(TaskEventBroadcast {
             task_id: id,
             old_status: "claimed".to_string(),
@@ -178,16 +199,25 @@ impl MutationRoot {
             .await
             .map_err(crate::graphql::graphql_db_err)?
             .ok_or_else(|| async_graphql::Error::new("task not found"))?;
-        if !crate::api::did_matches(caller, existing.assignee_did.as_deref().unwrap_or_default()) {
+        if !crate::api::did_matches(
+            caller,
+            crate::db::trim_assignee_did(existing.assignee_did.as_deref().unwrap_or_default()),
+        ) {
             return Err(async_graphql::Error::new(
                 "only the task assignee can fail it",
             ));
         }
         let reason = input.reason.unwrap_or_default();
         let task = db
-            .finish_task(&id, "failed", Some(&reason))
+            .finish_task(&id, "failed", Some(&reason), caller)
             .await
             .map_err(crate::graphql::graphql_db_err)?;
+        let by_did = task
+            .assignee_did
+            .as_deref()
+            .map(crate::db::trim_assignee_did)
+            .unwrap_or(by_did.as_str())
+            .to_string();
         let _ = tx.send(TaskEventBroadcast {
             task_id: id,
             old_status: "claimed".to_string(),
@@ -572,5 +602,163 @@ mod tests {
             !errs.contains("machine_id") && !errs.contains("column"),
             "schema text leaked through the gate: {errs}"
         );
+    }
+
+    /// Pre-assigned GraphQL claimTask must reject a stranger (no UCAN leak)
+    /// and admit the reserved assignee.
+    #[sqlx::test]
+    async fn claim_task_honors_preassigned_assignee(pool: PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let reserved = "did:key:zGQLRESERVEDAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let thief = "did:key:zGQLTHIEFBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let now = chrono::Utc::now().to_rfc3339();
+        let task = crate::db::AgentTask {
+            id: "task-gql-reserved".into(),
+            repo_id: None,
+            kind: "build".into(),
+            status: "pending".into(),
+            delegator_did: "did:key:zGQLDELEGATORCCCCCCCCCCCCCCCCCCCCCCCCCC".into(),
+            assignee_did: Some(reserved.into()),
+            capability: "repo:write".into(),
+            ucan_token: Some("gql-ucan-secret".into()),
+            payload: None,
+            result: None,
+            created_at: now.clone(),
+            updated_at: now,
+            deadline: None,
+        };
+        state.db.create_task(&task).await.expect("seed");
+        let schema = state.graphql_schema.as_ref();
+
+        let q = |actor: &str| {
+            format!(
+                r#"mutation {{ claimTask(id: "task-gql-reserved", assigneeDid: "{actor}") {{ id status ucanToken }} }}"#
+            )
+        };
+
+        let resp = schema
+            .execute(Request::new(q(thief)).data(AuthenticatedDid(thief.into())))
+            .await;
+        let errs = errors(&resp);
+        assert!(
+            errs.contains("reserved"),
+            "stranger claim must surface reserved deny distinctly: {errs}"
+        );
+        assert!(
+            !errs.contains("gql-ucan-secret"),
+            "UCAN must not leak in GraphQL errors: {errs}"
+        );
+        if let Ok(data) = resp.data.into_json() {
+            let s = data.to_string();
+            assert!(
+                !s.contains("gql-ucan-secret"),
+                "UCAN must not leak in GraphQL data on failed claim: {s}"
+            );
+        }
+        // Parity with REST: failed steal must leave the row untouched.
+        let still = state
+            .db
+            .get_task("task-gql-reserved")
+            .await
+            .expect("get")
+            .expect("task exists");
+        assert_eq!(
+            still.status, "pending",
+            "status must stay pending after steal"
+        );
+        assert_eq!(
+            still.assignee_did.as_deref(),
+            Some(reserved),
+            "assignee_did must stay reserved after steal"
+        );
+
+        let resp = schema
+            .execute(Request::new(q(reserved)).data(AuthenticatedDid(reserved.into())))
+            .await;
+        assert!(
+            errors(&resp).is_empty(),
+            "reserved assignee must claim: {}",
+            errors(&resp)
+        );
+        let data = resp.data.into_json().expect("json data");
+        assert_eq!(data["claimTask"]["status"], "claimed");
+        assert_eq!(data["claimTask"]["ucanToken"], "gql-ucan-secret");
+    }
+
+    /// create_task normalizes a whitespace-only assignee to NULL (open task),
+    /// so the create response must show the stored row, not echo the input: a
+    /// client trusting the echoed "reservation" would believe a claimable task
+    /// is reserved. Before the fix the response was built from the pre-insert
+    /// struct and returned the padded input verbatim.
+    #[sqlx::test]
+    async fn create_task_reports_stored_assignee_not_input(pool: PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let caller = "did:key:zGQLCREATORAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let schema = state.graphql_schema.as_ref();
+        let q = format!(
+            r#"mutation {{ createTask(delegatorDid: "{caller}", input: {{ kind: "build", capability: "repo:write", assigneeDid: "   " }}) {{ id assigneeDid }} }}"#
+        );
+        let resp = schema
+            .execute(Request::new(q).data(AuthenticatedDid(caller.into())))
+            .await;
+        let data = resp.data.into_json().expect("json data");
+        assert!(
+            data["createTask"]["assigneeDid"].is_null(),
+            "whitespace-only assigneeDid must come back null (stored shape): {data}"
+        );
+    }
+
+    /// A task seeded with a whitespace-padded assignee must still be
+    /// completable by that assignee over GraphQL: REST and Db::finish_task
+    /// trim the stored value before comparing, and the GraphQL gate must do
+    /// the same or padded reservations finish only through REST.
+    #[sqlx::test]
+    async fn graphql_finish_accepts_padded_stored_assignee(pool: PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let assignee = "did:key:zGQLPADDEDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let now = chrono::Utc::now().to_rfc3339();
+        let task = crate::db::AgentTask {
+            id: "task-gql-padded".into(),
+            repo_id: None,
+            kind: "build".into(),
+            status: "pending".into(),
+            delegator_did: "did:key:zGQLDELEGATORDDDDDDDDDDDDDDDDDDDDDDDDDD".into(),
+            assignee_did: Some(format!("\t{assignee}\n")),
+            capability: "repo:write".into(),
+            ucan_token: None,
+            payload: None,
+            result: None,
+            created_at: now.clone(),
+            updated_at: now,
+            deadline: None,
+        };
+        state.db.create_task(&task).await.expect("seed");
+        let schema = state.graphql_schema.as_ref();
+
+        let claim = format!(
+            r#"mutation {{ claimTask(id: "task-gql-padded", assigneeDid: "{assignee}") {{ id status }} }}"#
+        );
+        let resp = schema
+            .execute(Request::new(claim).data(AuthenticatedDid(assignee.into())))
+            .await;
+        assert!(
+            errors(&resp).is_empty(),
+            "reserved assignee must claim a padded reservation: {}",
+            errors(&resp)
+        );
+
+        let finish = format!(
+            r#"mutation {{ completeTask(id: "task-gql-padded", byDid: "{assignee}", input: {{}}) {{ id status }} }}"#
+        );
+        let resp = schema
+            .execute(Request::new(finish).data(AuthenticatedDid(assignee.into())))
+            .await;
+        let errs = errors(&resp);
+        assert!(
+            errs.is_empty(),
+            "assignee must complete a padded reservation: {errs}"
+        );
+        let data = resp.data.into_json().expect("json data");
+        assert_eq!(data["completeTask"]["status"], "completed");
     }
 }
