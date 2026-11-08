@@ -2133,7 +2133,15 @@ async fn gate_and_serve(
 /// Returns all CIDs that have been pinned to the local IPFS node from git
 /// objects received via push. Each entry includes the git SHA-256 hex, the
 /// CIDv1 string, and the timestamp when it was pinned.
-pub async fn list_pins(State(state): State<AppState>) -> Result<Json<serde_json::Value>> {
+pub async fn list_pins(
+    State(state): State<AppState>,
+    auth: Option<Extension<crate::auth::AuthenticatedDid>>,
+) -> Result<Json<serde_json::Value>> {
+    if auth.is_none() {
+        return Err(crate::error::AppError::Unauthorized(
+            "authentication required for pin listing".into(),
+        ));
+    }
     // Bare `?` so connection-class sqlx failures downcast to `AppError::Db` and
     // map to 503 `db_unavailable` (not 500 via `.map_err(AppError::Internal)`) (#251).
     let pins = state.db.list_pinned_cids().await?;
@@ -2426,6 +2434,7 @@ mod closed_pool_tests {
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/ipfs/pins")
+                    .extension(crate::auth::AuthenticatedDid("did:key:test".into()))
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )

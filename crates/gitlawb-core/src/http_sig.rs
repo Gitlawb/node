@@ -567,6 +567,26 @@ mod tests {
     }
 
     #[test]
+    fn extreme_created_timestamps_reject_without_wrapping() {
+        let kp = Keypair::generate();
+        let did = kp.did();
+        let parse = |created: i64| {
+            let sig_input =
+                format!(r#"sig1=("@method");keyid="{did}";alg="ed25519";created={created}"#);
+            HttpSignature::parse(&sig_input, "sig1=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:").unwrap()
+        };
+        // i64::MIN used to panic in debug (subtraction overflow) and wrap to a
+        // passing skew in release; now - 2^63 wrapped to i64::MIN, whose abs()
+        // wrapped back to itself and read as fresh. Both must reject.
+        for created in [i64::MIN, i64::MAX, Utc::now().timestamp() - i64::MAX] {
+            assert!(
+                parse(created).check_created().is_err(),
+                "created={created} must not pass the freshness gate"
+            );
+        }
+    }
+
+    #[test]
     fn parse_error_missing_sig1_prefix() {
         let err = HttpSignature::parse(
             "badprefix=(\"@method\");keyid=\"did:key:z\";alg=\"ed25519\";created=1000",

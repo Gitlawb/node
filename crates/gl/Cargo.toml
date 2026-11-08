@@ -26,6 +26,8 @@ clap = { version = "4", features = ["derive", "env"] }
 dirs = "5"
 reqwest = { workspace = true }
 uuid = { workspace = true }
+url = { workspace = true }
+percent-encoding = { workspace = true }
 urlencoding = "2"
 alloy = { version = "1", default-features = false, features = [
     "contract",

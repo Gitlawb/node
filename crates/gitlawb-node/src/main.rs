@@ -51,6 +51,7 @@ use state::AppState;
 struct DegradedState {
     node_did: String,
     db_startup: Arc<DbStartupStatus>,
+    web_url: Option<String>,
 }
 
 /// Two independent counters with no cross-field invariant — atomics, not a
@@ -159,6 +160,7 @@ async fn main() -> Result<()> {
         degraded_listener,
         node_did.to_string(),
         Arc::clone(&db_startup),
+        config.web_url.clone(),
         db_ready_rx,
         shutdown_tx.subscribe(),
     ));
@@ -429,6 +431,8 @@ async fn main() -> Result<()> {
         std::time::Duration::from_secs(3600),
         200_000,
     );
+    let federated_rate_limiter =
+        rate_limit::RateLimiter::new_bounded(12, std::time::Duration::from_secs(60), 10_000);
     if config.sync_trigger_rate_limit == 0 {
         tracing::warn!(
             "GITLAWB_SYNC_TRIGGER_RATE_LIMIT=0 — /sync/trigger IP rate limiting disabled"
@@ -467,6 +471,7 @@ async fn main() -> Result<()> {
         push_limiter_trust,
         sync_trigger_rate_limiter,
         peer_write_rate_limiter,
+        federated_rate_limiter,
         shutdown_tx: shutdown_tx.clone(),
         git_read_semaphore: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_git_ops)),
         git_write_semaphore: Arc::new(tokio::sync::Semaphore::new(
@@ -869,11 +874,12 @@ async fn run_degraded_server(
     listener: TcpListener,
     node_did: String,
     db_startup: Arc<DbStartupStatus>,
+    web_url: Option<String>,
     mut db_ready_rx: watch::Receiver<bool>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let addr = listener.local_addr().ok();
-    let router = build_degraded_router(node_did, db_startup);
+    let router = build_degraded_router(node_did, db_startup, web_url);
     info!(?addr, "degraded HTTP server ready");
 
     axum::serve(listener, router)
@@ -890,10 +896,15 @@ async fn run_degraded_server(
     Ok(())
 }
 
-fn build_degraded_router(node_did: String, db_startup: Arc<DbStartupStatus>) -> Router {
+fn build_degraded_router(
+    node_did: String,
+    db_startup: Arc<DbStartupStatus>,
+    web_url: Option<String>,
+) -> Router {
     let state = DegradedState {
         node_did,
         db_startup,
+        web_url,
     };
     // Everything answers 503 with the same body — including /health and
     // /ready, so peer readiness probes and uptime monitors correctly see a
@@ -925,6 +936,9 @@ async fn degraded_node_info(State(state): State<DegradedState>) -> impl IntoResp
         obj.insert("name".into(), "gitlawb-node".into());
         obj.insert("version".into(), env!("CARGO_PKG_VERSION").into());
         obj.insert("did".into(), state.node_did.clone().into());
+        if let Some(web_url) = &state.web_url {
+            obj.insert("web_url".into(), web_url.clone().into());
+        }
     }
     (StatusCode::SERVICE_UNAVAILABLE, Json(body))
 }
@@ -1171,6 +1185,7 @@ mod rate_limiter_sweep_tests {
         state.close_issue_rate_limiter = RateLimiter::new(10, window);
         state.sync_trigger_rate_limiter = RateLimiter::new(10, window);
         state.peer_write_rate_limiter = RateLimiter::new(10, window);
+        state.federated_rate_limiter = RateLimiter::new(10, window);
         state.ipfs_rate_limiter = RateLimiter::new(10, window);
 
         let limiters = |s: &crate::state::AppState| {
@@ -1181,6 +1196,7 @@ mod rate_limiter_sweep_tests {
                 s.close_issue_rate_limiter.clone(),
                 s.sync_trigger_rate_limiter.clone(),
                 s.peer_write_rate_limiter.clone(),
+                s.federated_rate_limiter.clone(),
                 s.ipfs_rate_limiter.clone(),
             ]
         };

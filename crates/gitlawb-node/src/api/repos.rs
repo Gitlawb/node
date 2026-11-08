@@ -3,6 +3,8 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use axum::Json;
 use bytes::Bytes;
+use futures::{stream, StreamExt};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -21,6 +23,18 @@ use crate::webhooks;
 
 /// The git all-zeros object id — the create/delete sentinel in a ref update.
 const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
+
+const FEDERATED_PEER_CONCURRENCY: usize = 4;
+const FEDERATED_PEER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const FEDERATED_AGGREGATE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const MAX_FEDERATED_PEERS: usize = 200;
+const MAX_FEDERATED_PEER_BYTES: usize = 512 * 1024;
+const MAX_FEDERATED_PEER_REPOS: usize = 200;
+const MAX_FEDERATED_REPOS: usize = 1_000;
+const MAX_FEDERATED_REPO_JSON_BYTES: usize = 2 * 1024 * 1024;
+// The aggregate byte budget counts serialized repo values and separators. Keep
+// a fixed reserve for the response object's keys, counters, and closing bytes.
+const FEDERATED_RESPONSE_OVERHEAD_BYTES: usize = 256;
 
 /// The set of blob and withheld-subtree tree OIDs withheld from **anonymous**
 /// replication for a repo, or `None` when the repo must not replicate at all
@@ -3233,11 +3247,206 @@ pub async fn list_refs(
     ))
 }
 
+struct FederatedPeerRepos {
+    node_url: String,
+    node_did: String,
+    repos: Vec<serde_json::Value>,
+    truncated: bool,
+}
+
+struct FederatedPeerPage {
+    repos: Vec<serde_json::Value>,
+    truncated: bool,
+}
+
+struct BoundedFederatedPeerRows(Vec<serde_json::Value>, bool);
+
+impl<'de> serde::Deserialize<'de> for BoundedFederatedPeerRows {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct RowsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for RowsVisitor {
+            type Value = BoundedFederatedPeerRows;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a bounded array of repository objects")
+            }
+
+            fn visit_seq<A>(self, mut rows: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut repos = Vec::with_capacity(MAX_FEDERATED_PEER_REPOS);
+                while repos.len() < MAX_FEDERATED_PEER_REPOS {
+                    let Some(repo) = rows.next_element::<serde_json::Value>()? else {
+                        return Ok(BoundedFederatedPeerRows(repos, false));
+                    };
+                    if !repo.is_object() {
+                        return Err(<A::Error as serde::de::Error>::custom(
+                            "peer repository row is not an object",
+                        ));
+                    }
+                    repos.push(repo);
+                }
+                let mut truncated = false;
+                while rows.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    truncated = true;
+                }
+                Ok(BoundedFederatedPeerRows(repos, truncated))
+            }
+        }
+
+        deserializer.deserialize_seq(RowsVisitor)
+    }
+}
+
+struct FederatedRepoBudget {
+    repos: Vec<serde_json::Value>,
+    json_bytes: usize,
+    max_repos: usize,
+    max_json_bytes: usize,
+    truncated: bool,
+}
+
+impl FederatedRepoBudget {
+    fn new(capacity: usize, max_repos: usize, max_json_bytes: usize) -> Self {
+        Self {
+            repos: Vec::with_capacity(capacity.min(max_repos)),
+            json_bytes: FEDERATED_RESPONSE_OVERHEAD_BYTES,
+            max_repos,
+            max_json_bytes,
+            truncated: false,
+        }
+    }
+
+    fn push(&mut self, repo: serde_json::Value) -> bool {
+        if self.is_saturated() {
+            self.truncated = true;
+            return false;
+        }
+        let Ok(repo_bytes) = serde_json::to_vec(&repo) else {
+            return true;
+        };
+        let charged = repo_bytes.len().saturating_add(1);
+        if self.json_bytes.saturating_add(charged) > self.max_json_bytes {
+            self.truncated = true;
+            return false;
+        }
+        self.json_bytes += charged;
+        self.repos.push(repo);
+        true
+    }
+
+    fn is_saturated(&self) -> bool {
+        self.repos.len() >= self.max_repos || self.json_bytes >= self.max_json_bytes
+    }
+}
+
+async fn fetch_federated_peer_repos(
+    client: &reqwest::Client,
+    url: &str,
+) -> Option<FederatedPeerPage> {
+    let mut response = client.get(url).send().await.ok()?;
+    if !response.status().is_success()
+        || response
+            .content_length()
+            .is_some_and(|len| len > MAX_FEDERATED_PEER_BYTES as u64)
+    {
+        return None;
+    }
+    let total = response
+        .headers()
+        .get("x-total-count")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok());
+
+    let capacity = response
+        .content_length()
+        .and_then(|len| usize::try_from(len).ok())
+        .unwrap_or(0)
+        .min(MAX_FEDERATED_PEER_BYTES);
+    let mut body = Vec::with_capacity(capacity);
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if body.len().saturating_add(chunk.len()) > MAX_FEDERATED_PEER_BYTES {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    let BoundedFederatedPeerRows(repos, overflow) = serde_json::from_slice(&body).ok()?;
+    let truncated = overflow || total.is_some_and(|total| total > repos.len() as u64);
+    Some(FederatedPeerPage { repos, truncated })
+}
+
+fn enrich_federated_repo(
+    mut repo: serde_json::Value,
+    node_url: &str,
+    node_did: &str,
+) -> Option<serde_json::Value> {
+    let object = repo.as_object_mut()?;
+    object.insert(
+        "node_url".to_string(),
+        serde_json::Value::String(node_url.to_string()),
+    );
+    object.insert(
+        "node_did".to_string(),
+        serde_json::Value::String(node_did.to_string()),
+    );
+    object.insert("local".to_string(), serde_json::Value::Bool(false));
+    Some(repo)
+}
+
+async fn collect_federated_fetches<I, F>(fetches: I, aggregate: &mut FederatedRepoBudget) -> usize
+where
+    I: IntoIterator<Item = F>,
+    F: Future<Output = Option<FederatedPeerRepos>>,
+{
+    let mut responses = stream::iter(fetches).buffer_unordered(FEDERATED_PEER_CONCURRENCY);
+    let mut nodes_queried = 0;
+
+    let deadline = tokio::time::Instant::now() + FEDERATED_AGGREGATE_DEADLINE;
+    loop {
+        let response = match tokio::time::timeout_at(deadline, responses.next()).await {
+            Ok(Some(response)) => response,
+            Ok(None) => break,
+            Err(_) => {
+                aggregate.truncated = true;
+                tracing::warn!("federated aggregation deadline exceeded");
+                break;
+            }
+        };
+        let Some(response) = response else {
+            aggregate.truncated = true;
+            tracing::warn!("federated peer fetch failed or exceeded its response limits");
+            continue;
+        };
+        nodes_queried += 1;
+        aggregate.truncated |= response.truncated;
+        for repo in response.repos {
+            let Some(repo) = enrich_federated_repo(repo, &response.node_url, &response.node_did)
+            else {
+                continue;
+            };
+            if !aggregate.push(repo) || aggregate.is_saturated() {
+                aggregate.truncated = true;
+                return nodes_queried;
+            }
+        }
+    }
+
+    nodes_queried
+}
+
 /// GET /api/v1/repos/federated
 ///
 /// Query all known peers for their public repos and return a merged view of
 /// the network. Each repo includes a `node_url` and `node_did` indicating
-/// which node hosts it. Results from unreachable peers are silently omitted.
+/// which node hosts it. Peer work is bounded by `FEDERATED_AGGREGATE_DEADLINE`
+/// and `MAX_FEDERATED_PEERS`; omitted
+/// results set `truncated`. The route admits 12 requests per minute per client IP.
 pub async fn list_federated_repos(
     State(state): State<AppState>,
     auth: Option<Extension<AuthenticatedDid>>,
@@ -3265,66 +3474,76 @@ pub async fn list_federated_repos(
         .unwrap_or_else(|| "http://127.0.0.1:7545".to_string());
     let local_node_did = state.node_did.to_string();
 
-    let mut all_repos: Vec<serde_json::Value> = Vec::with_capacity(local_repos.len());
+    let mut aggregate = FederatedRepoBudget::new(
+        local_repos.len(),
+        MAX_FEDERATED_REPOS,
+        MAX_FEDERATED_REPO_JSON_BYTES,
+    );
     for (r, count) in &local_repos {
-        let mut v = serde_json::to_value(to_response(r, &state, *count)).unwrap_or_default();
-        v["node_url"] = serde_json::Value::String(local_node_url.clone());
-        v["node_did"] = serde_json::Value::String(local_node_did.clone());
-        v["local"] = serde_json::Value::Bool(true);
-        all_repos.push(v);
-    }
-
-    // Query peers in parallel
-    let peers = state.db.list_peers().await.unwrap_or_default();
-    let client = &state.http_client;
-
-    let fetch_tasks: Vec<_> = peers
-        .into_iter()
-        .filter(|p| p.last_ping_ok && !p.http_url.is_empty())
-        .map(|peer| {
-            let client = Arc::clone(client);
-            let url = format!("{}/api/v1/repos", peer.http_url.trim_end_matches('/'));
-            let peer_did = peer.did.clone();
-            let peer_url = peer.http_url.clone();
-            tokio::spawn(async move {
-                let result = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    client.get(&url).send(),
-                )
-                .await;
-                match result {
-                    Ok(Ok(resp)) if resp.status().is_success() => {
-                        if let Ok(repos) = resp.json::<Vec<serde_json::Value>>().await {
-                            let enriched: Vec<serde_json::Value> = repos
-                                .into_iter()
-                                .map(|mut r| {
-                                    r["node_url"] = serde_json::Value::String(peer_url.clone());
-                                    r["node_did"] = serde_json::Value::String(peer_did.clone());
-                                    r["local"] = serde_json::Value::Bool(false);
-                                    r
-                                })
-                                .collect();
-                            return enriched;
-                        }
-                    }
-                    _ => {}
-                }
-                vec![]
-            })
-        })
-        .collect();
-
-    for task in fetch_tasks {
-        if let Ok(repos) = task.await {
-            all_repos.extend(repos);
+        let Ok(mut repo) = serde_json::to_value(to_response(r, &state, *count)) else {
+            continue;
+        };
+        repo["node_url"] = serde_json::Value::String(local_node_url.clone());
+        repo["node_did"] = serde_json::Value::String(local_node_did.clone());
+        repo["local"] = serde_json::Value::Bool(true);
+        if !aggregate.push(repo) || aggregate.is_saturated() {
+            aggregate.truncated = true;
+            break;
         }
     }
 
-    let count = all_repos.len();
+    // Keep peer work bounded even when the table contains many reachable rows.
+    // Dropping the buffered stream at the aggregate ceiling cancels its in-flight
+    // request futures and leaves the remaining iterator entries unpolled.
+    // One extra row detects omitted peers without materializing the full table.
+    let mut peers = state
+        .db
+        .list_federation_peers(MAX_FEDERATED_PEERS as i64 + 1)
+        .await?;
+    aggregate.truncated |= peers.len() > MAX_FEDERATED_PEERS;
+    peers.truncate(MAX_FEDERATED_PEERS);
+    let fetches: Vec<_> = peers
+        .into_iter()
+        .filter(|p| p.last_ping_ok && !p.http_url.is_empty())
+        .map(|peer| {
+            let client = Arc::clone(&state.http_client);
+            let url = format!(
+                "{}/api/v1/repos?limit={MAX_FEDERATED_PEER_REPOS}&offset=0",
+                peer.http_url.trim_end_matches('/')
+            );
+            let peer_did = peer.did.clone();
+            let peer_url = peer.http_url.clone();
+            async move {
+                tokio::time::timeout(
+                    FEDERATED_PEER_TIMEOUT,
+                    fetch_federated_peer_repos(&client, &url),
+                )
+                .await
+                .ok()
+                .flatten()
+                .map(|page| FederatedPeerRepos {
+                    node_url: peer_url,
+                    node_did: peer_did,
+                    repos: page.repos,
+                    truncated: page.truncated,
+                })
+            }
+        })
+        .collect();
+
+    let peer_nodes_queried = if aggregate.is_saturated() {
+        0
+    } else {
+        collect_federated_fetches(fetches, &mut aggregate).await
+    };
+
+    let count = aggregate.repos.len();
+    let truncated = aggregate.truncated;
     Ok(Json(serde_json::json!({
-        "repos": all_repos,
+        "repos": aggregate.repos,
         "count": count,
-        "nodes_queried": 1, // local + peers that responded
+        "nodes_queried": 1 + peer_nodes_queried,
+        "truncated": truncated,
     })))
 }
 
@@ -3533,6 +3752,17 @@ pub struct ForkRepoRequest {
 }
 
 /// POST /api/v1/repos/:owner/:repo/fork
+/// Argv for the fork's mirror clone, with `--` before the first positional (#374).
+///
+/// Both positionals here are server-derived paths rather than caller-supplied
+/// URLs, so this is defence in depth rather than a reachable injection. It is
+/// still the same argv contract as the other clone sites, and it is extracted for
+/// the same reason: so the delimiter's placement is pinned by a test instead of
+/// resting on review.
+fn fork_clone_args<'a>(source: &'a str, dest: &'a str) -> [&'a str; 5] {
+    ["clone", "--mirror", "--", source, dest]
+}
+
 pub async fn fork_repo(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthenticatedDid>,
@@ -3610,12 +3840,10 @@ pub async fn fork_repo(
 
     // Clone the source repo as a mirror
     let output = std::process::Command::new("git")
-        .args([
-            "clone",
-            "--mirror",
+        .args(fork_clone_args(
             source_path.to_str().unwrap_or(""),
             disk_path.to_str().unwrap_or(""),
-        ])
+        ))
         .output()
         .map_err(|e| AppError::Git(format!("git clone --mirror failed: {e}")))?;
 
@@ -4082,6 +4310,30 @@ fn dedupe_canonical_repos(rows: Vec<(RepoRecord, i64)>) -> Vec<(RepoRecord, i64)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #374: the fork path builds its own `git clone --mirror` argv. Driven
+    /// through real git so a missing or misplaced `--` fails, matching the
+    /// coverage on the `gl clone`, `gl mirror`, and sync sinks.
+    #[test]
+    fn fork_clone_never_parses_the_source_as_a_git_option() {
+        let td = tempfile::TempDir::new().unwrap();
+        let dest = td.path().join("fork.git");
+        let injected = "--upload-pack=false";
+
+        let out = std::process::Command::new("git")
+            .env("LC_ALL", "C")
+            .args(fork_clone_args(injected, dest.to_str().unwrap()))
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+
+        assert!(!out.status.success(), "an option-shaped source must fail");
+        assert!(
+            stderr.contains(&format!("repository '{injected}'")),
+            "git must name the source as the repository, not consume it as an option: {stderr}"
+        );
+    }
+
     use crate::auth::caller_authorized_to_push;
     use crate::error::AppError;
     use gitlawb_core::identity::Keypair;
@@ -4269,6 +4521,46 @@ mod tests {
         }
     }
 
+    #[sqlx::test]
+    async fn federated_peer_query_is_bounded(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        sqlx::query("INSERT INTO peers (did, http_url, last_ping_ok, announced_at) SELECT 'peer-' || n, 'https://example.com', TRUE, '2026-01-01T00:00:00Z' FROM generate_series(1, $1) n")
+            .bind(MAX_FEDERATED_PEERS as i64 + 5)
+            .execute(&pool).await.unwrap();
+        let peers = state.db.list_federation_peers(i64::MAX).await.unwrap();
+        assert_eq!(peers.len(), MAX_FEDERATED_PEERS + 1);
+        assert_eq!(state.db.list_federation_peers(2).await.unwrap().len(), 2);
+        assert!(state.db.list_federation_peers(0).await.unwrap().is_empty());
+    }
+
+    #[sqlx::test]
+    async fn federated_route_brakes_repeated_anonymous_requests(pool: sqlx::PgPool) {
+        use tower::ServiceExt;
+        let mut state = crate::test_support::test_state(pool).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.federated_rate_limiter =
+            crate::rate_limit::RateLimiter::new_bounded(1, std::time::Duration::from_secs(60), 10);
+        let router = crate::server::build_router(state);
+        for n in 0..2 {
+            let mut request = axum::http::Request::builder()
+                .uri("/api/v1/repos/federated")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                "203.0.113.42:5000".parse::<std::net::SocketAddr>().unwrap(),
+            ));
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                if n == 0 {
+                    StatusCode::OK
+                } else {
+                    StatusCode::TOO_MANY_REQUESTS
+                }
+            );
+        }
+    }
+
     #[test]
     fn fork_clone_guard_removes_its_own_mirror_on_drop() {
         let root = tempfile::TempDir::new().unwrap();
@@ -4314,6 +4606,464 @@ mod tests {
             validated.exists(),
             "a failed attempt must not delete the directory a successor now owns"
         );
+    }
+
+    #[tokio::test]
+    async fn federated_route_uses_the_state_owned_bucket_before_database_access() {
+        use tower::ServiceExt;
+        let mut state = crate::test_support::test_state_lazy();
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.federated_rate_limiter =
+            crate::rate_limit::RateLimiter::new_bounded(1, std::time::Duration::from_secs(60), 10);
+        assert!(state.federated_rate_limiter.check("203.0.113.42").await);
+        // Both routers must use the same exhausted bucket from AppState.
+        for router in [
+            crate::server::build_router(state.clone()),
+            crate::server::build_router(state),
+        ] {
+            let mut request = axum::http::Request::builder()
+                .uri("/api/v1/repos/federated")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                "203.0.113.42:5000".parse::<std::net::SocketAddr>().unwrap(),
+            ));
+            let response =
+                tokio::time::timeout(std::time::Duration::from_secs(1), router.oneshot(request))
+                    .await
+                    .expect("the exhausted bucket must reject before accessing the lazy database")
+                    .unwrap();
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+    }
+
+    #[tokio::test]
+    async fn federated_aggregate_deadline_returns_partial_results() {
+        let mut budget = FederatedRepoBudget::new(0, 1000, MAX_FEDERATED_REPO_JSON_BYTES);
+        let fetches =
+            (0..8).map(|_| async { std::future::pending::<Option<FederatedPeerRepos>>().await });
+        let nodes = tokio::time::timeout(
+            FEDERATED_AGGREGATE_DEADLINE + std::time::Duration::from_secs(2),
+            collect_federated_fetches(fetches, &mut budget),
+        )
+        .await
+        .expect("the aggregate must stop before the caller deadline");
+        assert_eq!(nodes, 0);
+        assert!(budget.truncated);
+    }
+
+    #[tokio::test]
+    async fn federated_peer_response_enforces_byte_and_row_ceilings() {
+        let mut row_server = mockito::Server::new_async().await;
+        let row_body =
+            serde_json::to_string(&vec![serde_json::json!({}); MAX_FEDERATED_PEER_REPOS + 1])
+                .unwrap();
+        let row_mock = row_server
+            .mock("GET", "/api/v1/repos")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(row_body)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = reqwest::Client::new();
+        let page =
+            fetch_federated_peer_repos(&client, &format!("{}/api/v1/repos", row_server.url()))
+                .await
+                .unwrap();
+        assert_eq!(page.repos.len(), MAX_FEDERATED_PEER_REPOS);
+        assert!(page.truncated);
+        row_mock.assert_async().await;
+
+        let byte_body = serde_json::to_string(&vec![serde_json::json!({
+            "description": "x".repeat(MAX_FEDERATED_PEER_BYTES)
+        })])
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let byte_server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1_024];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                         transfer-encoding: chunked\r\nconnection: close\r\n\r\n{:x}\r\n",
+                        byte_body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let _ = socket.write_all(byte_body.as_bytes()).await;
+            let _ = socket.write_all(b"\r\n0\r\n\r\n").await;
+        });
+
+        assert!(
+            fetch_federated_peer_repos(&client, &format!("http://{address}/api/v1/repos"))
+                .await
+                .is_none(),
+            "a chunked peer body above the byte ceiling must be omitted without Content-Length"
+        );
+        byte_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn federated_peer_total_count_prevents_false_complete_page() {
+        let mut server = mockito::Server::new_async().await;
+        let body = serde_json::to_string(
+            &(0..MAX_FEDERATED_PEER_REPOS)
+                .map(|id| serde_json::json!({ "id": id }))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let page_mock = server
+            .mock("GET", "/api/v1/repos")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("x-total-count", &(MAX_FEDERATED_PEER_REPOS + 1).to_string())
+            .with_body(body)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let page = fetch_federated_peer_repos(
+            &reqwest::Client::new(),
+            &format!("{}/api/v1/repos", server.url()),
+        )
+        .await
+        .expect("the capped peer page is otherwise valid");
+        page_mock.assert_async().await;
+        assert_eq!(page.repos.len(), MAX_FEDERATED_PEER_REPOS);
+        assert!(page.truncated, "the peer total proves another row exists");
+
+        let mut aggregate = FederatedRepoBudget::new(300, 300, MAX_FEDERATED_REPO_JSON_BYTES);
+        let nodes = collect_federated_fetches(
+            [std::future::ready(Some(FederatedPeerRepos {
+                node_url: server.url(),
+                node_did: "did:key:peer".to_string(),
+                repos: page.repos,
+                truncated: page.truncated,
+            }))],
+            &mut aggregate,
+        )
+        .await;
+        assert_eq!(nodes, 1);
+        assert_eq!(aggregate.repos.len(), MAX_FEDERATED_PEER_REPOS);
+        assert!(
+            aggregate.truncated,
+            "the aggregate must not report the paged peer as complete"
+        );
+
+        let mut malformed_server = mockito::Server::new_async().await;
+        let malformed_mock = malformed_server
+            .mock("GET", "/api/v1/repos")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("x-total-count", "not-a-count")
+            .with_body("[{}]")
+            .expect(1)
+            .create_async()
+            .await;
+        let malformed = fetch_federated_peer_repos(
+            &reqwest::Client::new(),
+            &format!("{}/api/v1/repos", malformed_server.url()),
+        )
+        .await
+        .expect("a malformed optional total must not discard a bounded page");
+        malformed_mock.assert_async().await;
+        assert!(!malformed.truncated);
+        assert_eq!(malformed.repos.len(), 1);
+    }
+
+    #[test]
+    fn federated_aggregate_stays_inside_row_and_serialized_byte_budgets() {
+        let mut rows = FederatedRepoBudget::new(3, 2, 4_096);
+        assert!(rows.push(serde_json::json!({ "name": "one" })));
+        assert!(rows.push(serde_json::json!({ "name": "two" })));
+        assert!(rows.is_saturated());
+        assert!(!rows.push(serde_json::json!({ "name": "three" })));
+        assert_eq!(rows.repos.len(), 2);
+        assert!(rows.truncated);
+
+        let max_bytes = 600;
+        let mut bytes = FederatedRepoBudget::new(8, 8, max_bytes);
+        while bytes.push(serde_json::json!({ "description": "x".repeat(100) })) {}
+        let count = bytes.repos.len();
+        let truncated = bytes.truncated;
+        let response = serde_json::json!({
+            "repos": bytes.repos,
+            "count": count,
+            "nodes_queried": 1,
+            "truncated": truncated,
+        });
+        assert!(serde_json::to_vec(&response).unwrap().len() <= max_bytes);
+        assert!(response["truncated"].as_bool().unwrap());
+    }
+
+    struct ActiveFetch {
+        active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Drop for ActiveFetch {
+        fn drop(&mut self) {
+            self.active
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn federated_collection_bounds_concurrency_and_cancels_at_aggregate_limit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let mut senders = Vec::new();
+        let mut fetches = Vec::new();
+
+        for i in 0..10 {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            senders.push(Some(tx));
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            let started = Arc::clone(&started);
+            fetches.push(async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_active.fetch_max(current, Ordering::SeqCst);
+                let _active = ActiveFetch { active };
+                rx.await.ok()?;
+                Some(FederatedPeerRepos {
+                    node_url: format!("https://peer-{i}.example"),
+                    node_did: format!("did:key:peer-{i}"),
+                    repos: vec![serde_json::json!({ "id": i })],
+                    truncated: false,
+                })
+            });
+        }
+
+        let task = tokio::spawn(async move {
+            let mut aggregate = FederatedRepoBudget::new(1, 1, usize::MAX);
+            let nodes = collect_federated_fetches(fetches, &mut aggregate).await;
+            (aggregate, nodes)
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while started.load(Ordering::SeqCst) < FEDERATED_PEER_CONCURRENCY {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the bounded fetch window should fill");
+
+        assert_eq!(started.load(Ordering::SeqCst), FEDERATED_PEER_CONCURRENCY);
+        assert_eq!(active.load(Ordering::SeqCst), FEDERATED_PEER_CONCURRENCY);
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            FEDERATED_PEER_CONCURRENCY
+        );
+
+        senders[0].take().unwrap().send(()).unwrap();
+        let (aggregate, nodes) = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("the aggregate ceiling should stop collection")
+            .unwrap();
+
+        assert_eq!(nodes, 1);
+        assert_eq!(aggregate.repos.len(), 1);
+        assert!(aggregate.truncated);
+        assert_eq!(started.load(Ordering::SeqCst), FEDERATED_PEER_CONCURRENCY);
+        assert_eq!(
+            active.load(Ordering::SeqCst),
+            0,
+            "in-flight fetches must be dropped"
+        );
+    }
+
+    async fn json_body(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    fn federated_request() -> axum::http::Request<axum::body::Body> {
+        let mut request = axum::http::Request::builder()
+            .uri("/api/v1/repos/federated")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(axum::extract::ConnectInfo(
+            "203.0.113.42:5000".parse::<std::net::SocketAddr>().unwrap(),
+        ));
+        request
+    }
+
+    /// Pins the federated response contract end to end: the envelope fields
+    /// (`count`, `nodes_queried`, `truncated`) and the per-repo annotations
+    /// (`node_url`, `node_did`, `local`) are asserted on an actual HTTP 200
+    /// body driven through `build_router`, not on a self-constructed value.
+    /// The seeded repo is deliberately owned by a DID other than the node:
+    /// the envelope must carry the node's DID, so a regression that reports
+    /// the owner DID instead would fail the `node_did` assertion.
+    #[sqlx::test]
+    async fn federated_route_envelope_annotates_repos_on_real_200_body(pool: sqlx::PgPool) {
+        use tower::ServiceExt;
+
+        let state = crate::test_support::test_state(pool).await;
+        let node_did = state.node_did.to_string();
+        state
+            .db
+            .create_repo(&repo_owned_by("did:key:z6MkEnvelopeOwnerNotTheNode"))
+            .await
+            .expect("seed local repo");
+
+        let router = crate::server::build_router(state);
+        let response = router.oneshot(federated_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+
+        assert_eq!(body["count"].as_u64(), Some(1));
+        assert_eq!(
+            body["nodes_queried"].as_u64(),
+            Some(1),
+            "no peers seeded, only the local node was queried"
+        );
+        assert_eq!(body["truncated"].as_bool(), Some(false));
+        let repo = &body["repos"][0];
+        assert_eq!(repo["name"].as_str(), Some("demo"));
+        assert_eq!(repo["local"].as_bool(), Some(true));
+        assert_eq!(repo["node_did"].as_str(), Some(node_did.as_str()));
+        assert!(
+            repo["node_url"].as_str().is_some_and(|u| !u.is_empty()),
+            "local repos must carry the node's URL, got {repo}"
+        );
+    }
+
+    /// `truncated` must be observable on the wire when the peer table holds
+    /// more rows than `MAX_FEDERATED_PEERS`. Every seeded peer points at the
+    /// same reachable stub returning `[]`, so no fetch can fail and no peer
+    /// page can report truncation: the count bound is the only reason the
+    /// body says `truncated`. The `nodes_queried` assertion pins the fetch
+    /// side: every peer inside the bound is queried, and dropping the count
+    /// bound would report `truncated: false`.
+    #[sqlx::test]
+    async fn federated_route_reports_truncated_when_peer_table_overflows(pool: sqlx::PgPool) {
+        use tower::ServiceExt;
+
+        let mut peer_server = mockito::Server::new_async().await;
+        let peer_mock = peer_server
+            .mock("GET", "/api/v1/repos")
+            .match_query(mockito::Matcher::Exact(format!(
+                "limit={MAX_FEDERATED_PEER_REPOS}&offset=0"
+            )))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("[]")
+            .expect(MAX_FEDERATED_PEERS)
+            .create_async()
+            .await;
+
+        let state = crate::test_support::test_state(pool.clone()).await;
+        sqlx::query("INSERT INTO peers (did, http_url, last_ping_ok, announced_at) SELECT 'peer-' || n, $1, TRUE, '2026-01-01T00:00:00Z' FROM generate_series(1, $2) n")
+            .bind(peer_server.url())
+            .bind(MAX_FEDERATED_PEERS as i64 + 2)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let response = router.oneshot(federated_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(
+            body["truncated"].as_bool(),
+            Some(true),
+            "more peers than the bound must surface as truncated"
+        );
+        assert_eq!(
+            body["nodes_queried"].as_u64(),
+            Some(1 + MAX_FEDERATED_PEERS as u64),
+            "the stub is reachable, so every peer inside the bound is queried"
+        );
+        peer_mock.assert_async().await;
+    }
+
+    /// A single unreachable peer must still flip `truncated` on the wire via
+    /// the failed-fetch path, even though the peer table stays under the
+    /// bound. Guards the `aggregate.truncated = true` on fetch failure.
+    #[sqlx::test]
+    async fn federated_route_reports_truncated_when_peer_fetch_fails(pool: sqlx::PgPool) {
+        use tower::ServiceExt;
+
+        let state = crate::test_support::test_state(pool.clone()).await;
+        sqlx::query("INSERT INTO peers (did, http_url, last_ping_ok, announced_at) VALUES ('did:key:deadpeer', 'http://127.0.0.1:1/', TRUE, '2026-01-01T00:00:00Z')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let response = router.oneshot(federated_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(
+            body["truncated"].as_bool(),
+            Some(true),
+            "a failed peer fetch must surface as truncated"
+        );
+        assert_eq!(body["nodes_queried"].as_u64(), Some(1));
+    }
+
+    /// Peer repos must carry `node_url`, `node_did` and `local: false` on the
+    /// real response body. Guards `enrich_federated_repo`: dropping an
+    /// annotation there must turn this red.
+    #[sqlx::test]
+    async fn federated_route_annotates_peer_repos_on_real_200_body(pool: sqlx::PgPool) {
+        use tower::ServiceExt;
+
+        let mut peer_server = mockito::Server::new_async().await;
+        let peer_mock = peer_server
+            .mock("GET", "/api/v1/repos")
+            // Pin the outbound peer query parameters: production must request
+            // the bounded page. Dropping the parameters stops matching this
+            // mock, so the peer fetch fails and the body reports
+            // `truncated: true` instead of `false` below.
+            .match_query(mockito::Matcher::Exact(format!(
+                "limit={MAX_FEDERATED_PEER_REPOS}&offset=0"
+            )))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"[{"id": "peer-repo-1", "name": "from-peer"}]"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let state = crate::test_support::test_state(pool.clone()).await;
+        sqlx::query("INSERT INTO peers (did, http_url, last_ping_ok, announced_at) VALUES ('did:key:peer1', $1, TRUE, '2026-01-01T00:00:00Z')")
+            .bind(peer_server.url())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let response = router.oneshot(federated_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["truncated"].as_bool(), Some(false));
+        assert_eq!(body["nodes_queried"].as_u64(), Some(2));
+        let repo = body["repos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"].as_str() == Some("peer-repo-1"))
+            .expect("peer repo present in federated body");
+        assert_eq!(repo["node_url"].as_str(), Some(peer_server.url().as_str()));
+        assert_eq!(repo["node_did"].as_str(), Some("did:key:peer1"));
+        assert_eq!(repo["local"].as_bool(), Some(false));
+        peer_mock.assert_async().await;
     }
 
     #[test]
