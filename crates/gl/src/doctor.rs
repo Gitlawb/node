@@ -145,7 +145,11 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
     ));
 
     // ── 4. Node connectivity ──────────────────────────────────────────────
-    let client = NodeClient::new(&args.node, None);
+    // GITLAWB_NODE="" binds args.node to "" through clap, and check 3 groups
+    // empty with unset. The probe must apply the same normalization or it
+    // would dial "" and Fail while the env row only Warns.
+    let node_url = effective_node_url(&args.node);
+    let client = NodeClient::new(node_url, None);
     match client.get("/").await {
         Ok(resp) if resp.status().is_success() => {
             let info = resp.json::<serde_json::Value>().await.unwrap_or_default();
@@ -154,7 +158,7 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
             let short_did = did.chars().take(30).collect::<String>();
             checks.push(Check::pass(
                 "node",
-                format!("{} — v{version} ({short_did}…)", args.node),
+                format!("{} — v{version} ({short_did}…)", node_url),
             ));
             // Capability drift: a node newer than this CLI may require features
             // (RFC 9421 signing, iCaptcha) the CLI doesn't speak.
@@ -173,14 +177,14 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
         Ok(resp) => {
             checks.push(Check::fail(
                 "node",
-                format!("{} returned HTTP {}", args.node, resp.status()),
+                format!("{} returned HTTP {}", node_url, resp.status()),
                 "check GITLAWB_NODE env var or try gl register --node <url>",
             ));
         }
         Err(e) => {
             checks.push(Check::fail(
                 "node",
-                format!("{} unreachable: {e}", args.node),
+                format!("{} unreachable: {e}", node_url),
                 "check your internet connection or set GITLAWB_NODE",
             ));
         }
@@ -334,6 +338,19 @@ fn gitlawb_node_env_check(env_val: Option<&str>) -> Check {
             "not set — git-remote-gitlawb will fall back to http://127.0.0.1:7545",
             format!("export GITLAWB_NODE={PUBLIC_NODE}"),
         ),
+    }
+}
+
+/// The URL the connectivity probe should dial. `GITLAWB_NODE` set but empty
+/// (or whitespace-only) binds `args.node` to `""` through clap rather than
+/// to the `default_value`, and check 3 already groups empty with unset, so
+/// the probe applies the same normalization: an empty effective URL means
+/// the public node, same as unset.
+fn effective_node_url(node: &str) -> &str {
+    if node.trim().is_empty() {
+        PUBLIC_NODE
+    } else {
+        node
     }
 }
 
@@ -734,6 +751,21 @@ mod tests {
         assert!(check.detail.contains("not set"));
         let empty = gitlawb_node_env_check(Some(""));
         assert!(matches!(empty.state, CheckState::Warn));
+    }
+
+    /// `GITLAWB_NODE=""` binds `args.node` to `""` through clap, and check 3
+    /// groups empty with unset. The probe must dial the same URL unset
+    /// would — removing the normalization makes check 4 probe `""` and Fail
+    /// while the env row only Warns, so an empty env install exits 1.
+    #[test]
+    fn effective_node_url_treats_empty_and_blank_as_unset() {
+        assert_eq!(effective_node_url(""), PUBLIC_NODE);
+        assert_eq!(effective_node_url("   "), PUBLIC_NODE);
+        assert_eq!(effective_node_url("\t\n"), PUBLIC_NODE);
+        assert_eq!(
+            effective_node_url("http://127.0.0.1:7545"),
+            "http://127.0.0.1:7545"
+        );
     }
 
     #[test]
