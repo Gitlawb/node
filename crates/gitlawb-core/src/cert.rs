@@ -5,6 +5,28 @@
 //!
 //! The schema is frozen at v1. All fields are mandatory for forward compatibility.
 //! Nodes that receive a certificate with an unknown version MUST reject it.
+//!
+//! ## Replay
+//!
+//! A certificate proves *who* asserted a ref update and *what* they asserted.
+//! It does not prove the assertion is fresh. [`RefUpdateBody::seq`] and
+//! [`RefUpdateBody::nonce`] are inside the signed bytes (see
+//! [`RefUpdateBody::to_signing_bytes`]), so a verifier can trust the values,
+//! but deciding whether a nonce is being reused or a `seq` is going backwards
+//! needs state.
+//!
+//! This crate is deliberately stateless — it is embedded in both nodes and
+//! clients — so replay is **not** enforced here and cannot be. Ownership of
+//! the check sits with the verifier that accepts and persists certificates,
+//! which must:
+//!
+//! - reject a `nonce` it has already accepted for the same `(repo, ref_name)`;
+//! - reject a `seq` that does not advance past the last accepted `seq` for
+//!   that `(repo, ref_name)`.
+//!
+//! Until such a verifier exists, replay of ref-update certificates is not
+//! enforced anywhere in this workspace. This contract exists so the first one
+//! inherits the requirement instead of re-deriving it.
 
 use std::collections::HashSet;
 
@@ -35,9 +57,10 @@ const ENCODED_SIG_LEN: usize = 86;
 /// only the first N entries would let junk placed ahead of the real
 /// signatures starve them out of the window, which is the #349 denial again
 /// in positional form. An attacker positioned to inflate the list past this
-/// ceiling can already suppress the certificate outright, so the loud
-/// rejection concedes nothing that was not already conceded to that
-/// attacker.
+/// ceiling can already suppress the certificate outright. The loud
+/// rejection does deny a legitimately over-long certificate; that is an
+/// explicit, detectable denial above the cap rather than a silent window
+/// junk placement could exploit.
 const MAX_SIGNATURE_ENTRIES: usize = 64;
 
 /// A signature on a ref-update certificate.
@@ -62,11 +85,19 @@ pub struct RefUpdateBody {
     pub from: String,
     /// The new commit hash (SHA-256 hex).
     pub to: String,
-    /// Monotonically increasing sequence number. Prevents replay.
+    /// Monotonically increasing sequence number, scoped to `(repo, ref_name)`.
+    ///
+    /// Signed, but not enforced by this crate: core holds no state. The
+    /// verifier that persists certificates must reject a `seq` that does not
+    /// advance for the same repo and ref. See the module docs on replay.
     pub seq: u64,
     /// RFC 3339 timestamp of this update.
     pub timestamp: DateTime<Utc>,
-    /// Random nonce for deduplication.
+    /// Random nonce, unique per certificate.
+    ///
+    /// Signed, but not enforced by this crate: core holds no state. The
+    /// verifier that persists certificates must reject a nonce it has already
+    /// accepted for the same repo and ref. See the module docs on replay.
     pub nonce: String,
 }
 
@@ -187,15 +218,15 @@ impl RefUpdateCert {
     /// - the scan returns as soon as the threshold is met.
     pub fn satisfies_threshold(&self, maintainers: &[Did], threshold: usize) -> Result<bool> {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        if threshold == 0 {
+            return Err(Error::RefCert("threshold must be at least 1".to_string()));
+        }
         if self.signatures.len() > MAX_SIGNATURE_ENTRIES {
             return Err(Error::RefCert(format!(
                 "certificate carries {} signature entries (max {})",
                 self.signatures.len(),
                 MAX_SIGNATURE_ENTRIES
             )));
-        }
-        if threshold == 0 {
-            return Ok(true);
         }
         let signing_bytes = self.body.to_signing_bytes()?;
         let mut counted: HashSet<&Did> = HashSet::new();
@@ -477,16 +508,35 @@ mod tests {
         .unwrap();
         cert.countersign(&kp2).unwrap();
 
-        // Append entries that are unparseable / invalid in different ways.
-        cert.signatures.push(CertSignature {
-            signer: kp1.did(),
-            sig: "!!!not-base64!!!".to_string(),
-        });
+        // Junk sits AHEAD of the real entries so the scan must actually skip
+        // it: appended last, the threshold-2 early return at the second real
+        // signature would fire before any junk is examined and the test would
+        // stay green even if the skip logic never ran.
+        cert.signatures.insert(
+            0,
+            CertSignature {
+                signer: kp1.did(),
+                sig: "!!!not-base64!!!".to_string(),
+            },
+        );
         // Valid base64 but only 3 bytes — fails the 64-byte length check.
-        cert.signatures.push(CertSignature {
-            signer: kp2.did(),
-            sig: "AAAA".to_string(),
-        });
+        cert.signatures.insert(
+            0,
+            CertSignature {
+                signer: kp2.did(),
+                sig: "AAAA".to_string(),
+            },
+        );
+        // Exactly ENCODED_SIG_LEN of valid base64 decoding to garbage —
+        // exercises the decode+verify path before the skip, not just the
+        // length gate.
+        cert.signatures.insert(
+            0,
+            CertSignature {
+                signer: kp1.did(),
+                sig: "A".repeat(ENCODED_SIG_LEN),
+            },
+        );
 
         let maintainers = vec![kp1.did(), kp2.did()];
         assert!(cert.satisfies_threshold(&maintainers, 2).unwrap());
@@ -582,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn threshold_zero_is_always_satisfied() {
+    fn threshold_zero_is_rejected() {
         let kp = Keypair::generate();
         let cert = RefUpdateCert::new(
             kp.did(),
@@ -593,6 +643,120 @@ mod tests {
             &kp,
         )
         .unwrap();
-        assert!(cert.satisfies_threshold(&[], 0).unwrap());
+
+        // Zero must never read as "no signatures required", even with an empty
+        // maintainer set.
+        let err = cert.satisfies_threshold(&[], 0).unwrap_err();
+        assert!(
+            err.to_string().contains("threshold must be at least 1"),
+            "zero must be refused as an invalid threshold"
+        );
+    }
+
+    /// The threshold is checked before any signature work, so a zero is
+    /// reported as a threshold error even when the certificate's signatures
+    /// are also invalid. Otherwise a broken certificate would let a caller
+    /// mistake the failure for a legitimate verification result.
+    #[test]
+    fn threshold_zero_is_rejected_before_signature_verification() {
+        let kp = Keypair::generate();
+        let other = Keypair::generate();
+        let mut cert = RefUpdateCert::new(
+            kp.did(),
+            "refs/heads/main".to_string(),
+            dummy_hash('0'),
+            dummy_hash('a'),
+            1,
+            &kp,
+        )
+        .unwrap();
+        cert.signatures[0].sig = other.sign_b64(b"unrelated bytes");
+
+        let err = cert.satisfies_threshold(&[kp.did()], 0).unwrap_err();
+        assert!(
+            err.to_string().contains("threshold must be at least 1"),
+            "the invalid threshold must win over the invalid signature"
+        );
+    }
+
+    /// `seq` and `nonce` are the verifier's replay inputs, so they have to be
+    /// inside the signed body; tapping either one must invalidate the
+    /// certificate rather than leave it verifying with different values.
+    #[test]
+    fn replay_fields_are_covered_by_the_signature() {
+        let kp = Keypair::generate();
+        let cert = RefUpdateCert::new(
+            kp.did(),
+            "refs/heads/main".to_string(),
+            dummy_hash('0'),
+            dummy_hash('a'),
+            7,
+            &kp,
+        )
+        .unwrap();
+        cert.verify_all().expect("baseline must verify");
+
+        let mut bumped = cert.clone();
+        bumped.body.seq = 8;
+        assert!(
+            matches!(bumped.verify_all(), Err(Error::SignatureInvalid)),
+            "changing seq must invalidate the signature"
+        );
+
+        let mut renamed = cert.clone();
+        renamed.body.nonce = "different-nonce".to_string();
+        assert!(
+            matches!(renamed.verify_all(), Err(Error::SignatureInvalid)),
+            "changing nonce must invalidate the signature"
+        );
+    }
+
+    /// A signature minted by a real key must not verify when the signer is
+    /// spelled in another multibase alphabet. Otherwise the same identity
+    /// would satisfy a maintainer allowlist under several DID strings.
+    ///
+    /// Base64url is deliberate: its 47-character method-id fits under the
+    /// pre-existing length bound, so this test reaches the canonical-prefix
+    /// rule and fails on the pre-fix code instead of being refused for length.
+    #[test]
+    fn verify_all_rejects_a_non_canonical_did_spelling() {
+        let kp = Keypair::generate();
+        let mut cert = RefUpdateCert::new(
+            kp.did(),
+            "refs/heads/main".to_string(),
+            dummy_hash('0'),
+            dummy_hash('a'),
+            1,
+            &kp,
+        )
+        .unwrap();
+
+        let mut prefixed = vec![0xed, 0x01];
+        prefixed.extend_from_slice(&kp.verifying_key().to_bytes());
+        cert.signatures[0].signer = format!(
+            "did:key:{}",
+            multibase::encode(multibase::Base::Base64Url, &prefixed)
+        )
+        .parse()
+        .expect("method is still `key`");
+
+        let err = cert
+            .verify_all()
+            .expect_err("a non-canonical did:key spelling must not resolve");
+        assert!(
+            err.to_string().contains("base58btc"),
+            "rejection must come from the canonical-prefix rule, not the length guard"
+        );
+        assert!(
+            !matches!(
+                cert.satisfies_threshold(&[cert.signatures[0].signer.clone()], 1),
+                Ok(true)
+            ),
+            "the alternate spelling must not satisfy a threshold"
+        );
+
+        // The canonical spelling of the same key is unaffected.
+        cert.signatures[0].signer = kp.did();
+        assert!(cert.satisfies_threshold(&[kp.did()], 1).unwrap());
     }
 }

@@ -5,7 +5,7 @@ use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-use crate::http::NodeClient;
+use crate::http::{sanitize_node_msg, NodeClient};
 use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
@@ -25,14 +25,22 @@ pub enum RepoCmd {
         private: bool,
         #[arg(long, default_value = "main")]
         branch: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
     },
     /// List repositories on a node
     List {
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -40,7 +48,11 @@ pub enum RepoCmd {
     /// Print the gitlawb:// clone command for a repo
     Clone {
         name: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -48,7 +60,11 @@ pub enum RepoCmd {
     /// Show repository metadata
     Info {
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -63,7 +79,11 @@ pub enum RepoCmd {
         /// Max number of commits to show
         #[arg(long, short, default_value = "20")]
         limit: u32,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -75,7 +95,11 @@ pub enum RepoCmd {
         /// New name for the fork (defaults to source repo name)
         #[arg(long, short)]
         name: Option<String>,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -84,7 +108,11 @@ pub enum RepoCmd {
     LabelAdd {
         repo: String,
         label: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -93,7 +121,11 @@ pub enum RepoCmd {
     LabelRemove {
         repo: String,
         label: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -101,7 +133,11 @@ pub enum RepoCmd {
     /// List labels on a repository
     LabelList {
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -110,7 +146,11 @@ pub enum RepoCmd {
     Owner {
         /// Repository name or owner/repo
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -126,7 +166,11 @@ pub enum RepoCmd {
         #[arg(long)]
         url: String,
         /// URL of the origin node (where the repo lives)
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -135,7 +179,11 @@ pub enum RepoCmd {
     ReplicaUnregister {
         /// Repository in owner/repo format
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -144,7 +192,11 @@ pub enum RepoCmd {
     Replicas {
         /// Repository in owner/repo format
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -222,6 +274,126 @@ async fn resolve_owner_did(_node: &str, dir: Option<&std::path::Path>) -> Result
     Ok(did.split(':').next_back().unwrap_or(&did).to_string())
 }
 
+/// Fetch `GET /` from the node and return the `web_url` if the node advertises one.
+///
+/// The View: link is a nice-to-have, so every failure mode degrades to `None`
+/// rather than failing the enclosing command — but failures are surfaced as
+/// stderr warnings (request error, non-success HTTP status with the status,
+/// malformed advertised value), since they all mean the node itself is
+/// misbehaving or misconfigured, which the user would otherwise never learn.
+/// A successful response that lacks a usable `web_url` (field missing or
+/// blank) omits the link silently: self-hosted nodes without a web front-end
+/// are expected to not advertise one (#370).
+///
+/// The body is treated like every other caller-chosen node reply (INV-6): the
+/// read is capped and an accepted `web_url` must be free of control/bidi bytes
+/// — it reaches the terminal verbatim through the View: line.
+pub(crate) async fn fetch_node_web_url(node: &str) -> Option<String> {
+    let info_client = NodeClient::new(node, None);
+    let info_resp = match info_client.get("/").await {
+        Ok(resp) => resp,
+        Err(err) => {
+            eprintln!("warning: node info request failed ({err}); skipping View link");
+            return None;
+        }
+    };
+    let status = info_resp.status();
+    if !status.is_success() {
+        eprintln!("warning: node info request returned {status}; skipping View link");
+        return None;
+    }
+    // An info reply is a DID, a few URLs and counts — 8 KiB is well past what
+    // the shape needs; anything longer is hostile or broken (peer.rs precedent).
+    let raw_body = crate::http::read_body_capped(info_resp, 8 * 1024).await;
+    match web_url_from_info_body(&raw_body) {
+        Ok(url) => url,
+        Err(reason) => {
+            eprintln!("warning: {reason}; skipping View link");
+            None
+        }
+    }
+}
+
+/// Classify a capped `GET /` body for the `View:` advertisement. Split out of
+/// `fetch_node_web_url` so tests can pin the classification contract directly:
+/// a truncated or half-read body is indistinguishable from a node that
+/// advertised nothing, so it must warn rather than silently omit the link.
+fn web_url_from_info_body(
+    raw_body: &crate::http::CappedBody,
+) -> std::result::Result<Option<String>, String> {
+    if raw_body.truncated || raw_body.read_failed {
+        return Err("node info body was oversized or could not be read in full".to_string());
+    }
+    let info: Value = match serde_json::from_str(&raw_body.text) {
+        Ok(json) => json,
+        Err(_) => return Err("node info body was not valid JSON".to_string()),
+    };
+    // Missing field / non-string degrade to None without warning — same contract
+    // as before; only transport- and advertisement-level failures warn there.
+    let raw = match info["web_url"].as_str() {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    // A present-but-malformed value means the node is misconfigured; say so
+    // instead of quietly dropping the link. Mirrors the node-side boot
+    // validation: must be an absolute http(s) URL with no query or fragment —
+    // the link is built by string-appending `/{owner}/{repo}` to it. Control
+    // and bidi-format bytes are rejected outright (not stripped): they have no
+    // legitimate place in a base URL and would reach the terminal through the
+    // View: line — including when they arrive percent-encoded (INV-6).
+    let malformed_reason: Option<String> = if trimmed
+        .chars()
+        .any(|c| c.is_control() || gitlawb_core::sanitize::is_bidi_format(c))
+    {
+        Some("contains control or bidi characters".to_string())
+    } else {
+        match trimmed.parse::<url::Url>() {
+            Err(_) => Some("not an absolute URL".to_string()),
+            Ok(parsed) if !matches!(parsed.scheme(), "http" | "https") => {
+                Some("not http(s)".to_string())
+            }
+            Ok(parsed) if parsed.query().is_some() || parsed.fragment().is_some() => {
+                Some("contains a query or fragment".to_string())
+            }
+            // userinfo is rejected because the `View:` line prints the
+            // value verbatim; a remote advertisement carrying
+            // `user:pass@host` would land that credential in terminal
+            // scrollback and CI logs.
+            Ok(parsed) if !parsed.username().is_empty() || parsed.password().is_some() => {
+                Some("contains a username or password".to_string())
+            }
+            Ok(parsed)
+                if parsed
+                    .host_str()
+                    .unwrap_or("")
+                    .chars()
+                    .chain(
+                        percent_encoding::percent_decode_str(parsed.path())
+                            .decode_utf8_lossy()
+                            .chars(),
+                    )
+                    .any(|c| c.is_control() || gitlawb_core::sanitize::is_bidi_format(c)) =>
+            {
+                Some("contains control or bidi characters, even percent-encoded".to_string())
+            }
+            Ok(_) => None,
+        }
+    };
+    match malformed_reason {
+        // The reason string is ours; the advertised value is not — defang it
+        // exactly as it would have been defanged had it been accepted.
+        Some(reason) => Err(format!(
+            "node advertised a malformed web_url ({:?}, {reason})",
+            sanitize_node_msg(trimmed)
+        )),
+        None => Ok(Some(trimmed.to_string())),
+    }
+}
+
 async fn cmd_create(
     name: String,
     description: Option<String>,
@@ -251,13 +423,7 @@ async fn cmd_create(
         .post("/api/v1/repos", &body)
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let payload: Value = resp.json().await.context("invalid JSON response")?;
-
-    if !status.is_success() {
-        let msg = payload["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("create failed ({status}): {msg}");
-    }
+    let payload = crate::http::read_json(resp, "create").await?;
 
     let clone_url = payload["clone_url"].as_str().unwrap_or("");
     let gitlawb_url = format!("gitlawb://{owner_did}/{name}");
@@ -265,7 +431,11 @@ async fn cmd_create(
     println!("✓ Created repository: {name}");
     println!("  Clone: git clone {gitlawb_url}");
     println!("  HTTP:  {clone_url}");
-    println!("  View:  https://gitlawb.com/{owner_short}/{name}");
+    // Only print View: when the node advertises a web_url — self-hosted nodes
+    // without a web front-end would otherwise produce a 404 link (#370).
+    if let Some(web_url) = fetch_node_web_url(&node).await {
+        println!("  View:  {web_url}/{owner_short}/{name}");
+    }
     if let Some(desc) = payload["description"].as_str().filter(|s| !s.is_empty()) {
         println!("  Desc:  {desc}");
     }
@@ -277,12 +447,7 @@ async fn cmd_list(node: String, dir: Option<PathBuf>) -> Result<()> {
     let client = NodeClient::new(&node, None);
 
     let url = format!("/api/v1/repos?owner={owner}");
-    let repos: Value = client
-        .get(&url)
-        .await?
-        .json()
-        .await
-        .context("failed to list repos")?;
+    let repos = crate::http::read_json(client.get(&url).await?, "list repos").await?;
     let repos = repos.as_array().context("expected array")?;
 
     if repos.is_empty() {
@@ -296,7 +461,10 @@ async fn cmd_list(node: String, dir: Option<PathBuf>) -> Result<()> {
         let name = r["name"].as_str().unwrap_or("?");
         let desc = r["description"].as_str().unwrap_or("");
         let public = r["is_public"].as_bool().unwrap_or(true);
-        let updated = r["updated_at"].as_str().map(|s| &s[..10]).unwrap_or("?");
+        let updated = r["updated_at"]
+            .as_str()
+            .map(|s| crate::text::truncate(s, 10))
+            .unwrap_or("?");
         let vis = if public { "public" } else { "private" };
         println!("  {name:<24}  {vis:<8}  {updated}  {desc}");
     }
@@ -351,20 +519,13 @@ async fn cmd_info(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
     // A non-existent (or unreadable/quarantined) repo is a real 404 from the
     // node — surface it plainly instead of printing a stub card with `?` fields
     // and a placeholder owner DID.
-    if !resp.status().is_success() {
-        if resp.status().as_u16() == 404 {
-            anyhow::bail!("repository '{owner}/{name}' not found");
-        }
-        let status = resp.status();
-        let msg = resp
-            .json::<Value>()
-            .await
-            .ok()
-            .and_then(|v| v["message"].as_str().map(String::from))
-            .unwrap_or_else(|| "request failed".to_string());
-        anyhow::bail!("repo info failed ({status}): {msg}");
+    if resp.status().as_u16() == 404 {
+        anyhow::bail!("repository '{owner}/{name}' not found");
     }
-    let r: Value = resp.json().await.context("parse repo info")?;
+    // Every other status routes through read_json: a 2xx yields the parsed body,
+    // any other non-2xx yields the node's capped + sanitized message, and
+    // the error read is bounded rather than buffering the whole hostile body.
+    let r = crate::http::read_json(resp, "repo info").await?;
 
     let owner_did = r["owner_did"].as_str().unwrap_or(&owner);
     let gitlawb_url = format!("gitlawb://{owner_did}/{name}");
@@ -423,12 +584,7 @@ async fn cmd_replica_register(
         .await
         .context("failed to connect to origin node")?;
 
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or_default();
-    if !status.is_success() {
-        let msg = body["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("replica register failed ({status}): {msg}");
-    }
+    let body = crate::http::read_json(resp, "replica register").await?;
 
     let count = body["replica_count"].as_i64().unwrap_or(0);
     println!("Registered as replica of {owner}/{name}");
@@ -455,12 +611,7 @@ async fn cmd_replica_unregister(repo: String, node: String, dir: Option<PathBuf>
         .await
         .context("failed to connect to origin node")?;
 
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or_default();
-    if !status.is_success() {
-        let msg = body["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("replica unregister failed ({status}): {msg}");
-    }
+    let body = crate::http::read_json(resp, "replica unregister").await?;
 
     let count = body["replica_count"].as_i64().unwrap_or(0);
     println!("Unregistered as replica of {owner}/{name}  ({count} replicas remaining)");
@@ -480,12 +631,7 @@ async fn cmd_replicas(repo: String, node: String, dir: Option<PathBuf>) -> Resul
         .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}/replicas"))
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or_default();
-    if !status.is_success() {
-        let msg = body["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("replicas list failed ({status}): {msg}");
-    }
+    let body = crate::http::read_json(resp, "replicas list").await?;
 
     let count = body["replica_count"].as_i64().unwrap_or(0);
     println!("{owner}/{name}: {count} replicas");
@@ -495,7 +641,7 @@ async fn cmd_replicas(repo: String, node: String, dir: Option<PathBuf>) -> Resul
             let url = r["replica_url"].as_str().unwrap_or("?");
             let registered = r["registered_at"]
                 .as_str()
-                .map(|s| &s[..10.min(s.len())])
+                .map(|s| crate::text::truncate(s, 10))
                 .unwrap_or("?");
             println!("  {registered}  {did}  →  {url}");
         }
@@ -521,12 +667,7 @@ pub(crate) async fn cmd_commits(
     };
 
     let url = format!("/api/v1/repos/{owner}/{name}/commits?branch={branch}&limit={limit}");
-    let resp: Value = client
-        .get(&url)
-        .await?
-        .json()
-        .await
-        .context("failed to fetch commits")?;
+    let resp = crate::http::read_json(client.get(&url).await?, "commits").await?;
 
     let commits = resp["commits"].as_array().cloned().unwrap_or_default();
     if commits.is_empty() {
@@ -542,7 +683,7 @@ pub(crate) async fn cmd_commits(
             .or_else(|| c["sha"].as_str())
             .or_else(|| c["oid"].as_str())
             .unwrap_or("?");
-        let short_sha = &sha[..sha.len().min(10)];
+        let short_sha = crate::text::truncate(sha, 10);
         let msg = c["message"].as_str().unwrap_or("(no message)");
         let first_line = msg.lines().next().unwrap_or(msg);
         let author = c["author_name"]
@@ -552,7 +693,7 @@ pub(crate) async fn cmd_commits(
         let date = c["date"]
             .as_str()
             .or_else(|| c["committer_date"].as_str())
-            .map(|s| &s[..10.min(s.len())])
+            .map(|s| crate::text::truncate(s, 10))
             .unwrap_or("?");
         println!("  {short_sha}  {date}  {first_line}  ({author})");
     }
@@ -579,13 +720,7 @@ async fn cmd_fork(
         .post(&format!("/api/v1/repos/{owner}/{repo_name}/fork"), &body)
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let result: Value = resp.json().await.context("invalid JSON response")?;
-
-    if !status.is_success() {
-        let msg = result["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("fork failed ({status}): {msg}");
-    }
+    let result = crate::http::read_json(resp, "fork").await?;
 
     let fork_name = result["name"].as_str().unwrap_or(&repo_name);
     let owner_did = result["owner_did"].as_str().unwrap_or("?");
@@ -623,13 +758,7 @@ async fn cmd_label_add(
         .post(&format!("/api/v1/repos/{owner}/{name}/labels"), &body)
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let result: Value = resp.json().await.context("invalid JSON")?;
-
-    if !status.is_success() {
-        let msg = result["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("add label failed ({status}): {msg}");
-    }
+    let result = crate::http::read_json(resp, "add label").await?;
 
     let added = result["added"].as_bool().unwrap_or(true);
     if added {
@@ -654,13 +783,7 @@ async fn cmd_label_remove(
         .delete(&format!("/api/v1/repos/{owner}/{name}/labels/{label}"), &[])
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let result: Value = resp.json().await.context("invalid JSON")?;
-
-    if !status.is_success() {
-        let msg = result["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("remove label failed ({status}): {msg}");
-    }
+    let _ = crate::http::read_json(resp, "remove label").await?;
 
     println!("- Label removed: {label} from {owner}/{name}");
     Ok(())
@@ -673,18 +796,21 @@ async fn cmd_label_list(repo: String, node: String, dir: Option<PathBuf>) -> Res
     // read their own labels, while public repos stay anonymously listable.
     let client = NodeClient::new(&node, load_keypair_from_dir(dir.as_deref()).ok());
 
-    let resp = client
-        .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}/labels"))
-        .await
-        .context("failed to connect to node")?;
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or_default();
-    if !status.is_success() {
-        let msg = body["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("list labels failed ({status}): {msg}");
-    }
+    // Marry both refactors: main's get_maybe_signed (read-visibility gating —
+    // public repos stay anon-listable, private-repo owner signs) carrying the
+    // PR's read_json status-check-before-parse (#186: bounded error read, no
+    // parse-before-status). get_authed from the PR is dropped in favor of
+    // get_maybe_signed so the visibility gate is preserved.
+    let resp = crate::http::read_json(
+        client
+            .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}/labels"))
+            .await
+            .context("failed to connect to node")?,
+        "list labels",
+    )
+    .await?;
 
-    let labels = body["labels"].as_array().cloned().unwrap_or_default();
+    let labels = resp["labels"].as_array().cloned().unwrap_or_default();
     if labels.is_empty() {
         println!("No labels on {owner}/{name}");
     } else {
@@ -847,6 +973,285 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_fetch_node_web_url_with_web_url() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"web_url":"https://example.com","did":"did:key:z6Mk"}"#)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url.as_deref(), Some("https://example.com"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_node_web_url_trims_trailing_slash() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"web_url":"https://example.com/"}"#)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url.as_deref(), Some("https://example.com"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_node_web_url_without_web_url() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"did":"did:key:z6Mk"}"#)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url, None);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_node_web_url_empty_string() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"web_url":""}"#)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url, None);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_node_web_url_whitespace_only() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"web_url":"   "}"#)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url, None);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_node_web_url_server_error() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(500)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url, None);
+    }
+
+    /// A node advertising a present-but-malformed web_url (not an absolute
+    /// http(s) URL) must not yield a View link — and must warn, since a
+    /// malformed advertisement means the node is misconfigured (#370).
+    #[tokio::test]
+    async fn test_fetch_node_web_url_malformed_value_is_rejected() {
+        for bad in [
+            "gitlawb.com",
+            "not a url",
+            "ftp://files.example.com",
+            // Query/fragment corrupt the appended /{owner}/{repo} path.
+            "https://example.com?a=1",
+            "https://example.com/#faq",
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let _m = server
+                .mock("GET", "/")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!(r#"{{"web_url":"{bad}"}}"#))
+                .create_async()
+                .await;
+
+            let web_url = fetch_node_web_url(&server.url()).await;
+            assert_eq!(
+                web_url, None,
+                "malformed web_url {bad:?} must not render a View link"
+            );
+        }
+    }
+
+    /// A transport-level failure (connection refused) degrades to None but is
+    /// no longer silent: the request error is surfaced on stderr so an
+    /// unreachable node isn't indistinguishable from one without a web_url.
+    #[tokio::test]
+    async fn test_fetch_node_web_url_connection_refused_warns() {
+        // Port 1 on localhost is reserved (tcpmux) and refuses connections.
+        let web_url = fetch_node_web_url("http://127.0.0.1:1").await;
+        assert_eq!(web_url, None);
+    }
+
+    /// A hostile node can smuggle ANSI/bell/bidi controls inside a web_url that
+    /// still passes http(s) URL parsing — those bytes would reach the terminal
+    /// verbatim through the View: line. The advertised value must be rejected
+    /// outright: no control byte may survive into the returned string.
+    #[tokio::test]
+    async fn test_fetch_node_web_url_rejects_control_bytes() {
+        for bad in [
+            "https://example.com/\x1b[31mred",      // ANSI CSI escape in path
+            "https://example.com\x07",              // bell
+            "https://ex\u{202e}ample.com",          // bidi override (RLO)
+            "https://example.com/\u{200f}",         // RLM format char
+            "\x1b]0;title\x07https://evil.example", // OSC title-set prefix
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let _m = server
+                .mock("GET", "/")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                // serde_json escapes the control bytes so the body is VALID
+                // JSON — a raw literal would make parse fail and the test
+                // would pass without reaching the control check at all.
+                .with_body(serde_json::json!({"web_url": bad}).to_string())
+                .create_async()
+                .await;
+
+            let web_url = fetch_node_web_url(&server.url()).await;
+            assert_eq!(
+                web_url, None,
+                "web_url with control bytes {bad:?} must be rejected"
+            );
+        }
+    }
+
+    /// An oversized or half-read `GET /` body must warn, not silently
+    /// classify as "no web front-end": a cut body fails JSON parse, which is
+    /// indistinguishable from a node that advertised nothing without the
+    /// truncated flag. Removing the flag check makes this test pass
+    /// vacuously through the parse-fail arm.
+    #[test]
+    fn web_url_from_info_body_warns_on_truncated_reads() {
+        for (body, label) in [
+            (
+                crate::http::CappedBody {
+                    text: r#"{"web_url":"https://x"#.repeat(2000),
+                    truncated: true,
+                    read_failed: false,
+                },
+                "truncated",
+            ),
+            (
+                crate::http::CappedBody {
+                    text: r#"{"web_url":"https://x"#.to_string(),
+                    truncated: false,
+                    read_failed: true,
+                },
+                "read_failed",
+            ),
+        ] {
+            let err = web_url_from_info_body(&body)
+                .expect_err(&format!("{label} body must warn, not silently classify"));
+            assert!(
+                err.contains("oversized or could not be read"),
+                "{label}: got {err}"
+            );
+        }
+        // A clean body missing web_url still classifies as a silent None.
+        let clean = crate::http::CappedBody {
+            text: r#"{"did":"did:key:x"}"#.to_string(),
+            truncated: false,
+            read_failed: false,
+        };
+        assert_eq!(web_url_from_info_body(&clean).unwrap(), None);
+    }
+
+    /// Percent-encoded bidi must not slip past the literal scan: a node
+    /// advertising `https://example.com/%E2%80%AE` serves wire bytes with no
+    /// Cf code point, but a browser decodes it into a reordering character
+    /// on the rendered View: link (INV-6).
+    #[test]
+    fn web_url_from_info_body_rejects_percent_encoded_bidi() {
+        let body = crate::http::CappedBody {
+            text: r#"{"web_url":"https://example.com/%E2%80%AE"}"#.to_string(),
+            truncated: false,
+            read_failed: false,
+        };
+        let err = web_url_from_info_body(&body).expect_err("percent-encoded bidi must be rejected");
+        assert!(err.contains("bidi"), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_node_web_url_validates_after_trimming() {
+        // Trailing slash is trimmed before validation; result stays usable.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"web_url":"http://localhost:8080/ui/"}"#)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url.as_deref(), Some("http://localhost:8080/ui"));
+    }
+
+    /// A remote node that advertises `web_url` with userinfo (`user@`,
+    /// `user:pass@`) must be dropped: the value is reprinted on the `View:`
+    /// line, and a credential embedded in the URL would land in terminal
+    /// scrollback and CI logs. Mirrors the node-side boot validation.
+    #[tokio::test]
+    async fn test_fetch_node_web_url_rejects_userinfo() {
+        for bad in [
+            "https://user@example.com",
+            "https://user:secret@example.com",
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let _m = server
+                .mock("GET", "/")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!(r#"{{"web_url":"{}"}}"#, bad))
+                .create_async()
+                .await;
+
+            let web_url = fetch_node_web_url(&server.url()).await;
+            assert_eq!(
+                web_url, None,
+                "web_url with userinfo {bad:?} must be rejected"
+            );
+        }
+    }
+
+    /// A non-success status must still return None (View link is cosmetic) but
+    /// the status surfaces as a user-visible stderr warning instead of being
+    /// swallowed silently (#370 review).
+    #[tokio::test]
+    async fn test_fetch_node_web_url_non_success_warns_with_status() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(503)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url, None);
+        // The warning itself goes to stderr; mockito can't capture it here, so
+        // this asserts only the None contract. Manual check: run against a
+        // 503-ing node and observe "node info request returned 503" on stderr.
+    }
+
+    #[tokio::test]
     async fn test_cmd_create_server_error() {
         let dir = TempDir::new().unwrap();
         write_identity(&dir);
@@ -857,6 +1262,7 @@ mod tests {
             .with_status(409)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"repository already exists"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -872,6 +1278,8 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("already exists"));
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -937,6 +1345,33 @@ mod tests {
         cmd_list(server.url(), Some(dir.path().to_path_buf()))
             .await
             .unwrap();
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cmd_list_repos_surfaces_denial() {
+        // A node error must Err with the status, not trip the vague "expected
+        // array" fallback that hides the node's actual response.
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos\?owner=".to_string()),
+            )
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"boom"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let err = cmd_list(server.url(), Some(dir.path().to_path_buf()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("500"), "got: {err}");
         _m.assert_async().await;
     }
 
@@ -1039,6 +1474,7 @@ mod tests {
             .with_status(400)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"you already have a repo named myrepo"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -1054,6 +1490,8 @@ mod tests {
             err.to_string().contains("already have a repo"),
             "got: {err}"
         );
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -1426,6 +1864,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"not found"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -1438,6 +1877,106 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("not found"), "got: {err}");
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _repo.assert_async().await;
+    }
+
+    // ── Gated CLI reads surface node denials, not empty renders (#123) ──
+
+    #[tokio::test]
+    async fn cmd_commits_surfaces_denial_not_empty() {
+        // A gated 404 must Err, not print "No commits" as if the repo were empty.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/alice/secret/commits".to_string()),
+            )
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = cmd_commits(
+            "alice/secret".to_string(),
+            "main".to_string(),
+            20,
+            server.url(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "cmd_commits must Err on 404");
+        assert!(result.unwrap_err().to_string().contains("not found"));
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cmd_label_list_surfaces_denial_not_empty() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/alice/secret/labels".to_string()),
+            )
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = cmd_label_list("alice/secret".to_string(), server.url(), None).await;
+        assert!(result.is_err(), "cmd_label_list must Err on 404");
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
+    }
+
+    // cmd_info keeps its bespoke 404 message ahead of read_json...
+    #[tokio::test]
+    async fn cmd_info_404_keeps_bespoke_message() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/secret")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"gone"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let err = cmd_info("alice/secret".to_string(), server.url(), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("repository 'alice/secret' not found"),
+            "bespoke 404 text lost: {err}"
+        );
+        _m.assert_async().await;
+    }
+
+    // ...and every other non-2xx routes through read_json (capped + sanitized).
+    #[tokio::test]
+    async fn cmd_info_500_routes_through_read_json() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/secret")
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"boom"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let err = cmd_info("alice/secret".to_string(), server.url(), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("repo info failed"),
+            "read_json label lost: {err}"
+        );
+        assert!(err.contains("500"), "status not surfaced: {err}");
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -1636,7 +2175,7 @@ mod vet_merge_deny_arms {
     }
 
     // An authenticated caller DENIED with a 403 must surface an error, never
-    // render a repo card (deny-as-success is the INV-8 client-contract break).
+    // render a repo card (deny-as-success is the client-contract break).
     #[tokio::test]
     async fn cmd_info_403_denied_surfaces_error_not_card() {
         let dir = TempDir::new().unwrap();
