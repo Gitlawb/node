@@ -20,8 +20,8 @@ members = [
 edition = "2021"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
-authors = ["gitlawb contributors"]
-repository = "https://github.com/gitlawb/node"
+authors = ["Twigpine contributors"]
+repository = "https://github.com/Twigpine/node"
 
 [workspace.dependencies]
 # async

@@ -1,11 +1,11 @@
 {
-  "$comment": "Canonical seed list for the Gitlawb network. Merged with GITLAWB_BOOTSTRAP_PEERS at startup. PRs to add public nodes welcome.",
+  "$comment": "Canonical seed list for the Twigpine network. Merged with GITLAWB_BOOTSTRAP_PEERS at startup. PRs to add public nodes welcome.",
   "version": 1,
   "updated": "2026-06-30",
   "peers": [
     {
       "name": "gitlawb",
-      "operator": "Gitlawb",
+      "operator": "Twigpine",
       "did": "did:key:z6MkqDnb7Siv3Cwj7pGJq4T5EsUisECqR8KpnDLwcaZq5TPr",
       "http_url": "https://node.gitlawb.com",
       "p2p_multiaddr": null,
@@ -13,7 +13,7 @@
     },
     {
       "name": "gitlawb-node2",
-      "operator": "Gitlawb",
+      "operator": "Twigpine",
       "did": null,
       "http_url": "https://node2.gitlawb.com",
       "p2p_multiaddr": null,
@@ -21,7 +21,7 @@
     },
     {
       "name": "gitlawb-node3",
-      "operator": "Gitlawb",
+      "operator": "Twigpine",
       "did": null,
       "http_url": "https://node3.gitlawb.com",
       "p2p_multiaddr": null,
@@ -29,7 +29,7 @@
     },
     {
       "name": "gitlawb-manila",
-      "operator": "Gitlawb",
+      "operator": "Twigpine",
       "did": null,
       "http_url": "https://manila.gitlawb.com",
       "p2p_multiaddr": null,

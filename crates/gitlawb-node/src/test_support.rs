@@ -103,6 +103,7 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
         create_ip_rate_limiter: RateLimiter::new(1000, Duration::from_secs(3600)),
         push_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
+        close_issue_rate_limiter: RateLimiter::new(120, Duration::from_secs(3600)),
         ipfs_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
         ipfs_work_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
         ipfs_max_history_walks: crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST,
@@ -115,6 +116,7 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         push_limiter_trust: crate::rate_limit::TrustedProxy::None,
         sync_trigger_rate_limiter: RateLimiter::new(60, Duration::from_secs(3600)),
         peer_write_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
+        federated_rate_limiter: RateLimiter::new_bounded(12, Duration::from_secs(60), 10_000),
         shutdown_tx: tokio::sync::watch::channel(false).0,
         // Generous — no test drives the handler-level shed (git_permit is unit-tested).
         git_read_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
@@ -187,8 +189,8 @@ mod tests {
     use crate::db::{AgentTask, RepoRecord};
     use axum::http::StatusCode;
     use chrono::Utc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
-
     fn seed_repo(owner_did: &str, name: &str) -> RepoRecord {
         let now = Utc::now();
         RepoRecord {
@@ -203,6 +205,136 @@ mod tests {
             disk_path: format!("/tmp/{name}"),
             forked_from: None,
             machine_id: None,
+        }
+    }
+
+    /// `list_refs` must resolve both owner-DID forms to the SAME refs.
+    /// `branch_cids.repo` is written as `{normalize_owner_key(owner_did)}/{name}`
+    /// (`api/repos.rs:2643` -> `:2754`), and `get_repo` resolves `did:key:zX` and
+    /// bare `zX` to one repo, so both path forms authorize. Reading the table with
+    /// the raw path segments instead of the canonical slug returns an empty page
+    /// with a 200, which is a denial rendered as success. The second repo pins the
+    /// other direction: the filter must not widen to another owner's refs.
+    #[sqlx::test]
+    async fn list_refs_resolves_both_owner_did_forms_to_the_canonical_slug(pool: PgPool) {
+        let owner_did = "did:key:zREFSCANON";
+        let other_did = "did:key:zREFSOTHER";
+        let state = test_state(pool).await;
+
+        for did in [owner_did, other_did] {
+            let mut repo = seed_repo(did, "refs-canon");
+            repo.is_public = true;
+            // Same repo name under two owners, so the name-derived disk_path
+            // from the helper would collide on its unique constraint.
+            repo.disk_path = format!("/tmp/refs-canon-{}", crate::db::normalize_owner_key(did));
+            state.db.create_repo(&repo).await.expect("seed repo");
+            // Exactly the slug the production push path writes.
+            let slug = format!("{}/{}", crate::db::normalize_owner_key(did), "refs-canon");
+            let cid = format!("bafy{}", crate::db::normalize_owner_key(did));
+            state
+                .db
+                .upsert_branch_cid(
+                    &slug,
+                    "refs/heads/main",
+                    &"1".repeat(64),
+                    &cid,
+                    "did:key:zNODE",
+                )
+                .await
+                .expect("seed branch cid");
+        }
+
+        async fn body_for(state: &crate::state::AppState, owner: &str) -> String {
+            let router = crate::server::build_router(state.clone());
+            let resp = router
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(format!("/api/v1/repos/{owner}/refs-canon/refs"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "both owner-DID forms resolve to the same repo, so both must authorize"
+            );
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+
+        for owner in ["zREFSCANON", "did:key:zREFSCANON"] {
+            let body = body_for(&state, owner).await;
+            assert!(
+                body.contains("bafyzREFSCANON"),
+                "?owner={owner} must return the ref written under the canonical slug, \
+                 not an empty page with a 200. body was: {body}"
+            );
+            assert!(
+                !body.contains("bafyzREFSOTHER"),
+                "?owner={owner} must not return another owner's refs. body was: {body}"
+            );
+        }
+    }
+
+    /// The read gate on `list_refs`, driven in the deny direction. Without this
+    /// the slug regression above proves only that the query key is right: every
+    /// repo it seeds is public, so deleting `authorize_repo_read` outright leaves
+    /// it green. A private repo must answer an anonymous caller with the same 404
+    /// a missing repo gets, and must not put a CID in the body on the way out.
+    #[sqlx::test]
+    async fn list_refs_denies_an_anonymous_caller_on_a_private_repo(pool: PgPool) {
+        let owner_did = "did:key:zREFSPRIV";
+        let state = test_state(pool).await;
+
+        let mut repo = seed_repo(owner_did, "refs-private");
+        repo.is_public = false;
+        state.db.create_repo(&repo).await.expect("seed repo");
+        state
+            .db
+            .upsert_branch_cid(
+                &format!(
+                    "{}/{}",
+                    crate::db::normalize_owner_key(owner_did),
+                    "refs-private"
+                ),
+                "refs/heads/main",
+                &"1".repeat(64),
+                "bafyzREFSPRIVSECRET",
+                "did:key:zNODE",
+            )
+            .await
+            .expect("seed branch cid");
+
+        for owner in ["zREFSPRIV", "did:key:zREFSPRIV"] {
+            let router = crate::server::build_router(state.clone());
+            let resp = router
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(format!("/api/v1/repos/{owner}/refs-private/refs"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "anonymous read of a private repo must 404, not disclose it (owner form {owner})"
+            );
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8_lossy(&bytes);
+            assert!(
+                !body.contains("bafyzREFSPRIVSECRET"),
+                "the deny body must not carry a pinned CID. body was: {body}"
+            );
         }
     }
 
@@ -557,6 +689,321 @@ mod tests {
         );
     }
 
+    /// Fork disk paths must go through `validated_repo_disk_path` so a user-supplied
+    /// name cannot reach `remove_dir_all` on an escaped path (CodeQL path-injection).
+    #[sqlx::test]
+    async fn fork_rejects_name_that_fails_validated_disk_path(pool: PgPool) {
+        let owner = "did:key:zFORKOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        let repo = seed_repo(owner, "fork-src");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/fork",
+                axum::routing::post(crate::api::repos::fork_repo),
+            )
+            .with_state(state.clone());
+        let too_long = "a".repeat(101);
+        let uri = format!("/api/v1/repos/{owner}/fork-src/fork");
+        let body = Body::from(format!(r#"{{"name":"{too_long}"}}"#));
+        let resp = router
+            .oneshot(signed_request_as(owner, Method::POST, &uri, body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "fork names that fail validated_repo_disk_path must be rejected before clone"
+        );
+    }
+
+    /// A fork name that is empty passes `fork_repo`'s character allowlist
+    /// (`.chars().all(..)` is vacuously true on ""), and the handler then builds
+    /// its clone destination with the RAW `store::repo_disk_path`. Every other
+    /// repo-creation route goes through `validated_repo_disk_path`, whose
+    /// `validate_repo_name` rejects an empty name, so fork is the one entrypoint
+    /// that skips that barrier and lands a repo at `<repos_dir>/<owner>/.git`
+    /// instead of `<repos_dir>/<owner>/<name>.git`.
+    ///
+    /// Closed #272 fixed this class on the sync route and named
+    /// `repo_disk_path` as the sanitizing convention; it is in fact the
+    /// unvalidated join, and the fork route was never scoped.
+    #[sqlx::test]
+    async fn fork_rejects_an_empty_name(pool: PgPool) {
+        // `repo_store::for_testing` pins its on-disk root to /tmp, so the config
+        // the handler reads at the raw join must name the same root or the two
+        // halves of this test look at different directories.
+        // A per-run owner: the fixture path is a fixed /tmp/<slug>, so a shared
+        // constant lets two concurrent `cargo test` PROCESSES delete each
+        // other's repo mid-test.
+        let owner = format!(
+            "did:key:zFORKEMPTY{}",
+            gitlawb_core::identity::Keypair::generate()
+                .did()
+                .to_string()
+                .replace("did:key:", "")
+        );
+        let owner = owner.as_str();
+        let owner_slug = owner.replace([':', '/'], "_");
+        let repos_dir = std::path::PathBuf::from("/tmp");
+        let owner_dir = repos_dir.join(&owner_slug);
+        let _cleanup = OwnerDirGuard(owner_dir.clone());
+        let _ = std::fs::remove_dir_all(&owner_dir);
+
+        let state = test_state_with(pool, |cfg| cfg.repos_dir = repos_dir.clone()).await;
+        let repo = seed_repo(owner, "source-repo");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        // Put the source where `repo_store.acquire` reads, so the handler gets
+        // past acquire and the empty name is what this test measures.
+        let source_path = crate::git::store::repo_disk_path(&repos_dir, owner, "source-repo");
+        std::fs::create_dir_all(&owner_dir).expect("owner dir");
+        crate::git::store::init_bare(&source_path).expect("init source repo");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/fork",
+                axum::routing::post(crate::api::repos::fork_repo),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner}/source-repo/fork");
+        let resp = router
+            .oneshot(signed_request_as(
+                owner,
+                Method::POST,
+                &uri,
+                Body::from(r#"{"name":""}"#),
+            ))
+            .await
+            .unwrap();
+
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read fork response body");
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an empty fork name must be refused, not turned into a '.git' path; body={body}"
+        );
+
+        // The barrier's real job: nothing may be created at <owner>/.git.
+        assert!(
+            !owner_dir.join(".git").exists(),
+            "an empty fork name must not materialize <repos_dir>/<owner>/.git"
+        );
+        let owner_short = owner.split(':').next_back().unwrap();
+        assert!(
+            state
+                .db
+                .get_repo(owner_short, "")
+                .await
+                .expect("get_repo")
+                .is_none(),
+            "no repo row may be created for a refused fork"
+        );
+    }
+
+    /// End-to-end companion to `fork_rejects_an_empty_name`, through the
+    /// PRODUCTION router with REAL Ed25519 signatures rather than an injected
+    /// `AuthenticatedDid`. `signed_request_as` only sets the extension, so the
+    /// unit test above proves the handler but says nothing about the request
+    /// actually clearing `require_signature` / `require_ucan_chain` and the
+    /// creation-route rate limiter that `build_router` puts in front of fork.
+    ///
+    /// It also pins the FULL set the barrier refuses, not just the empty name.
+    /// The handler's own allowlist is `char::is_alphanumeric`, which is
+    /// Unicode-aware and has no length or leading-character rule, so it admits
+    /// "", "cafe\u{301}"-style names, a leading '-', and a 101-char name.
+    /// `validate_repo_name` is ASCII-only and bounded, so routing fork through
+    /// the shared barrier narrows all five at once. The positive control is what
+    /// keeps that from being a blanket refusal: an ordinary name must still fork.
+    #[sqlx::test]
+    async fn fork_name_rules_match_the_shared_barrier_e2e(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+
+        // repo_store::for_testing pins its root to /tmp; the handler reads
+        // config.repos_dir at the join, so both must name the same root.
+        let repos_dir = std::path::PathBuf::from("/tmp");
+        let owner_slug = owner_did.replace([':', '/'], "_");
+        let owner_dir = repos_dir.join(&owner_slug);
+        let _cleanup = OwnerDirGuard(owner_dir.clone());
+
+        let state = test_state_with(pool, |cfg| cfg.repos_dir = repos_dir.clone()).await;
+        let source = seed_repo(&owner_did, "source-repo");
+        state
+            .db
+            .create_repo(&source)
+            .await
+            .expect("seed source repo");
+
+        let source_path = crate::git::store::repo_disk_path(&repos_dir, &owner_did, "source-repo");
+        std::fs::create_dir_all(&owner_dir).expect("owner dir");
+        crate::git::store::init_bare(&source_path).expect("init source repo");
+
+        let path = format!("/api/v1/repos/{short}/source-repo/fork");
+        let long_name = "x".repeat(101);
+
+        // Every name the handler's own allowlist admits but the shared barrier
+        // refuses. Each must now be a 400 through the real stack.
+        let refused: [(&str, &str); 4] = [
+            ("", "empty"),
+            ("caf\u{e9}", "non-ascii alphanumeric"),
+            ("-lead", "leading hyphen"),
+            (long_name.as_str(), "over the 100-char bound"),
+        ];
+        for (name, why) in refused {
+            let body = serde_json::to_vec(&serde_json::json!({ "name": name })).unwrap();
+            let signed = sign_request(&kp, "POST", &path, &body);
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(&path)
+                .header("content-type", "application/json")
+                .header("content-digest", signed.content_digest)
+                .header("signature-input", signed.signature_input)
+                .header("signature", signed.signature)
+                .body(Body::from(body))
+                .unwrap();
+            let resp = crate::server::build_router(state.clone())
+                .oneshot(req)
+                .await
+                .unwrap();
+            let status = resp.status();
+            let rb = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let rb = String::from_utf8_lossy(&rb);
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "a fork name that is {why} must be refused through the real router; body={rb}"
+            );
+        }
+
+        // The specific artifact the empty name used to leave behind.
+        assert!(
+            !owner_dir.join(".git").exists(),
+            "no fork may materialize <repos_dir>/<owner_slug>/.git"
+        );
+        assert!(
+            state
+                .db
+                .get_repo(&short, "")
+                .await
+                .expect("get_repo")
+                .is_none(),
+            "no repo row may be created for a refused fork"
+        );
+
+        // Positive control: an ordinary name still forks, all the way to disk
+        // and a row. Without this the four assertions above would also pass if
+        // the barrier rejected everything.
+        let body = serde_json::to_vec(&serde_json::json!({ "name": "forked-ok" })).unwrap();
+        let signed = sign_request(&kp, "POST", &path, &body);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(&path)
+            .header("content-type", "application/json")
+            .header("content-digest", signed.content_digest)
+            .header("signature-input", signed.signature_input)
+            .header("signature", signed.signature)
+            .body(Body::from(body))
+            .unwrap();
+        let resp = crate::server::build_router(state.clone())
+            .oneshot(req)
+            .await
+            .unwrap();
+        let status = resp.status();
+        let rb = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rb = String::from_utf8_lossy(&rb);
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "an ordinary fork name must still succeed through the real router; body={rb}"
+        );
+        assert!(
+            owner_dir.join("forked-ok.git").is_dir(),
+            "the accepted fork must exist on disk at <repos_dir>/<owner_slug>/forked-ok.git"
+        );
+        assert!(
+            state
+                .db
+                .get_repo(&short, "forked-ok")
+                .await
+                .expect("get_repo")
+                .is_some(),
+            "the accepted fork must have a repo row"
+        );
+    }
+
+    /// The name barrier must run BEFORE the proof spend and the source acquire.
+    /// `fork_repo`'s header comment promises that a fork rejected for a bad name
+    /// never burns a valid proof, and the first version of this fix validated
+    /// after both, so an empty name paid a Tigris download and spent the proof
+    /// before its 400.
+    ///
+    /// The seam that pins the order without iCaptcha plumbing: seed a repo ROW
+    /// whose bytes are not on disk. If validation still ran after the acquire,
+    /// the acquire fails first and the caller sees a 500 from git. A 400 proves
+    /// the refusal came first.
+    #[sqlx::test]
+    async fn fork_refuses_a_bad_name_before_acquiring_the_source(pool: PgPool) {
+        let owner = "did:key:zFORKORDERAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let repos_dir = std::path::PathBuf::from("/tmp");
+        let state = test_state_with(pool, |cfg| cfg.repos_dir = repos_dir.clone()).await;
+
+        // Row only. Nothing is written to disk, so `repo_store.acquire` cannot
+        // succeed and any 500 here means validation ran too late.
+        let repo = seed_repo(owner, "absent-source");
+        state.db.create_repo(&repo).await.expect("seed source row");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/fork",
+                axum::routing::post(crate::api::repos::fork_repo),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner}/absent-source/fork");
+        let resp = router
+            .oneshot(signed_request_as(
+                owner,
+                Method::POST,
+                &uri,
+                Body::from(r#"{"name":""}"#),
+            ))
+            .await
+            .unwrap();
+
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a bad fork name must be refused before the source acquire, not after; body={body}"
+        );
+    }
+
+    /// Fixed-path temp cleanup that survives a panic (the suite's convention;
+    /// `TempDir` cannot own a path this test must compute up front).
+    struct OwnerDirGuard(std::path::PathBuf);
+    impl Drop for OwnerDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// N13: the task handlers bind the acting DID to the signer. A caller signed
     /// as B claiming delegator_did A is rejected before any DB write (DB-free).
     #[sqlx::test]
@@ -587,6 +1034,345 @@ mod tests {
             resp.status(),
             StatusCode::FORBIDDEN,
             "delegator_did must be bound to the signer"
+        );
+    }
+
+    /// #496: create_task must reject a caller-supplied repo_id that names a
+    /// hosted repo the caller does not own. A stranger naming the victim's repo
+    /// gets 403, leaking nothing about the repo and persisting nothing; the
+    /// owner files (201). Repo-less tasks stay allowed; an id naming no hosted
+    /// repo (unknown, or quarantined, hidden as if it did not exist) is stored
+    /// verbatim as an opaque label, and the 403-vs-201 split between a hosted
+    /// id and an unknown one is itself a one-bit oracle. This is a write gate:
+    /// task reads are caller-independent and not repo-scoped on this base.
+    #[sqlx::test]
+    async fn create_task_rejects_foreign_repo_id(pool: PgPool) {
+        let owner = "did:key:zTASKREPOOWNERAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let stranger = "did:key:zTASKREPOSTRANGERBBBBBBBBBBBBBBBBBBBBBB";
+        let state = test_state(pool).await;
+        let repo = seed_repo(owner, "task-gate-repo");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/tasks",
+                    axum::routing::post(crate::api::tasks::create_task),
+                )
+                .with_state(state.clone())
+        };
+        let post_as = |signer: &str, body: String| {
+            router().oneshot(signed_request_as(
+                signer,
+                Method::POST,
+                "/api/v1/tasks",
+                Body::from(body),
+            ))
+        };
+        let body_with = |signer: &str, repo_id: Option<&str>| {
+            let repo_field = repo_id
+                .map(|id| format!(r#","repo_id":"{id}""#))
+                .unwrap_or_default();
+            format!(
+                r#"{{"kind":"build","capability":"repo:write","delegator_did":"{signer}"{repo_field}}}"#
+            )
+        };
+        let created_id = |bytes: &[u8]| -> String {
+            let v: serde_json::Value = serde_json::from_slice(bytes).expect("task json");
+            v["id"].as_str().expect("task id").to_string()
+        };
+
+        // Stranger filing under the victim's repo id → exact 403.
+        let resp = post_as(stranger, body_with(stranger, Some(&repo.id)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a non-owner must not file tasks against a foreign repo id"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains(r#""error":"forbidden""#),
+            "denial must keep the forbidden envelope: {text}"
+        );
+        assert!(
+            text.contains(crate::api::REPO_OWNER_ONLY_MESSAGE),
+            "denial must carry the shared owner-denial text (same as GraphQL): {text}"
+        );
+
+        // The denial must not persist: no task row may carry the victim's
+        // repo id afterwards — a 403 that still writes is the injection.
+        let stored = state
+            .db
+            .list_tasks(None, None, 50)
+            .await
+            .expect("list tasks");
+        assert!(
+            stored
+                .iter()
+                .all(|t| t.repo_id.as_deref() != Some(repo.id.as_str())),
+            "a denied write must not leave a task under the foreign repo id"
+        );
+
+        // Owner filing under their own repo id → 201.
+        let resp = post_as(owner, body_with(owner, Some(&repo.id)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "the owner must be able to file tasks against their repo"
+        );
+
+        // Repo-less task → 201 (unaffected).
+        let resp = post_as(stranger, body_with(stranger, None)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "repo-less task creation must keep working"
+        );
+
+        // Unknown repo id → 201 as an opaque label.
+        let resp = post_as(stranger, body_with(stranger, Some("no-such-repo-id")))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "an id naming no hosted repo stays an opaque label"
+        );
+        // Read back the row: the unresolved id must be stored verbatim, not
+        // dropped or rewritten to a repo it never named.
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let task = state
+            .db
+            .get_task(&created_id(&bytes))
+            .await
+            .expect("get task")
+            .expect("task must be stored");
+        assert_eq!(
+            task.repo_id.as_deref(),
+            Some("no-such-repo-id"),
+            "an unresolved id must be stored verbatim as a label"
+        );
+
+        // Quarantined repo id → treated as unknown (201), never a 403 that
+        // would confirm the id names a real repo.
+        state
+            .db
+            .set_repo_quarantine(&repo.id, true)
+            .await
+            .expect("quarantine");
+        let resp = post_as(stranger, body_with(stranger, Some(&repo.id)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "a quarantined repo id must not 403 (existence oracle)"
+        );
+        // Read back the row: the quarantined id is stored verbatim as a label
+        // too, so the accepted write is not silently dropped.
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let task = state
+            .db
+            .get_task(&created_id(&bytes))
+            .await
+            .expect("get task")
+            .expect("task must be stored");
+        assert_eq!(
+            task.repo_id.as_deref(),
+            Some(repo.id.as_str()),
+            "a quarantined id must be stored verbatim as a label"
+        );
+    }
+
+    /// #496 (REST): a repo-lookup fault in the create_task gate must render the
+    /// module's opaque `db_error` envelope, not the raw sqlx text. Dropping a
+    /// column `get_repo_by_id` selects faults that first lookup; the 500 body
+    /// stays fixed and names no column (#250/#226).
+    #[sqlx::test]
+    async fn create_task_gate_repo_lookup_fault_is_opaque(pool: PgPool) {
+        let owner = "did:key:zTASKFAULTOWNERAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool.clone()).await;
+        let repo = seed_repo(owner, "task-gate-fault-repo");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/tasks",
+                    axum::routing::post(crate::api::tasks::create_task),
+                )
+                .with_state(state.clone())
+        };
+        let body = format!(
+            r#"{{"kind":"build","capability":"repo:write","delegator_did":"{owner}","repo_id":"{}"}}"#,
+            repo.id
+        );
+
+        // Drop a column the lookup's SELECT names so get_repo_by_id faults.
+        sqlx::query("ALTER TABLE repos DROP COLUMN machine_id")
+            .execute(&pool)
+            .await
+            .expect("drop machine_id");
+
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::POST,
+                "/api/v1/tasks",
+                Body::from(body),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a faulted repo lookup must be a 500"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains(r#""error":"db_error""#),
+            "gate DB fault must keep the opaque envelope: {text}"
+        );
+        assert!(
+            text.contains(crate::error::DB_ERROR_MESSAGE),
+            "gate DB fault must carry the fixed message: {text}"
+        );
+        assert!(
+            !text.contains("machine_id") && !text.contains("column"),
+            "schema text leaked through the gate: {text}"
+        );
+    }
+
+    /// #496 (REST): the gate's second lookup (`is_repo_quarantined`) runs through
+    /// the same opaque helper. Dropping the column only it selects leaves
+    /// `get_repo_by_id` succeeding, so this pins that second call site too.
+    #[sqlx::test]
+    async fn create_task_gate_quarantine_lookup_fault_is_opaque(pool: PgPool) {
+        let owner = "did:key:zTASKFAULT2OWNERAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool.clone()).await;
+        let repo = seed_repo(owner, "task-gate-fault2-repo");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/tasks",
+                    axum::routing::post(crate::api::tasks::create_task),
+                )
+                .with_state(state.clone())
+        };
+        let body = format!(
+            r#"{{"kind":"build","capability":"repo:write","delegator_did":"{owner}","repo_id":"{}"}}"#,
+            repo.id
+        );
+
+        // `quarantined` is not in get_repo_by_id's SELECT, so that lookup still
+        // succeeds and the fault lands on is_repo_quarantined.
+        sqlx::query("ALTER TABLE repos DROP COLUMN quarantined")
+            .execute(&pool)
+            .await
+            .expect("drop quarantined");
+
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::POST,
+                "/api/v1/tasks",
+                Body::from(body),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a faulted quarantine lookup must be a 500"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains(r#""error":"db_error""#),
+            "quarantine DB fault must keep the opaque envelope: {text}"
+        );
+        assert!(
+            text.contains(crate::error::DB_ERROR_MESSAGE),
+            "quarantine DB fault must carry the fixed message: {text}"
+        );
+        assert!(
+            !text.contains("quarantined") && !text.contains("column"),
+            "schema text leaked through the gate: {text}"
+        );
+    }
+
+    /// #496 (REST): the create_task INSERT goes through the same opaque helper,
+    /// so a write fault must not serialize sqlx text either. A repo-less task
+    /// reaches the INSERT without a gate lookup; dropping a column the INSERT
+    /// names faults it.
+    #[sqlx::test]
+    async fn create_task_insert_fault_is_opaque(pool: PgPool) {
+        let signer = "did:key:zTASKINSERTFAULTAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool.clone()).await;
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/tasks",
+                    axum::routing::post(crate::api::tasks::create_task),
+                )
+                .with_state(state.clone())
+        };
+        let body =
+            format!(r#"{{"kind":"build","capability":"repo:write","delegator_did":"{signer}"}}"#);
+
+        sqlx::query("ALTER TABLE agent_tasks DROP COLUMN status")
+            .execute(&pool)
+            .await
+            .expect("drop status");
+
+        let resp = router()
+            .oneshot(signed_request_as(
+                signer,
+                Method::POST,
+                "/api/v1/tasks",
+                Body::from(body),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a faulted INSERT must be a 500"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains(r#""error":"db_error""#),
+            "INSERT fault must keep the opaque envelope: {text}"
+        );
+        assert!(
+            text.contains(crate::error::DB_ERROR_MESSAGE),
+            "INSERT fault must carry the fixed message: {text}"
+        );
+        assert!(
+            !text.contains("status") && !text.contains("column"),
+            "schema text leaked through the INSERT: {text}"
         );
     }
 
@@ -783,6 +1569,1868 @@ mod tests {
             resp.status().is_success(),
             "the owner should be able to open a PR, got {}",
             resp.status()
+        );
+    }
+
+    /// SINK GUARD (defense in depth): a poisoned PR row that bypassed the create_pr
+    /// (a pre-fix row, or any writer create_pr does not gate) still reach the git
+    /// sink? Inserts the row directly via db.create_pr and drives get_pr_diff
+    /// anonymously. If the attacker-named file appears, the storage-boundary fix
+    /// does not cover legacy/other-writer rows and the sink itself needs a guard.
+    #[sqlx::test]
+    async fn poisoned_pr_row_cannot_write_a_file_through_the_diff_sink(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        use std::process::Command;
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let state = test_state(pool).await;
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let src = std::env::temp_dir().join(format!("gl-probe-src-{short}"));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        let _sg = DirGuard(src.clone());
+        run(&["init", "-q", "-b", "main"], &src);
+        run(&["config", "user.email", "t@t"], &src);
+        run(&["config", "user.name", "t"], &src);
+        std::fs::write(src.join("f.txt"), b"hi").unwrap();
+        run(&["add", "f.txt"], &src);
+        run(&["commit", "-q", "-m", "seed"], &src);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("probe.git");
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let _bg = DirGuard(bare.clone());
+        run(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                src.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            &std::env::temp_dir(),
+        );
+
+        let mut repo = seed_repo(&owner_did, "probe");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let pwn = std::env::temp_dir().join(format!("gl-PROBE-{short}"));
+        let _ = std::fs::remove_file(&pwn);
+        let pwn_glued: std::path::PathBuf = format!("{}...main", pwn.to_str().unwrap()).into();
+        let _pg1 = DirGuard(pwn.clone());
+        let _pg2 = DirGuard(pwn_glued.clone());
+
+        // Insert the poisoned row DIRECTLY, as a pre-fix row or an ungated writer would.
+        let pr = crate::db::PullRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: repo.id.clone(),
+            number: 1,
+            title: "x".into(),
+            body: None,
+            author_did: owner_did.clone(),
+            source_branch: "main".into(),
+            target_branch: format!("--output={}", pwn.to_str().unwrap()),
+            status: "open".into(),
+            merged_by_did: None,
+            merged_at: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        state.db.create_pr(&pr).await.expect("insert poisoned row");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/diff",
+                axum::routing::get(crate::api::pulls::get_pr_diff),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner_did}/probe/pulls/1/diff");
+        let resp = router.oneshot(anon_get(&uri)).await.unwrap();
+        let st = resp.status();
+        assert!(
+            !st.is_success(),
+            "get_pr_diff must not succeed for a poisoned row (got {st})"
+        );
+
+        let written = pwn.exists() || pwn_glued.exists();
+        assert!(
+            !written,
+            "the sink must not write a file even for a poisoned row that bypassed the \
+             create_pr boundary (get_pr_diff status {st})"
+        );
+    }
+
+    /// SECURITY (option injection, source arm): create_pr must reject an
+    /// option-shaped source_branch too. merge_branch interpolates source as its
+    /// own argv element (git merge {source}), so this is the merge-shaped twin of
+    /// the target test above.
+    #[sqlx::test]
+    async fn create_pr_rejects_option_injecting_source_branch(pool: PgPool) {
+        let owner = "did:key:zPRSRCINJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        let repo = seed_repo(owner, "pub-src-inj-repo");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls",
+                axum::routing::post(crate::api::pulls::create_pr),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner}/pub-src-inj-repo/pulls");
+        let body = Body::from(
+            r#"{"title":"x","source_branch":"--output=/tmp/gl-should-not-exist-src","target_branch":"main"}"#,
+        );
+        let resp = router
+            .oneshot(signed_request_as(owner, Method::POST, &uri, body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "an option-shaped source_branch must be rejected, got {}",
+            resp.status()
+        );
+        let prs = state.db.list_prs(&repo.id).await.expect("list_prs");
+        assert!(prs.is_empty(), "no PR row when source_branch is rejected");
+    }
+
+    /// SECURITY (option injection, second entry point): create_repo must reject a
+    /// default_branch that git would parse as an option. Otherwise an owner sets
+    /// default_branch = "--output=...", opens a PR omitting target_branch so the
+    /// stored target falls back to that default, and the diff/merge sink injects.
+    #[sqlx::test]
+    async fn create_repo_rejects_option_injecting_default_branch(pool: PgPool) {
+        let owner = "did:key:zRepoDEFINJAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos",
+                axum::routing::post(crate::api::repos::create_repo),
+            )
+            .with_state(state.clone());
+        let body = Body::from(
+            r#"{"name":"inj-default","default_branch":"--output=/tmp/gl-should-not-exist-def"}"#,
+        );
+        let resp = router
+            .oneshot(signed_request_as(
+                owner,
+                Method::POST,
+                "/api/v1/repos",
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "an option-shaped default_branch must be rejected, got {}",
+            resp.status()
+        );
+
+        // Nothing stored: the boundary rejects before init/create_repo.
+        assert!(
+            state
+                .db
+                .get_repo(owner, "inj-default")
+                .await
+                .unwrap()
+                .is_none(),
+            "no repo row must be created when default_branch is rejected"
+        );
+    }
+
+    /// SECURITY (option injection): create_pr must reject a branch ref that git
+    /// would parse as an option, so a stored `--output=...` target cannot later
+    /// turn get_pr_diff / merge into an arbitrary file write. The caller here is
+    /// the owner (a reader) of a PUBLIC repo, i.e. the minimum access needed to
+    /// plant a PR, and the request must be refused before any row is written.
+    #[sqlx::test]
+    async fn create_pr_rejects_option_injecting_branch_ref(pool: PgPool) {
+        let owner = "did:key:zPRINJOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        let repo = seed_repo(owner, "pub-inj-repo"); // is_public = true
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls",
+                axum::routing::post(crate::api::pulls::create_pr),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner}/pub-inj-repo/pulls");
+        let body = Body::from(
+            r#"{"title":"x","source_branch":"main","target_branch":"--output=/tmp/gl-should-not-exist-inj"}"#,
+        );
+
+        let resp = router
+            .oneshot(signed_request_as(owner, Method::POST, &uri, body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "an option-shaped branch ref must be rejected, got {}",
+            resp.status()
+        );
+
+        // And nothing was stored: the boundary rejects before the write.
+        let prs = state.db.list_prs(&repo.id).await.expect("list_prs");
+        assert!(
+            prs.is_empty(),
+            "no PR row must be created when the branch ref is rejected"
+        );
+    }
+
+    /// Branch-name contract (jatmn #379): create_pr must reject symbolic revision
+    /// names and trailing-dot components that `git check-ref-format --branch` refuses.
+    #[sqlx::test]
+    async fn create_pr_rejects_non_branch_ref_names(pool: PgPool) {
+        let owner = "did:key:zPRBRANCHREFAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        let repo = seed_repo(owner, "branch-ref-repo");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/pulls",
+                    axum::routing::post(crate::api::pulls::create_pr),
+                )
+                .with_state(state.clone())
+        };
+        let uri = format!("/api/v1/repos/{owner}/branch-ref-repo/pulls");
+
+        for (field, bad) in [
+            ("source_branch", "HEAD"),
+            ("source_branch", "@"),
+            ("source_branch", "@{-1}"),
+            ("source_branch", "FETCH_HEAD"),
+            ("source_branch", "ORIG_HEAD"),
+            ("source_branch", "MERGE_HEAD"),
+            ("source_branch", "CHERRY_PICK_HEAD"),
+            ("source_branch", "RERERE_MERGE_HEAD"),
+            ("source_branch", "feature."),
+            ("source_branch", "feature/x."),
+            ("source_branch", "refs/tags/v1"),
+            ("source_branch", "heads/main"),
+            ("source_branch", "tags/v1"),
+            ("target_branch", "HEAD"),
+            ("target_branch", "@"),
+            ("target_branch", "@{-1}"),
+            ("target_branch", "FETCH_HEAD"),
+            ("target_branch", "ORIG_HEAD"),
+            ("target_branch", "feature."),
+            ("target_branch", "feature/x."),
+            ("target_branch", "refs/heads/main"),
+            ("target_branch", "heads/main"),
+            ("target_branch", "tags/v1"),
+        ] {
+            let body_json = if field == "source_branch" {
+                format!(r#"{{"title":"x","source_branch":"{bad}","target_branch":"main"}}"#)
+            } else {
+                format!(r#"{{"title":"x","source_branch":"main","target_branch":"{bad}"}}"#)
+            };
+            let body = Body::from(body_json);
+            let resp = router()
+                .oneshot(signed_request_as(owner, Method::POST, &uri, body))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "{field}={bad:?} must be rejected, got {}",
+                resp.status()
+            );
+            let prs = state.db.list_prs(&repo.id).await.expect("list_prs");
+            assert!(prs.is_empty(), "no PR row when {field}={bad:?} is rejected");
+        }
+    }
+
+    /// Branch-name contract (jatmn #379): create_repo must reject a default_branch
+    /// that is not a real branch name.
+    #[sqlx::test]
+    async fn create_repo_rejects_non_branch_default_branch(pool: PgPool) {
+        let owner = "did:key:zREPOBRANCHREFAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos",
+                    axum::routing::post(crate::api::repos::create_repo),
+                )
+                .with_state(state.clone())
+        };
+
+        for (name_suffix, bad) in [
+            ("head", "HEAD"),
+            ("at-shorthand", "@"),
+            ("reflog-shorthand", "@{-1}"),
+            ("fetch-head", "FETCH_HEAD"),
+            ("orig-head", "ORIG_HEAD"),
+            ("merge-head", "MERGE_HEAD"),
+            ("cherry-head", "CHERRY_PICK_HEAD"),
+            ("rerere-head", "RERERE_MERGE_HEAD"),
+            ("trail-dot", "feature."),
+            ("trail-dot-comp", "feature/x."),
+            ("tag-ref", "refs/tags/v1"),
+            ("qualified-head", "refs/heads/main"),
+            ("heads-shorthand", "heads/main"),
+            ("tags-shorthand", "tags/v1"),
+            ("remotes-shorthand", "remotes/origin/main"),
+        ] {
+            let repo_name = format!("bad-def-{name_suffix}");
+            let body = Body::from(format!(
+                r#"{{"name":"{repo_name}","default_branch":"{bad}"}}"#
+            ));
+            let resp = router()
+                .oneshot(signed_request_as(
+                    owner,
+                    Method::POST,
+                    "/api/v1/repos",
+                    body,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "default_branch={bad:?} must be rejected, got {}",
+                resp.status()
+            );
+            assert!(
+                state
+                    .db
+                    .get_repo(owner, &repo_name)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "no repo row when default_branch={bad:?} is rejected"
+            );
+        }
+    }
+
+    /// SINK GUARD: a legacy row with source_branch=HEAD must be rejected before
+    /// merge_branch runs git. Without the sink guard, git merge HEAD succeeds on
+    /// the checked-out target and the PR is recorded as merged without merging
+    /// the submitted source branch.
+    #[sqlx::test]
+    async fn legacy_pr_row_with_head_source_is_rejected_at_merge_sink(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        use std::process::Command;
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let state = test_state(pool).await;
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let src = std::env::temp_dir().join(format!("gl-head-src-{short}"));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        let _sg = DirGuard(src.clone());
+        run(&["init", "-q", "-b", "main"], &src);
+        run(&["config", "user.email", "t@t"], &src);
+        run(&["config", "user.name", "t"], &src);
+        std::fs::write(src.join("f.txt"), b"hi").unwrap();
+        run(&["add", "f.txt"], &src);
+        run(&["commit", "-q", "-m", "seed"], &src);
+        run(&["branch", "feature"], &src);
+        std::fs::write(src.join("f.txt"), b"changed").unwrap();
+        run(&["add", "f.txt"], &src);
+        run(&["commit", "-q", "-m", "on feature"], &src);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("head-probe.git");
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let _bg = DirGuard(bare.clone());
+        run(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                src.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            &std::env::temp_dir(),
+        );
+
+        let mut repo = seed_repo(&owner_did, "head-probe");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let pr = crate::db::PullRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: repo.id.clone(),
+            number: 1,
+            title: "x".into(),
+            body: None,
+            author_did: owner_did.clone(),
+            source_branch: "HEAD".into(),
+            target_branch: "main".into(),
+            status: "open".into(),
+            merged_by_did: None,
+            merged_at: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        state.db.create_pr(&pr).await.expect("insert legacy row");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/merge",
+                axum::routing::post(crate::api::pulls::merge_pr),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner_did}/head-probe/pulls/1/merge");
+        let resp = router
+            .oneshot(signed_request_as(
+                &owner_did,
+                Method::POST,
+                &uri,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            !resp.status().is_success(),
+            "merge must not succeed for source_branch=HEAD, got {}",
+            resp.status()
+        );
+
+        let stored = state
+            .db
+            .get_pr(&repo.id, 1)
+            .await
+            .expect("get_pr")
+            .expect("pr row");
+        assert_eq!(
+            stored.status, "open",
+            "a rejected merge must not record pull_request.merged"
+        );
+    }
+
+    /// SINK GUARD: a legacy row with source_branch=@ must be rejected before
+    /// merge_branch runs git. Without the sink guard, git merge @ is a no-op on
+    /// the checked-out target and the PR is recorded as merged without merging
+    /// the submitted source branch.
+    #[sqlx::test]
+    async fn legacy_pr_row_with_at_shorthand_source_is_rejected_at_merge_sink(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        use std::process::Command;
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let state = test_state(pool).await;
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let src = std::env::temp_dir().join(format!("gl-at-src-{short}"));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        let _sg = DirGuard(src.clone());
+        run(&["init", "-q", "-b", "main"], &src);
+        run(&["config", "user.email", "t@t"], &src);
+        run(&["config", "user.name", "t"], &src);
+        std::fs::write(src.join("f.txt"), b"hi").unwrap();
+        run(&["add", "f.txt"], &src);
+        run(&["commit", "-q", "-m", "seed"], &src);
+        run(&["branch", "feature"], &src);
+        std::fs::write(src.join("f.txt"), b"changed").unwrap();
+        run(&["add", "f.txt"], &src);
+        run(&["commit", "-q", "-m", "on feature"], &src);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("at-probe.git");
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let _bg = DirGuard(bare.clone());
+        run(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                src.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            &std::env::temp_dir(),
+        );
+
+        let mut repo = seed_repo(&owner_did, "at-probe");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let pr = crate::db::PullRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: repo.id.clone(),
+            number: 1,
+            title: "x".into(),
+            body: None,
+            author_did: owner_did.clone(),
+            source_branch: "@".into(),
+            target_branch: "main".into(),
+            status: "open".into(),
+            merged_by_did: None,
+            merged_at: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        state.db.create_pr(&pr).await.expect("insert legacy row");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/merge",
+                axum::routing::post(crate::api::pulls::merge_pr),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner_did}/at-probe/pulls/1/merge");
+        let resp = router
+            .oneshot(signed_request_as(
+                &owner_did,
+                Method::POST,
+                &uri,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            !resp.status().is_success(),
+            "merge must not succeed for source_branch=@, got {}",
+            resp.status()
+        );
+
+        let stored = state
+            .db
+            .get_pr(&repo.id, 1)
+            .await
+            .expect("get_pr")
+            .expect("pr row");
+        assert_eq!(
+            stored.status, "open",
+            "a rejected merge must not record pull_request.merged"
+        );
+    }
+
+    /// SINK GUARD: legacy rows with reflog shorthands or pseudoref source branches
+    /// must be rejected at merge before git runs.
+    #[sqlx::test]
+    async fn legacy_pr_rows_with_shorthand_or_pseudoref_source_rejected_at_merge_sink(
+        pool: PgPool,
+    ) {
+        use gitlawb_core::identity::Keypair;
+        use std::process::Command;
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        for (label, bad_source) in [
+            ("reflog", "@{-1}"),
+            ("fetch-head", "FETCH_HEAD"),
+            ("merge-head", "MERGE_HEAD"),
+        ] {
+            let kp = Keypair::generate();
+            let owner_did = kp.did().to_string();
+            let short = owner_did.split(':').next_back().unwrap().to_string();
+            let slug = owner_did.replace([':', '/'], "_");
+            let state = test_state(pool.clone()).await;
+            let run = |args: &[&str], cwd: &std::path::Path| {
+                let out = Command::new("git")
+                    .args(args)
+                    .current_dir(cwd)
+                    .output()
+                    .expect("git");
+                assert!(
+                    out.status.success(),
+                    "git {args:?}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            };
+            let src = std::env::temp_dir().join(format!("gl-{label}-src-{short}"));
+            let _ = std::fs::remove_dir_all(&src);
+            std::fs::create_dir_all(&src).unwrap();
+            let _sg = DirGuard(src.clone());
+            run(&["init", "-q", "-b", "main"], &src);
+            run(&["config", "user.email", "t@t"], &src);
+            run(&["config", "user.name", "t"], &src);
+            std::fs::write(src.join("f.txt"), b"hi").unwrap();
+            run(&["add", "f.txt"], &src);
+            run(&["commit", "-q", "-m", "seed"], &src);
+            run(&["branch", "feature"], &src);
+            std::fs::write(src.join("f.txt"), b"changed").unwrap();
+            run(&["add", "f.txt"], &src);
+            run(&["commit", "-q", "-m", "on feature"], &src);
+            let bare = std::path::PathBuf::from("/tmp")
+                .join(&slug)
+                .join(format!("{label}-probe.git"));
+            let _ = std::fs::remove_dir_all(&bare);
+            std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+            let _bg = DirGuard(bare.clone());
+            run(
+                &[
+                    "clone",
+                    "--bare",
+                    "-q",
+                    src.to_str().unwrap(),
+                    bare.to_str().unwrap(),
+                ],
+                &std::env::temp_dir(),
+            );
+
+            let repo_name = format!("{label}-probe");
+            let mut repo = seed_repo(&owner_did, &repo_name);
+            repo.is_public = true;
+            state.db.create_repo(&repo).await.expect("seed repo");
+
+            let pr = crate::db::PullRequest {
+                id: uuid::Uuid::new_v4().to_string(),
+                repo_id: repo.id.clone(),
+                number: 1,
+                title: "x".into(),
+                body: None,
+                author_did: owner_did.clone(),
+                source_branch: bad_source.into(),
+                target_branch: "main".into(),
+                status: "open".into(),
+                merged_by_did: None,
+                merged_at: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            };
+            state.db.create_pr(&pr).await.expect("insert legacy row");
+
+            let router = Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/pulls/{number}/merge",
+                    axum::routing::post(crate::api::pulls::merge_pr),
+                )
+                .with_state(state.clone());
+            let uri = format!("/api/v1/repos/{owner_did}/{repo_name}/pulls/1/merge");
+            let resp = router
+                .oneshot(signed_request_as(
+                    &owner_did,
+                    Method::POST,
+                    &uri,
+                    Body::empty(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "merge must return git_error for source_branch={bad_source:?}, got {}",
+                resp.status()
+            );
+
+            let stored = state
+                .db
+                .get_pr(&repo.id, 1)
+                .await
+                .expect("get_pr")
+                .expect("pr row");
+            assert_eq!(
+                stored.status, "open",
+                "merge must not record pull_request.merged for source_branch={bad_source:?}"
+            );
+        }
+    }
+
+    /// SINK GUARD: legacy rows with reflog/pseudoref refs must be rejected at diff
+    /// before git argv is built.
+    #[sqlx::test]
+    async fn legacy_pr_rows_with_shorthand_or_pseudoref_rejected_at_diff_sink(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        use std::process::Command;
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        for (label, bad_source) in [("reflog", "@{-1}"), ("fetch-head", "FETCH_HEAD")] {
+            let kp = Keypair::generate();
+            let owner_did = kp.did().to_string();
+            let short = owner_did.split(':').next_back().unwrap().to_string();
+            let slug = owner_did.replace([':', '/'], "_");
+            let state = test_state(pool.clone()).await;
+            let run = |args: &[&str], cwd: &std::path::Path| {
+                let out = Command::new("git")
+                    .args(args)
+                    .current_dir(cwd)
+                    .output()
+                    .expect("git");
+                assert!(
+                    out.status.success(),
+                    "git {args:?}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            };
+            let src = std::env::temp_dir().join(format!("gl-diff-{label}-src-{short}"));
+            let _ = std::fs::remove_dir_all(&src);
+            std::fs::create_dir_all(&src).unwrap();
+            let _sg = DirGuard(src.clone());
+            run(&["init", "-q", "-b", "main"], &src);
+            run(&["config", "user.email", "t@t"], &src);
+            run(&["config", "user.name", "t"], &src);
+            std::fs::write(src.join("f.txt"), b"hi").unwrap();
+            run(&["add", "f.txt"], &src);
+            run(&["commit", "-q", "-m", "seed"], &src);
+            let bare = std::path::PathBuf::from("/tmp")
+                .join(&slug)
+                .join(format!("diff-{label}.git"));
+            let _ = std::fs::remove_dir_all(&bare);
+            std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+            let _bg = DirGuard(bare.clone());
+            run(
+                &[
+                    "clone",
+                    "--bare",
+                    "-q",
+                    src.to_str().unwrap(),
+                    bare.to_str().unwrap(),
+                ],
+                &std::env::temp_dir(),
+            );
+
+            let repo_name = format!("diff-{label}");
+            let mut repo = seed_repo(&owner_did, &repo_name);
+            repo.is_public = true;
+            state.db.create_repo(&repo).await.expect("seed repo");
+
+            let pr = crate::db::PullRequest {
+                id: uuid::Uuid::new_v4().to_string(),
+                repo_id: repo.id.clone(),
+                number: 1,
+                title: "x".into(),
+                body: None,
+                author_did: owner_did.clone(),
+                source_branch: bad_source.into(),
+                target_branch: "main".into(),
+                status: "open".into(),
+                merged_by_did: None,
+                merged_at: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            };
+            state.db.create_pr(&pr).await.expect("insert legacy row");
+
+            let router = Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/pulls/{number}/diff",
+                    axum::routing::get(crate::api::pulls::get_pr_diff),
+                )
+                .with_state(state.clone());
+            let uri = format!("/api/v1/repos/{owner_did}/{repo_name}/pulls/1/diff");
+            let resp = router.oneshot(anon_get(&uri)).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "get_pr_diff must return git_error for source_branch={bad_source:?}, got {}",
+                resp.status()
+            );
+        }
+    }
+
+    /// When git cannot be spawned for check-ref-format, storage boundaries must
+    /// return git_error (500), not bad_request (400).
+    #[sqlx::test]
+    async fn create_pr_returns_git_error_when_validate_git_ref_cannot_spawn_git(pool: PgPool) {
+        let owner = "did:key:zPRGITSPAWNAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let mut state = test_state(pool).await;
+        state.git_bin = "/nonexistent/gitlawb-validate-git".into();
+        let repo = seed_repo(owner, "git-spawn-pr");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls",
+                axum::routing::post(crate::api::pulls::create_pr),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner}/git-spawn-pr/pulls");
+        let body = Body::from(r#"{"title":"x","source_branch":"main","target_branch":"main"}"#);
+        let resp = router
+            .oneshot(signed_request_as(owner, Method::POST, &uri, body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "spawn failure must not surface as 400, got {}",
+            resp.status()
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(
+            v.get("error").and_then(|e| e.as_str()),
+            Some("git_error"),
+            "spawn failure must use git_error code, got {v}"
+        );
+        let prs = state.db.list_prs(&repo.id).await.expect("list_prs");
+        assert!(prs.is_empty(), "no PR row when git is unavailable");
+    }
+
+    #[sqlx::test]
+    async fn create_repo_returns_git_error_when_validate_git_ref_cannot_spawn_git(pool: PgPool) {
+        let mut state = test_state(pool).await;
+        state.git_bin = "/nonexistent/gitlawb-validate-git".into();
+        let owner = "did:key:zREPOGITSPAWNAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos",
+                axum::routing::post(crate::api::repos::create_repo),
+            )
+            .with_state(state.clone());
+        let body = Body::from(r#"{"name":"git-spawn-repo","default_branch":"main"}"#);
+        let resp = router
+            .oneshot(signed_request_as(
+                owner,
+                Method::POST,
+                "/api/v1/repos",
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "spawn failure must not surface as 400, got {}",
+            resp.status()
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(
+            v.get("error").and_then(|e| e.as_str()),
+            Some("git_error"),
+            "spawn failure must use git_error code, got {v}"
+        );
+        assert!(
+            state
+                .db
+                .get_repo(owner, "git-spawn-repo")
+                .await
+                .unwrap()
+                .is_none(),
+            "no repo row when git is unavailable"
+        );
+    }
+
+    /// SINK GUARD: legacy target_branch=HEAD must be rejected before worktree add.
+    #[sqlx::test]
+    async fn legacy_pr_row_with_head_target_is_rejected_at_merge_sink(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        use std::process::Command;
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let state = test_state(pool).await;
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let src = std::env::temp_dir().join(format!("gl-head-tgt-{short}"));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        let _sg = DirGuard(src.clone());
+        run(&["init", "-q", "-b", "main"], &src);
+        run(&["config", "user.email", "t@t"], &src);
+        run(&["config", "user.name", "t"], &src);
+        std::fs::write(src.join("f.txt"), b"hi").unwrap();
+        run(&["add", "f.txt"], &src);
+        run(&["commit", "-q", "-m", "seed"], &src);
+        run(&["branch", "feature"], &src);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("head-tgt-probe.git");
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let _bg = DirGuard(bare.clone());
+        run(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                src.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            &std::env::temp_dir(),
+        );
+
+        let mut repo = seed_repo(&owner_did, "head-tgt-probe");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let pr = crate::db::PullRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: repo.id.clone(),
+            number: 1,
+            title: "x".into(),
+            body: None,
+            author_did: owner_did.clone(),
+            source_branch: "feature".into(),
+            target_branch: "HEAD".into(),
+            status: "open".into(),
+            merged_by_did: None,
+            merged_at: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        state.db.create_pr(&pr).await.expect("insert legacy row");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/merge",
+                axum::routing::post(crate::api::pulls::merge_pr),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner_did}/head-tgt-probe/pulls/1/merge");
+        let resp = router
+            .oneshot(signed_request_as(
+                &owner_did,
+                Method::POST,
+                &uri,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            !resp.status().is_success(),
+            "merge must not succeed for target_branch=HEAD, got {}",
+            resp.status()
+        );
+        let stored = state
+            .db
+            .get_pr(&repo.id, 1)
+            .await
+            .expect("get_pr")
+            .expect("pr row");
+        assert_eq!(stored.status, "open");
+    }
+
+    /// Successful merge path (jatmn #379): diverged branches must produce a merge
+    /// commit on refs/heads/{target}, not only on a detached worktree HEAD.
+    #[sqlx::test]
+    async fn merge_pr_advances_target_ref_with_diverged_branches(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        use std::process::Command;
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let state = test_state(pool).await;
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        };
+        let rev = |args: &[&str], cwd: &std::path::Path| {
+            String::from_utf8_lossy(&run(args, cwd).stdout)
+                .trim()
+                .to_string()
+        };
+
+        let src = std::env::temp_dir().join(format!("gl-merge-ok-src-{short}"));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        let _sg = DirGuard(src.clone());
+        run(&["init", "-q", "-b", "main"], &src);
+        run(&["config", "user.email", "t@t"], &src);
+        run(&["config", "user.name", "t"], &src);
+        std::fs::write(src.join("base.txt"), b"base").unwrap();
+        run(&["add", "base.txt"], &src);
+        run(&["commit", "-q", "-m", "seed"], &src);
+        run(&["checkout", "-b", "feature"], &src);
+        std::fs::write(src.join("feature.txt"), b"feature-only").unwrap();
+        run(&["add", "feature.txt"], &src);
+        run(&["commit", "-q", "-m", "on feature"], &src);
+        run(&["checkout", "main"], &src);
+        std::fs::write(src.join("main.txt"), b"main-only").unwrap();
+        run(&["add", "main.txt"], &src);
+        run(&["commit", "-q", "-m", "on main"], &src);
+        let feature_tip = rev(&["rev-parse", "feature"], &src);
+
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("merge-success.git");
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let _bg = DirGuard(bare.clone());
+        run(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                src.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            &std::env::temp_dir(),
+        );
+        let main_before = rev(&["rev-parse", "refs/heads/main"], &bare);
+
+        let mut repo = seed_repo(&owner_did, "merge-success");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let pr = crate::db::PullRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: repo.id.clone(),
+            number: 1,
+            title: "merge feature".into(),
+            body: None,
+            author_did: owner_did.clone(),
+            source_branch: "feature".into(),
+            target_branch: "main".into(),
+            status: "open".into(),
+            merged_by_did: None,
+            merged_at: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        state.db.create_pr(&pr).await.expect("insert pr row");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/merge",
+                axum::routing::post(crate::api::pulls::merge_pr),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner_did}/merge-success/pulls/1/merge");
+        let resp = router
+            .oneshot(signed_request_as(
+                &owner_did,
+                Method::POST,
+                &uri,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "merge must succeed for diverged branches, got {}",
+            resp.status()
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        let merge_sha = json["merge_sha"].as_str().expect("merge_sha in response");
+        assert_eq!(json["status"].as_str(), Some("merged"));
+
+        let stored = state
+            .db
+            .get_pr(&repo.id, 1)
+            .await
+            .expect("get_pr")
+            .expect("pr row");
+        assert_eq!(stored.status, "merged");
+        assert!(stored.merged_by_did.is_some());
+
+        let main_after = rev(&["rev-parse", "refs/heads/main"], &bare);
+        assert_ne!(
+            main_after, main_before,
+            "refs/heads/main must advance after a successful merge"
+        );
+        assert_eq!(
+            main_after, merge_sha,
+            "reported merge_sha must match refs/heads/main"
+        );
+        run(
+            &["merge-base", "--is-ancestor", &feature_tip, &main_after],
+            &bare,
+        );
+        run(
+            &["cat-file", "-e", &format!("{main_after}:feature.txt")],
+            &bare,
+        );
+    }
+
+    /// SINK GUARD (jatmn #379): a PR targeting a name that exists only as a tag
+    /// (refs/tags/{name}, no refs/heads/{name}) must fail closed. Without the
+    /// exact-ref checks, git's revision DWIM resolves the bare name to the tag,
+    /// `worktree add` checks out a detached HEAD there, the merge succeeds on
+    /// that disposable HEAD, cleanup discards the commit, and the unchecked
+    /// final rev-parse echoes "refs/heads/{name}" back as a bogus merge SHA —
+    /// so the PR is marked merged and pull_request.merged fires even though no
+    /// branch ever moved.
+    #[sqlx::test]
+    async fn merge_pr_fails_closed_when_target_is_only_a_tag(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        use std::process::Command;
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let state = test_state(pool).await;
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        };
+        let rev = |args: &[&str], cwd: &std::path::Path| {
+            String::from_utf8_lossy(&run(args, cwd).stdout)
+                .trim()
+                .to_string()
+        };
+
+        let src = std::env::temp_dir().join(format!("gl-tag-only-src-{short}"));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        let _sg = DirGuard(src.clone());
+        run(&["init", "-q", "-b", "main"], &src);
+        run(&["config", "user.email", "t@t"], &src);
+        run(&["config", "user.name", "t"], &src);
+        std::fs::write(src.join("base.txt"), b"base").unwrap();
+        run(&["add", "base.txt"], &src);
+        run(&["commit", "-q", "-m", "seed"], &src);
+        // The tag that shadows the missing target branch: "release" resolves via
+        // DWIM but refs/heads/release never exists.
+        run(&["tag", "release"], &src);
+        run(&["checkout", "-q", "-b", "feature"], &src);
+        std::fs::write(src.join("feature.txt"), b"feature-only").unwrap();
+        run(&["add", "feature.txt"], &src);
+        run(&["commit", "-q", "-m", "on feature"], &src);
+
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("tag-only.git");
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let _bg = DirGuard(bare.clone());
+        run(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                src.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            &std::env::temp_dir(),
+        );
+        let tag_before = rev(&["rev-parse", "refs/tags/release"], &bare);
+        // Precondition of the whole scenario: the tag exists, the branch does not.
+        let no_branch = Command::new("git")
+            .args(["show-ref", "--verify", "--quiet", "refs/heads/release"])
+            .current_dir(&bare)
+            .output()
+            .expect("git show-ref");
+        assert!(
+            !no_branch.status.success(),
+            "fixture must not have a local release branch"
+        );
+
+        let mut repo = seed_repo(&owner_did, "tag-only");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let pr = crate::db::PullRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: repo.id.clone(),
+            number: 1,
+            title: "merge into tag-shadowed name".into(),
+            body: None,
+            author_did: owner_did.clone(),
+            source_branch: "feature".into(),
+            target_branch: "release".into(),
+            status: "open".into(),
+            merged_by_did: None,
+            merged_at: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        state.db.create_pr(&pr).await.expect("insert pr row");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/merge",
+                axum::routing::post(crate::api::pulls::merge_pr),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner_did}/tag-only/pulls/1/merge");
+        let resp = router
+            .oneshot(signed_request_as(
+                &owner_did,
+                Method::POST,
+                &uri,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            !resp.status().is_success(),
+            "merge must fail when the target exists only as a tag, got {}",
+            resp.status()
+        );
+
+        // The handler updates the PR row and fires pull_request.merged only
+        // after merge_branch returns Ok, so an open row proves no merged event
+        // was emitted.
+        let stored = state
+            .db
+            .get_pr(&repo.id, 1)
+            .await
+            .expect("get_pr")
+            .expect("pr row");
+        assert_eq!(
+            stored.status, "open",
+            "a failed merge must leave the PR open and emit no pull_request.merged"
+        );
+        assert!(stored.merged_by_did.is_none());
+
+        // The repo itself must be untouched: still no local release branch, and
+        // the tag did not move.
+        let still_no_branch = Command::new("git")
+            .args(["show-ref", "--verify", "--quiet", "refs/heads/release"])
+            .current_dir(&bare)
+            .output()
+            .expect("git show-ref");
+        assert!(
+            !still_no_branch.status.success(),
+            "a failed merge must not create refs/heads/release"
+        );
+        let tag_after = rev(&["rev-parse", "refs/tags/release"], &bare);
+        assert_eq!(tag_after, tag_before, "the tag must not move");
+    }
+
+    /// Companion to the tag-only case (jatmn #379): when a same-named tag AND a
+    /// local branch coexist, the merge must attach to and advance
+    /// refs/heads/{target} while refs/tags/{target} stays where it was — the
+    /// exact-ref binding must pick the branch, not merely fail less.
+    #[sqlx::test]
+    async fn merge_pr_advances_local_branch_shadowed_by_same_named_tag(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        use std::process::Command;
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let state = test_state(pool).await;
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        };
+        let rev = |args: &[&str], cwd: &std::path::Path| {
+            String::from_utf8_lossy(&run(args, cwd).stdout)
+                .trim()
+                .to_string()
+        };
+
+        let src = std::env::temp_dir().join(format!("gl-tag-shadow-src-{short}"));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        let _sg = DirGuard(src.clone());
+        run(&["init", "-q", "-b", "main"], &src);
+        run(&["config", "user.email", "t@t"], &src);
+        run(&["config", "user.name", "t"], &src);
+        std::fs::write(src.join("base.txt"), b"base").unwrap();
+        run(&["add", "base.txt"], &src);
+        run(&["commit", "-q", "-m", "seed"], &src);
+        // Tag "release" pinned at the seed commit; the branch of the same name
+        // moves past it. Revision DWIM prefers refs/tags/ over refs/heads/ for
+        // an ambiguous short name, so this fixture is the strongest shadowing
+        // shape: a naive resolution would merge onto the stale tag commit.
+        run(&["tag", "release"], &src);
+        run(&["checkout", "-q", "-b", "release"], &src);
+        std::fs::write(src.join("release.txt"), b"release-only").unwrap();
+        run(&["add", "release.txt"], &src);
+        run(&["commit", "-q", "-m", "on release"], &src);
+        run(&["checkout", "-q", "-b", "feature"], &src);
+        std::fs::write(src.join("feature.txt"), b"feature-only").unwrap();
+        run(&["add", "feature.txt"], &src);
+        run(&["commit", "-q", "-m", "on feature"], &src);
+        run(&["checkout", "-q", "release"], &src);
+        std::fs::write(src.join("release2.txt"), b"release-again").unwrap();
+        run(&["add", "release2.txt"], &src);
+        run(&["commit", "-q", "-m", "diverge release"], &src);
+        let feature_tip = rev(&["rev-parse", "refs/heads/feature"], &src);
+
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("tag-shadow.git");
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let _bg = DirGuard(bare.clone());
+        run(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                src.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            &std::env::temp_dir(),
+        );
+        let tag_before = rev(&["rev-parse", "refs/tags/release"], &bare);
+        let branch_before = rev(&["rev-parse", "refs/heads/release"], &bare);
+        assert_ne!(
+            tag_before, branch_before,
+            "fixture must diverge the tag from the branch"
+        );
+
+        let mut repo = seed_repo(&owner_did, "tag-shadow");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let pr = crate::db::PullRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: repo.id.clone(),
+            number: 1,
+            title: "merge feature into shadowed release".into(),
+            body: None,
+            author_did: owner_did.clone(),
+            source_branch: "feature".into(),
+            target_branch: "release".into(),
+            status: "open".into(),
+            merged_by_did: None,
+            merged_at: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        state.db.create_pr(&pr).await.expect("insert pr row");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/merge",
+                axum::routing::post(crate::api::pulls::merge_pr),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner_did}/tag-shadow/pulls/1/merge");
+        let resp = router
+            .oneshot(signed_request_as(
+                &owner_did,
+                Method::POST,
+                &uri,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "merge must succeed when the local branch exists alongside the tag, got {}",
+            resp.status()
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        let merge_sha = json["merge_sha"].as_str().expect("merge_sha in response");
+        assert_eq!(json["status"].as_str(), Some("merged"));
+
+        let stored = state
+            .db
+            .get_pr(&repo.id, 1)
+            .await
+            .expect("get_pr")
+            .expect("pr row");
+        assert_eq!(stored.status, "merged");
+
+        // The LOCAL BRANCH advanced to the reported merge SHA; the tag stayed put.
+        let branch_after = rev(&["rev-parse", "refs/heads/release"], &bare);
+        assert_ne!(
+            branch_after, branch_before,
+            "refs/heads/release must advance past the merge"
+        );
+        assert_eq!(
+            branch_after, merge_sha,
+            "reported merge_sha must match refs/heads/release"
+        );
+        let tag_after = rev(&["rev-parse", "refs/tags/release"], &bare);
+        assert_eq!(tag_after, tag_before, "the tag must not move");
+        run(
+            &["merge-base", "--is-ancestor", &feature_tip, &branch_after],
+            &bare,
+        );
+        run(
+            &["cat-file", "-e", &format!("{branch_after}:feature.txt")],
+            &bare,
+        );
+    }
+
+    /// E2E for the leftover-worktree cleanup (CodeRabbit #379), driven through the
+    /// real merge endpoint rather than merge_branch directly, because the defect's
+    /// consequence is an endpoint that wedges: every later merge on the repo fails.
+    ///
+    /// The fixture leaves the repo in the worst reachable leftover state -- the
+    /// `_merge_worktree` registration present, its directory gone, AND the worktree
+    /// LOCKED. `git worktree add` refuses that with "missing but locked worktree",
+    /// a single `--force` refuses to remove it, and `git worktree prune` skips it.
+    ///
+    /// Both response classes are asserted, not just the 200: the PR row must end
+    /// "merged" with a merge_sha that IS the new refs/heads/{target}, and the
+    /// endpoint must not report success without advancing the branch. REVERT PROOF
+    /// (RED): drop either --force from remove_worktree in store.rs and this test
+    /// fails with the endpoint returning non-200 and the PR row still open.
+    #[sqlx::test]
+    async fn merge_pr_recovers_from_a_locked_stale_worktree(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        use std::process::Command;
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let state = test_state(pool).await;
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        };
+        let rev = |args: &[&str], cwd: &std::path::Path| {
+            String::from_utf8_lossy(&run(args, cwd).stdout)
+                .trim()
+                .to_string()
+        };
+
+        let src = std::env::temp_dir().join(format!("gl-locked-wt-src-{short}"));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        let _sg = DirGuard(src.clone());
+        run(&["init", "-q", "-b", "main"], &src);
+        run(&["config", "user.email", "t@t"], &src);
+        run(&["config", "user.name", "t"], &src);
+        std::fs::write(src.join("base.txt"), b"base").unwrap();
+        run(&["add", "base.txt"], &src);
+        run(&["commit", "-q", "-m", "seed"], &src);
+        run(&["checkout", "-q", "-b", "feature"], &src);
+        std::fs::write(src.join("feature.txt"), b"feature-only").unwrap();
+        run(&["add", "feature.txt"], &src);
+        run(&["commit", "-q", "-m", "on feature"], &src);
+        run(&["checkout", "-q", "main"], &src);
+        let feature_tip = rev(&["rev-parse", "refs/heads/feature"], &src);
+
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("locked-wt.git");
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let _bg = DirGuard(bare.clone());
+        run(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                src.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            &std::env::temp_dir(),
+        );
+        let main_before = rev(&["rev-parse", "refs/heads/main"], &bare);
+
+        // Wedge the repo exactly the way a failed cleanup does: register the
+        // worktree, lock it, then delete its directory. remove_worktree's
+        // unconditional remove_dir_all is what produces the directory half of
+        // this in production; the lock is what makes a single --force useless.
+        run(&["worktree", "add", "_merge_worktree", "main"], &bare);
+        run(&["worktree", "lock", "_merge_worktree"], &bare);
+        std::fs::remove_dir_all(bare.join("_merge_worktree")).unwrap();
+        assert!(
+            bare.join("worktrees/_merge_worktree").exists(),
+            "fixture must leave a locked registration behind"
+        );
+        // Prove the fixture really is the refusing state before asserting recovery,
+        // so a future git that stopped refusing cannot make this test vacuous.
+        let blocked = Command::new("git")
+            .args(["worktree", "add", "_merge_worktree", "main"])
+            .current_dir(&bare)
+            .output()
+            .expect("git");
+        assert!(
+            !blocked.status.success()
+                && String::from_utf8_lossy(&blocked.stderr).contains("missing but locked"),
+            "fixture must be the state git refuses, got: {}",
+            String::from_utf8_lossy(&blocked.stderr)
+        );
+
+        let mut repo = seed_repo(&owner_did, "locked-wt");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let pr = crate::db::PullRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: repo.id.clone(),
+            number: 1,
+            title: "merge over a locked leftover worktree".into(),
+            body: None,
+            author_did: owner_did.clone(),
+            source_branch: "feature".into(),
+            target_branch: "main".into(),
+            status: "open".into(),
+            merged_by_did: None,
+            merged_at: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        state.db.create_pr(&pr).await.expect("insert pr row");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/merge",
+                axum::routing::post(crate::api::pulls::merge_pr),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner_did}/locked-wt/pulls/1/merge");
+        let resp = router
+            .oneshot(signed_request_as(
+                &owner_did,
+                Method::POST,
+                &uri,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a locked leftover worktree must not wedge the merge endpoint, got {}",
+            resp.status()
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        let merge_sha = json["merge_sha"].as_str().expect("merge_sha in response");
+        assert_eq!(json["status"].as_str(), Some("merged"));
+
+        let stored = state
+            .db
+            .get_pr(&repo.id, 1)
+            .await
+            .expect("get_pr")
+            .expect("pr row");
+        assert_eq!(stored.status, "merged");
+        assert_eq!(stored.merged_by_did.as_deref(), Some(owner_did.as_str()));
+
+        // A reported merge is only real if the branch moved to exactly that sha
+        // and carries the source commit. This is the half that catches a wedge
+        // rendered as success rather than as an error.
+        let main_after = rev(&["rev-parse", "refs/heads/main"], &bare);
+        assert_ne!(
+            main_after, main_before,
+            "refs/heads/main must advance past the merge"
+        );
+        assert_eq!(
+            main_after, merge_sha,
+            "reported merge_sha must match refs/heads/main"
+        );
+        run(
+            &["merge-base", "--is-ancestor", &feature_tip, &main_after],
+            &bare,
+        );
+        run(
+            &["cat-file", "-e", &format!("{main_after}:feature.txt")],
+            &bare,
+        );
+
+        // The cleanup must also leave nothing behind for the NEXT merge.
+        assert!(
+            !bare.join("worktrees/_merge_worktree").exists(),
+            "the merge must not leave its own worktree registered"
+        );
+        assert!(
+            !bare.join("_merge_worktree").exists(),
+            "the merge must not leave its own worktree directory"
+        );
+    }
+
+    /// SINK GUARD: a poisoned row with option-shaped source_branch must not reach
+    /// git merge argv (distinct from the diff revspec injection shape).
+    #[sqlx::test]
+    async fn poisoned_pr_row_option_source_is_rejected_at_merge_sink(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        use std::process::Command;
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let state = test_state(pool).await;
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let src = std::env::temp_dir().join(format!("gl-merge-src-{short}"));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        let _sg = DirGuard(src.clone());
+        run(&["init", "-q", "-b", "main"], &src);
+        run(&["config", "user.email", "t@t"], &src);
+        run(&["config", "user.name", "t"], &src);
+        std::fs::write(src.join("f.txt"), b"hi").unwrap();
+        run(&["add", "f.txt"], &src);
+        run(&["commit", "-q", "-m", "seed"], &src);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("merge-probe.git");
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let _bg = DirGuard(bare.clone());
+        run(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                src.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            &std::env::temp_dir(),
+        );
+
+        let mut repo = seed_repo(&owner_did, "merge-probe");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let pwn = std::env::temp_dir().join(format!("gl-MERGE-{short}"));
+        let _ = std::fs::remove_file(&pwn);
+
+        let pr = crate::db::PullRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: repo.id.clone(),
+            number: 1,
+            title: "x".into(),
+            body: None,
+            author_did: owner_did.clone(),
+            source_branch: format!("--output={}", pwn.to_str().unwrap()),
+            target_branch: "main".into(),
+            status: "open".into(),
+            merged_by_did: None,
+            merged_at: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        state.db.create_pr(&pr).await.expect("insert poisoned row");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/merge",
+                axum::routing::post(crate::api::pulls::merge_pr),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner_did}/merge-probe/pulls/1/merge");
+        let resp = router
+            .oneshot(signed_request_as(
+                &owner_did,
+                Method::POST,
+                &uri,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            !resp.status().is_success(),
+            "merge must not succeed for option-shaped source_branch, got {}",
+            resp.status()
+        );
+        assert!(
+            !pwn.exists(),
+            "merge sink must not write via option-shaped source_branch"
+        );
+        let stored = state
+            .db
+            .get_pr(&repo.id, 1)
+            .await
+            .expect("get_pr")
+            .expect("pr row");
+        assert_eq!(stored.status, "open");
+    }
+
+    /// create_pr must validate the resolved target_branch even when the caller
+    /// omits target_branch and the repo row carries a poisoned default_branch.
+    #[sqlx::test]
+    async fn create_pr_rejects_resolved_target_from_poisoned_default_branch(pool: PgPool) {
+        let owner = "did:key:zPRDEFPOISONAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool.clone()).await;
+        let repo = seed_repo(owner, "def-poison-repo");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        sqlx::query("UPDATE repos SET default_branch = $1 WHERE id = $2")
+            .bind("HEAD")
+            .bind(&repo.id)
+            .execute(&pool)
+            .await
+            .expect("poison default_branch");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls",
+                axum::routing::post(crate::api::pulls::create_pr),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner}/def-poison-repo/pulls");
+        let body = Body::from(r#"{"title":"x","source_branch":"feature"}"#);
+        let resp = router
+            .oneshot(signed_request_as(owner, Method::POST, &uri, body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "resolved target from poisoned default_branch must be rejected, got {}",
+            resp.status()
+        );
+        let prs = state.db.list_prs(&repo.id).await.expect("list_prs");
+        assert!(
+            prs.is_empty(),
+            "no PR row when resolved target_branch is invalid"
         );
     }
 
@@ -1427,6 +4075,300 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND, "absent repo → 404");
     }
 
+    /// #435: register_replica / unregister_replica apply the same read-visibility
+    /// gate as list_replicas. Both mutate caller-bound replica metadata and their
+    /// responses disclose the replica count, so a non-reader of a private repo
+    /// gets the same 404 as a missing repo and nothing is written. Authorized
+    /// readers keep self-registering and self-removing.
+    #[sqlx::test]
+    async fn replica_register_unregister_are_read_visibility_gated(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        let owner = "did:key:zREPMUTOWNERRRRRRRRRRRRRRRRRRRRRRRRRR";
+        let reader = "did:key:zREPMUTREADERRRRRRRRRRRRRRRRRRRRRRRRR";
+        let stranger = "did:key:zREPMUTSTRGRRRRRRRRRRRRRRRRRRRRRRRRR";
+        let state = test_state(pool).await;
+
+        let mut priv_repo = seed_repo(owner, "repmut-priv");
+        priv_repo.is_public = false;
+        state
+            .db
+            .create_repo(&priv_repo)
+            .await
+            .expect("seed private repo");
+        let pub_repo = seed_repo(owner, "repmut-pub");
+        state
+            .db
+            .create_repo(&pub_repo)
+            .await
+            .expect("seed public repo");
+        // A listed reader of the private repo keeps mutation rights.
+        state
+            .db
+            .set_visibility_rule(
+                &priv_repo.id,
+                "/",
+                VisibilityMode::B,
+                &[reader.to_string()],
+                owner,
+            )
+            .await
+            .expect("seed reader rule");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/replicas",
+                    axum::routing::put(crate::api::replicas::register_replica)
+                        .delete(crate::api::replicas::unregister_replica),
+                )
+                .with_state(state.clone())
+        };
+        let replica_url = "https://replica.example.com/me";
+        let body = || Body::from(format!(r#"{{"url":"{replica_url}"}}"#));
+        let leaks = |bytes: &[u8]| {
+            let text = String::from_utf8_lossy(bytes);
+            text.contains(replica_url) || text.contains(&priv_repo.id)
+        };
+
+        // Private repo, non-reader stranger: register → 404, nothing written.
+        let resp = router()
+            .oneshot(signed_request_as(
+                stranger,
+                Method::PUT,
+                &format!("/api/v1/repos/{owner}/repmut-priv/replicas"),
+                body(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a non-reader must not register on a private repo"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !leaks(&bytes),
+            "a denied register body must not leak the replica url or repo data"
+        );
+        assert!(
+            state
+                .db
+                .list_replicas(&priv_repo.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a denied register must not create a replica row"
+        );
+
+        // Private repo, non-reader stranger: unregister → 404.
+        let resp = router()
+            .oneshot(signed_request_as(
+                stranger,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner}/repmut-priv/replicas"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a non-reader must not unregister on a private repo"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !leaks(&bytes),
+            "a denied unregister body must not leak the replica url or repo data"
+        );
+
+        // Private repo, listed reader: register → 201, unregister → 200.
+        let resp = router()
+            .oneshot(signed_request_as(
+                reader,
+                Method::PUT,
+                &format!("/api/v1/repos/{owner}/repmut-priv/replicas"),
+                body(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "a listed reader keeps self-registration on a private repo"
+        );
+        let resp = router()
+            .oneshot(signed_request_as(
+                reader,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner}/repmut-priv/replicas"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a listed reader keeps self-removal on a private repo"
+        );
+
+        // Public repo, authenticated stranger: register → 201.
+        let resp = router()
+            .oneshot(signed_request_as(
+                stranger,
+                Method::PUT,
+                &format!("/api/v1/repos/{owner}/repmut-pub/replicas"),
+                body(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "public-repo registration stays open to any authenticated replica"
+        );
+
+        // Owner self-registration is still refused.
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::PUT,
+                &format!("/api/v1/repos/{owner}/repmut-pub/replicas"),
+                body(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "the owner still cannot register as their own replica"
+        );
+    }
+
+    /// #435 end-to-end: drive the replica mutations through the PRODUCTION
+    /// router (`app` → require_signature → handler) with real RFC-9421
+    /// signatures, so the whole verify-then-authorize stack is exercised, not
+    /// just the handler with an injected DID. A stranger on a private repo
+    /// gets the same 404 as a missing repo with nothing written; a listed
+    /// reader registers and removes itself.
+    #[sqlx::test]
+    async fn replica_mutations_enforce_visibility_through_real_signature_e2e(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+
+        let owner_kp = Keypair::generate();
+        let owner_did = owner_kp.did().to_string();
+        // Short owner form in the path keeps the signed @path byte-identical
+        // to what the node sees (no colons) while did_matches still resolves.
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let stranger_kp = Keypair::generate();
+        let reader_kp = Keypair::generate();
+        let reader_did = reader_kp.did().to_string();
+
+        let state = test_state(pool.clone()).await;
+        let mut repo = seed_repo(&owner_did, "sig-repl-priv");
+        repo.is_public = false;
+        state
+            .db
+            .create_repo(&repo)
+            .await
+            .expect("seed private repo");
+        state
+            .db
+            .set_visibility_rule(&repo.id, "/", VisibilityMode::B, &[reader_did], &owner_did)
+            .await
+            .expect("seed reader rule");
+
+        let router = app(pool).await;
+        let path = format!("/api/v1/repos/{short}/sig-repl-priv/replicas");
+        let replica_url = "https://replica.example.com/e2e";
+        let reg_body: &[u8] = br#"{"url":"https://replica.example.com/e2e"}"#;
+        let leaks = |bytes: &[u8]| {
+            let text = String::from_utf8_lossy(bytes);
+            text.contains(replica_url) || text.contains(&repo.id)
+        };
+        let signed_req = |kp: &Keypair, method: &str, body: &'static [u8]| {
+            let signed = sign_request(kp, method, &path, body);
+            Request::builder()
+                .method(method)
+                .uri(&path)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header("content-digest", signed.content_digest)
+                .header("signature-input", signed.signature_input)
+                .header("signature", signed.signature)
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        // Stranger (verified signature, not a reader) → 404, no row written.
+        let resp = router
+            .clone()
+            .oneshot(signed_req(&stranger_kp, "PUT", reg_body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a verified non-reader must not register on a private repo"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !leaks(&bytes),
+            "a denied register body must not leak the replica url or repo data"
+        );
+        assert!(
+            state.db.list_replicas(&repo.id).await.unwrap().is_empty(),
+            "a denied register must not create a replica row"
+        );
+
+        // Stranger DELETE → 404.
+        let resp = router
+            .clone()
+            .oneshot(signed_req(&stranger_kp, "DELETE", b""))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a verified non-reader must not unregister on a private repo"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !leaks(&bytes),
+            "a denied unregister body must not leak the replica url or repo data"
+        );
+
+        // Listed reader: PUT → 201, DELETE → 200.
+        let resp = router
+            .clone()
+            .oneshot(signed_req(&reader_kp, "PUT", reg_body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "a listed reader registers through the real middleware"
+        );
+        let resp = router
+            .clone()
+            .oneshot(signed_req(&reader_kp, "DELETE", b""))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a listed reader unregisters through the real middleware"
+        );
+    }
+
     /// #94 sibling: list_labels is read-visibility-gated. A public repo's labels
     /// stay anonymously listable; a private repo's label names must not leak to a
     /// non-reader (404). A listed reader of the private repo reads the label; the
@@ -1969,7 +4911,10 @@ mod tests {
                 "/api/v1/repos/{owner}/{repo}/hooks",
                 axum::routing::get(crate::api::webhooks::list_webhooks),
             )
-            .layer(axum::middleware::from_fn(crate::auth::optional_signature))
+            .layer(axum::middleware::from_fn_with_state(
+                crate::auth::SignatureBodyLimit(crate::server::SIGNED_BODY_LIMIT),
+                crate::auth::optional_signature,
+            ))
             .with_state(state);
 
         let resp = router.oneshot(req).await.unwrap();
@@ -2211,7 +5156,10 @@ mod tests {
                     "/{owner}/{repo}/info/refs",
                     axum::routing::get(crate::api::repos::git_info_refs),
                 )
-                .layer(axum::middleware::from_fn(crate::auth::optional_signature))
+                .layer(axum::middleware::from_fn_with_state(
+                    crate::auth::SignatureBodyLimit(crate::server::SIGNED_BODY_LIMIT),
+                    crate::auth::optional_signature,
+                ))
                 .with_state(state.clone())
         };
         let path = |service: &str| format!("/{short}/ir-priv.git/info/refs?service={service}");
@@ -2310,7 +5258,10 @@ mod tests {
                 "/{owner}/{repo}/git-receive-pack",
                 axum::routing::post(crate::api::repos::git_receive_pack),
             )
-            .layer(axum::middleware::from_fn(crate::auth::require_signature))
+            .layer(axum::middleware::from_fn_with_state(
+                crate::auth::SignatureBodyLimit(crate::server::SIGNED_BODY_LIMIT),
+                crate::auth::require_signature,
+            ))
             .with_state(state);
 
         let req = Request::builder()
@@ -2366,7 +5317,10 @@ mod tests {
                 "/{owner}/{repo}/git-receive-pack",
                 axum::routing::post(crate::api::repos::git_receive_pack),
             )
-            .layer(axum::middleware::from_fn(crate::auth::require_signature))
+            .layer(axum::middleware::from_fn_with_state(
+                crate::auth::SignatureBodyLimit(crate::server::SIGNED_BODY_LIMIT),
+                crate::auth::require_signature,
+            ))
             .with_state(state);
 
         let path = format!("/{short}/defrepo.git/git-receive-pack");
@@ -2423,7 +5377,10 @@ mod tests {
                     "/{owner}/{repo}/git-upload-pack",
                     axum::routing::post(crate::api::repos::git_upload_pack),
                 )
-                .layer(axum::middleware::from_fn(crate::auth::optional_signature))
+                .layer(axum::middleware::from_fn_with_state(
+                    crate::auth::SignatureBodyLimit(crate::server::SIGNED_BODY_LIMIT),
+                    crate::auth::optional_signature,
+                ))
                 .with_state(state.clone())
         };
         // A non-empty body (git-remote-gitlawb skips the POST when the body is empty).
@@ -2574,7 +5531,10 @@ mod tests {
                     "/{owner}/{repo}/info/refs",
                     axum::routing::get(crate::api::repos::git_info_refs),
                 )
-                .layer(axum::middleware::from_fn(crate::auth::optional_signature))
+                .layer(axum::middleware::from_fn_with_state(
+                    crate::auth::SignatureBodyLimit(crate::server::SIGNED_BODY_LIMIT),
+                    crate::auth::optional_signature,
+                ))
                 .with_state(state.clone())
         };
         async fn body_of(resp: axum::response::Response) -> String {
@@ -3755,7 +6715,7 @@ mod tests {
         let m = server
             .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
             .with_status(200)
-            .with_body(r#"{"Hash":"bafyshouldnothappen"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .expect(0)
             .create_async()
             .await;
@@ -3881,7 +6841,7 @@ mod tests {
         let m = server
             .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
             .with_status(200)
-            .with_body(r#"{"Hash":"bafyshouldnothappen"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .expect(0)
             .create_async()
             .await;
@@ -4071,7 +7031,7 @@ mod tests {
         let m = server
             .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
             .with_status(200)
-            .with_body(r#"{"Hash":"bafyshouldnothappen"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .expect(0)
             .create_async()
             .await;
@@ -5891,7 +8851,7 @@ mod tests {
         let m = server
             .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
             .with_status(200)
-            .with_body(r#"{"Hash":"bafyprovtest"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .expect_at_least(1)
             .create_async()
             .await;
@@ -5951,7 +8911,7 @@ mod tests {
         let m = server
             .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
             .with_status(200)
-            .with_body(r#"{"Hash":"bafyproviderhash"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .expect(2)
             .create_async()
             .await;
@@ -6210,7 +9170,7 @@ mod tests {
         let m = server
             .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
             .with_status(200)
-            .with_body(r#"{"Hash":"bafyshouldnothappen"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .expect(0)
             .create_async()
             .await;
@@ -6333,7 +9293,7 @@ mod tests {
         let m = server
             .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
             .with_status(200)
-            .with_body(r#"{"Hash":"bafyshouldnothappen"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .expect(0)
             .create_async()
             .await;
@@ -6435,7 +9395,7 @@ mod tests {
         let m = server
             .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
             .with_status(200)
-            .with_body(r#"{"Hash":"x"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .expect(0)
             .create_async()
             .await;
@@ -6499,7 +9459,7 @@ mod tests {
         server
             .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
             .with_status(200)
-            .with_body(r#"{"Hash":"x"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .expect(0)
             .create_async()
             .await;
@@ -8206,6 +11166,177 @@ mod tests {
                 .len(),
             0,
             "no source is recorded from a quarantined repo"
+        );
+    }
+
+    // ── #285 U7: the sweep skips trees whose publish is unresolved ─────────
+    //
+    // Two different things are called "quarantine" on this node. The operator
+    // status flag on the repo row, which the test above pins, and the sidecar
+    // marker beside a live tree whose publish never resolved. The sweep has
+    // never heard of the second. It does not merely read: it rewrites provider
+    // CIDs and records the repo as a source, durable state fed to the resolver,
+    // out of refs that may never become durable.
+
+    /// #285 U7, gap-driving. A KNOWN source (the row carries `repo_id`) whose
+    /// live tree is marked unresolved must be skipped before any object bytes
+    /// are read, and accounted the way a cold candidate is: retryable, so the
+    /// row is re-walked once the publish resolves.
+    #[sqlx::test]
+    async fn sweep_skips_a_source_whose_publish_is_unresolved_and_leaves_the_row_retryable(
+        pool: PgPool,
+    ) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+        let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+
+        let fx = seed_cid_repos(&slug, &short, &["swsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("swsrc.git");
+        let repo = seed_repo(&owner_did, "swsrc");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let (_raw_cid, provider_cid) =
+            seed_legacy_pin(&pool, &bare, &fx.public_oid, Some(&repo.id)).await;
+
+        // The sidecar an unresolved publish leaves beside the live tree.
+        crate::git::repo_store::quarantine_local_tree(
+            &bare,
+            "swsrc",
+            Some(&crate::git::publish::PublishAttemptId::new()),
+        );
+
+        crate::ipfs_pin::reset_legacy_repair_reads();
+        let stats = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+                &mut Default::default(),
+            ),
+        )
+        .await
+        .expect("the sweep terminates");
+
+        assert_eq!(
+            stats.repaired, 0,
+            "the sweep must not read objects out of a tree whose publish is unresolved"
+        );
+        assert_eq!(
+            crate::ipfs_pin::legacy_repair_reads(),
+            0,
+            "an unresolved tree is skipped before any object bytes are read"
+        );
+        assert_eq!(
+            stored_pin(&pool, &fx.public_oid).await.0,
+            provider_cid,
+            "the legacy key must not be rewritten from an unconfirmed tree"
+        );
+        assert_eq!(
+            stats.retryable_skips, 1,
+            "an unresolved source must be a retryable skip, like a cold one, so the row is re-walked once the publish resolves"
+        );
+
+        // THE CONTROL: the same row, the same bytes, the marker gone.
+        crate::git::repo_store::clear_quarantine(&bare, "swsrc");
+        state.db.set_pin_repair_cursor("").await.unwrap();
+        crate::ipfs_pin::reset_legacy_repair_reads();
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+                &mut Default::default(),
+            ),
+        )
+        .await
+        .expect("the second run terminates");
+        assert_eq!(
+            second.repaired, 1,
+            "once the publish resolves the same row repairs"
+        );
+    }
+
+    /// #285 U7, gap-driving. The discovery half: the row names no repo, so the
+    /// sweep goes looking for a warm holder. A holder whose publish is
+    /// unresolved must be filtered at warm-check time, before any probe, and
+    /// must never be recorded as a source.
+    #[sqlx::test]
+    async fn sweep_discovery_skips_a_warm_candidate_whose_publish_is_unresolved(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["unressrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("unressrc.git");
+        let repo = seed_repo(&owner_did, "unressrc");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        // The DB status is deliberately left alone: this candidate is healthy as
+        // far as the operator flag is concerned, and only the sidecar withholds it.
+        let (_raw_cid, provider_cid) = seed_legacy_pin(&pool, &bare, &fx.public_oid, None).await;
+        crate::git::repo_store::quarantine_local_tree(
+            &bare,
+            "unressrc",
+            Some(&crate::git::publish::PublishAttemptId::new()),
+        );
+
+        crate::ipfs_pin::reset_legacy_repair_reads();
+        let stats = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+                &mut Default::default(),
+            ),
+        )
+        .await
+        .expect("the sweep terminates");
+
+        assert_eq!(
+            stats.repaired, 0,
+            "discovery must not probe the objects of a candidate whose publish is unresolved"
+        );
+        assert_eq!(
+            crate::ipfs_pin::legacy_repair_reads(),
+            0,
+            "the marker filters the candidate at warm-check time, before any probe"
+        );
+        assert_eq!(
+            stored_pin(&pool, &fx.public_oid).await.0,
+            provider_cid,
+            "the row keeps its provider key"
+        );
+        assert_eq!(
+            state
+                .db
+                .pin_sources_for_oid(&fx.public_oid)
+                .await
+                .unwrap()
+                .len(),
+            0,
+            "no source may be recorded from an unconfirmed tree"
         );
     }
 
@@ -11679,7 +14810,10 @@ mod tests {
                 "/ipfs/{cid}",
                 axum::routing::get(crate::api::ipfs::get_by_cid),
             )
-            .layer(axum::middleware::from_fn(crate::auth::optional_signature))
+            .layer(axum::middleware::from_fn_with_state(
+                crate::auth::SignatureBodyLimit(crate::server::SIGNED_BODY_LIMIT),
+                crate::auth::optional_signature,
+            ))
             .with_state(state.clone())
     }
     async fn cid_parts(resp: axum::response::Response) -> (StatusCode, String) {
@@ -13767,6 +16901,181 @@ mod tests {
         );
     }
 
+    /// #134 R2 (split buckets): signed `/api/v1/ipfs/pins` polling must NOT debit
+    /// the CID resolver's per-IP flood brake. The pre-fix composition merged
+    /// pins under the same router as `/ipfs/{cid}`, so every signed pin
+    /// request consumed a token from `ipfs_rate_limiter` and a flood of pinned
+    /// traffic could 429 legitimate CID reads. RED before the split (pins
+    /// debited the bucket): a flood of pins followed by a CID request → 429
+    /// on the CID. GREEN after the split: the CID bucket is untouched.
+    #[sqlx::test]
+    async fn ipfs_pins_do_not_debit_the_cid_bucket(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let mut state = test_state(pool).await;
+        // Bucket size 2: any third /ipfs/{cid} request from the same IP would
+        // 429 if the bucket were touched by the preceding pin requests.
+        state.ipfs_rate_limiter = crate::rate_limit::RateLimiter::new(2, Duration::from_secs(3600));
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(600, Duration::from_secs(3600));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
+
+        // Seed a public, walk-free CID so /ipfs/{cid} serves cheaply. This
+        // matters because the proof half of the test fires a real CID request
+        // and needs the route bucket to be the only thing that can 429 it.
+        let fx = seed_cid_repos(&slug, &short, &["pinsdebit"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("pinsdebit.git");
+        let repo = seed_repo(&owner_did, "pinsdebit");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let cid = pin_cid_for(&bare, &fx.public_oid, &state.db).await;
+
+        let router = crate::server::build_router(state);
+        let peer_ip = "203.0.113.50";
+
+        // Five signed pin requests — more than the bucket — all must 200 (the
+        // pins route has no rate limit; the bucket only charges /ipfs/{cid}).
+        let pins_path = "/api/v1/ipfs/pins";
+        let pins_signed = sign_request(&kp, "GET", pins_path, b"");
+        for i in 0..5 {
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri(pins_path)
+                .header("content-digest", &pins_signed.content_digest)
+                .header("signature-input", &pins_signed.signature_input)
+                .header("signature", &pins_signed.signature)
+                .header("x-forwarded-for", peer_ip)
+                .body(Body::empty())
+                .unwrap();
+            let resp = router.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "pin request {i} must not be rate-limited even though the CID bucket is size 2"
+            );
+        }
+
+        // A subsequent /ipfs/{cid} request from the same IP must still serve
+        // 200 — the bucket was untouched by the pin traffic. (If pins had
+        // debited it, the bucket would be empty and the CID request would 429.)
+        let cid_path = format!("/ipfs/{cid}");
+        let cid_signed = sign_request(&kp, "GET", &cid_path, b"");
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(&cid_path)
+            .header("content-digest", cid_signed.content_digest)
+            .header("signature-input", cid_signed.signature_input)
+            .header("signature", cid_signed.signature)
+            .header("x-forwarded-for", peer_ip)
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the CID bucket must still have tokens — pin traffic did not debit it"
+        );
+    }
+
+    /// #134 R2 (split buckets, second half): an EXHAUSTED CID bucket must
+    /// NOT block a valid signed `/api/v1/ipfs/pins` listing. The pre-fix
+    /// composition routed pins through the same middleware stack, so a CID
+    /// flood that exhausted the bucket would 429 the pins endpoint too. RED
+    /// before the split: a CID request that 429s the bucket makes the next
+    /// pin request 429 too. GREEN after the split: pins never see this
+    /// bucket and remain servable.
+    #[sqlx::test]
+    async fn ipfs_pins_survive_an_exhausted_cid_bucket(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let mut state = test_state(pool).await;
+        // Bucket size 1: the first /ipfs/{cid} request from the IP spends the
+        // only token; the second is 429 (proves exhaustion).
+        state.ipfs_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(3600));
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(600, Duration::from_secs(3600));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
+
+        let fx = seed_cid_repos(&slug, &short, &["pinsexh"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("pinsexh.git");
+        let repo = seed_repo(&owner_did, "pinsexh");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let cid = pin_cid_for(&bare, &fx.public_oid, &state.db).await;
+
+        let router = crate::server::build_router(state);
+        let peer_ip = "203.0.113.60";
+
+        // First /ipfs/{cid} request — debits the single CID token, serves 200.
+        let cid_path = format!("/ipfs/{cid}");
+        let cid_signed = sign_request(&kp, "GET", &cid_path, b"");
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(&cid_path)
+            .header("content-digest", cid_signed.content_digest)
+            .header("signature-input", cid_signed.signature_input)
+            .header("signature", cid_signed.signature)
+            .header("x-forwarded-for", peer_ip)
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the first CID request spends the token and serves"
+        );
+
+        // Second /ipfs/{cid} request — bucket empty → 429 (proves the
+        // exhaustion is real and observable on this router). Re-sign because
+        // `SignedHeaders` holds owned `String`s.
+        let cid_signed_2 = sign_request(&kp, "GET", &cid_path, b"");
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(&cid_path)
+            .header("content-digest", cid_signed_2.content_digest)
+            .header("signature-input", cid_signed_2.signature_input)
+            .header("signature", cid_signed_2.signature)
+            .header("x-forwarded-for", peer_ip)
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the second CID request from the same IP is 429 — bucket exhausted"
+        );
+
+        // A signed /api/v1/ipfs/pins request from the SAME IP must still
+        // serve 200 — pins are auth-only and never see this bucket.
+        let pins_path = "/api/v1/ipfs/pins";
+        let pins_signed = sign_request(&kp, "GET", pins_path, b"");
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(pins_path)
+            .header("content-digest", pins_signed.content_digest)
+            .header("signature-input", pins_signed.signature_input)
+            .header("signature", pins_signed.signature)
+            .header("x-forwarded-for", peer_ip)
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "an exhausted CID bucket must not block a valid signed pin listing"
+        );
+    }
+
     /// U5 (R6): the two buckets are independent — the WORK budget can be exhausted
     /// (429) WITHOUT draining the ROUTE bucket. Through the production router, route
     /// generous (5) but work tight (1): one request drives two legacy probes, so the
@@ -14362,6 +17671,236 @@ mod tests {
         assert!(resp.status().is_success());
     }
 
+    /// #344: `remove_label` must canonicalize the path segment the same way
+    /// `add_label` does, so a label stored as `bug` is matched by `DELETE
+    /// .../labels/Bug`. A delete that matched nothing must be reported as 404
+    /// rather than as `removed:true` — the no-op-rendered-as-success shape the
+    /// rest of the API already rejects on the client side.
+    #[sqlx::test]
+    async fn remove_label_canonicalizes_and_404s_on_no_match(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zLBLREMOVEO0000000000000000000000000000000000";
+        let owner_short = "zLBLREMOVEO0000000000000000000000000000000000";
+        let repo_name = "lbl-remove";
+        state
+            .db
+            .create_repo(&seed_repo(owner, repo_name))
+            .await
+            .expect("seed repo");
+        state
+            .db
+            .add_label(
+                &state
+                    .db
+                    .get_repo(owner_short, repo_name)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                "bug",
+            )
+            .await
+            .expect("seed label");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/labels/{label}",
+                    axum::routing::delete(crate::api::labels::remove_label),
+                )
+                .with_state(state.clone())
+        };
+
+        // Mixed-case path segment matches the lowercased stored label.
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner_short}/{repo_name}/labels/Bug"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "canonicalized delete succeeds"
+        );
+        let body = json_body(resp).await;
+        assert_eq!(body["label"], "bug");
+        assert_eq!(body["removed"], true);
+
+        // Second delete with the same form → no row, must 404 not 200/removed:true.
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner_short}/{repo_name}/labels/Bug"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "no-op delete must report 404, not removed:true"
+        );
+
+        // Path with surrounding whitespace still canonicalizes to a valid label.
+        state
+            .db
+            .add_label(
+                &state
+                    .db
+                    .get_repo(owner_short, repo_name)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                "feature",
+            )
+            .await
+            .expect("seed feature label");
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner_short}/{repo_name}/labels/%20feature%20"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "trimmed path segment matches the stored label"
+        );
+
+        // Path segment that canonicalizes to an invalid (empty) label → 400.
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner_short}/{repo_name}/labels/%20%20"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a label that canonicalizes to empty is a client error"
+        );
+
+        // Disallowed charset → 400 (validation lives in the shared path now).
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner_short}/{repo_name}/labels/bad%20label"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "spaces are rejected by canonicalize_label"
+        );
+
+        // Length arm: 51 chars → 400, 50 chars decouples the no-match 404 from
+        // the double-delete above so the helper's len>50 branch is pinned
+        // even if the earlier 404 assertion is ever reworked.
+        let too_long = "a".repeat(51);
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner_short}/{repo_name}/labels/{too_long}"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "51-char label is rejected by canonicalize_label"
+        );
+
+        let exactly_50 = "a".repeat(50);
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner_short}/{repo_name}/labels/{exactly_50}"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "50-char label passes validation but still 404s when absent"
+        );
+    }
+
+    /// #344: `remove_label` stays owner-gated. A non-owner with a real signed
+    /// request against a label that does exist gets 403, never 404 — the
+    /// owner-gated write keeps the existence-leak shape separate from the
+    /// not-found shape (matches `add_label` and the AGENTS.md gate rules).
+    #[sqlx::test]
+    async fn remove_label_denies_non_owner(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zLBLRMOwnr0000000000000000000000000000000000";
+        let owner_short = "zLBLRMOwnr0000000000000000000000000000000000";
+        let stranger = "did:key:zLBLRMStrn0000000000000000000000000000000000";
+        let repo_name = "lbl-rm-priv";
+        state
+            .db
+            .create_repo(&seed_repo(owner, repo_name))
+            .await
+            .expect("seed repo");
+        let repo_id = state
+            .db
+            .get_repo(owner_short, repo_name)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        state
+            .db
+            .add_label(&repo_id, "bug")
+            .await
+            .expect("seed label");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/labels/{label}",
+                    axum::routing::delete(crate::api::labels::remove_label),
+                )
+                .with_state(state.clone())
+        };
+        let resp = router()
+            .oneshot(signed_request_as(
+                stranger,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner_short}/{repo_name}/labels/bug"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "non-owner gets 403, the owner-gated mutation shape"
+        );
+
+        // Label is still there.
+        let labels = state.db.list_labels(&repo_id).await.unwrap();
+        assert!(labels.contains(&"bug".to_string()));
+    }
+
     #[sqlx::test]
     async fn list_repo_bounties_gate_denies_anon_on_private(pool: PgPool) {
         let state = test_state(pool).await;
@@ -14736,6 +18275,204 @@ mod tests {
         assert!(resp.status().is_success());
     }
 
+    // ── #341: the id-keyed bounty mutations must gate on repo read before the
+    // status and participant checks, so a caller holding an opaque id cannot
+    // distinguish an existing private-repo bounty from an absent one. The deny
+    // shape is 404 with a "not found" body, identical to the absent-id case.
+
+    fn seed_bounty(
+        id: &str,
+        owner: &str,
+        repo: &str,
+        status: &str,
+        claimant: Option<&str>,
+    ) -> crate::db::BountyRecord {
+        crate::db::BountyRecord {
+            id: id.into(),
+            repo_owner: owner.into(),
+            repo_name: repo.into(),
+            issue_id: None,
+            title: "Bounty".into(),
+            amount: 100,
+            creator_did: owner.into(),
+            claimant_did: claimant.map(str::to_string),
+            claimant_wallet: None,
+            pr_id: None,
+            status: status.into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            claimed_at: claimant.map(|_| "2026-01-02T00:00:00Z".into()),
+            submitted_at: None,
+            completed_at: None,
+            deadline_secs: 86400,
+            tx_hash: None,
+        }
+    }
+
+    fn signed_bounty_post(kp: &Keypair, uri: &str, body: &[u8]) -> Request<Body> {
+        let signed = gitlawb_core::http_sig::sign_request(kp, "POST", uri, body);
+        Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("content-digest", signed.content_digest)
+            .header("signature-input", signed.signature_input)
+            .header("signature", signed.signature)
+            .body(Body::from(body.to_vec()))
+            .unwrap()
+    }
+
+    /// Drives one bounty mutation route as a stranger against a private repo and
+    /// asserts the denial is indistinguishable from the absent-id case: same
+    /// 404 status, same "not found" body shape, no status or participant detail.
+    /// `bounty_status` is whichever lifecycle state reaches the route's
+    /// participant check today, so the assertion exercises the deepest leak.
+    async fn assert_bounty_mutation_denies_stranger_on_private(
+        pool: PgPool,
+        route: &str,
+        bounty_status: &str,
+        body: &[u8],
+    ) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zB341PRIVOWNERAAAAAAAAAAAAAAAAAAAAAAAA";
+        let claimant = "did:key:zB341PRIVCLAIMANTAAAAAAAAAAAAAAAAAAAAA";
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "secret-bounty-repo"))
+            .await
+            .unwrap();
+        state
+            .db
+            .create_bounty(&seed_bounty(
+                "b341-held-id",
+                owner,
+                "secret-bounty-repo",
+                bounty_status,
+                Some(claimant),
+            ))
+            .await
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let stranger = Keypair::generate();
+
+        // Held id: the stranger knows the bounty id but cannot read the repo.
+        let held_uri = format!("/api/v1/bounties/b341-held-id/{route}");
+        let resp = router
+            .clone()
+            .oneshot(signed_bounty_post(&stranger, &held_uri, body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "{route} on a held private-repo bounty id must deny as 404, not a \
+             distinguishable status/participant error"
+        );
+        let held_body = json_body(resp).await;
+
+        // Absent id: the control case. The body must carry the same not_found
+        // shape so a denial discloses nothing beyond the caller-supplied id.
+        let absent_uri = format!("/api/v1/bounties/b341-no-such-id/{route}");
+        let resp = router
+            .oneshot(signed_bounty_post(&stranger, &absent_uri, body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let absent_body = json_body(resp).await;
+
+        for (id, got) in [
+            ("b341-held-id", &held_body),
+            ("b341-no-such-id", &absent_body),
+        ] {
+            assert_eq!(
+                *got,
+                serde_json::json!({
+                    "error": "not_found",
+                    "message": format!("bounty {id} not found"),
+                }),
+                "{route} denial body for {id} must be the bare not-found shape, got {got}"
+            );
+        }
+    }
+
+    #[sqlx::test]
+    async fn submit_bounty_gate_denies_stranger_on_private(pool: PgPool) {
+        assert_bounty_mutation_denies_stranger_on_private(
+            pool,
+            "submit",
+            "claimed",
+            br#"{"pr_id":"owner/repo#1"}"#,
+        )
+        .await;
+    }
+
+    #[sqlx::test]
+    async fn approve_bounty_gate_denies_stranger_on_private(pool: PgPool) {
+        assert_bounty_mutation_denies_stranger_on_private(pool, "approve", "submitted", b"{}")
+            .await;
+    }
+
+    #[sqlx::test]
+    async fn cancel_bounty_gate_denies_stranger_on_private(pool: PgPool) {
+        assert_bounty_mutation_denies_stranger_on_private(pool, "cancel", "open", b"").await;
+    }
+
+    #[sqlx::test]
+    async fn dispute_bounty_gate_denies_stranger_on_private(pool: PgPool) {
+        assert_bounty_mutation_denies_stranger_on_private(pool, "dispute", "claimed", b"").await;
+    }
+
+    /// The read gate must admit readable repos: on a PUBLIC repo a stranger
+    /// still reaches the participant checks, so the four routes answer 403
+    /// rather than the gated 404.
+    #[sqlx::test]
+    async fn bounty_mutation_gates_still_reach_participant_check_on_public(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zB341PUBOWNERAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let claimant = "did:key:zB341PUBCLAIMANTAAAAAAAAAAAAAAAAAAAAAA";
+        let mut repo = seed_private_repo(owner, "public-bounty-repo");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.unwrap();
+
+        let cases: [(&str, &str, &[u8]); 4] = [
+            ("submit", "claimed", br#"{"pr_id":"owner/repo#1"}"#),
+            ("approve", "submitted", b"{}"),
+            ("cancel", "open", b""),
+            ("dispute", "claimed", b""),
+        ];
+        for (i, (_, status, _)) in cases.iter().enumerate() {
+            let id = format!("b341-pub-{i}");
+            state
+                .db
+                .create_bounty(&seed_bounty(
+                    &id,
+                    owner,
+                    "public-bounty-repo",
+                    status,
+                    Some(claimant),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let router = crate::server::build_router(state);
+        let stranger = Keypair::generate();
+        for (i, (route, _, body)) in cases.iter().enumerate() {
+            let id = format!("b341-pub-{i}");
+            let uri = format!("/api/v1/bounties/{id}/{route}");
+            let resp = router
+                .clone()
+                .oneshot(signed_bounty_post(&stranger, &uri, body))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "{route} on a public repo must still reach the participant check"
+            );
+        }
+    }
+
     #[sqlx::test]
     async fn list_all_bounties_filters_private_repos_for_anon(pool: PgPool) {
         let state = test_state(pool).await;
@@ -14854,6 +18591,626 @@ mod tests {
             bounties.len(),
             0,
             "anon should see 0 bounties from private repo even with 2 entries"
+        );
+    }
+
+    // ── #477: bounty stats aggregates ignore repo visibility ──────────────────
+
+    #[sqlx::test]
+    async fn bounty_stats_filters_private_repos_for_anon(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zSTATSBOUNTYOWNERAAAAAAAAAAAAAAAAAAAA";
+        let agent_private = "did:key:zSTATSPRIVATECLAIMANT00000000000";
+        let agent_public = "did:key:zSTATSPUBLICCLAIMANT000000000000";
+
+        // Private repo with 1 open and 1 completed bounty
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "private-repo"))
+            .await
+            .unwrap();
+        state
+            .db
+            .create_bounty(&crate::db::BountyRecord {
+                id: "bounty-priv-open".into(),
+                repo_owner: owner.into(),
+                repo_name: "private-repo".into(),
+                issue_id: None,
+                title: "Private Open".into(),
+                amount: 100,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            })
+            .await
+            .unwrap();
+        // Drive the private completed bounty through the real claim/approve path
+        // so `claimant_did` and `completed_at` are actually persisted (#477 P1).
+        state
+            .db
+            .create_bounty(&crate::db::BountyRecord {
+                id: "bounty-priv-comp".into(),
+                repo_owner: owner.into(),
+                repo_name: "private-repo".into(),
+                issue_id: None,
+                title: "Private Completed".into(),
+                amount: 500,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: "2026-01-02T00:00:00Z".into(),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            })
+            .await
+            .unwrap();
+        state
+            .db
+            .claim_bounty(
+                "bounty-priv-comp",
+                agent_private,
+                None,
+                "2026-01-02T01:00:00Z",
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .submit_bounty("bounty-priv-comp", "pr-priv-1", "2026-01-02T02:00:00Z")
+            .await
+            .unwrap();
+        state
+            .db
+            .approve_bounty("bounty-priv-comp", "2026-01-03T00:00:00Z", None)
+            .await
+            .unwrap();
+
+        // Public repo with 1 open and 1 completed bounty
+        let mut public_repo = seed_private_repo(owner, "public-repo");
+        public_repo.is_public = true;
+        state.db.create_repo(&public_repo).await.unwrap();
+        state
+            .db
+            .create_bounty(&crate::db::BountyRecord {
+                id: "bounty-pub-open".into(),
+                repo_owner: owner.into(),
+                repo_name: "public-repo".into(),
+                issue_id: None,
+                title: "Public Open".into(),
+                amount: 200,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: "2026-01-04T00:00:00Z".into(),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            })
+            .await
+            .unwrap();
+        // Drive the public completed bounty through claim→submit→approve.
+        state
+            .db
+            .create_bounty(&crate::db::BountyRecord {
+                id: "bounty-pub-comp".into(),
+                repo_owner: owner.into(),
+                repo_name: "public-repo".into(),
+                issue_id: None,
+                title: "Public Completed".into(),
+                amount: 300,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: "2026-01-05T00:00:00Z".into(),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            })
+            .await
+            .unwrap();
+        state
+            .db
+            .claim_bounty(
+                "bounty-pub-comp",
+                agent_public,
+                None,
+                "2026-01-05T01:00:00Z",
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .submit_bounty("bounty-pub-comp", "pr-pub-1", "2026-01-05T02:00:00Z")
+            .await
+            .unwrap();
+        state
+            .db
+            .approve_bounty("bounty-pub-comp", "2026-01-06T00:00:00Z", None)
+            .await
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(anon_get("/api/v1/bounties/stats"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+
+        // Anonymous observer must only see counts from the public repo (#477)
+        assert_eq!(
+            body["open"], 1,
+            "only 1 public open bounty should be counted"
+        );
+        assert_eq!(
+            body["completed"], 1,
+            "only 1 public completed bounty should be counted"
+        );
+        let leaders = body["leaderboard"].as_array().unwrap();
+        assert_eq!(
+            leaders.len(),
+            1,
+            "leaderboard must exclude private earnings"
+        );
+        assert_eq!(leaders[0]["did"], agent_public);
+        assert_eq!(leaders[0]["completed"], 1);
+        assert_eq!(leaders[0]["total_earned"], 300);
+    }
+
+    #[sqlx::test]
+    async fn agent_bounty_stats_filters_private_repos_for_anon(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zAGNTSTATSBOWNERAAAAAAAAAAAAAAAAAAAA";
+        let agent = "did:key:zAGNTSTATSAAGENT000000000000000000";
+
+        // Private repo where agent earned a bounty
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "agent-secret-repo"))
+            .await
+            .unwrap();
+        // Drive through the real claim path so claimant_did persists.
+        state
+            .db
+            .create_bounty(&crate::db::BountyRecord {
+                id: "bounty-secret-agent".into(),
+                repo_owner: owner.into(),
+                repo_name: "agent-secret-repo".into(),
+                issue_id: None,
+                title: "Secret Task".into(),
+                amount: 750,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            })
+            .await
+            .unwrap();
+        state
+            .db
+            .claim_bounty("bounty-secret-agent", agent, None, "2026-01-01T01:00:00Z")
+            .await
+            .unwrap();
+        state
+            .db
+            .submit_bounty("bounty-secret-agent", "pr-secret-1", "2026-01-01T02:00:00Z")
+            .await
+            .unwrap();
+        state
+            .db
+            .approve_bounty("bounty-secret-agent", "2026-01-02T00:00:00Z", None)
+            .await
+            .unwrap();
+
+        // Public repo where the SAME agent also earned a bounty: proves the
+        // filter admits public earnings rather than always returning zero.
+        let mut public_repo = seed_private_repo(owner, "agent-public-repo");
+        public_repo.is_public = true;
+        state.db.create_repo(&public_repo).await.unwrap();
+        state
+            .db
+            .create_bounty(&crate::db::BountyRecord {
+                id: "bounty-public-agent".into(),
+                repo_owner: owner.into(),
+                repo_name: "agent-public-repo".into(),
+                issue_id: None,
+                title: "Public Task".into(),
+                amount: 250,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: "2026-01-03T00:00:00Z".into(),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            })
+            .await
+            .unwrap();
+        state
+            .db
+            .claim_bounty("bounty-public-agent", agent, None, "2026-01-03T01:00:00Z")
+            .await
+            .unwrap();
+        state
+            .db
+            .submit_bounty("bounty-public-agent", "pr-pub-1", "2026-01-03T02:00:00Z")
+            .await
+            .unwrap();
+        state
+            .db
+            .approve_bounty("bounty-public-agent", "2026-01-04T00:00:00Z", None)
+            .await
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let uri = format!("/api/v1/agents/{agent}/bounties");
+        let resp = router.oneshot(anon_get(&uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+
+        // Anonymous query must not leak private earnings, but must still admit
+        // the agent's public earnings (not an always-zero over-denial).
+        assert_eq!(
+            body["completed_bounties"], 1,
+            "only the public completed bounty must be counted"
+        );
+        assert_eq!(
+            body["total_earned"], 250,
+            "only the public bounty's earnings must be counted, not the private 750"
+        );
+    }
+
+    fn open_bounty_on(id: &str, owner: &str, repo: &str, amount: i64) -> crate::db::BountyRecord {
+        crate::db::BountyRecord {
+            id: id.into(),
+            repo_owner: owner.into(),
+            repo_name: repo.into(),
+            issue_id: None,
+            title: id.into(),
+            amount,
+            creator_did: owner.into(),
+            claimant_did: None,
+            claimant_wallet: None,
+            pr_id: None,
+            status: "open".into(),
+            created_at: "2026-03-01T00:00:00Z".into(),
+            claimed_at: None,
+            submitted_at: None,
+            completed_at: None,
+            deadline_secs: 86400,
+            tx_hash: None,
+        }
+    }
+
+    /// `claimant_did` is stored in whatever form the claimer sent, so the
+    /// per-agent lookup must match both `did:key:<key>` and the bare key for
+    /// either spelling of the request path.
+    #[sqlx::test]
+    async fn agent_bounty_stats_matches_full_and_bare_claimant_forms(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zCLAIMFORMOWNERAAAAAAAAAAAAAAAAAAAA";
+        let bare = "zCLAIMFORMAGENT0000000000000000000";
+        let full = format!("did:key:{bare}");
+
+        let mut repo = seed_private_repo(owner, "claim-form-repo");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.unwrap();
+
+        for (id, claimant, amount) in [("cf-full", full.as_str(), 100), ("cf-bare", bare, 30)] {
+            state
+                .db
+                .create_bounty(&open_bounty_on(id, owner, "claim-form-repo", amount))
+                .await
+                .unwrap();
+            state
+                .db
+                .claim_bounty(id, claimant, None, "2026-03-01T01:00:00Z")
+                .await
+                .unwrap();
+            state
+                .db
+                .submit_bounty(id, "pr-cf", "2026-03-01T02:00:00Z")
+                .await
+                .unwrap();
+            state
+                .db
+                .approve_bounty(id, "2026-03-02T00:00:00Z", None)
+                .await
+                .unwrap();
+        }
+
+        let router = crate::server::build_router(state);
+        for path_did in [full.as_str(), bare] {
+            let uri = format!("/api/v1/agents/{path_did}/bounties");
+            let resp = router.clone().oneshot(anon_get(&uri)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = json_body(resp).await;
+            assert_eq!(
+                body["completed_bounties"], 2,
+                "both claimant spellings must count for path {path_did}"
+            );
+            assert_eq!(
+                body["total_earned"], 130,
+                "both claimant spellings must be summed for path {path_did}"
+            );
+        }
+    }
+
+    /// A database failure must surface as an error status, never as a 200
+    /// carrying zero counts that read as confirmed absence of activity.
+    #[sqlx::test]
+    async fn bounty_stats_db_failure_is_not_reported_as_zero(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        let router = crate::server::build_router(state);
+        pool.close().await;
+
+        for uri in [
+            "/api/v1/bounties/stats",
+            "/api/v1/agents/did:key:zDBFAILAGENTAAAAAAAAAAAAAAAAAAAAA/bounties",
+        ] {
+            let resp = router.clone().oneshot(anon_get(uri)).await.unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::OK,
+                "{uri} must not report zero counts when the database is down"
+            );
+            assert!(resp.status().is_server_error(), "{uri}: {}", resp.status());
+        }
+    }
+
+    /// Mirror rows are written with `is_public = true` and no replicated rules,
+    /// so a mirror alone says nothing about the origin's visibility. The
+    /// aggregates must (a) hide bounties of a repo whose canonical twin is
+    /// private (the dedup keeps the canonical row and its rules), and (b) count
+    /// bounties of a mirror-only repo, which is how `authorize_repo_read` and
+    /// `/stats` already treat it. Both classes are pinned here.
+    #[sqlx::test]
+    async fn bounty_stats_mirror_rows_follow_canonical_twin_or_count_when_alone(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zMIRRORTWINOWNERAAAAAAAAAAAAAAAAAAA";
+        let short = owner.strip_prefix("did:key:").unwrap();
+        let remote = "did:key:zMIRRORONLYOWNERAAAAAAAAAAAAAAAAAAA";
+        let remote_short = remote.strip_prefix("did:key:").unwrap();
+
+        // Canonical private repo plus a mirror row for the same (owner, name).
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "twinned"))
+            .await
+            .unwrap();
+        state
+            .db
+            .upsert_mirror_repo(short, "twinned", "/tmp/mirror-twinned", None, false)
+            .await
+            .unwrap();
+        state
+            .db
+            .create_bounty(&open_bounty_on("bounty-twinned", owner, "twinned", 10))
+            .await
+            .unwrap();
+
+        // Mirror-only repo: no canonical twin on this node.
+        state
+            .db
+            .upsert_mirror_repo(remote_short, "alone", "/tmp/mirror-alone", None, false)
+            .await
+            .unwrap();
+        state
+            .db
+            .create_bounty(&open_bounty_on("bounty-alone", remote, "alone", 20))
+            .await
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(anon_get("/api/v1/bounties/stats"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(
+            body["open"], 1,
+            "only the mirror-only repo's bounty counts; the private canonical twin's must not"
+        );
+    }
+
+    /// Exercises the root-rule branch of `listable_at_root`: a repo with
+    /// `is_public = true` plus a root visibility rule (`path_glob = "/"`)
+    /// whose `reader_dids` does NOT include the anonymous caller.  The rule
+    /// takes precedence over `is_public`, so the repo's bounties must be
+    /// excluded from anonymous aggregates.
+    #[sqlx::test]
+    async fn bounty_stats_root_rule_overrides_is_public(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zROOTRULEOWNERAAAAAAAAAAAAAAAAAAAAA";
+        let insider = "did:key:zROOTRULEINSIDERAAAAAAAAAAAAAAAAA";
+        let agent = "did:key:zROOTRULEAGENT0AAAAAAAAAAAAAAAAAAA";
+
+        // Public repo with a root rule that restricts to `insider` only.
+        // `is_public = true`, but the root rule makes it anonymous-invisible.
+        let mut repo = seed_private_repo(owner, "restricted-public");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.unwrap();
+        state
+            .db
+            .set_visibility_rule(
+                &repo.id,
+                "/",
+                crate::db::VisibilityMode::A,
+                &[insider.to_string()],
+                owner,
+            )
+            .await
+            .unwrap();
+
+        // Open bounty on the root-rule-restricted repo.
+        state
+            .db
+            .create_bounty(&crate::db::BountyRecord {
+                id: "bounty-rootrule-open".into(),
+                repo_owner: owner.into(),
+                repo_name: "restricted-public".into(),
+                issue_id: None,
+                title: "Root Rule Open".into(),
+                amount: 400,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: "2026-02-01T00:00:00Z".into(),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            })
+            .await
+            .unwrap();
+
+        // Completed bounty, driven through claim→submit→approve.
+        state
+            .db
+            .create_bounty(&crate::db::BountyRecord {
+                id: "bounty-rootrule-comp".into(),
+                repo_owner: owner.into(),
+                repo_name: "restricted-public".into(),
+                issue_id: None,
+                title: "Root Rule Completed".into(),
+                amount: 600,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: "2026-02-02T00:00:00Z".into(),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            })
+            .await
+            .unwrap();
+        state
+            .db
+            .claim_bounty("bounty-rootrule-comp", agent, None, "2026-02-02T01:00:00Z")
+            .await
+            .unwrap();
+        state
+            .db
+            .submit_bounty(
+                "bounty-rootrule-comp",
+                "pr-rootrule-1",
+                "2026-02-02T02:00:00Z",
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .approve_bounty("bounty-rootrule-comp", "2026-02-03T00:00:00Z", None)
+            .await
+            .unwrap();
+
+        // Truly public repo (no root rule) as a control.
+        let mut control = seed_private_repo(owner, "truly-public");
+        control.is_public = true;
+        state.db.create_repo(&control).await.unwrap();
+        state
+            .db
+            .create_bounty(&crate::db::BountyRecord {
+                id: "bounty-control-open".into(),
+                repo_owner: owner.into(),
+                repo_name: "truly-public".into(),
+                issue_id: None,
+                title: "Control Open".into(),
+                amount: 100,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: "2026-02-04T00:00:00Z".into(),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            })
+            .await
+            .unwrap();
+
+        let router = crate::server::build_router(state.clone());
+        let resp = router
+            .oneshot(anon_get("/api/v1/bounties/stats"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+
+        // Anonymous caller must see only the control repo's bounty, not the
+        // root-rule-restricted repo's bounties — even though is_public = true.
+        assert_eq!(
+            body["open"], 1,
+            "root-rule-restricted repo's open bounty must be excluded"
+        );
+        assert_eq!(
+            body["completed"], 0,
+            "root-rule-restricted repo's completed bounty must be excluded"
+        );
+        let leaders = body["leaderboard"].as_array().unwrap();
+        assert!(
+            leaders.is_empty(),
+            "leaderboard must not show earnings from root-rule-restricted repo"
+        );
+
+        // Also verify agent bounty stats for the root-rule-restricted repo's claimant
+        let router = crate::server::build_router(state);
+        let resp_agent = router
+            .oneshot(anon_get(&format!("/api/v1/agents/{agent}/bounties")))
+            .await
+            .unwrap();
+        assert_eq!(resp_agent.status(), StatusCode::OK);
+        let body_agent = json_body(resp_agent).await;
+        assert_eq!(
+            body_agent["completed_bounties"], 0,
+            "root-rule-restricted repo's completed bounty must not count for agent"
+        );
+        assert_eq!(
+            body_agent["total_earned"], 0,
+            "root-rule-restricted repo's earnings must not count for agent"
         );
     }
 
@@ -15694,7 +20051,9 @@ mod tests {
             let _m = server
                 .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
                 .with_status(200)
-                .with_body(r#"{"Hash":"bafyprovider"}"#)
+                .with_body(
+                    r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#,
+                )
                 .expect_at_least(1)
                 .create_async()
                 .await;
@@ -15762,7 +20121,9 @@ mod tests {
             let _m = server
                 .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
                 .with_status(200)
-                .with_body(r#"{"Hash":"bafyprovider"}"#)
+                .with_body(
+                    r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#,
+                )
                 .expect_at_least(1)
                 .create_async()
                 .await;
@@ -15830,7 +20191,9 @@ mod tests {
             let _m = server
                 .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
                 .with_status(200)
-                .with_body(r#"{"Hash":"bafyprovider"}"#)
+                .with_body(
+                    r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#,
+                )
                 .expect_at_least(1)
                 .create_async()
                 .await;
@@ -15900,7 +20263,9 @@ mod tests {
             let _m = server
                 .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
                 .with_status(200)
-                .with_body(r#"{"Hash":"bafyprovider"}"#)
+                .with_body(
+                    r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#,
+                )
                 .expect_at_least(1)
                 .create_async()
                 .await;
@@ -15941,65 +20306,6 @@ mod tests {
             use super::*;
             use crate::api::repos::drain_faults;
 
-            /// Process-wide tracing capture so a test can assert the give-up is logged at
-            /// ERROR. A global default subscriber can only be installed once per process,
-            /// so it is shared by every test here and assertions filter on the repo id,
-            /// which is a fresh uuid per test.
-            mod logcap {
-                use std::sync::{Arc, Mutex, OnceLock};
-                use tracing::{Event, Level, Subscriber};
-                use tracing_subscriber::layer::{Context, Layer};
-                use tracing_subscriber::prelude::*;
-
-                type Lines = Arc<Mutex<Vec<(Level, String)>>>;
-
-                fn lines() -> &'static Lines {
-                    static LINES: OnceLock<Lines> = OnceLock::new();
-                    LINES.get_or_init(|| Arc::new(Mutex::new(Vec::new())))
-                }
-
-                struct Capture;
-                impl<S: Subscriber> Layer<S> for Capture {
-                    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-                        struct V(String);
-                        impl tracing::field::Visit for V {
-                            fn record_debug(
-                                &mut self,
-                                field: &tracing::field::Field,
-                                value: &dyn std::fmt::Debug,
-                            ) {
-                                self.0.push_str(&format!(" {}={:?}", field.name(), value));
-                            }
-                        }
-                        let mut v = V(String::new());
-                        event.record(&mut v);
-                        lines()
-                            .lock()
-                            .unwrap()
-                            .push((*event.metadata().level(), v.0));
-                    }
-                }
-
-                pub(super) fn install() {
-                    static ONCE: OnceLock<()> = OnceLock::new();
-                    ONCE.get_or_init(|| {
-                        let _ = tracing::subscriber::set_global_default(
-                            tracing_subscriber::registry().with(Capture),
-                        );
-                    });
-                }
-
-                pub(super) fn errors_containing(needle: &str) -> Vec<String> {
-                    lines()
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .filter(|(lvl, msg)| *lvl == Level::ERROR && msg.contains(needle))
-                        .map(|(_, msg)| msg.clone())
-                        .collect()
-                }
-            }
-
             /// SCENARIO 1. The repo re-read fails once, then succeeds: the drain lap
             /// must still RUN, under the refreshed state, and pin the coalesced push's
             /// object. RED before the fix (the single `Err` returned `None`, the lap
@@ -16023,7 +20329,9 @@ mod tests {
                 let _m = server
                     .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
                     .with_status(200)
-                    .with_body(r#"{"Hash":"bafyprovider"}"#)
+                    .with_body(
+                        r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#,
+                    )
                     .expect_at_least(1)
                     .create_async()
                     .await;
@@ -16065,11 +20373,11 @@ mod tests {
             }
 
             /// SCENARIO 2. Every re-read attempt fails: the loop must give up on a BOUND
-            /// (asserted as a literal, so raising or removing the bound goes RED) and log
-            /// the give-up at ERROR so the residual loss is observable rather than silent.
+            /// (asserted as a literal, so raising or removing the bound goes RED) and hit
+            /// the give-up path that logs at ERROR in production (asserted here via the
+            /// drain_faults seam, which fires on the same branch as that log).
             #[sqlx::test]
             async fn u2_sustained_repo_reread_failure_is_bounded_and_logged(pool: PgPool) {
-                logcap::install();
                 let state = test_state(pool).await;
                 let owner = new_did();
                 let repo = seed_repo(&owner, "u2-bounded");
@@ -16085,7 +20393,9 @@ mod tests {
                 let _m = server
                     .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
                     .with_status(200)
-                    .with_body(r#"{"Hash":"bafyprovider"}"#)
+                    .with_body(
+                        r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#,
+                    )
                     .expect_at_least(1)
                     .create_async()
                     .await;
@@ -16120,11 +20430,10 @@ mod tests {
                     !state.db.is_pinned(&obj2).await.unwrap(),
                     "with the read never succeeding there is nothing fresh to act on"
                 );
-                let errs = logcap::errors_containing(&repo.id);
                 assert!(
-                    !errs.is_empty(),
-                    "the exhausted drain re-read is logged at ERROR with the repo id, so \
-                     the residual work loss is observable; captured: {errs:?}"
+                    drain_faults::reread_exhausted(&repo.id),
+                    "the exhausted drain re-read must hit the give-up path that logs at \
+                     ERROR in production"
                 );
                 assert!(
                     state.encrypt_inflight.is_empty(),
@@ -16222,7 +20531,9 @@ mod tests {
                 let _m = server
                     .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
                     .with_status(200)
-                    .with_body(r#"{"Hash":"bafyprovider"}"#)
+                    .with_body(
+                        r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#,
+                    )
                     .expect_at_least(1)
                     .create_async()
                     .await;
@@ -16301,7 +20612,9 @@ mod tests {
                 let _m = server
                     .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
                     .with_status(200)
-                    .with_body(r#"{"Hash":"bafyprovider"}"#)
+                    .with_body(
+                        r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#,
+                    )
                     .expect_at_least(1)
                     .create_async()
                     .await;
@@ -16362,7 +20675,9 @@ mod tests {
                 let _m = server
                     .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
                     .with_status(200)
-                    .with_body(r#"{"Hash":"bafyprovider"}"#)
+                    .with_body(
+                        r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#,
+                    )
                     .expect_at_least(1)
                     .create_async()
                     .await;
@@ -16461,7 +20776,9 @@ mod tests {
                 let _m = server
                     .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
                     .with_status(200)
-                    .with_body(r#"{"Hash":"bafyprovider"}"#)
+                    .with_body(
+                        r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#,
+                    )
                     .expect_at_least(1)
                     .create_async()
                     .await;
@@ -16547,7 +20864,9 @@ mod tests {
                 let _m = server
                     .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
                     .with_status(200)
-                    .with_body(r#"{"Hash":"bafyprovider"}"#)
+                    .with_body(
+                        r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#,
+                    )
                     .expect_at_least(1)
                     .create_async()
                     .await;
@@ -16609,5 +20928,577 @@ mod tests {
                 );
             }
         }
+    }
+    // ── Pre-auth body buffering in `require_signature` ───────────────────────
+    //
+    // `require_signature` buffers the whole body BEFORE it verifies anything, so
+    // an unauthenticated caller could make the node hold an arbitrary amount of
+    // memory just by opening a request. Nothing upstream bounded it: on the git
+    // write routes `RequestBodyLimitLayer` sits on the INNER router (a later
+    // `.layer()` is the OUTER service, so auth runs first and sees the raw body),
+    // and on the other eight signed groups axum's 2 MB `DefaultBodyLimit` only
+    // works through the extractors, which this middleware bypasses by collecting
+    // the body itself.
+    //
+    // Every test below asserts on bytes ACTUALLY POLLED out of the body, not just
+    // the status code: a status-only assertion passes whether or not the body was
+    // drained, which is exactly the failure mode being fixed.
+
+    /// A streaming body of `total` bytes in `chunk`-sized frames that counts the
+    /// bytes a consumer actually pulls out of it. The counter is the measurement
+    /// the drain assertions rest on.
+    fn counting_body(total: usize, chunk: usize) -> (Body, std::sync::Arc<AtomicUsize>) {
+        let polled = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = polled.clone();
+        let stream = futures::stream::unfold(0usize, move |sent| {
+            let counter = counter.clone();
+            async move {
+                if sent >= total {
+                    return None;
+                }
+                let n = chunk.min(total - sent);
+                counter.fetch_add(n, Ordering::SeqCst);
+                Some((
+                    Ok::<_, std::convert::Infallible>(bytes::Bytes::from(vec![0u8; n])),
+                    sent + n,
+                ))
+            }
+        });
+        (Body::from_stream(stream), polled)
+    }
+
+    /// Frame size for the counting bodies. `Limited` rejects on the frame that
+    /// carries the total past the limit, and that frame has already been polled,
+    /// so the drain assertions allow exactly one frame of slack over the limit.
+    const DRAIN_CHUNK: usize = 8 * 1024;
+
+    /// A test state whose git routes are capped at `max_pack_bytes`, so an
+    /// oversize push body is a few hundred KiB rather than gigabytes.
+    fn state_with_pack_limit(mut state: AppState, max_pack_bytes: usize) -> AppState {
+        use clap::Parser;
+        state.config = Arc::new(crate::config::Config::parse_from([
+            "gitlawb-node",
+            "--max-pack-bytes",
+            &max_pack_bytes.to_string(),
+        ]));
+        state
+    }
+
+    /// Scenario 1, the regression test for the probe that found this: an UNSIGNED
+    /// POST to `/{owner}/{repo}/git-receive-pack` with a body far larger than the
+    /// configured `GITLAWB_MAX_PACK_BYTES`. Before the fix this drained all 4 MiB
+    /// into memory and then returned 401 (no DID, no signature, no repo needed).
+    #[tokio::test]
+    async fn unsigned_oversize_push_is_not_drained_into_memory() {
+        const LIMIT: usize = 64 * 1024;
+        let state = state_with_pack_limit(test_state_lazy(), LIMIT);
+        let router = crate::server::build_router(state);
+
+        let (body, polled) = counting_body(4 * 1024 * 1024, DRAIN_CHUNK);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/zowner/repo/git-receive-pack")
+            .body(body)
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        let drained = polled.load(Ordering::SeqCst);
+        assert!(
+            drained <= LIMIT + DRAIN_CHUNK,
+            "unsigned push must stop reading at the pack limit, drained {drained} of 4 MiB \
+             against a {LIMIT}-byte limit"
+        );
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "an over-limit body is rejected as too large"
+        );
+    }
+
+    /// Scenario 2: the same hole on a non-git signed group. These eight groups
+    /// have no `RequestBodyLimitLayer` at all and rely on axum's 2 MB default,
+    /// which the middleware's own `collect()` bypasses.
+    #[tokio::test]
+    async fn unsigned_oversize_profile_write_is_not_drained_into_memory() {
+        let router = crate::server::build_router(test_state_lazy());
+
+        let (body, polled) = counting_body(6 * 1024 * 1024, DRAIN_CHUNK);
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/v1/profile")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        let drained = polled.load(Ordering::SeqCst);
+        assert!(
+            drained <= crate::server::SIGNED_BODY_LIMIT + DRAIN_CHUNK,
+            "non-git signed routes stop reading at the 2 MB default, drained {drained}"
+        );
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// Scenario 5: the over-limit rejection is distinguishable. It is neither the
+    /// 401 an unsigned request gets nor the 400 an unreadable body gets, so a
+    /// client can tell "too big" from "not authenticated".
+    #[tokio::test]
+    async fn over_limit_is_413_not_401_or_400() {
+        const LIMIT: usize = 64 * 1024;
+        let state = state_with_pack_limit(test_state_lazy(), LIMIT);
+        let router = crate::server::build_router(state);
+
+        let (body, _polled) = counting_body(LIMIT * 4, DRAIN_CHUNK);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/zowner/repo/git-receive-pack")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let status = resp.status();
+        assert_ne!(status, StatusCode::UNAUTHORIZED, "size, not identity");
+        assert_ne!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "size, not an unreadable body"
+        );
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// Scenario 6, degenerate cases: an empty body and a body exactly at the limit
+    /// are both under the cap, so they fall through to the existing signature
+    /// check and get the same 401 they always did.
+    #[tokio::test]
+    async fn empty_and_exactly_at_limit_bodies_behave_as_before() {
+        const LIMIT: usize = 64 * 1024;
+        let state = state_with_pack_limit(test_state_lazy(), LIMIT);
+
+        let resp = crate::server::build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/zowner/repo/git-receive-pack")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "an empty unsigned body still fails at the signature check, not the limit"
+        );
+
+        let (body, polled) = counting_body(LIMIT, DRAIN_CHUNK);
+        let resp = crate::server::build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/zowner/repo/git-receive-pack")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            polled.load(Ordering::SeqCst),
+            LIMIT,
+            "a body exactly at the limit is read in full"
+        );
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "exactly at the limit is allowed through to the signature check"
+        );
+    }
+
+    /// Scenario 3, the discriminator: without it the fix could "pass" by rejecting
+    /// everything. A correctly signed push just under `max_pack_bytes` must clear
+    /// the limit AND the signature check with its body intact, which means the
+    /// full body was read (content-digest is computed over it) and the request
+    /// reached the handler. The handler then 404s because no repo was seeded,
+    /// which is the first thing `git_receive_pack` does after auth.
+    #[sqlx::test]
+    async fn signed_push_just_under_the_pack_limit_still_reaches_the_handler(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+
+        const LIMIT: usize = 256 * 1024;
+        let state = state_with_pack_limit(test_state(pool).await, LIMIT);
+        let kp = Keypair::generate();
+        let short = kp
+            .did()
+            .to_string()
+            .split(':')
+            .next_back()
+            .unwrap()
+            .to_string();
+
+        // Just under the cap, and signed over the exact bytes so content-digest
+        // verification proves the middleware handed the body through unmodified.
+        let payload = vec![0u8; LIMIT - 1];
+        let path = format!("/{short}/pushrepo/git-receive-pack");
+        let signed = sign_request(&kp, "POST", &path, &payload);
+        let len = payload.len();
+
+        let resp = crate::server::build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&path)
+                    .header("content-digest", signed.content_digest)
+                    .header("signature-input", signed.signature_input)
+                    .header("signature", signed.signature)
+                    .body(Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a {len}-byte push under a {LIMIT}-byte cap must not be rejected as too large"
+        );
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "auth passed with the body intact; the handler 404s on the unseeded repo"
+        );
+    }
+
+    /// Scenario 4: a correctly signed, in-limit request on a non-git signed route
+    /// still succeeds end to end, so the 2 MB constant did not narrow anything
+    /// that used to work.
+    #[sqlx::test]
+    async fn signed_in_limit_profile_write_still_succeeds(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+
+        let kp = Keypair::generate();
+        let did = kp.did().to_string();
+        let payload =
+            serde_json::to_vec(&serde_json::json!({ "display_name": "limit-probe" })).unwrap();
+        let signed = sign_request(&kp, "PUT", "/api/v1/profile", &payload);
+
+        let resp = crate::server::build_router(test_state(pool).await)
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/v1/profile")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .header("content-digest", signed.content_digest)
+                    .header("signature-input", signed.signature_input)
+                    .header("signature", signed.signature)
+                    .body(Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "signed in-limit write succeeds"
+        );
+        let body = json_body(resp).await;
+        assert_eq!(body["did"], did);
+        assert_eq!(body["display_name"], "limit-probe");
+    }
+
+    // ── The buffered body must reach git byte-for-byte ──────────────────────
+    //
+    // Scenario 3 above proves a large signed push clears the limit and the
+    // signature check, but it stops at the handler's repo lookup. That leaves one
+    // hole: middleware that truncated or reordered the buffered body past some
+    // threshold would still pass it, because nothing downstream ever consumed the
+    // bytes. The two tests below close it by driving a REAL `git push` request
+    // into a REAL bare repo and asserting on the refs that land on disk.
+
+    /// Removes a fixed path on drop, so a failing assertion still cleans up.
+    /// `repo_store::for_testing` pins the on-disk layout to `/tmp/<slug>/<name>.git`,
+    /// so these paths cannot be `tempfile::TempDir` randoms.
+    struct PushDirGuard(std::path::PathBuf);
+
+    impl Drop for PushDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// What [`real_push_fixture`] hands back: the exact request bytes a git client
+    /// sends, the commit that push carries, and the empty bare repo it targets.
+    struct PushFixture {
+        body: Vec<u8>,
+        new_sha: String,
+        bare: std::path::PathBuf,
+        _guards: Vec<PushDirGuard>,
+    }
+
+    /// Build a real push: a source repo holding one commit with `payload` bytes of
+    /// incompressible content, an EMPTY bare repo at the exact path `repo_store`
+    /// will write to, and the `git-receive-pack` request body a real `git push`
+    /// produces for it.
+    ///
+    /// The body is captured off the wire from a throwaway local server rather than
+    /// hand-assembled, so the limit tests drive the bytes a client actually sends
+    /// (pkt-line command list, flush, then the pack) instead of an approximation
+    /// that real `git receive-pack` might reject for unrelated reasons.
+    async fn real_push_fixture(owner_did: &str, name: &str, payload: usize) -> PushFixture {
+        use std::process::Command;
+
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        let slug = owner_did.replace([':', '/'], "_");
+        let mut guards = Vec::new();
+
+        // Source repo with one commit. The content is incompressible so the pack
+        // stays close to `payload`: a file of zeros would deflate to nothing and
+        // the request would never approach the limit under test.
+        let src = std::env::temp_dir().join(format!("gl-push-src-{slug}-{name}"));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        guards.push(PushDirGuard(src.clone()));
+        run(&["init", "-q", "-b", "main"], &src);
+        run(&["config", "user.email", "t@t"], &src);
+        run(&["config", "user.name", "t"], &src);
+        let mut blob = Vec::with_capacity(payload);
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        while blob.len() < payload {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            blob.extend_from_slice(&x.to_le_bytes());
+        }
+        blob.truncate(payload);
+        std::fs::write(src.join("big.bin"), &blob).unwrap();
+        run(&["add", "big.bin"], &src);
+        run(&["commit", "-qm", "big"], &src);
+        let new_sha = run(&["rev-parse", "HEAD"], &src);
+
+        // Empty bare repo at the path repo_store.acquire_write() resolves to.
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join(format!("{name}.git"));
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        run(&["init", "-q", "--bare", bare.to_str().unwrap()], &src);
+        guards.push(PushDirGuard(bare.clone()));
+
+        // Capture server: advertises the real (empty) bare repo so the client
+        // computes a genuine old→new command list, and records the POST body.
+        let adv_repo = bare.clone();
+        let captured: Arc<std::sync::Mutex<Vec<u8>>> = Arc::default();
+        let sink = captured.clone();
+        let app = Router::new()
+            .route(
+                "/repo.git/info/refs",
+                axum::routing::get(move || {
+                    let repo = adv_repo.clone();
+                    async move {
+                        // `info_refs` gained a git binary, a service timeout and an
+                        // admission guard on main while this branch was out; this
+                        // capture server wants none of them bounded, so it passes the
+                        // default binary, a generous timeout and no admission.
+                        crate::git::smart_http::info_refs(
+                            "git",
+                            "git-receive-pack",
+                            &repo,
+                            std::time::Duration::from_secs(600),
+                            None,
+                        )
+                        .await
+                        .expect("advertise refs")
+                    }
+                }),
+            )
+            .route(
+                "/repo.git/git-receive-pack",
+                axum::routing::post(move |body: bytes::Bytes| {
+                    let sink = sink.clone();
+                    async move {
+                        *sink.lock().unwrap() = body.to_vec();
+                        StatusCode::OK
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let push_src = src.clone();
+        tokio::task::spawn_blocking(move || {
+            // The capture server answers with an empty body, so git reports a
+            // disconnect once it has sent the request. The request is all we want
+            // here, so the exit status is deliberately not asserted.
+            let _ = Command::new("git")
+                .args([
+                    "push",
+                    &format!("http://127.0.0.1:{port}/repo.git"),
+                    "HEAD:refs/heads/main",
+                ])
+                .current_dir(&push_src)
+                .output()
+                .expect("git push runs");
+        })
+        .await
+        .unwrap();
+        server.abort();
+
+        let body = captured.lock().unwrap().clone();
+        assert!(
+            body.windows(4).any(|w| w == b"PACK"),
+            "the captured request must carry a real pack, got {} bytes",
+            body.len()
+        );
+        PushFixture {
+            body,
+            new_sha,
+            bare,
+            _guards: guards,
+        }
+    }
+
+    /// Read a ref out of a bare repo, or `None` when it does not exist.
+    fn bare_ref(bare: &std::path::Path, name: &str) -> Option<String> {
+        let out = std::process::Command::new("git")
+            .args(["--git-dir", bare.to_str().unwrap(), "rev-parse", name])
+            .output()
+            .expect("git runs");
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    /// The discriminator with teeth: a signed push of a real ~300 KiB pack against
+    /// a limit just above it must not only return 200, it must LAND. Asserting on
+    /// the ref that appears in the bare repo is what catches a middleware that
+    /// buffers the body but hands a truncated or reordered copy downstream, which
+    /// a status-only assertion cannot see.
+    #[sqlx::test]
+    async fn signed_large_push_under_the_limit_lands_on_disk(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let fixture = real_push_fixture(&owner_did, "bigpush-ok", 300 * 1024).await;
+        let len = fixture.body.len();
+        assert!(
+            len > 256 * 1024,
+            "the fixture push must be many frames long to exercise the limit, got {len} bytes"
+        );
+
+        // The cap sits just above this push, so passing means the limit admitted a
+        // body it was sized for, not that the limit was slack.
+        let state = state_with_pack_limit(test_state(pool).await, len + 1024);
+        state
+            .db
+            .create_repo(&seed_repo(&owner_did, "bigpush-ok"))
+            .await
+            .expect("seed repo");
+
+        let path = format!("/{short}/bigpush-ok.git/git-receive-pack");
+        let signed = sign_request(&kp, "POST", &path, &fixture.body);
+        let resp = crate::server::build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&path)
+                    .header("content-digest", signed.content_digest)
+                    .header("signature-input", signed.signature_input)
+                    .header("signature", signed.signature)
+                    .body(Body::from(fixture.body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a {len}-byte push under a {}-byte cap must be served",
+            len + 1024
+        );
+        assert_eq!(
+            bare_ref(&fixture.bare, "refs/heads/main").as_deref(),
+            Some(fixture.new_sha.as_str()),
+            "the push must take effect: refs/heads/main points at the pushed commit"
+        );
+        assert!(
+            bare_ref(&fixture.bare, &format!("{}^{{tree}}", fixture.new_sha)).is_some(),
+            "the pushed objects must be present, not just the ref"
+        );
+    }
+
+    /// The negative twin: the same real push against a cap one byte below it is
+    /// rejected 413, and the repo is untouched. A partial write here would mean
+    /// the middleware forwarded a prefix of an over-limit body.
+    #[sqlx::test]
+    async fn signed_large_push_over_the_limit_is_rejected_and_writes_nothing(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let fixture = real_push_fixture(&owner_did, "bigpush-over", 300 * 1024).await;
+        let len = fixture.body.len();
+
+        let state = state_with_pack_limit(test_state(pool).await, len - 1);
+        state
+            .db
+            .create_repo(&seed_repo(&owner_did, "bigpush-over"))
+            .await
+            .expect("seed repo");
+
+        let path = format!("/{short}/bigpush-over.git/git-receive-pack");
+        let signed = sign_request(&kp, "POST", &path, &fixture.body);
+        let resp = crate::server::build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&path)
+                    .header("content-digest", signed.content_digest)
+                    .header("signature-input", signed.signature_input)
+                    .header("signature", signed.signature)
+                    .body(Body::from(fixture.body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a {len}-byte push against a {}-byte cap is too large",
+            len - 1
+        );
+        assert_eq!(
+            bare_ref(&fixture.bare, "refs/heads/main"),
+            None,
+            "a rejected push must leave no ref behind"
+        );
+        // Peel to `^{commit}`: `rev-parse` echoes a bare 40-hex SHA back without
+        // checking that the object exists, so only the peeled form is evidence.
+        assert_eq!(
+            bare_ref(&fixture.bare, &format!("{}^{{commit}}", fixture.new_sha)),
+            None,
+            "a rejected push must leave no objects behind"
+        );
     }
 }

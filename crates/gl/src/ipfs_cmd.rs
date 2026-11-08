@@ -1,6 +1,6 @@
 //! `gl ipfs` — IPFS pin management commands.
 //!
-//! Communicates with the gitlawb node to list pinned CIDs and retrieve git
+//! Communicates with the Twigpine node to list pinned CIDs and retrieve git
 //! objects by their content-addressed CID.
 
 use std::path::PathBuf;
@@ -22,7 +22,11 @@ pub struct IpfsArgs {
 pub enum IpfsCmd {
     /// List all CIDs pinned to the node's local IPFS daemon
     List {
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         /// Identity directory (default: ~/.gitlawb)
         #[arg(long)]
@@ -69,7 +73,11 @@ pub enum IpfsCmd {
     Get {
         /// The CIDv1 string (e.g. bafkrei...)
         cid: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         /// Identity directory (default: ~/.gitlawb)
         #[arg(long)]
@@ -123,11 +131,7 @@ async fn cmd_list(node: String, dir: Option<PathBuf>) -> Result<()> {
         let sha = pin["sha256_hex"].as_str().unwrap_or("?");
         let pinned_at = pin["pinned_at"].as_str().unwrap_or("?");
         // Trim pinned_at to date+time without subseconds
-        let ts = if pinned_at.len() >= 19 {
-            &pinned_at[..19]
-        } else {
-            pinned_at
-        };
+        let ts = crate::text::truncate(pinned_at, 19);
         println!("  {cid}");
         println!("    sha256: {sha}");
         println!("    pinned: {ts}");
