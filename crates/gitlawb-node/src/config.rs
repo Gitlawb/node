@@ -284,6 +284,29 @@ pub struct Config {
     #[arg(long, env = "GITLAWB_SHUTDOWN_GRACE_SECS", default_value_t = 30)]
     pub shutdown_grace_secs: u64,
 
+    /// Maximum number of creation requests (repo create, issue create, PR
+    /// create, register, fork) allowed per DID within the rate-limit window.
+    /// 0 is rejected at parse time: it would silently disable the limiter
+    /// (RateLimiter treats max_requests == 0 as allow-all), not block every
+    /// creation request.
+    #[arg(
+        long,
+        env = "GITLAWB_RATE_LIMIT_MAX",
+        default_value_t = 10,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub rate_limit_max_requests: u32,
+
+    /// Rate-limit window size, in seconds, over which
+    /// `rate_limit_max_requests` applies. 0 is rejected at parse time: every
+    /// timestamp would prune immediately, silently disabling the limiter.
+    #[arg(
+        long,
+        env = "GITLAWB_RATE_LIMIT_WINDOW_SECS",
+        default_value_t = 3600,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub rate_limit_window_secs: u64,
     /// Maximum wall-clock time a single served git operation (upload-pack /
     /// receive-pack through `run_git_service`) may run before it is aborted and
     /// its process group torn down, in seconds. Bounds a git that neither

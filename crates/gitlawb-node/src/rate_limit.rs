@@ -70,6 +70,14 @@ impl RateLimiter {
         self.window.min(Duration::from_secs(1))
     }
 
+    /// The configured window, exposed so a 429 can carry an honest
+    /// `retry-after`: a hardcoded value lies when the operator retunes the
+    /// window, and a client that honors the header would retry into another
+    /// 429 until the real window elapses.
+    pub fn window(&self) -> Duration {
+        self.window
+    }
+
     pub(crate) async fn check(&self, key: &str) -> bool {
         // max_requests == 0 means the limiter is disabled, not "block all".
         if self.max_requests == 0 {
@@ -293,12 +301,7 @@ pub async fn rate_limit_by_did(request: Request, next: Next) -> Response {
 
     if let (Some(limiter), Some(did)) = (limiter, did) {
         if !limiter.check(&did).await {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                [("retry-after", "60")],
-                RATE_LIMIT_MESSAGE,
-            )
-                .into_response();
+            return too_many_requests(limiter.window().as_secs());
         }
     }
 
@@ -409,10 +412,10 @@ pub const RATE_LIMIT_MESSAGE: &str = "rate limit exceeded — try again later";
 /// The shared 429 response for the per-IP flood brakes. Route-agnostic: this
 /// middleware now serves the push path AND the peer-sync routes, so the message
 /// stays generic (the offending path is recorded in the warn log below).
-pub fn too_many_requests() -> Response {
+pub fn too_many_requests(retry_after_secs: u64) -> Response {
     (
         StatusCode::TOO_MANY_REQUESTS,
-        [("retry-after", "60")],
+        [("retry-after", retry_after_secs.to_string())],
         RATE_LIMIT_MESSAGE,
     )
         .into_response()
@@ -481,7 +484,7 @@ pub async fn rate_limit_by_ip(request: Request, next: Next) -> Response {
         if let Some(key) = client_key(request.headers(), peer, limiter.trust) {
             if !limiter.limiter.check(&key).await {
                 tracing::warn!(key = %key, path = %request.uri().path(), "per-IP rate limit exceeded");
-                return too_many_requests();
+                return too_many_requests(limiter.limiter.window().as_secs());
             }
         }
     }

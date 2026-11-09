@@ -357,9 +357,14 @@ async fn main() -> Result<()> {
     );
 
     // Per-DID limiter for the creation endpoints. Keyed on the authenticated
-    // DID (attacker-varied), so bound its key set to cap memory.
-    let rate_limiter =
-        rate_limit::RateLimiter::new_bounded(10, std::time::Duration::from_secs(3600), 200_000);
+    // DID (attacker-varied), so bound its key set to cap memory. Max and window
+    // are operator-configurable via GITLAWB_RATE_LIMIT_MAX /
+    // GITLAWB_RATE_LIMIT_WINDOW_SECS; both reject 0 at parse time.
+    let rate_limiter = rate_limit::RateLimiter::new_bounded(
+        config.rate_limit_max_requests as usize,
+        std::time::Duration::from_secs(config.rate_limit_window_secs),
+        200_000,
+    );
 
     // Per-client-IP flood brake for the creation endpoints. The per-DID limiter
     // above is bypassed by a DID farm (one throwaway did:key per repo), which is
