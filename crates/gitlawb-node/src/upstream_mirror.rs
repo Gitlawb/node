@@ -737,22 +737,45 @@ esac
         assert!(!command.args.iter().any(|arg| arg == "+refs/*:refs/*"));
     }
 
+    /// Spawn `git` inside a fixture repo with inherited repository-location
+    /// and config environment scrubbed, so a test run inside an outer Git
+    /// checkout or custom config can never leak into the fixture.
+    fn fixture_git(dir: &std::path::Path) -> std::process::Command {
+        let mut cmd = std::process::Command::new("git");
+        cmd.current_dir(dir);
+        for var in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_CONFIG",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_CONFIG_COUNT",
+            "GIT_EXEC_PATH",
+            "GIT_SSH",
+            "GIT_SSH_COMMAND",
+            "GIT_ASKPASS",
+            "SSH_ASKPASS",
+        ] {
+            cmd.env_remove(var);
+        }
+        cmd
+    }
+
     #[test]
     fn repository_local_instead_of_rewrite_is_rejected() {
         let repo = tempfile::tempdir().unwrap();
-        let init = std::process::Command::new("git")
+        let init = fixture_git(repo.path())
             .args(["init", "--bare"])
-            .current_dir(repo.path())
             .output()
             .unwrap();
         assert!(init.status.success());
-        let config = std::process::Command::new("git")
+        let config = fixture_git(repo.path())
             .args([
                 "config",
                 "url.https://evil.example/.insteadOf",
                 "https://github.example/",
             ])
-            .current_dir(repo.path())
             .output()
             .unwrap();
         assert!(config.status.success());
@@ -770,9 +793,8 @@ esac
     #[test]
     fn repository_local_network_and_credential_config_is_rejected() {
         let repo = tempfile::tempdir().unwrap();
-        let init = std::process::Command::new("git")
+        let init = fixture_git(repo.path())
             .args(["init", "--bare"])
-            .current_dir(repo.path())
             .output()
             .unwrap();
         assert!(init.status.success());
@@ -780,9 +802,8 @@ esac
         reject_sensitive_local_config("git", repo.path(), Instant::now() + Duration::from_secs(5))
             .unwrap();
 
-        let config = std::process::Command::new("git")
+        let config = fixture_git(repo.path())
             .args(["config", "http.sslCert", "/tmp/untrusted-client.pem"])
-            .current_dir(repo.path())
             .output()
             .unwrap();
         assert!(config.status.success());
@@ -800,9 +821,8 @@ esac
     #[test]
     fn hardened_real_git_reaches_https_transport_for_equals_path() {
         let repo = tempfile::tempdir().unwrap();
-        let init = std::process::Command::new("git")
+        let init = fixture_git(repo.path())
             .args(["init", "--bare"])
-            .current_dir(repo.path())
             .output()
             .unwrap();
         assert!(init.status.success());
