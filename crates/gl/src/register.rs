@@ -72,7 +72,10 @@ pub async fn run(args: RegisterArgs) -> Result<()> {
             "did": did.to_string(),
             "saved_at": chrono::Utc::now().to_rfc3339(),
         });
-        std::fs::write(&ucan_path, serde_json::to_string_pretty(&record)?)?;
+        crate::secret_file::write(
+            &ucan_path,
+            serde_json::to_string_pretty(&record)?.as_bytes(),
+        )?;
         tracing::debug!("saved UCAN to {}", ucan_path.display());
     }
 
@@ -108,7 +111,7 @@ fn ucan_path(dir: Option<&std::path::Path>) -> Result<PathBuf> {
             .context("could not determine home directory")?
             .join(".gitlawb")
     };
-    std::fs::create_dir_all(&base)?;
+    crate::secret_file::create_dir(&base)?;
     Ok(base.join("ucan.json"))
 }
 

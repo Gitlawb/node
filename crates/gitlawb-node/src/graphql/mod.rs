@@ -76,6 +76,7 @@ pub(crate) fn graphql_app_err(e: crate::error::AppError) -> async_graphql::Error
         // Curated client-safe variants — `Display` is intentional API text.
         safe @ (crate::error::AppError::RepoNotFound(_)
         | crate::error::AppError::RepoExists(_)
+        | crate::error::AppError::Conflict(_)
         | crate::error::AppError::NotFound(_)
         | crate::error::AppError::Unauthorized(_)
         | crate::error::AppError::Forbidden(_)
@@ -92,15 +93,81 @@ pub(crate) fn graphql_app_err(e: crate::error::AppError) -> async_graphql::Error
     }
 }
 
+/// Classify a failed `claim_task` for GraphQL exactly as REST's claim handler
+/// classifies it: a lost race is a client-safe conflict, a real sqlx fault
+/// stays opaque. Lives here rather than at the three call sites so the
+/// classification cannot drift between transports (#327 review), and so
+/// `every_graphql_map_err_uses_opaque_helpers` can keep whitelisting by name.
+pub(crate) fn graphql_claim_conflict(e: anyhow::Error) -> async_graphql::Error {
+    graphql_app_err(crate::api::tasks::task_write_conflict(
+        e,
+        "task not claimable: not found or already claimed",
+    ))
+}
+
+/// The `finish_task` half of [`graphql_claim_conflict`], covering both
+/// `completeTask` and `failTask`.
+pub(crate) fn graphql_finish_conflict(e: anyhow::Error) -> async_graphql::Error {
+    graphql_app_err(crate::api::tasks::task_write_conflict(
+        e,
+        "task not found or not in claimed state",
+    ))
+}
+
+pub struct TaskReadBrakeExtension;
+
+impl async_graphql::extensions::ExtensionFactory for TaskReadBrakeExtension {
+    fn create(&self) -> Arc<dyn async_graphql::extensions::Extension> {
+        Arc::new(TaskReadBrakeExtensionImpl)
+    }
+}
+
+use async_graphql::async_trait::async_trait;
+
+struct TaskReadBrakeExtensionImpl;
+
+#[async_trait]
+impl async_graphql::extensions::Extension for TaskReadBrakeExtensionImpl {
+    async fn prepare_request(
+        &self,
+        ctx: &async_graphql::extensions::ExtensionContext<'_>,
+        mut request: async_graphql::Request,
+        next: async_graphql::extensions::NextPrepareRequest<'_>,
+    ) -> async_graphql::ServerResult<async_graphql::Request> {
+        if let Some(session_brake) = ctx
+            .session_data
+            .get(&std::any::TypeId::of::<crate::rate_limit::TaskReadBrake>())
+            .and_then(|d| d.downcast_ref::<crate::rate_limit::TaskReadBrake>())
+        {
+            request = request.data(crate::rate_limit::TaskReadBrake {
+                limiter: session_brake.limiter.clone(),
+                key: session_brake.key.clone(),
+                request_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            });
+        }
+        if let Some(did) = ctx
+            .session_data
+            .get(&std::any::TypeId::of::<crate::auth::AuthenticatedDid>())
+            .and_then(|d| d.downcast_ref::<crate::auth::AuthenticatedDid>())
+        {
+            request = request.data(did.clone());
+        }
+        next.run(ctx, request).await
+    }
+}
+
 pub fn build_schema(
     db: Arc<Db>,
     ref_update_tx: tokio::sync::broadcast::Sender<RefUpdateBroadcast>,
     task_event_tx: tokio::sync::broadcast::Sender<TaskEventBroadcast>,
+    task_cursor_key: crate::api::task_cursor::TaskCursorKey,
 ) -> GitlawbSchema {
     apply_query_limits(Schema::build(QueryRoot, MutationRoot, SubscriptionRoot))
         .data(db)
         .data(ref_update_tx)
         .data(task_event_tx)
+        .data(task_cursor_key)
+        .extension(TaskReadBrakeExtension)
         .finish()
 }
 
@@ -192,6 +259,7 @@ mod tests {
             db,
             tokio::sync::broadcast::channel(1).0,
             tokio::sync::broadcast::channel(1).0,
+            crate::api::task_cursor::TaskCursorKey::derive(&[42u8; 32]),
         )
     }
 
@@ -217,6 +285,7 @@ mod tests {
             Arc::new(Db::for_testing(pool)),
             ref_tx.clone(),
             task_tx.clone(),
+            crate::api::task_cursor::TaskCursorKey::derive(&[42u8; 32]),
         );
         for count in [7, 8] {
             let fields = (0..count)
@@ -313,7 +382,10 @@ mod tests {
                 assert_eq!(response.errors.len(), 1);
                 assert_eq!(response.errors[0].message, "Query is too complex.");
                 assert_eq!(
-                    db.list_tasks(Some("pending"), None, 8).await.unwrap().len(),
+                    db.list_tasks_keyset(Some("pending"), None, 8, None)
+                        .await
+                        .unwrap()
+                        .len(),
                     8
                 );
                 continue;
@@ -330,7 +402,7 @@ mod tests {
                 7
             );
             assert_eq!(
-                db.list_tasks(Some("claimed"), Some(caller), 8)
+                db.list_tasks_keyset(Some("claimed"), Some(caller), 8, None)
                     .await
                     .unwrap()
                     .len(),
@@ -352,7 +424,7 @@ mod tests {
         // documented maximums instead of going stale as literals.
         for (field, selection, max) in [
             ("refUpdates", "repo", MAX_VISIBLE_REF_UPDATES),
-            ("tasks", "id", MAX_VISIBLE_TASK_PAGE_SIZE),
+            ("tasks", "items { id }", MAX_VISIBLE_TASK_PAGE_SIZE),
             (
                 "reposPage",
                 "nodes { name }",
@@ -595,7 +667,12 @@ mod tests {
         pool.close().await;
         let (ref_tx, _) = tokio::sync::broadcast::channel(16);
         let (task_tx, _) = tokio::sync::broadcast::channel(16);
-        let schema = build_schema(Arc::new(Db::for_testing(pool)), ref_tx, task_tx);
+        let schema = build_schema(
+            Arc::new(Db::for_testing(pool)),
+            ref_tx,
+            task_tx,
+            crate::api::task_cursor::TaskCursorKey::derive(&[42u8; 32]),
+        );
 
         // refUpdates(limit: MAX_VISIBLE_REF_UPDATES):
         // Single-field selection has child_complexity 1 -> cost 100 + 200 + 1 = 301 <= 400.
@@ -649,12 +726,12 @@ mod tests {
         );
 
         // tasks(limit: MAX_VISIBLE_TASK_PAGE_SIZE):
-        // Single-field selection has child_complexity 1, so the cost is
-        // 50 + MAX_VISIBLE_TASK_PAGE_SIZE + 1 <= 400.
+        // Selection items { id } has child_complexity 2, so the cost is
+        // 50 + MAX_VISIBLE_TASK_PAGE_SIZE + 2 <= 400.
         // It passes validation and reaches the resolver.
         let single_task = schema
             .execute(format!(
-                "{{ tasks(limit: {MAX_VISIBLE_TASK_PAGE_SIZE}) {{ id }} }}"
+                "{{ tasks(limit: {MAX_VISIBLE_TASK_PAGE_SIZE}) {{ items {{ id }} }} }}"
             ))
             .await;
         assert!(
@@ -674,14 +751,14 @@ mod tests {
             single_task.errors
         );
 
-        // Two-field selection has child_complexity 2, so the cost is
-        // 50 + MAX_VISIBLE_TASK_PAGE_SIZE + 2 <= 400.
+        // Selection items { id status } has child_complexity 3, so the cost is
+        // 50 + MAX_VISIBLE_TASK_PAGE_SIZE + 3 <= 400.
         // A request at the documented maximum stays reachable with multiple
         // fields (the old multiplicative price rejected it at 450); it passes
         // validation and reaches the resolver like the single-field case.
         let multi_task = schema
             .execute(format!(
-                "{{ tasks(limit: {MAX_VISIBLE_TASK_PAGE_SIZE}) {{ id status }} }}"
+                "{{ tasks(limit: {MAX_VISIBLE_TASK_PAGE_SIZE}) {{ items {{ id status }} }} }}"
             ))
             .await;
         assert!(
@@ -843,8 +920,10 @@ mod tests {
     }
 
     /// Every `.map_err(` in the GraphQL query/mutation resolvers must route
-    /// through the opaque helpers, or discard the error (`|_|`). Same source-
-    /// scrape pattern as `api::authz_guard` (#255 review).
+    /// through one of the curated helpers in this module, or discard the error
+    /// (`|_|`). Same source-scrape pattern as `api::authz_guard` (#255
+    /// review). The list is deliberately a whitelist of names rather than a
+    /// prefix match, so adding a new mapper is a decision a reviewer sees.
     #[test]
     fn every_graphql_map_err_uses_opaque_helpers() {
         for (file, src) in [
@@ -859,6 +938,8 @@ mod tests {
                 let after = code[idx + ".map_err(".len()..].trim_start();
                 let ok = after.starts_with("crate::graphql::graphql_db_err")
                     || after.starts_with("crate::graphql::graphql_app_err")
+                    || after.starts_with("crate::graphql::graphql_claim_conflict")
+                    || after.starts_with("crate::graphql::graphql_finish_conflict")
                     || after.starts_with("|_|")
                     || after.starts_with("|_ ");
                 assert!(
