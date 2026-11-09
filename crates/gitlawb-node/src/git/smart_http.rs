@@ -106,7 +106,7 @@ pub async fn info_refs(
 
     let mut command = Command::new(git_bin);
     command
-        .arg(service_to_command(service))
+        .arg(service_to_command(service)?)
         .arg("--stateless-rpc")
         .arg("--advertise-refs")
         .arg(repo_path);
@@ -220,6 +220,7 @@ pub fn response_served_pack(output: &[u8]) -> bool {
 ///
 /// Accepts a push. The caller MUST verify HTTP Signature auth before
 /// calling this function.
+#[allow(dead_code)] // used by tests; production uses receive_pack_raw
 pub async fn receive_pack(
     git_bin: &str,
     repo_path: &Path,
@@ -242,6 +243,219 @@ pub async fn receive_pack(
         .header("Content-Type", "application/x-git-receive-pack-result")
         .header("Cache-Control", "no-cache")
         .body(Body::from(output))?)
+}
+
+/// Run `git-receive-pack` and return the raw stdout bytes together with
+/// the process exit status. Unlike [`receive_pack`], this does NOT bail
+/// on a non-zero exit: the caller needs the stdout (which contains the
+/// report-status with per-ref ok/ng results) even when the process
+/// exits non-zero. A timeout still returns `Err`.
+///
+/// `reflog_action` (typically `gitlawb-request:<request_id>`) is
+/// exported as `GIT_REFLOG_ACTION` so the ref transaction writes
+/// request-bound landing evidence into the reflog. Recovery requires
+/// that evidence before auto-promoting a stranded row; without it a
+/// later request recreating the same old/new tuple is
+/// indistinguishable from the stranded one.
+#[allow(dead_code)]
+pub async fn receive_pack_raw(
+    git_bin: &str,
+    repo_path: &Path,
+    request_body: Bytes,
+    timeout: Duration,
+    admission: Option<AdmissionGuard>,
+) -> Result<(Vec<u8>, bool)> {
+    receive_pack_raw_with_reflog(git_bin, repo_path, request_body, timeout, admission, None).await
+}
+
+/// [`receive_pack_raw`] with explicit reflog binding.
+pub async fn receive_pack_raw_with_reflog(
+    git_bin: &str,
+    repo_path: &Path,
+    request_body: Bytes,
+    timeout: Duration,
+    admission: Option<AdmissionGuard>,
+    reflog_action: Option<&str>,
+) -> Result<(Vec<u8>, bool)> {
+    let mut command = Command::new(git_bin);
+    command
+        .arg("receive-pack")
+        .arg("--stateless-rpc")
+        .arg(repo_path);
+    if let Some(action) = reflog_action {
+        command.env("GIT_REFLOG_ACTION", action);
+    }
+    let (out, err, status, _admission) = drive_git_child_raw(
+        command,
+        request_body,
+        timeout,
+        "git-receive-pack",
+        admission,
+    )
+    .await?;
+    // On timeout, drive_git_child_raw returns Err — we never reach here.
+    // On success/non-zero exit, we have the stdout and exit status.
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&err);
+        tracing::warn!(stderr = %stderr, "git-receive-pack exited non-zero");
+    }
+    Ok((out, status.success()))
+}
+
+/// Parse the git-receive-pack report-status output to determine per-ref
+/// success/failure. Returns `(unpack_ok, per_ref_results)` where
+/// `per_ref_results` is a list of `(ref_name, is_ok)`.
+///
+/// The report-status format (after the sideband framing) is:
+/// ```text
+/// unpack ok\n          (or: unpack fail\n)
+/// ok <refname>\n       (per successful ref)
+/// ng <refname> <reason>\n  (per rejected ref)
+/// \n                   (empty line terminates)
+/// ```
+///
+/// Returns `None` if the output cannot be parsed (e.g. the client did
+/// not request report-status, or the output is truncated). In that
+/// case the caller should treat all refs as uncertain.
+pub fn parse_report_status(output: &[u8]) -> Option<(bool, Vec<(String, bool)>)> {
+    let text = std::str::from_utf8(output).ok()?;
+    // Strip sideband framing: each line starts with a pkt-line length
+    // prefix and a channel byte (1 = stdout, 2 = stderr). The actual
+    // data starts after the first `0000` flush packet or after we
+    // strip sideband bytes.
+    //
+    // Framing completeness is part of authority, at whichever level the
+    // framing lives. A double-framed capture carries the report stream
+    // (itself pkt-line framed, flush-terminated) inside the sideband
+    // envelope — real git output has been observed with NO outer flush,
+    // so the outer level cannot require one; the inner frame's flush is
+    // authoritative there. A single-framed (or unframed) payload has no
+    // inner frame, so its only completion marker is the outer flush:
+    // output ending after a complete `unpack ok` / `ok <ref>` packet but
+    // before the outer `0000` is a truncated report and yields `None`
+    // (uncertain), not a successful report.
+    let (stripped, outer_flush) = strip_sideband(text, false)?;
+    // The report-status vocabulary (`unpack ...`, `ok ...`, `ng ...`)
+    // never opens with four hex digits, so a hex quartet here is inner
+    // pkt-line framing, not report text.
+    let stripped = if stripped.len() >= 4
+        && stripped.as_bytes()[..4]
+            .iter()
+            .all(|b| b.is_ascii_hexdigit())
+    {
+        strip_sideband(&stripped, true)?.0
+    } else if !outer_flush {
+        return None;
+    } else {
+        stripped
+    };
+    // The report is framed TWICE when the client negotiated side-band-64k,
+    // which `git push` over smart HTTP does — so this is the common case, not
+    // an exotic one. The outer frame is the side-band envelope; band 1 carries
+    // the report-status stream, which is ITSELF pkt-line encoded. Real bytes
+    // from git 2.50.1 rejecting one ref of a two-ref push:
+    //
+    //   0057\x01000eunpack ok\n0028ng refs/heads/main non-fast-forward\n...
+    //
+    // After one pass the first line reads `000eunpack ok`, which fails the
+    // `unpack ok` check below and makes this return None — i.e. "no report",
+    // which the caller treats as inconclusive and keeps every declared ref.
+    // The per-ref gate would then be inert for exactly the pushes it exists to
+    // filter. The second pass above already removed the inner pkt-line
+    // framing where present (and required its flush); it is a no-op
+    // on the single-framed shape, because plain report text does not begin
+    // with four hex digits.
+    let lines: Vec<&str> = stripped.lines().collect();
+    if lines.is_empty() {
+        return None;
+    }
+
+    // First non-empty line is "unpack ok" or "unpack fail".
+    let unpack_line = lines.iter().find(|l| !l.is_empty())?;
+    let unpack_ok = if unpack_line.starts_with("unpack ok") {
+        true
+    } else if unpack_line.starts_with("unpack fail") {
+        false
+    } else {
+        return None;
+    };
+
+    let mut results = Vec::new();
+    for line in &lines[1..] {
+        let line = line.trim();
+        if line.is_empty() {
+            break;
+        }
+        if let Some(rest) = line.strip_prefix("ok ") {
+            results.push((rest.to_string(), true));
+        } else if let Some(rest) = line.strip_prefix("ng ") {
+            // "ng <refname> <reason>" — skip the reason
+            let ref_name = rest.split_whitespace().next()?.to_string();
+            results.push((ref_name, false));
+        }
+    }
+
+    Some((unpack_ok, results))
+}
+
+/// Strip git sideband framing from a pkt-line encoded output.
+/// Sideband-encoded lines start with a 4-hex-digit length, then a
+/// channel byte (0x01=stdout, 0x02=stderr), then payload. Returns the
+/// decoded payload plus whether the stream saw its terminating flush
+/// packet, or `None` if the framing is malformed. With `require_flush`,
+/// a stream that never sees its flush is also `None` — the caller uses
+/// this for the level whose completion marker is authoritative (see
+/// [`parse_report_status`]).
+fn strip_sideband(text: &str, require_flush: bool) -> Option<(String, bool)> {
+    let mut output = String::new();
+    let mut pos = 0;
+    let bytes = text.as_bytes();
+    let mut saw_flush = false;
+
+    loop {
+        if pos == bytes.len() {
+            break;
+        }
+        if pos + 4 > bytes.len() {
+            // Truncated framing mid-header: fail closed.
+            return None;
+        }
+        let len_str = std::str::from_utf8(&bytes[pos..pos + 4]).ok()?;
+        let len = usize::from_str_radix(len_str, 16).ok()?;
+        if len == 0 {
+            // Flush packet — end of sideband stream
+            saw_flush = true;
+            break;
+        }
+        if len < 4 || pos + len > bytes.len() {
+            // Truncated pkt-line extends past EOF: incomplete framing.
+            return None;
+        }
+        let pkt_data = std::str::from_utf8(&bytes[pos + 4..pos + len]).ok()?;
+        pos += len;
+
+        // Sideband: first byte is channel (1=stdout, 2=stderr)
+        if let Some(payload) = pkt_data.strip_prefix('\x01') {
+            output.push_str(payload);
+        } else if pkt_data.starts_with('\x02') {
+            // stderr — skip (git error messages)
+        } else {
+            // Not sideband encoded — pass through
+            output.push_str(pkt_data);
+        }
+    }
+
+    if require_flush && !saw_flush {
+        // Truncated at a packet boundary: every packet parsed, but the
+        // stream never completed. Indistinguishable from a report git was
+        // killed mid-write, so no authority.
+        return None;
+    }
+    if output.is_empty() {
+        None
+    } else {
+        Some((output, saw_flush))
+    }
 }
 
 /// Sends SIGTERM to a child's whole process group on drop, unless disarmed first.
@@ -426,7 +640,7 @@ async fn run_git_service(
 ) -> Result<Vec<u8>> {
     let mut command = Command::new(git_bin);
     command
-        .arg(service_to_command(service))
+        .arg(service_to_command(service)?)
         .arg("--stateless-rpc")
         .arg(repo_path);
     let (out, admission) = drive_git_child(command, input, timeout, service, admission).await?;
@@ -578,11 +792,128 @@ async fn drive_git_child(
     Ok((out, admission))
 }
 
-fn service_to_command(service: &str) -> &str {
+/// Like [`drive_git_child`], but returns stdout and stderr even on a
+/// non-zero exit status. Used by [`receive_pack_raw`] so the caller
+/// can parse the report-status output from a failed `git-receive-pack`.
+async fn drive_git_child_raw(
+    mut command: Command,
+    input: Bytes,
+    timeout: Duration,
+    what: &str,
+    admission: Option<AdmissionGuard>,
+) -> Result<(
+    Vec<u8>,
+    Vec<u8>,
+    std::process::ExitStatus,
+    Option<AdmissionGuard>,
+)> {
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = command.spawn()?;
+
+    let mut stdin = child.stdin.take();
+    let mut stdout = child.stdout.take().context("git stdout was not piped")?;
+    let mut stderr = child.stderr.take().context("git stderr was not piped")?;
+
+    #[cfg(unix)]
+    let pgid = child.id().map(|id| id as i32);
+    #[cfg(unix)]
+    let mut group_guard = KillGroupOnDrop {
+        child: Some(child),
+        pgid,
+        admission,
+    };
+
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+
+    let interact = async {
+        let write = async {
+            match stdin.take() {
+                Some(mut s) => s.write_all(&input).await,
+                None => Ok(()),
+            }
+        };
+        #[cfg(unix)]
+        let child_ref = group_guard.child_mut();
+        #[cfg(not(unix))]
+        let child_ref = &mut child;
+        let (write_result, r_out, r_err, status) = tokio::join!(
+            write,
+            stdout.read_to_end(&mut out),
+            stderr.read_to_end(&mut err),
+            child_ref.wait(),
+        );
+        r_out?;
+        r_err?;
+        Ok::<_, anyhow::Error>((write_result, status?))
+    };
+
+    let timed = tokio::time::timeout(timeout, interact).await;
+    let (write_result, status, admission) = match timed {
+        Ok(result) => {
+            #[cfg(unix)]
+            let admission = group_guard.disarm();
+            let (write_result, status) = result?;
+            (write_result, status, admission)
+        }
+        Err(_elapsed) => {
+            #[cfg(unix)]
+            {
+                reap_group_on_timeout(group_guard.child_mut()).await;
+                drop(group_guard.disarm());
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = child.start_kill();
+                let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+                drop(admission);
+            }
+            return Err(GitServiceTimeout.into());
+        }
+    };
+
+    // Prefer the child's collected answer over a stdin-write error: an early
+    // rejection (unpack failure, command-level deny) makes git print a complete
+    // report-status and exit WITHOUT draining stdin, so a body larger than the
+    // pipe buffer EPIPEs the write while the answer is already on stdout. The
+    // child is reaped (the join above waited on it), so `out`/`err`/`status`
+    // are complete and authoritative — returning Err here would discard them:
+    // `receive_pack_raw_with_reflog` would propagate the write error and the
+    // handler would mark every prepared row `uncertain` instead of driving
+    // `cancelled` per the report. That durable fate is the effect: on a
+    // non-zero exit the client still gets `Err(AppError::Git)` (the handler
+    // maps the failed run itself, not this write), while on exit 0 an error
+    // here would answer a push git actually landed with a server error. The
+    // non-raw `drive_git_child` orders the same way (exit status and git's own
+    // failure first, stdin-write error last — pinned by
+    // `run_git_service_surfaces_git_stderr_over_a_stdin_epipe`), but it must
+    // fail on non-zero because its callers do not parse output from a failed
+    // child; the raw driver exists precisely to parse that output.
+    if let Err(e) = &write_result {
+        tracing::warn!(
+            err = %e,
+            what = %what,
+            "git stdin write failed after child exit; surfacing collected output"
+        );
+    }
+
+    Ok((out, err, status, admission))
+}
+
+/// Map a validated service name to its git subcommand. Only the two fixed
+/// subcommands can come out, so an unrecognized service can never reach git's argv.
+fn service_to_command(service: &str) -> Result<&'static str> {
     match service {
-        "git-upload-pack" => "upload-pack",
-        "git-receive-pack" => "receive-pack",
-        _ => service,
+        "git-upload-pack" => Ok("upload-pack"),
+        "git-receive-pack" => Ok("receive-pack"),
+        other => bail!("unknown git service: {other}"),
     }
 }
 
@@ -865,6 +1196,104 @@ mod tests {
     use super::*;
     use std::process::Command;
     use tempfile::TempDir;
+
+    /// Byte-for-byte capture from `git receive-pack` 2.50.1 rejecting one ref of
+    /// a two-ref push, with side-band-64k negotiated — what `git push` over
+    /// smart HTTP actually sends. The report is framed twice: the outer
+    /// side-band envelope, then the report-status stream's own pkt-lines.
+    ///
+    /// This fixture is the point of the test. A hand-written single-framed
+    /// string parses fine with only one strip pass, so a fixture invented to
+    /// match the parser hides the exact case the parser is for.
+    const REAL_SIDEBAND_REPORT: &[u8] =
+        b"0057\x01000eunpack ok\n0028ng refs/heads/main non-fast-forward\n0018ok refs/heads/third\n0000";
+
+    #[test]
+    fn a_real_double_framed_sideband_report_is_read_not_treated_as_absent() {
+        let (unpack_ok, refs) =
+            parse_report_status(REAL_SIDEBAND_REPORT).expect("a real git report must parse");
+        assert!(unpack_ok, "unpack line must be read through both frames");
+        assert_eq!(
+            refs,
+            vec![
+                ("refs/heads/main".to_string(), false),
+                ("refs/heads/third".to_string(), true),
+            ],
+            "the rejected ref must be distinguished from the accepted one"
+        );
+    }
+
+    /// The single-framed shape must keep working: the second pass has to be a
+    /// no-op there, not a corruption. Plain report text does not begin with
+    /// four hex digits, which is what makes that safe.
+    #[test]
+    fn a_single_framed_report_still_parses_after_the_second_pass() {
+        // Framed programmatically rather than by a hand-counted hex prefix: a
+        // wrong length makes the parser return None, which would look exactly
+        // like the regression this pair of tests exists to catch.
+        let payload = "\x01unpack ok\nok refs/heads/x\n";
+        let single = format!("{:04x}{payload}0000", payload.len() + 4);
+        let (unpack_ok, refs) =
+            parse_report_status(single.as_bytes()).expect("single-framed must parse");
+        assert!(unpack_ok);
+        assert_eq!(refs, vec![("refs/heads/x".to_string(), true)]);
+    }
+
+    #[test]
+    fn truncated_mid_packet_report_is_indeterminate_not_partial() {
+        // Truncate a valid single-framed report mid-packet (overrun):
+        // must return None so the handler persists the whole request as
+        // indeterminate instead of committing a partial ok set.
+        let payload = "\x01unpack ok\nok refs/heads/x\n";
+        let single = format!("{:04x}{payload}0000", payload.len() + 4);
+        let truncated = &single.as_bytes()[..single.len() - 6];
+        assert!(
+            parse_report_status(truncated).is_none(),
+            "mid-packet truncation must be indeterminate"
+        );
+    }
+
+    /// Truncation exactly at a packet boundary (every packet complete, but
+    /// the outer flush never arrived — e.g. git killed after the last `ok`
+    /// line) must also be indeterminate: the payload is complete but the
+    /// frame is not, and framing completeness is part of authority. The
+    /// mid-packet sibling above cannot catch this; only the flush gate can.
+    /// Removing the `require_flush` enforcement returns `Some` and turns
+    /// this red.
+    #[test]
+    fn truncated_at_packet_boundary_report_is_indeterminate_not_partial() {
+        let payload = "\x01unpack ok\nok refs/heads/x\n";
+        let single = format!("{:04x}{payload}0000", payload.len() + 4);
+        let no_flush = &single.as_bytes()[..single.len() - 4];
+        assert!(
+            parse_report_status(no_flush).is_none(),
+            "a report missing its outer flush must be indeterminate, \
+             even with every packet intact"
+        );
+        // Sanity: the untruncated fixture still parses (flush present).
+        assert!(
+            parse_report_status(single.as_bytes()).is_some(),
+            "the same bytes with the flush must parse"
+        );
+    }
+
+    #[test]
+    fn service_to_command_maps_allowlist_and_rejects_passthrough() {
+        assert_eq!(
+            service_to_command("git-upload-pack").unwrap(),
+            "upload-pack"
+        );
+        assert_eq!(
+            service_to_command("git-receive-pack").unwrap(),
+            "receive-pack"
+        );
+        for bad in ["git-fetch-pack", "--version", "upload-pack", ""] {
+            assert!(
+                service_to_command(bad).is_err(),
+                "must reject passthrough for {bad:?}"
+            );
+        }
+    }
 
     /// List OIDs in a pack by writing it to a temp dir and running verify-pack.
     pub(super) fn pack_object_ids(pack: &[u8]) -> std::collections::HashSet<String> {
@@ -2619,6 +3048,62 @@ mod tests {
             "run_git_service must surface git's stderr (a classifiable 400), not the \
              stdin-write EPIPE (a generic 500); got: {msg}"
         );
+    }
+
+    // The raw driver's counterpart: a rejection-shaped early exit where git
+    // prints a COMPLETE report-status and exits without draining stdin, so a
+    // body larger than the pipe buffer (~64 KiB) EPIPEs the write while the
+    // answer is already on stdout. `receive_pack_raw` must surface that report
+    // (Ok + stdout + exit status), not discard it as a stdin-write error — an
+    // Err here loses parseable output: `receive_pack_raw_with_reflog`
+    // propagates it and the handler marks every prepared row `uncertain`
+    // instead of driving `cancelled` from the report (the durable fate is the
+    // effect; the client-visible status on a failed run is `AppError::Git`
+    // either way). Goes RED if the stdin-write check returns Err after the
+    // join. Both exit codes are pinned: receive-pack rejections and successes
+    // both carry reports the handler must parse.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn receive_pack_raw_surfaces_report_status_over_a_stdin_epipe() {
+        for exit_code in [0, 1] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            std::fs::write(tmp.path().join("report.bin"), REAL_SIDEBAND_REPORT).unwrap();
+            // Never reads stdin: the pending body blocks the pipe, then EPIPEs
+            // once the fake exits. `cat` delivers the report first.
+            let git_bin = write_fake_git(
+                tmp.path(),
+                &format!("#!/bin/sh\ncat \"$(dirname \"$0\")/report.bin\"\nexit {exit_code}\n"),
+            );
+            let body = Bytes::from(vec![0u8; 256 * 1024]);
+            let (out, ok) = receive_pack_raw(
+                git_bin.to_str().unwrap(),
+                tmp.path(),
+                body,
+                Duration::from_secs(60),
+                None,
+            )
+            .await
+            .expect(
+                "a report-status printed before exit must not be discarded as a \
+                 stdin-write error",
+            );
+            assert_eq!(
+                ok,
+                exit_code == 0,
+                "the exit status rides the Ok return for both report shapes"
+            );
+            let (unpack_ok, results) = parse_report_status(&out)
+                .expect("git's report survives the EPIPE and stays parseable");
+            assert!(unpack_ok, "unpack ok parses");
+            assert_eq!(
+                results,
+                vec![
+                    ("refs/heads/main".to_string(), false),
+                    ("refs/heads/third".to_string(), true),
+                ],
+                "the per-ref report reaches the handler instead of an HTTP error"
+            );
+        }
     }
 
     // ── #192 F1: response_served_pack detector (real git output) ────────────

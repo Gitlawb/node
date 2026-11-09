@@ -68,6 +68,22 @@ jobs:
       - name: Test release tag resolver
         run: scripts/test-resolve-release-tag.sh
 
+  triage-detector:
+    name: triage detector matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # pr-triage.yml runs on pull_request_target and never checks out PR
+      # code, so its inline detector can only be exercised here, where the
+      # proposed workflow body IS the checked-out one.
+      - name: Test inline-test detector
+        run: node scripts/test-pr-triage-detect.mjs
+
   test:
     name: test (${{ matrix.toolchain }})
     runs-on: ubuntu-latest
