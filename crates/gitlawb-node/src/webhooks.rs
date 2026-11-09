@@ -47,8 +47,9 @@ pub fn fire_event(
 /// (ledger is claimed before spawn), which the PR scope allows.
 ///
 /// For durable outbox usage, call `claim_webhook_delivery_before_spawn` first
-/// to claim deliveries synchronously, then call this with `skip_claim=true` and
-/// the claimed hook IDs to only spawn HTTP POST for claimed hooks.
+/// to claim deliveries synchronously, then call
+/// `fire_event_occurrence_with_claimed_hooks` with the claimed hook IDs to
+/// spawn HTTP POST only for claimed hooks.
 pub fn fire_event_occurrence(
     db: Arc<Db>,
     http_client: Arc<reqwest::Client>,
