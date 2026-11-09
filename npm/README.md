@@ -1,4 +1,4 @@
-# npm distribution for the gitlawb CLI
+# npm distribution for the Twigpine CLI
 
 This directory packages the `gl` and `git-remote-gitlawb` binaries as the
 [`@gitlawb/gl`](https://www.npmjs.com/package/@gitlawb/gl) npm package.
@@ -23,7 +23,7 @@ packages/
 Publishing is **automated** by `.github/workflows/release.yml` (the `npm-publish`
 job) on every release-please release. That job:
 
-1. Downloads the four unix release tarballs from the `Gitlawb/node` GitHub release.
+1. Downloads the four unix release tarballs from the `Twigpine/node` GitHub release.
 2. Lays `gl` + `git-remote-gitlawb` into each platform package.
 3. Rewrites every `package.json` `version` (and the wrapper's
    `optionalDependencies` pins) to the release version.

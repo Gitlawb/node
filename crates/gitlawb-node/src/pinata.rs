@@ -70,7 +70,8 @@ pub async fn pin_object(
 /// Pin any of the given candidate git objects that haven't yet been sent to
 /// Pinata.
 ///
-/// `object_list` is the already-withheld-filtered OID set to pin: the caller
+/// `object_list` is the already-withheld-filtered OID set to pin (blobs and
+/// withheld-subtree trees already dropped): the caller
 /// applies `visibility_pack::replicable_objects` on the delta path or the
 /// `..._fail_closed` filter on the full-scan path before calling. `repo_path` is
 /// still needed to read each object's bytes, and `git_bin` names the binary those
@@ -911,6 +912,7 @@ mod tests {
     /// probe carries its oid on stdin rather than in argv, so an oid appears in the log only
     /// once an object has already got past its probe, and a healthy object costs two
     /// invocations to a faulting one's one.
+    #[cfg(unix)]
     fn objects_attempted(log: &std::path::Path) -> usize {
         std::fs::read_to_string(log)
             .unwrap_or_default()

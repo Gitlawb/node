@@ -2,7 +2,6 @@
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
-use serde_json::Value;
 use std::path::PathBuf;
 
 use crate::http::NodeClient;
@@ -39,7 +38,11 @@ pub enum BountyCmd {
         /// Deadline in seconds (default 7 days)
         #[arg(long)]
         deadline: Option<i64>,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -51,7 +54,11 @@ pub enum BountyCmd {
         /// Filter by status: open, claimed, submitted, completed
         #[arg(long)]
         status: Option<String>,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -60,7 +67,11 @@ pub enum BountyCmd {
     Show {
         /// Bounty ID
         id: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -72,7 +83,11 @@ pub enum BountyCmd {
         /// Your wallet address for payout
         #[arg(long)]
         wallet: Option<String>,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -84,7 +99,11 @@ pub enum BountyCmd {
         /// Pull request ID
         #[arg(long)]
         pr: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -96,7 +115,11 @@ pub enum BountyCmd {
         /// On-chain payout tx hash
         #[arg(long)]
         tx_hash: Option<String>,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -105,14 +128,22 @@ pub enum BountyCmd {
     Cancel {
         /// Bounty ID
         id: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
     },
     /// Show bounty stats and leaderboard
     Stats {
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
     },
 }
@@ -189,13 +220,7 @@ async fn cmd_create(
         .await
         .context("failed to connect to node")?;
 
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or_default();
-
-    if !status.is_success() {
-        let msg = body["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("create bounty failed ({status}): {msg}");
-    }
+    let body = crate::http::read_json(resp, "create bounty").await?;
 
     let id = body["id"].as_str().unwrap_or("?");
     println!("Bounty created: {id}");
@@ -231,11 +256,14 @@ async fn cmd_list(
         u
     };
 
-    let resp = client
-        .get_authed(&url)
-        .await
-        .context("failed to connect to node")?;
-    let body: Value = resp.json().await.unwrap_or_default();
+    let body = crate::http::read_json(
+        client
+            .get_authed(&url)
+            .await
+            .context("failed to connect to node")?,
+        "bounties",
+    )
+    .await?;
 
     let bounties = body["bounties"].as_array();
     if let Some(arr) = bounties {
@@ -247,7 +275,7 @@ async fn cmd_list(
                 let title = b["title"].as_str().unwrap_or("?");
                 let amount = b["amount"].as_i64().unwrap_or(0);
                 let st = b["status"].as_str().unwrap_or("?");
-                let short_id = &id[..8.min(id.len())];
+                let short_id = crate::text::truncate(id, 8);
                 println!("{short_id}  {st:<10}  {amount:>12} $GITLAWB  {title}");
             }
         }
@@ -259,13 +287,7 @@ async fn cmd_show(id: String, node: String, dir: Option<PathBuf>) -> Result<()> 
     let client = signed_client(&node, dir.as_deref());
     let resp = client.get_authed(&format!("/api/v1/bounties/{id}")).await?;
 
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or_default();
-
-    if !status.is_success() {
-        let msg = body["message"].as_str().unwrap_or("not found");
-        anyhow::bail!("bounty not found: {msg}");
-    }
+    let body = crate::http::read_json(resp, "show bounty").await?;
 
     println!("{}", serde_json::to_string_pretty(&body)?);
     Ok(())
@@ -289,13 +311,7 @@ async fn cmd_claim(
         )
         .await?;
 
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or_default();
-
-    if !status.is_success() {
-        let msg = body["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("claim failed ({status}): {msg}");
-    }
+    let _ = crate::http::read_json(resp, "claim").await?;
 
     println!("Bounty {id} claimed. Deadline starts now.");
     Ok(())
@@ -314,13 +330,7 @@ async fn cmd_submit(id: String, pr: String, node: String, dir: Option<PathBuf>) 
         )
         .await?;
 
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or_default();
-
-    if !status.is_success() {
-        let msg = body["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("submit failed ({status}): {msg}");
-    }
+    let _ = crate::http::read_json(resp, "submit").await?;
 
     println!("Bounty {id} submitted with PR {pr}. Awaiting creator approval.");
     Ok(())
@@ -344,13 +354,7 @@ async fn cmd_approve(
         )
         .await?;
 
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or_default();
-
-    if !status.is_success() {
-        let msg = body["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("approve failed ({status}): {msg}");
-    }
+    let _ = crate::http::read_json(resp, "approve").await?;
 
     println!("Bounty {id} approved! Payout released to agent.");
     Ok(())
@@ -369,13 +373,7 @@ async fn cmd_cancel(id: String, node: String, dir: Option<PathBuf>) -> Result<()
         )
         .await?;
 
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or_default();
-
-    if !status.is_success() {
-        let msg = body["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("cancel failed ({status}): {msg}");
-    }
+    let _ = crate::http::read_json(resp, "cancel").await?;
 
     println!("Bounty {id} cancelled. Tokens refunded.");
     Ok(())
@@ -383,8 +381,11 @@ async fn cmd_cancel(id: String, node: String, dir: Option<PathBuf>) -> Result<()
 
 async fn cmd_stats(node: String) -> Result<()> {
     let client = NodeClient::new(&node, None);
-    let resp = client.get("/api/v1/bounties/stats").await?;
-    let body: Value = resp.json().await.unwrap_or_default();
+    // Route through read_json so a node denial (403/404/5xx, incl. a non-JSON
+    // body) surfaces as an error instead of a fake `Bounty Stats` with every
+    // counter zeroed (#186, the denial-as-success class #123 fixes elsewhere).
+    let body =
+        crate::http::read_json(client.get("/api/v1/bounties/stats").await?, "bounty stats").await?;
 
     let open = body["open"].as_i64().unwrap_or(0);
     let claimed = body["claimed"].as_i64().unwrap_or(0);
@@ -402,7 +403,7 @@ async fn cmd_stats(node: String) -> Result<()> {
                 let did = entry["did"].as_str().unwrap_or("?");
                 let count = entry["completed"].as_i64().unwrap_or(0);
                 let earned = entry["total_earned"].as_i64().unwrap_or(0);
-                let short = &did[did.len().saturating_sub(8)..];
+                let short = crate::text::truncate_suffix(did, 8);
                 println!(
                     "  {}. ...{short}  {count} bounties  {earned} $GITLAWB",
                     i + 1
@@ -521,6 +522,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"not found"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -528,6 +530,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not found"));
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy the error assertion vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -543,5 +547,87 @@ mod tests {
             .await;
 
         cmd_stats(server.url()).await.unwrap();
+    }
+
+    /// #186 (F1): a node denial on the stats endpoint must surface as an error,
+    /// not print a fake `Bounty Stats` with every counter zeroed. RED before the
+    /// fix (unwrap_or_default + no status check -> Ok with zeros), GREEN after
+    /// (read_json bails on the non-2xx).
+    #[tokio::test]
+    async fn cmd_stats_surfaces_denial_not_fake_result() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("GET", mockito::Matcher::Regex(r"/stats$".to_string()))
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"forbidden"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let err = cmd_stats(server.url())
+            .await
+            .expect_err("a 403 must be an error, not a zeroed fake result");
+        assert!(err.to_string().contains("403"), "err={err}");
+        // Pin the mock hit explicitly. The status assertion above already fails
+        // when the route does not match (mockito answers an unmatched route with
+        // 501, so "403" is absent), but that proof is incidental to mockito's
+        // fallback status; assert the hit directly so it survives a reworded
+        // assertion.
+        m.assert_async().await;
+    }
+
+    /// #186 (F1): the same denial-as-error behavior across the non-2xx response
+    /// classes, not just 403 — a 404 and a 500 (incl. a non-JSON body) must each
+    /// surface as an error with the status, never a zeroed fake result.
+    #[tokio::test]
+    async fn cmd_stats_surfaces_denial_across_status_classes() {
+        for (status, body, json) in [
+            (404, r#"{"message":"not found"}"#, true),
+            (500, "internal boom", false),
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let mut m = server
+                .mock("GET", mockito::Matcher::Regex(r"/stats$".to_string()))
+                .with_status(status)
+                .with_body(body);
+            if json {
+                m = m.with_header("content-type", "application/json");
+            }
+            let m = m.expect(1).create_async().await;
+
+            let err = cmd_stats(server.url()).await.unwrap_err().to_string();
+            assert!(
+                err.contains(&status.to_string()),
+                "status {status} must surface as an error, got: {err}"
+            );
+            m.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cmd_list_repo_scoped_surfaces_denial_not_empty() {
+        // `gl bounty list --repo owner/name` hits the gated /repos/{o}/{n}/bounties;
+        // a 404 must Err, not silently print nothing.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/repos/alice/secret/bounties".to_string()),
+            )
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = cmd_list(Some("alice/secret".to_string()), None, server.url(), None).await;
+        assert!(
+            result.is_err(),
+            "bounty list --repo must Err on a gated 404"
+        );
+        // Prove the gated repo-scoped path was actually requested: without this,
+        // an unmatched route (mockito's 501, also non-2xx) would satisfy is_err().
+        _m.assert_async().await;
     }
 }

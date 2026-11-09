@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use crate::http::NodeClient;
 use crate::identity::load_keypair_from_dir;
 
-const PUBLIC_NODE: &str = "https://node.gitlawb.com";
+const PUBLIC_NODE: &str = "https://node.twigpine.com";
 
 #[derive(Args)]
 pub struct QuickstartArgs {
@@ -117,7 +117,8 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
                     // response may not even be JSON. Saying success here would
                     // also leave a stale ucan.json from another node in place.
                     println!("  ✗  Registration returned no UCAN (unexpected response body)");
-                    println!("     You can retry with: gl register --node {}", args.node);
+                    // No retry hint here: a `gl register` instruction without
+                    // this invocation's --dir would load a different identity.
                 }
                 println!();
             }
