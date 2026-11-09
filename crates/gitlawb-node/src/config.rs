@@ -152,6 +152,46 @@ pub struct Config {
     #[arg(long, env = "GITLAWB_AUTO_SYNC", default_value_t = false)]
     pub auto_sync: bool,
 
+    /// Periodically fetch configured INBOUND repositories from their external
+    /// HTTPS upstream. Disabled by default: enabling this also requires
+    /// `GITLAWB_ENFORCE_OWNER_PUSH=true`, so an upstream-authoritative mirror
+    /// cannot accept writes from arbitrary signed identities between fetches.
+    #[arg(long, env = "GITLAWB_UPSTREAM_MIRROR_ENABLED", default_value_t = false)]
+    pub upstream_mirror_enabled: bool,
+
+    /// Pause between complete upstream-mirror scans. A scan is sequential and
+    /// paginated; the pause begins only after the prior scan has finished, so a
+    /// slow forge cannot create overlapping worker cycles.
+    #[arg(
+        long,
+        env = "GITLAWB_UPSTREAM_MIRROR_INTERVAL_SECS",
+        default_value_t = 300,
+        value_parser = clap::value_parser!(u64).range(5..=86_400)
+    )]
+    pub upstream_mirror_interval_secs: u64,
+
+    /// Maximum wall-clock time for one external `git fetch`. The child runs in
+    /// its own process group and is fully reaped on timeout. The preflight
+    /// URL-rewrite and local-config probes run on their own short bounds and
+    /// do not consume this budget.
+    #[arg(
+        long,
+        env = "GITLAWB_UPSTREAM_MIRROR_FETCH_TIMEOUT_SECS",
+        default_value_t = 600,
+        value_parser = clap::value_parser!(u64).range(1..=GIT_SERVICE_TIMEOUT_SECS_MAX)
+    )]
+    pub upstream_mirror_fetch_timeout_secs: u64,
+
+    /// Number of durable INBOUND rows read per database page. Every page is
+    /// processed before the scan sleeps; this bounds query memory without
+    /// permanently starving repositories beyond the first page.
+    #[arg(
+        long,
+        env = "GITLAWB_UPSTREAM_MIRROR_PAGE_SIZE",
+        default_value_t = 100,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_000)
+    )]
+    pub upstream_mirror_page_size: usize,
     /// Enable the periodic reconciliation sweep that re-derives pin/seal sets
     /// and fills durability gaps.  Defaults to true; set to false to disable
     /// the sweep even when a pin backend (IPFS/Pinata) is configured.
@@ -858,6 +898,13 @@ impl Config {
                 Self::DB_LOCK_POOL_NON_PUSH_HEADROOM
             ));
         }
+        if self.upstream_mirror_enabled && !self.enforce_owner_push {
+            return Err(
+                "GITLAWB_UPSTREAM_MIRROR_ENABLED requires GITLAWB_ENFORCE_OWNER_PUSH=true: \
+                 an upstream-authoritative mirror must not accept writes from arbitrary signed identities"
+                    .to_string(),
+            );
+        }
         let main_floor = Self::DB_POOL_APP_HEADROOM as u64;
         if (self.db_max_connections as u64) < main_floor {
             return Err(format!(
@@ -1056,6 +1103,51 @@ pub(crate) fn validate_web_url(raw: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_mirror_worker_is_default_off_and_bounded() {
+        let mut config = Config::parse_from(["gitlawb-node"]);
+        assert!(!config.upstream_mirror_enabled);
+        assert_eq!(config.upstream_mirror_interval_secs, 300);
+        assert_eq!(config.upstream_mirror_fetch_timeout_secs, 600);
+        assert_eq!(config.upstream_mirror_page_size, 100);
+        config.validate().unwrap();
+
+        assert!(
+            Config::try_parse_from(["gitlawb-node", "--upstream-mirror-interval-secs", "4",])
+                .is_err()
+        );
+        assert!(
+            Config::try_parse_from(["gitlawb-node", "--upstream-mirror-page-size", "0",]).is_err()
+        );
+    }
+
+    #[test]
+    fn upstream_mirror_worker_requires_owner_push_enforcement() {
+        // enforce_owner_push defaults true on main, so the only unsafe shape
+        // is the explicit opt-out: mirror enabled plus enforcement refused.
+        let mut unsafe_config = Config::parse_from([
+            "gitlawb-node",
+            "--upstream-mirror-enabled",
+            "--enforce-owner-push",
+            "false",
+        ]);
+        let error = unsafe_config.validate().unwrap_err();
+        assert!(error.contains("GITLAWB_ENFORCE_OWNER_PUSH=true"));
+
+        Config::parse_from([
+            "gitlawb-node",
+            "--upstream-mirror-enabled",
+            "--enforce-owner-push",
+            "true",
+        ])
+        .validate()
+        .unwrap();
+        // The default posture alone also validates: enforcement is on.
+        Config::parse_from(["gitlawb-node", "--upstream-mirror-enabled"])
+            .validate()
+            .unwrap();
+    }
 
     #[test]
     fn lock_pool_size_defaults_to_40_and_rejects_zero() {
