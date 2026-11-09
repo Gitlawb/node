@@ -247,6 +247,40 @@ pub struct InfoRefsQuery {
 
 // ── Handlers ──────────────────────────────────────────────────────────────
 
+/// Validate a repository name at the create/fork write paths. The charset is
+/// restricted, and the length is bounded so every cursor the server emits
+/// parses back: `repo_cursor` embeds the name in a base64(JSON) cursor that
+/// `parse_repo_cursor` rejects over 4096 bytes (#465 4th round).
+///
+/// This is the API-side validator, and it deliberately differs from the
+/// stricter disk-side `validate_repo_name` in `git/repo_store.rs`: this one
+/// admits names the store rejects (empty, leading `-`, non-ASCII
+/// alphanumeric) and rejects `.`, which the store allows. The divergence
+/// predates this bound (#412 owns the fork half), so a store-rejected name
+/// still fails later at `repo_store.init` after the proof is spent. Do not
+/// "fix" the divergence here; the length bound below is the one that keeps
+/// emitted cursors parseable, and it is shared via `MAX_REPO_NAME_LEN` so the
+/// two validators cannot drift apart on length.
+fn validate_repo_name(name: &str) -> Result<()> {
+    // Sanitize name: alphanumeric, hyphens, underscores only
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(AppError::BadRequest(
+            "repo name must contain only alphanumeric characters, hyphens, and underscores".into(),
+        ));
+    }
+    // Byte length, not char count: the cursor budget is measured in bytes.
+    if name.len() > crate::db::MAX_REPO_NAME_LEN {
+        return Err(AppError::BadRequest(format!(
+            "repo name must be at most {} bytes",
+            crate::db::MAX_REPO_NAME_LEN
+        )));
+    }
+    Ok(())
+}
+
 /// POST /api/v1/repos
 /// Create a new repository. Requires HTTP Signature auth.
 pub async fn create_repo(
@@ -261,16 +295,7 @@ pub async fn create_repo(
     // rejected request (bad name, already exists) never burns a valid proof.
     let proof = crate::icaptcha::verify_request(&headers, &auth.0)?;
 
-    // Sanitize name: alphanumeric, hyphens, underscores only
-    if !req
-        .name
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err(AppError::BadRequest(
-            "repo name must contain only alphanumeric characters, hyphens, and underscores".into(),
-        ));
-    }
+    validate_repo_name(&req.name)?;
 
     // default_branch is caller-supplied and becomes a PR's target_branch when the
     // PR omits one, which is interpolated into a git revision argument. Validate
@@ -1465,14 +1490,17 @@ async fn pin_new_objects_gated(
     db: &Arc<crate::db::Db>,
     repo_id: &str,
     batch_budget: std::time::Duration,
-) -> Vec<(String, String)> {
+) -> crate::ipfs_pin::PinBatchOutcome {
     // Nothing to pin: answer before taking a permit (#174 F2b). The permit bounds how
     // many pin loops run concurrently, and an empty list does no pinning, so parking
     // here would spend a global pin slot on no work. The pool DEFERS rather
     // than sheds, so those calls stall pins for every other repo. Empty is the normal
     // shape for a push whose walk failed or that may replicate nothing.
     if object_list.is_empty() {
-        return Vec::new();
+        return crate::ipfs_pin::PinBatchOutcome {
+            confirmed: Vec::new(),
+            last_attempted: None,
+        };
     }
     let _permit = pin_sem
         .clone()
@@ -1488,6 +1516,7 @@ async fn pin_new_objects_gated(
         db,
         repo_id,
         batch_budget,
+        None,
     )
     .await
 }
@@ -1522,9 +1551,9 @@ async fn pin_and_encrypt_objects(
         crate::ipfs_pin::PIN_BATCH_BUDGET,
     )
     .await;
-    if !pinned.is_empty() {
-        tracing::info!(count = pinned.len(), "pinned git objects to IPFS");
-        for (sha, cid) in &pinned {
+    if !pinned.confirmed.is_empty() {
+        tracing::info!(count = pinned.confirmed.len(), "pinned git objects to IPFS");
+        for (sha, cid) in &pinned.confirmed {
             tracing::info!(sha = %sha, %cid, "pinned");
         }
     }
@@ -1556,7 +1585,14 @@ async fn pin_and_encrypt_objects(
                 &ctx.db,
                 repo_id,
                 &node_seed,
+                // The real git, not `ctx.git_bin`: tests point that at a fake
+                // walk git, and the seal reads must run the real one.
+                "git",
+                crate::ipfs_pin::PIN_BATCH_BUDGET,
                 &recipients,
+                // Push path: recipients derived at admission under a write lease,
+                // no sweep-style snapshot to fence (see PolicyFence's doc).
+                None,
             )
             .await;
 
@@ -3031,19 +3067,34 @@ async fn post_receive_replication_tail(
                         &db_clone,
                         &repo_id,
                         crate::ipfs_pin::PIN_BATCH_BUDGET,
+                        // Push path: no sweep-style batch snapshot to fence (see
+                        // PolicyFence's doc).
+                        None,
                     )
                     .await,
                 )
             } else {
-                (false, Vec::new())
+                (
+                    false,
+                    crate::ipfs_pin::PinBatchOutcome {
+                        confirmed: Vec::new(),
+                        last_attempted: None,
+                    },
+                )
             };
 
-            if !pinned.is_empty() {
-                tracing::info!(count = pinned.len(), "pinned git objects to Pinata");
+            if !pinned.confirmed.is_empty() {
+                tracing::info!(
+                    count = pinned.confirmed.len(),
+                    "pinned git objects to Pinata"
+                );
             }
 
-            // Build sha→cid map from pinned objects
-            let cid_map: std::collections::HashMap<String, String> = pinned.into_iter().collect();
+            // Build sha→cid map from durably recorded pins only: an
+            // unconfirmed provider upload must not drive branch/gossip CID
+            // state for a row the resolver cannot serve.
+            let cid_map: std::collections::HashMap<String, String> =
+                pinned.confirmed.into_iter().collect();
 
             // Record branch→CID for each ref update and publish gossip
             for (ref_name, old_sha, new_sha) in &ref_updates_clone {
@@ -3774,15 +3825,7 @@ pub async fn fork_repo(
     let fork_name = req.name.unwrap_or_else(|| source.name.clone());
     let forker_did = auth.0;
 
-    // Validate fork name
-    if !fork_name
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err(AppError::BadRequest(
-            "repo name must contain only alphanumeric characters, hyphens, and underscores".into(),
-        ));
-    }
+    validate_repo_name(&fork_name)?;
 
     // Same barrier every other repo-creation route goes through. The character
     // allowlist above is vacuously true on an empty name, and `repo_disk_path`
@@ -5050,6 +5093,50 @@ mod tests {
     }
 
     #[test]
+    fn repo_name_validation_rejects_bad_charset_and_overlong_names() {
+        assert!(validate_repo_name("ok-name_123").is_ok());
+        assert!(validate_repo_name(&"a".repeat(crate::db::MAX_REPO_NAME_LEN)).is_ok());
+        // The bound is in bytes: the cursor budget is measured in bytes.
+        let overlong = "a".repeat(crate::db::MAX_REPO_NAME_LEN + 1);
+        let err = validate_repo_name(&overlong).unwrap_err();
+        assert!(
+            matches!(err, AppError::BadRequest(_)),
+            "overlong name must be a 400, got: {err:?}"
+        );
+        assert!(validate_repo_name("bad name!").is_err());
+        // Empty names were already admissible before the length bound; the
+        // bound does not change that.
+        assert!(validate_repo_name("").is_ok());
+    }
+
+    #[tokio::test]
+    async fn create_repo_rejects_overlong_name_through_handler() {
+        // Pins the wiring: `create_repo` must call `validate_repo_name`
+        // before any database access. The lazy state never connects, so
+        // deleting the call site would let the handler proceed to `get_repo`
+        // and fail with a connection error instead of BadRequest.
+        let state = crate::test_support::test_state_lazy();
+        let overlong = "a".repeat(crate::db::MAX_REPO_NAME_LEN + 1);
+        let err = create_repo(
+            State(state),
+            Extension(AuthenticatedDid(OWNER_DID.to_owned())),
+            axum::http::HeaderMap::new(),
+            Json(CreateRepoRequest {
+                name: overlong,
+                description: None,
+                is_public: true,
+                default_branch: "main".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::BadRequest(ref msg) if msg.contains("at most")),
+            "overlong name through create_repo must be a 400, got: {err:?}"
+        );
+    }
+
+    #[test]
     fn upload_pack_request_finalizes_only_with_done_pktline() {
         let want = "0032want 1111111111111111111111111111111111111111\n";
         let have = "0032have 2222222222222222222222222222222222222222\n";
@@ -5883,7 +5970,13 @@ mod tests {
         )
         .await;
         assert!(replicable.contains(&head), "HEAD commit kept");
-        assert!(replicable.contains(&root_tree), "root tree kept");
+        // The root tree is dropped too under the structural gate: its bytes
+        // name the withheld subtree's OID, so pinning it to public IPFS leaks
+        // that subtree's existence (the same leak class as the subtree).
+        assert!(
+            !replicable.contains(&root_tree),
+            "root tree naming a withheld subtree drops under the structural gate"
+        );
         assert!(replicable.contains(&public_tree), "public tree kept");
         assert!(replicable.contains(&public_blob), "public blob kept");
         assert!(
@@ -6069,9 +6162,21 @@ mod tests {
         // ref check); rev-parse resolves HEAD; rev-list lists the one commit; ls-tree
         // emits "<mode> blob <oid>\t<path>" (NUL-delimited) under secret/ and burns
         // 1.2s of the 2s budget; pack-objects is the serve's 1.2s cost.
+        //
+        // #218 review round 8 P1 (fixture, not production): the `for-each-ref` arm
+        // must answer in the COLUMN SHAPE `blob_paths` phase 2 asks for
+        // (`%(objectname) %(objecttype)`, plus the peeled `%(*objectname)
+        // %(*objecttype)` pair when the tip is a tag), not a ref NAME. A single
+        // bare token made the phase-2 parse fail closed, so the walk returned an
+        // error and the request surfaced as a generic 500 — which silently
+        // repurposed this test from "the filtered serve shares the deadline" into
+        // "the walk errors", losing the #174 guard while looking merely red. A
+        // commit tip peels to nothing, so two columns is the whole line here; the
+        // 1.2s walk cost stays on `ls-tree` so walk and serve remain independently
+        // attributable.
         let body = format!(
             "#!/bin/sh\ncase \"$1\" in\n  \
-             for-each-ref) echo refs/heads/main ;;\n  \
+             for-each-ref) echo {commit} commit ;;\n  \
              cat-file) echo commit ;;\n  \
              rev-parse) echo {commit} ;;\n  \
              rev-list) echo {commit} ;;\n  \
@@ -9001,7 +9106,7 @@ mod tests {
         )
         .await
         .expect("the pin loop completes once admission frees");
-        assert!(out.is_empty(), "an empty ipfs_api pins nothing");
+        assert!(out.confirmed.is_empty(), "an empty ipfs_api pins nothing");
     }
 
     /// #173 F3, at the layer that actually owns the permit. `pin_new_objects_gated`
@@ -9013,8 +9118,8 @@ mod tests {
     /// permit comes back, even though the table is still locked.
     ///
     /// The endpoint is a LIVE mockito server, not the `""` the sibling test above
-    /// uses. `ipfs_pin::pin_new_objects` returns `vec![]` immediately on an empty
-    /// `ipfs_api`, so an empty-string copy would never reach `is_pinned`, never touch
+    /// uses. `ipfs_pin::pin_new_objects` returns an empty outcome immediately on an
+    /// empty `ipfs_api`, so an empty-string copy would never reach `is_pinned`, never touch
     /// the locked table, and pass identically with the bound deleted. The mock is at
     /// `.expect(0)` because a stalled pinned-status check must not fall through to an
     /// add.
@@ -9076,7 +9181,10 @@ mod tests {
              budget",
         );
 
-        assert!(out.is_empty(), "a stalled pinned-status check pins nothing");
+        assert!(
+            out.confirmed.is_empty(),
+            "a stalled pinned-status check pins nothing"
+        );
         assert_eq!(
             pin_sem.available_permits(),
             1,
@@ -9123,7 +9231,7 @@ mod tests {
         )
         .await
         .expect("an empty object list must not wait on pin admission (#174 F2b)");
-        assert!(out.is_empty(), "and it pins nothing");
+        assert!(out.confirmed.is_empty(), "and it pins nothing");
         assert_eq!(
             pin_sem.available_permits(),
             0,
@@ -9179,6 +9287,7 @@ mod tests {
     /// A pkt-line receive-pack body carrying one branch-create ref update, so the
     /// handler's post-receive tail resolves a non-empty new-tip set (the delta
     /// scan's git stages run).
+    #[cfg(unix)]
     fn ref_update_body(new_sha: &str) -> axum::body::Bytes {
         let line = format!("{ZERO_SHA} {new_sha} refs/heads/main");
         axum::body::Bytes::from(format!("{:04x}{}0000", line.len() + 4, line))
@@ -11636,6 +11745,7 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
     fn f2a_log(log: &std::path::Path) -> String {
         std::fs::read_to_string(log).unwrap_or_default()
     }
@@ -11643,6 +11753,7 @@ mod tests {
     /// Withheld-walk children run so far. `ls-tree` is the walk's signature child
     /// (`blob_paths` lists every reachable commit's tree); the delta scan and the
     /// full-scan fallback use `rev-list` / `cat-file` instead.
+    #[cfg(unix)]
     fn f2a_walks(log: &std::path::Path) -> usize {
         f2a_log(log)
             .lines()
@@ -11654,6 +11765,7 @@ mod tests {
     /// the withheld walk actually runs rather than taking the no-rule shortcut).
     /// The repo's on-disk path is passed to the tail directly, so no repo_store or
     /// receive-pack plumbing is involved.
+    #[cfg(unix)]
     async fn f2a_state(
         pool: sqlx::PgPool,
         git_bin: &str,
@@ -11685,6 +11797,7 @@ mod tests {
         (state, rec)
     }
 
+    #[cfg(unix)]
     fn f2a_update(ref_name: &str, new_sha: &str) -> Vec<RefUpdate> {
         vec![RefUpdate {
             old_sha: ZERO_SHA.to_string(),
@@ -11693,6 +11806,7 @@ mod tests {
         }]
     }
 
+    #[cfg(unix)]
     const F2A_PUSHER: &str = "did:key:z6MkF2aPusherAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
     /// When publish durability is fenced, the tail must not run walks or take
@@ -11805,6 +11919,7 @@ mod tests {
     }
     /// Poll `cond` until it holds, with a bound so a regression fails the test
     /// rather than hanging the suite.
+    #[cfg(unix)]
     async fn f2a_wait_for(mut cond: impl FnMut() -> bool, what: &str) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while !cond() {
@@ -11819,6 +11934,7 @@ mod tests {
     /// A `rev-list --objects` line names the tips a DELTA scan was asked to resolve,
     /// so it attributes that scan to one push's tips. The withheld walk's own
     /// `rev-list --all` / `ls-tree` lines never carry a tip as an argument this way.
+    #[cfg(unix)]
     fn f2a_delta_scanned(log: &std::path::Path, tip: &str) -> bool {
         f2a_log(log)
             .lines()
@@ -11967,6 +12083,7 @@ mod tests {
 
     /// Mount a Pinata upload endpoint that assigns every object the same CID, and
     /// point the state at it. Returns the server (kept alive by the caller) and CID.
+    #[cfg(unix)]
     async fn f2a_pinata(state: &mut AppState) -> (mockito::ServerGuard, String) {
         let cid = "bafyf2acoalescedmapping".to_string();
         let mut server = mockito::Server::new_async().await;
@@ -11986,6 +12103,7 @@ mod tests {
 
     /// Poll the branch to CID table until the push's mapping lands (the Pinata
     /// worker is detached), bounded so a regression fails rather than hangs.
+    #[cfg(unix)]
     async fn f2a_wait_for_branch_cid(
         db: &crate::db::Db,
         slug: &str,
@@ -12005,6 +12123,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn f2a_slug(rec: &crate::db::RepoRecord) -> String {
         format!(
             "{}/{}",
@@ -12139,6 +12258,7 @@ mod tests {
     // and `z6p2fail`), and owner-only push is on by default, so the identity has to
     // follow the repo each push targets rather than being fixed for both.
 
+    #[cfg(unix)]
     fn p2_push(
         state: &AppState,
         owner: &str,
@@ -12157,6 +12277,7 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
     fn p2_logged(log: &std::path::Path, prefix: &str) -> bool {
         f2a_log(log).lines().any(|l| l.starts_with(prefix))
     }
@@ -12170,6 +12291,19 @@ mod tests {
     /// step earlier in the handler.
     ///
     /// Load-bearing: with the spawn below `release` the walk's `for-each-ref` never
+    /// appears after the disconnect (RED). With it above, gated on
+    /// `receive_result.is_ok()`, it does (GREEN).
+    ///
+    /// Round-3 P1: a successful receive-pack followed by a disconnect during
+    /// `guard.release()` must still see its replication tail run. The tail is
+    /// spawned above `release` (gated on `receive_result.is_ok()`), and the marker
+    /// polls for `rev-list` (the new tail's primary walk command) — the previous
+    /// `for-each-ref` marker is dead because commit 91d0578 removed the last
+    /// tail-path use of that command (it lived in `assert_all_refs_are_commits`,
+    /// which is now gone). The new marker points at a real command the tail still
+    /// executes, so a future reorder that drops the tail will be caught.
+    ///
+    /// Load-bearing: with the spawn below `release` the walk's `rev-list` never
     /// appears after the disconnect (RED). With it above, gated on
     /// `receive_result.is_ok()`, it does (GREEN).
     #[cfg(unix)]
@@ -12205,8 +12339,14 @@ mod tests {
         // The disconnect: drop the handler future while `release` is still awaiting.
         drop(fut);
 
+        // Round-3 P1: marker is `rev-list`, not `for-each-ref` — the
+        // tail's primary walk is `git rev-list --objects --all` (the
+        // same call as `smart_http::rev_list_keep`); a successful
+        // re-key on the cloned path emits it from the post-receive
+        // tail. Polling for `for-each-ref` was vacuous after 91d0578
+        // removed the last tail-path use of that command.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !p2_logged(&log, "for-each-ref") {
+        while !p2_logged(&log, "rev-list") {
             assert!(
                 std::time::Instant::now() < deadline,
                 "RED: the pack landed but its replication tail never ran. A disconnect \
@@ -12275,8 +12415,14 @@ mod tests {
         drop(fut);
 
         tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+        // Round-3 P1: the must-not twin also runs the `rev-list`
+        // command (the actual tail walk). `for-each-ref` is dead in
+        // the tail path; the previous marker made the assertion
+        // vacuous. The new marker pins the same command the
+        // positive-control sibling above uses, so a future change
+        // that drops the tail leaves both tests red together.
         assert!(
-            !p2_logged(&log, "for-each-ref"),
+            !p2_logged(&log, "rev-list"),
             "a failed receive-pack must spawn no replication tail: pinning and \
              announcing a half-applied repo is exactly what release(false) refuses \
              to upload"
@@ -13152,6 +13298,7 @@ exit 0
     /// runs exactly one `rev-list --all`, so this counts the walks that were attempted
     /// (the `ls-tree` counter above cannot: a walk whose enumeration fails never gets
     /// to `ls-tree`).
+    #[cfg(unix)]
     fn f2b_walk_attempts(log: &std::path::Path) -> usize {
         f2a_log(log)
             .lines()

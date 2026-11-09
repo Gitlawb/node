@@ -11,7 +11,8 @@ use crate::state::AppState;
 
 /// Hard ceiling on rows any ref-update feed returns in one request. Shared by the
 /// shared collector's clamp and the per-handler request caps so they can't drift.
-const MAX_VISIBLE_REF_UPDATES: i64 = 200;
+/// `pub(crate)` so the GraphQL complexity meter can price against the same bound.
+pub(crate) const MAX_VISIBLE_REF_UPDATES: i64 = 200;
 
 /// Collect up to `limit` ref-update rows visible to `caller`, newest first,
 /// paging past rows the feed gate drops. Filtering after a plain SQL `LIMIT`

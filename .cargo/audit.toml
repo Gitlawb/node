@@ -21,6 +21,25 @@ ignore = [
     # the build, at which point it becomes a real reachable advisory.
     "RUSTSEC-2023-0071", # rsa Marvin attack (no fix; not linked in our build)
 
+    # lru 0.16.3 (use-after-free in pop()). Reachable via alloy. The
+    # lockfile holds only 0.16.3 — the aws-sdk-s3 path that once pulled
+    # 0.12.5 no longer does. The RUSTSEC-2026-0253 advisory covers this
+    # range, so the ignore stays load-bearing until a fixed 0.16.x lands;
+    # REMOVE when the locked version is fixed or lru leaves the tree.
+    # Retirement owner: node maintainers, enforced by the weekly
+    # audit-schedule drift guard ("Fail if lru moved while its ignore
+    # remains"), which fails if either locked version moves or lru
+    # leaves the tree. No separate tracking issue exists; file one
+    # against the lru upgrade if this waiver needs discussion outside
+    # the schedule job.
+    "RUSTSEC-2026-0253",
+    #
+    # Round-3 P2 (reviewer 2): the previous version of this file
+    # ignored RUSTSEC-2026-0258 for h2 0.4.13, but the lockfile
+    # already has h2 0.4.18 (verified 2026-08-31: cargo tree -p h2
+    # shows 0.4.18) — the fix is in. The ignore was stale and would
+    # have silently re-accepted the advisory if h2 dropped back to
+    # 0.4.13. Removed.
     # crypto-bigint 0.5.5 (secret-dependent branches in operations meant
     # to be constant-time). REACHABLE accepted risk, on two paths:
     # - alloy-signer -> elliptic-curve 0.13 -> crypto-bigint 0.5: the k256

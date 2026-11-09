@@ -81,7 +81,7 @@ time once updated.
 
 **Requirements:**
 - Rust stable (≥ 1.91) — install via [rustup](https://rustup.rs)
-- PostgreSQL — required for the node. Use the bundled `docker-compose.yml` for local dev.
+- PostgreSQL 16+ — required for the node (it uses `pg_input_is_valid`, which exists only on PostgreSQL 16 and later). Use the bundled `docker-compose.yml` for local dev.
 - Docker (optional, for full-stack local testing)
 
 **Environment variables:**

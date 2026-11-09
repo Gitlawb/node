@@ -75,6 +75,7 @@ alloy = { version = "1", default-features = false, features = [
     "network",
     "rpc-types-eth",
 ] }
+rand = { workspace = true }
 libp2p-dns = { version = "0.45.0", features = ["tokio"] }
 
 [dev-dependencies]
