@@ -55,8 +55,22 @@ pub(crate) fn create_dir(path: &Path) -> std::io::Result<()> {
         {
             Ok(dir) => {
                 use std::os::unix::io::AsRawFd;
-                if unsafe { libc::fchmod(dir.as_raw_fd(), 0o700) } != 0 {
-                    return Err(std::io::Error::last_os_error());
+                let fd = dir.as_raw_fd();
+                // Re-pin only a leaf this process owns. A --dir the caller
+                // can write but cannot chmod (foreign-owned 0775 leaf, ACL
+                // grant) is adopted unchanged: create_dir_all allowed the
+                // write before, and aborting turns a usable directory into
+                // a command failure. An owned directory that still refuses
+                // chmod (EPERM) is adopted the same way.
+                let owned = unsafe {
+                    let mut st: libc::stat = std::mem::zeroed();
+                    libc::fstat(fd, &mut st) == 0 && st.st_uid == libc::geteuid()
+                };
+                if owned && unsafe { libc::fchmod(fd, 0o700) } != 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.raw_os_error() != Some(libc::EPERM) {
+                        return Err(e);
+                    }
                 }
             }
             // ELOOP: the path is a symlink and is left alone per contract.
@@ -72,6 +86,19 @@ pub(crate) fn create_dir(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
+
+    #[test]
+    #[cfg(unix)]
+    fn create_dir_adopts_writable_leaf_it_cannot_chmod() {
+        use std::os::unix::fs::PermissionsExt;
+        // /tmp is root-owned 1777: writable by this euid, not chmod-able.
+        // The pre-helper create_dir_all allowed the write; the re-pin must
+        // adopt the leaf unchanged rather than abort on EPERM.
+        let before = std::fs::metadata("/tmp").unwrap().permissions().mode();
+        super::create_dir(std::path::Path::new("/tmp")).unwrap();
+        let after = std::fs::metadata("/tmp").unwrap().permissions().mode();
+        assert_eq!(before, after);
+    }
 
     #[test]
     #[cfg(unix)]
