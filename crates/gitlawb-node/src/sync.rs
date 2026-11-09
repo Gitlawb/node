@@ -758,6 +758,30 @@ fn show_ref_refname(line: &[u8]) -> anyhow::Result<Option<&[u8]>> {
 /// `<hex-sha> SP <refname>` — 40-hex SHA-1 or 64-hex SHA-256, which a sha256
 /// mirror inherits from its origin — fails the sync rather than being
 /// skipped into an unpruned wedge.
+/// Bounded git spawn for the prune below: `kill_on_drop` plus a hard timeout
+/// so a wedged child cannot stall a mirror import or sweep forever. The
+/// refname delete runs on exact bytes, so args arrive as `OsStr`, not `str`.
+/// Non-PruneInvalid failures (including a timeout) wrap as PruneFailed and
+/// defer for retry, matching the transient classification below.
+async fn prune_git(
+    local_path: &Path,
+    args: &[&std::ffi::OsStr],
+    label: &str,
+) -> anyhow::Result<std::process::Output> {
+    let fut = async {
+        // allow-unbounded-git: bounded by the tokio::time::timeout wrapping
+        // this future below, plus kill_on_drop.
+        let mut cmd = tokio::process::Command::new("git");
+        cmd.kill_on_drop(true);
+        cmd.arg("-C").arg(local_path).args(args);
+        cmd.output().await
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(30), fut)
+        .await
+        .map_err(|_| anyhow::anyhow!("{label} timed out"))?
+        .map_err(|e| anyhow::anyhow!("{label} failed to spawn: {e}"))
+}
+
 async fn prune_non_exempt_gitlawb_refs(local_path: &Path) -> anyhow::Result<()> {
     let local_str = local_path.to_str().unwrap_or(".");
     // Prove the path is itself a repo before trusting the enumeration:
@@ -766,11 +790,15 @@ async fn prune_non_exempt_gitlawb_refs(local_path: &Path) -> anyhow::Result<()> 
     // ANCESTOR's refs and `update-ref -d` would then run against that repo.
     // Require `rev-parse --absolute-git-dir` to resolve to the path itself
     // (mirrors are bare repos, where the git dir IS the path).
-    let git_dir_out = tokio::process::Command::new("git")
-        .args(["-C", local_str, "rev-parse", "--absolute-git-dir"])
-        .output()
-        .await
-        .map_err(|e| anyhow::anyhow!("git rev-parse failed to spawn: {e}"))?;
+    let git_dir_out = prune_git(
+        local_path,
+        &[
+            std::ffi::OsStr::new("rev-parse"),
+            std::ffi::OsStr::new("--absolute-git-dir"),
+        ],
+        "git rev-parse",
+    )
+    .await?;
     if !git_dir_out.status.success() {
         let stderr = String::from_utf8_lossy(&git_dir_out.stderr);
         return Err(anyhow::anyhow!(PruneInvalid(format!(
@@ -793,11 +821,12 @@ async fn prune_non_exempt_gitlawb_refs(local_path: &Path) -> anyhow::Result<()> 
             "mirror path {local_str} is not itself a repo (git dir resolves elsewhere); refusing to enumerate"
         ))));
     }
-    let out = tokio::process::Command::new("git")
-        .args(["-C", local_str, "show-ref"])
-        .output()
-        .await
-        .map_err(|e| anyhow::anyhow!("git show-ref failed to spawn: {e}"))?;
+    let out = prune_git(
+        local_path,
+        &[std::ffi::OsStr::new("show-ref")],
+        "git show-ref",
+    )
+    .await?;
     // Classify on the exit code (the `existing_promisor_state` precedent):
     // 0 parses, 1 with empty output is an empty repo, anything else is a
     // fatal enumeration failure that must not read as "nothing to prune".
@@ -829,13 +858,17 @@ async fn prune_non_exempt_gitlawb_refs(local_path: &Path) -> anyhow::Result<()> 
         // non-UTF-8 refname would otherwise survive the prune.
         let refname_os = os_from_raw_refname(raw);
         let shown = refname_os.to_string_lossy().into_owned();
-        let delete = tokio::process::Command::new("git")
-            .args(["-C", local_str, "update-ref", "-d"])
-            .arg(&refname_os)
-            .args(["--no-deref"])
-            .output()
-            .await
-            .map_err(|e| anyhow::anyhow!("git update-ref -d failed to spawn: {e}"))?;
+        let delete = prune_git(
+            local_path,
+            &[
+                std::ffi::OsStr::new("update-ref"),
+                std::ffi::OsStr::new("-d"),
+                refname_os.as_os_str(),
+                std::ffi::OsStr::new("--no-deref"),
+            ],
+            "git update-ref -d",
+        )
+        .await?;
         if !delete.status.success() {
             let stderr = String::from_utf8_lossy(&delete.stderr);
             return Err(anyhow::anyhow!(
@@ -948,6 +981,7 @@ async fn clone_repo(remote_url: &str, local_path: &Path, mode: MirrorMode) -> an
     if mode == MirrorMode::Promisor {
         args.push("--filter=blob:limit=10g");
     }
+    args.push("--");
     args.push(remote_url);
     args.push(local_str);
 
@@ -983,7 +1017,10 @@ async fn clone_repo(remote_url: &str, local_path: &Path, mode: MirrorMode) -> an
 async fn fetch_repo(local_path: &Path, remote_url: &str, mode: MirrorMode) -> anyhow::Result<()> {
     let local_str = local_path.to_str().unwrap_or(".");
 
-    git_run(&["-C", local_str, "remote", "set-url", "origin", remote_url]).await?;
+    git_run(&[
+        "-C", local_str, "remote", "set-url", "origin", "--", remote_url,
+    ])
+    .await?;
 
     // The fetch imports whatever the origin advertises via the stored
     // `+refs/*:refs/*` refspec; prune non-exempt `refs/gitlawb/*` refs after
@@ -1270,6 +1307,82 @@ mod tests {
         assert_eq!(probe, PromisorProbe::NotPromisor);
     }
 
+    /// #374: `clone_repo` interpolates the peer's origin URL into a `git
+    /// clone --mirror` argument list. Without a `--` delimiter git parses a
+    /// remote beginning with `-` as an option instead of a repository.
+    ///
+    /// The delimiter is what forces the same string to be a repository, and
+    /// git says so in its own words: it reports the whole argument as a
+    /// repository it cannot find. Undelimited, git consumes it as an option
+    /// and fails against the *destination* instead (`fatal: repository '<dest>' does not exist`),
+    /// never naming the injected string — which is why this assertion is RED
+    /// before the fix and GREEN after.
+    ///
+    /// The payload is deliberately free of `:` and spaces: a colon would make
+    /// git read the argument as an ssh-style `host:path` URL and report a
+    /// hostname rather than a repository, which is a different code path.
+    #[tokio::test]
+    async fn clone_never_parses_a_remote_as_a_git_option() {
+        let td = TempDir::new().unwrap();
+        let dest = td.path().join("mirror.git");
+        let injected = "--upload-pack=false";
+
+        let err = clone_repo(injected, &dest, MirrorMode::Plain)
+            .await
+            .expect_err("a remote that is not a repository must fail the clone")
+            .to_string();
+
+        assert!(
+            err.contains(injected),
+            "git must report the argument as a repository, not consume it as an option: {err}"
+        );
+    }
+
+    /// #374: `fetch_repo` interpolates the peer's origin URL into
+    /// `git remote set-url`, a second argv construction with the same contract as
+    /// the clone. It needs its own proof: the clone test cannot reach this path.
+    ///
+    /// The assertion is on stored state rather than on the error string, and that
+    /// is deliberate. `git_run` formats its failure as `git {args:?} failed:
+    /// {stderr}`, so the injected value is in the message via the debug-printed
+    /// argv whether or not the delimiter is present — asserting on containment
+    /// would pass with `--` deleted. Delimited, `set-url` succeeds and stores the
+    /// value verbatim; undelimited, git exits 129 with `unknown option` and leaves
+    /// the previous URL in place, so this goes red without the fix.
+    ///
+    /// The fetch that follows the rewrite fails, because the stored URL is not a
+    /// repository. That is expected and ignored: the property under test is what
+    /// `set-url` wrote, not whether the subsequent fetch could succeed.
+    #[tokio::test]
+    async fn fetch_never_parses_a_remote_as_a_git_option() {
+        let td = TempDir::new().unwrap();
+        let local = td.path().join("mirror.git");
+        let local_str = local.to_str().unwrap();
+        let placeholder = "http://example.invalid/x.git";
+
+        assert!(Command::new("git")
+            .args(["init", "-q", "--bare", local_str])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["-C", local_str, "remote", "add", "origin", placeholder])
+            .status()
+            .unwrap()
+            .success());
+
+        let injected = "--upload-pack=false";
+        let _ = fetch_repo(&local, injected, MirrorMode::Plain).await;
+
+        assert_eq!(
+            git_config_get(local_str, "remote.origin.url")
+                .await
+                .as_deref(),
+            Some(injected),
+            "set-url must store an option-shaped remote verbatim, not reject it as an option"
+        );
+    }
+
     #[tokio::test]
     async fn probe_reports_unknown_on_git_error() {
         // A path git cannot resolve as a repo at all (exit 128) is an indeterminate
@@ -1514,6 +1627,18 @@ mod tests {
         .await;
     }
 
+    /// Use a rooted path without a Windows drive prefix in the remote fixture.
+    /// The destination still resolves on the temp directory's current drive,
+    /// while the remote's relative path contains no illegal colon component.
+    fn absolute_slug_path(path: &Path) -> String {
+        assert!(path.is_absolute());
+        path.components()
+            .filter(|part| !matches!(part, std::path::Component::Prefix(_)))
+            .collect::<std::path::PathBuf>()
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
     #[sqlx::test]
     async fn process_batch_rejects_slug_escaping_repos_dir(pool: PgPool) {
         // The verified escape from #272: `PathBuf::join` discards everything
@@ -1529,12 +1654,13 @@ mod tests {
         // fails on but leaves the parent it created, so assert on both.
         let outside = TempDir::new().unwrap();
         let escape_dir = outside.path().join("nest");
-        let slug = format!("a/{}/escape", escape_dir.display());
+        let escape_path = absolute_slug_path(&escape_dir);
+        let slug = format!("a/{escape_path}/escape");
         let escape_target = escape_dir.join("escape.git");
 
         // Serve the composed URL for real, so a run without the guard genuinely
         // clones outside the root rather than merely failing at git.
-        let rel = format!("a{}/escape", escape_dir.display());
+        let rel = format!("a{escape_path}/escape");
         let (_remote, peer_url) = rooted_remote(&[&rel]);
 
         let did = "did:key:z6MkAttacker";
@@ -1654,6 +1780,7 @@ mod tests {
     // ── canonical containment before the git call (issue #272) ───────────────
 
     /// Every ref in `repo`, as one string, for a before/after comparison.
+    #[cfg(unix)]
     fn refs_of(repo: &Path) -> String {
         let out = Command::new("git")
             .args(["-C", repo.to_str().unwrap(), "for-each-ref"])
@@ -1986,6 +2113,7 @@ mod tests {
     /// starvation tests is fixed rather than dependent on how fast the loop
     /// runs. Two rows enqueued in the same microsecond would otherwise order
     /// arbitrarily.
+    #[cfg(unix)]
     async fn enqueue_at(db: &Db, pool: &PgPool, repo: &str, did: &str, enqueued_at: &str) {
         enqueue(db, repo, did).await;
         sqlx::query("UPDATE sync_queue SET enqueued_at = $1 WHERE repo = $2")
@@ -2179,7 +2307,8 @@ mod tests {
 
         let outside = TempDir::new().unwrap();
         let escape_dir = outside.path().join("nest");
-        let slug = format!("a/{}/gitlawb-probe", escape_dir.display());
+        let escape_path = absolute_slug_path(&escape_dir);
+        let slug = format!("a/{escape_path}/gitlawb-probe");
         let escape_target = escape_dir.join("gitlawb-probe.git");
 
         // Two things this fixture must get right or the test is green for the
@@ -2190,7 +2319,7 @@ mod tests {
         // run without the guard genuinely clones outside the root instead of
         // just failing at git. Db::upsert_peer cannot seed this row: it gates on
         // is_public_http_url, which rejects file://.
-        let rel = format!("a{}/gitlawb-probe", escape_dir.display());
+        let rel = format!("a{escape_path}/gitlawb-probe");
         let (_remote, peer_url) = rooted_remote(&[&rel]);
         let did = "did:key:z6MkAttacker";
         seed_local_peer(&pool, did, &peer_url).await;

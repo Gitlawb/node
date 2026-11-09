@@ -106,7 +106,7 @@ pub async fn info_refs(
 
     let mut command = Command::new(git_bin);
     command
-        .arg(service_to_command(service))
+        .arg(service_to_command(service)?)
         .arg("--stateless-rpc")
         .arg("--advertise-refs")
         .arg(repo_path);
@@ -640,7 +640,7 @@ async fn run_git_service(
 ) -> Result<Vec<u8>> {
     let mut command = Command::new(git_bin);
     command
-        .arg(service_to_command(service))
+        .arg(service_to_command(service)?)
         .arg("--stateless-rpc")
         .arg(repo_path);
     let (out, admission) = drive_git_child(command, input, timeout, service, admission).await?;
@@ -907,11 +907,13 @@ async fn drive_git_child_raw(
     Ok((out, err, status, admission))
 }
 
-fn service_to_command(service: &str) -> &str {
+/// Map a validated service name to its git subcommand. Only the two fixed
+/// subcommands can come out, so an unrecognized service can never reach git's argv.
+fn service_to_command(service: &str) -> Result<&'static str> {
     match service {
-        "git-upload-pack" => "upload-pack",
-        "git-receive-pack" => "receive-pack",
-        _ => service,
+        "git-upload-pack" => Ok("upload-pack"),
+        "git-receive-pack" => Ok("receive-pack"),
+        other => bail!("unknown git service: {other}"),
     }
 }
 
@@ -1273,6 +1275,24 @@ mod tests {
             parse_report_status(single.as_bytes()).is_some(),
             "the same bytes with the flush must parse"
         );
+    }
+
+    #[test]
+    fn service_to_command_maps_allowlist_and_rejects_passthrough() {
+        assert_eq!(
+            service_to_command("git-upload-pack").unwrap(),
+            "upload-pack"
+        );
+        assert_eq!(
+            service_to_command("git-receive-pack").unwrap(),
+            "receive-pack"
+        );
+        for bad in ["git-fetch-pack", "--version", "upload-pack", ""] {
+            assert!(
+                service_to_command(bad).is_err(),
+                "must reject passthrough for {bad:?}"
+            );
+        }
     }
 
     /// List OIDs in a pack by writing it to a temp dir and running verify-pack.

@@ -1752,6 +1752,7 @@ fn spawn_deferred_tail_after_proof(
             ref_updates,
             std::path::PathBuf::from(repo.disk_path.clone()),
             pusher_did,
+            None,
         )
         .await;
     });
@@ -4798,6 +4799,7 @@ mod drain_tests {
                 node_did: state.node_did.to_string(),
                 signature: "stale-signature".to_string(),
                 issued_at: stale_issued.clone(),
+                version: 1,
             })
             .await
             .unwrap();
@@ -4964,6 +4966,7 @@ mod drain_tests {
                 node_did: state.node_did.to_string(),
                 signature: "b-live-signature".to_string(),
                 issued_at: chrono::Utc::now().to_rfc3339(),
+                version: 1,
             })
             .await
             .unwrap();

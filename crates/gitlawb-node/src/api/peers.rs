@@ -70,6 +70,8 @@ pub struct PeerResponse {
     pub reachable: bool,
 }
 
+pub(crate) const PUBLIC_HTTP_URL_REQUIREMENT: &str = "must be a public http(s) URL (no loopback, private, localhost, .localhost, .internal, or .local hosts)";
+
 /// Extract an IPv4 address embedded in an IPv6 literal across the transition
 /// formats that carry one: IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible
 /// (`::a.b.c.d`), 6to4 (`2002:WWXX:YYZZ::/16`), and the NAT64 well-known prefix
@@ -104,8 +106,8 @@ fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
 
 /// Whether a peer `http_url` is a public http(s) endpoint safe to register.
 /// Rejects non-http(s) schemes, loopback/unspecified/private/link-local IPs,
-/// and `localhost` / `.local` / `.internal` hostnames. Used at announce time
-/// and by the boot-time prune of already-poisoned rows.
+/// and `localhost` / `.localhost` / `.local` / `.internal` hostnames. Used at
+/// announce time and by the boot-time prune of already-poisoned rows.
 pub fn is_public_http_url(raw: &str) -> bool {
     let url = match reqwest::Url::parse(raw) {
         Ok(u) => u,
@@ -118,13 +120,14 @@ pub fn is_public_http_url(raw: &str) -> bool {
         Some(h) => h.to_ascii_lowercase(),
         None => return false,
     };
-    // Drop a single trailing dot (FQDN root): `localhost.` resolves the same as
+    // Drop trailing dots (FQDN root): `localhost.` resolves the same as
     // `localhost`, so normalize before the suffix/equality checks below.
-    if let Some(stripped) = host.strip_suffix('.') {
-        host = stripped.to_string();
-    }
+    // Strip to fixation rather than once, or `localhost..` reduces to
+    // `localhost.` and matches neither the equality nor the suffix check.
+    host.truncate(host.trim_end_matches('.').len());
     if host.is_empty()
         || host == "localhost"
+        || host.ends_with(".localhost")
         || host.ends_with(".local")
         || host.ends_with(".internal")
     {
@@ -167,8 +170,13 @@ pub fn is_public_http_url(raw: &str) -> bool {
             }
             std::net::IpAddr::V6(v6) => {
                 let s = v6.segments();
-                // fc00::/7 (unique-local) or fe80::/10 (link-local)
-                if (s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80 {
+                // fc00::/7 (unique-local), fe80::/10 (link-local), or fec0::/10
+                // (site-local, deprecated by RFC 3879 and so never a legitimate
+                // peer address, but still routable on networks that kept it).
+                if (s[0] & 0xfe00) == 0xfc00
+                    || (s[0] & 0xffc0) == 0xfe80
+                    || (s[0] & 0xffc0) == 0xfec0
+                {
                     return false;
                 }
                 // Any NAT64 address (64:ff9b::/32) that is not the cleanly
@@ -183,6 +191,13 @@ pub fn is_public_http_url(raw: &str) -> bool {
                 }
             }
         }
+    } else if !host.contains('.') {
+        // A name with no dot at all. The `.local` / `.internal` rules above are
+        // suffix checks, so a single label slips both, and the resolver decides
+        // what it means by appending a search domain we cannot see from here.
+        // Only reachable when the host did not parse as an IP literal, which is
+        // what keeps bracketed IPv6 (also dotless) on the accepting path.
+        return false;
     }
     true
 }
@@ -248,9 +263,9 @@ pub async fn announce(
     // and turn our outbound sync-notify fan-out into an SSRF probe — and bury
     // the real peers under junk so node-origin repos stop replicating.
     if !is_public_http_url(&req.http_url) {
-        return Err(AppError::BadRequest(
-            "http_url must be a public http(s) URL (no loopback, private, or .internal/.local hosts)".into(),
-        ));
+        return Err(AppError::BadRequest(format!(
+            "http_url {PUBLIC_HTTP_URL_REQUIREMENT}"
+        )));
     }
 
     // Reject self-announcements: a peer row whose http_url is our own public
@@ -520,7 +535,7 @@ mod tests {
 
     #[test]
     fn accepts_public_https_and_http() {
-        assert!(is_public_http_url("https://node.gitlawb.com"));
+        assert!(is_public_http_url("https://node.twigpine.com"));
         assert!(is_public_http_url("https://manila.gitlawb.com/"));
         assert!(is_public_http_url("http://203.0.113.10:7545"));
     }
@@ -529,6 +544,7 @@ mod tests {
     fn rejects_loopback_private_and_internal() {
         for bad in [
             "http://localhost:7545",
+            "http://node.localhost:7545",
             "http://127.0.0.1:5432/",
             "http://localhost:22/",
             "http://0.0.0.0:7545",
@@ -544,7 +560,7 @@ mod tests {
             "http://[::1]:7545",
             "http://gitlawb-node.internal:7545",
             "http://my-node.local/",
-            "ftp://node.gitlawb.com",
+            "ftp://node.twigpine.com",
             "not-a-url",
             "",
             // Trailing-dot FQDN of an internal host.
@@ -572,6 +588,49 @@ mod tests {
             // Local-use NAT64 wrapping a *public* v4 (203.0.113.10) is still
             // rejected: the block is prefix-based, not payload-based.
             "http://[64:ff9b:1::cb00:710a]/",
+        ] {
+            assert!(!is_public_http_url(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_dotless_single_label_hosts() {
+        // `.local` and `.internal` are suffix checks, so a name with no dot at
+        // all never matches one. A single-label name is completed by whatever
+        // search domain the resolver is configured with, which is not a
+        // destination we can reason about from the URL.
+        for bad in [
+            "http://local/",
+            "http://internal/",
+            "http://intranet/",
+            "http://wpad/",
+            "http://metadata/",
+            "http://local./",
+            "http://internal.:7545",
+        ] {
+            assert!(!is_public_http_url(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_deprecated_site_local_v6() {
+        // fec0::/10, deprecated by RFC 3879. The link-local mask (0xffc0 ==
+        // 0xfe80) does not cover it: 0xfec0 & 0xffc0 is 0xfec0.
+        for bad in ["http://[fec0::1]/", "http://[feff:ffff::1]:7545"] {
+            assert!(!is_public_http_url(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_repeated_trailing_root_dots() {
+        // Stripping a single root dot leaves `localhost.`, which matches
+        // neither the equality nor the suffix check. The subdomain form now
+        // exercises the `.localhost` suffix rejection together with the extra
+        // trailing dot.
+        for bad in [
+            "http://localhost../",
+            "http://localhost...:7545",
+            "http://node.localhost../",
         ] {
             assert!(!is_public_http_url(bad), "{bad:?} must be rejected");
         }
@@ -1528,6 +1587,31 @@ mod tests {
             "/api/v1/peers/announce",
             Body::from(body.to_string()),
         )
+    }
+
+    #[sqlx::test]
+    async fn announce_rejects_localhost_subdomains_with_an_accurate_error(pool: PgPool) {
+        let state = test_state(pool).await;
+        let did = Keypair::generate().did().to_string();
+        let resp = announce_only(state.clone())
+            .oneshot(announce_as(
+                &did,
+                &announce_body(&did, "https://node.localhost:7545"),
+            ))
+            .await
+            .unwrap();
+
+        let (status, error, message) = status_and_error(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error, "bad_request");
+        assert_eq!(
+            message,
+            "http_url must be a public http(s) URL (no loopback, private, localhost, .localhost, .internal, or .local hosts)"
+        );
+        assert!(
+            snapshot(&state.db, &did).await.is_none(),
+            "a rejected .localhost announce must leave no row behind"
+        );
     }
 
     /// U4 scenario 1, and the first test the keyid branch has ever had: a caller

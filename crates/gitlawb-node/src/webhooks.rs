@@ -227,6 +227,19 @@ async fn fire_event_async_occurrence(
 
         let db_for_mark = db.clone();
         tokio::spawn(async move {
+            // Policy skip, not a delivery failure: the stored URL predates the
+            // create-time gate. The "invalid_url" label is documented on
+            // record_webhook_delivery in metrics.rs.
+            if !crate::api::peers::is_public_http_url(&hook.url) {
+                crate::metrics::record_webhook_delivery("invalid_url");
+                tracing::warn!(
+                    url = %hook.url,
+                    event = %event_name,
+                    "webhook delivery skipped: stored URL is not a public http(s) target"
+                );
+                return;
+            }
+
             let delivery_for_mark = delivery_id.clone();
             let signature = hook.secret.as_deref().map(|s| sign_payload(s, &bytes));
 

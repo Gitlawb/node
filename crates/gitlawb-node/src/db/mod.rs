@@ -7,6 +7,20 @@ use std::time::Duration;
 use tracing::info;
 use uuid::Uuid;
 
+/// Maximum visible repositories per page, plus one internal look-ahead row.
+pub(crate) const MAX_VISIBLE_REPO_PAGE_SIZE: usize = 200;
+
+/// Maximum repository name length in bytes. `repo_cursor` embeds the name in
+/// a base64(JSON) cursor that `parse_repo_cursor` rejects over 4096 bytes, so
+/// every write path must bound the name: a cursor the server emits must
+/// always parse back (#465 4th round). 100 bytes keeps the longest possible
+/// cursor an order of magnitude under the parse limit.
+pub(crate) const MAX_REPO_NAME_LEN: usize = 100;
+
+/// Maximum agent tasks returned per query. Shared by the GraphQL `tasks`
+/// complexity meter and the resolver clamp so they can't drift.
+pub(crate) const MAX_VISIBLE_TASK_PAGE_SIZE: i64 = 200;
+
 // ── Public data types ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +36,133 @@ pub struct RepoRecord {
     pub disk_path: String,
     pub forked_from: Option<String>,
     pub machine_id: Option<String>,
+}
+
+/// Which side is authoritative for a continuously mirrored repository.
+///
+/// A repository without an `upstream_url` has no mirror status. Transitioning
+/// states always carry a durable job id and phase so a node restart can resume
+/// or roll back instead of guessing which side owns writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(not(test), allow(dead_code))]
+pub enum MirrorStatus {
+    Inbound,
+    TransitioningInboundToOutbound,
+    Outbound,
+    TransitioningOutboundToInbound,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl MirrorStatus {
+    fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "inbound" => Ok(Self::Inbound),
+            "transitioning_inbound_to_outbound" => Ok(Self::TransitioningInboundToOutbound),
+            "outbound" => Ok(Self::Outbound),
+            "transitioning_outbound_to_inbound" => Ok(Self::TransitioningOutboundToInbound),
+            _ => anyhow::bail!("invalid mirror status stored in database"),
+        }
+    }
+
+    fn is_transitioning(self) -> bool {
+        matches!(
+            self,
+            Self::TransitioningInboundToOutbound | Self::TransitioningOutboundToInbound
+        )
+    }
+}
+
+/// Durable progress marker for a mirror-authority transition job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(not(test), allow(dead_code))]
+pub enum MirrorTransitionPhase {
+    Queued,
+    Starting,
+    InitializingMirrorFetch,
+    DrainingWrites,
+    FinalizingMirrorFetch,
+    FinalizingMirrorPush,
+    CommittingTargetStatus,
+    Completed,
+    RollingBack,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl MirrorTransitionPhase {
+    fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "queued" => Ok(Self::Queued),
+            "starting" => Ok(Self::Starting),
+            "initializing_mirror_fetch" => Ok(Self::InitializingMirrorFetch),
+            "draining_writes" => Ok(Self::DrainingWrites),
+            "finalizing_mirror_fetch" => Ok(Self::FinalizingMirrorFetch),
+            "finalizing_mirror_push" => Ok(Self::FinalizingMirrorPush),
+            "committing_target_status" => Ok(Self::CommittingTargetStatus),
+            "completed" => Ok(Self::Completed),
+            "rolling_back" => Ok(Self::RollingBack),
+            _ => anyhow::bail!("invalid mirror transition phase stored in database"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct RepoMirrorState {
+    pub repo_id: String,
+    pub upstream_url: String,
+    pub status: MirrorStatus,
+    pub transition_id: Option<Uuid>,
+    pub transition_phase: Option<MirrorTransitionPhase>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl RepoMirrorState {
+    fn validate(&self) -> Result<()> {
+        validate_mirror_upstream_url(&self.upstream_url)?;
+
+        match (
+            self.status.is_transitioning(),
+            self.transition_id,
+            self.transition_phase,
+        ) {
+            (true, Some(_), Some(phase)) if phase != MirrorTransitionPhase::Completed => Ok(()),
+            (false, None, None) => Ok(()),
+            (false, Some(_), Some(MirrorTransitionPhase::Completed)) => Ok(()),
+            _ => anyhow::bail!("mirror status and transition metadata are inconsistent"),
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn validate_mirror_upstream_url(raw: &str) -> Result<reqwest::Url> {
+    if raw.is_empty() || raw.len() > 2048 {
+        anyhow::bail!("mirror upstream URL must contain 1 to 2048 bytes");
+    }
+    if raw.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        anyhow::bail!("mirror upstream URL contains whitespace or control characters");
+    }
+
+    let url = reqwest::Url::parse(raw).context("parsing mirror upstream URL")?;
+    if url.scheme() != "https" {
+        anyhow::bail!("mirror upstream URL must use HTTPS");
+    }
+    if !crate::api::peers::is_public_http_url(raw) {
+        anyhow::bail!("mirror upstream URL must use a public host");
+    }
+    if url.host_str().is_none() || url.path().trim_matches('/').is_empty() {
+        anyhow::bail!("mirror upstream URL must include a host and repository path");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("mirror upstream URL must not embed credentials");
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        anyhow::bail!("mirror upstream URL must not contain a query or fragment");
+    }
+
+    Ok(url)
 }
 
 /// One row of a keyset page from [`Db::list_repos_page_for_scan`].
@@ -152,6 +293,14 @@ pub struct RefCertificate {
     pub node_did: String,
     pub signature: String,
     pub issued_at: String,
+    /// #26 Split PR 3 — the wire-format version of this cert. v1 is
+    /// the pre-versioning 7-field payload (no `version` key in the
+    /// signed bytes). v2+ is reserved for a new signed payload shape
+    /// that carries the version inside the signed bytes; it is not
+    /// v1 plus unsigned fields, because flipping this column must
+    /// invalidate the signature. Clients refuse to verify versions
+    /// they cannot represent rather than guessing.
+    pub version: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,7 +440,7 @@ pub struct PendingRefTransition {
     /// parsed refs in order. The push event identity and the cert
     /// identity are both `(request_id, ordinal)`, so a recovery replay
     /// re-derives the same artifact ids the live path produced without
-    /// depending on which ref happened to land first. Migration v30
+    /// depending on which ref happened to land first. Migration v38
     /// added this column; the live handler sets it from
     /// `ref_updates.iter().enumerate()` so it is stable across live and
     /// recovery.
@@ -300,7 +449,7 @@ pub struct PendingRefTransition {
     /// `"create"`, `"update"`, `"delete"`, or `"branch-create"` /
     /// `"tag-create"`. Recovery re-derives this from the per-ref
     /// report if it is null, so the column is informational. Migration
-    /// v30 added it; older rows are `NULL`.
+    /// v38 added it; older rows are `NULL`.
     pub git_target_kind: Option<String>,
 }
 
@@ -335,7 +484,7 @@ pub struct AnchorJobCompat {
 ///
 /// `request_bytes` is the raw HTTP body the handler received; the
 /// drain could in principle re-run `git receive-pack` against it
-/// after a crash, but the v30 model treats the parsed report as the
+/// after a crash, but the v38 model treats the parsed report as the
 /// durable truth and the `request_bytes` column is informational.
 /// `request_bytes_hash` is the SHA-256 digest of the body as raw
 /// bytes (32 bytes), so a future replay can verify the row's content
@@ -393,7 +542,7 @@ pub mod request_state {
     pub const EFFECTS_PENDING: &str = "effects_pending";
     /// Drain succeeded. Step 3's terminal state for a successful
     /// push. The request row is retained for the 7-day window
-    /// the v30 partial index on `completed_at` is built for.
+    /// the v38 partial index on `completed_at` is built for.
     #[allow(dead_code)]
     pub const COMPLETE: &str = "complete";
     /// Git returned with a non-zero exit and no parseable report.
@@ -435,7 +584,7 @@ pub fn deterministic_id(parts: &[&str]) -> String {
 /// Deterministic id for a push event row. Derived from
 /// `(request_id, ordinal)` so a recovery pass re-firing the same
 /// transition produces the same id and the ON CONFLICT collapses to a
-/// no-op rather than creating a second push event. Migration v30
+/// no-op rather than creating a second push event. Migration v38
 /// made the request's `accepted_ordinal` the carrier of the push
 /// event identity, so this helper takes the ordinal the request row
 /// stamps at `mark_request_outcomes_committed` time.
@@ -599,14 +748,20 @@ pub struct Db {
 }
 
 impl Db {
-    /// Access the underlying Postgres connection pool.
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
-    }
-
     #[cfg(test)]
     pub fn for_testing(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// Test-only: access the underlying Postgres connection pool.
+    ///
+    /// The production accessor was removed on main (ed76adf) once every
+    /// production caller had migrated to typed `Db` methods; this restores
+    /// it for tests only, for the raw-SQL fixtures and closed-pool cases in
+    /// this change that have no typed equivalent.
+    #[cfg(test)]
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
     }
 
     /// Test-only: apply the full schema to a fresh pool. `#[sqlx::test]`
@@ -642,6 +797,46 @@ impl Db {
         let db = Self { pool };
         db.migrate().await?;
         Ok(db)
+    }
+
+    /// Build the dedicated pool that advisory-lock connections come from.
+    ///
+    /// Deliberately **lazy**: connections open on first use rather than at boot.
+    /// The main pool has to connect eagerly because it runs migrations, which is
+    /// why it needs `connect_db_with_retry`'s backoff and degraded-server
+    /// handoff. This pool has no startup work at all, so an eager connect would
+    /// only add a new way for the process to fail to boot, and would need a
+    /// second copy of that retry machinery to be safe. Being lazy removes the
+    /// failure mode instead of handling it: if Postgres is unreachable when the
+    /// first write arrives, that write fails on the pool's own acquire timeout,
+    /// the same way any other database-backed request already does.
+    ///
+    /// Kept separate from the main pool so a burst of lock-holding connections
+    /// cannot starve ordinary request handlers. See
+    /// `GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS` for the sizing tradeoff.
+    pub fn lock_pool(
+        database_url: &str,
+        max_connections: u32,
+        acquire_timeout: Duration,
+    ) -> Result<PgPool> {
+        info!(
+            max_connections,
+            acquire_timeout_secs = acquire_timeout.as_secs(),
+            "creating dedicated advisory-lock pool (lazy)"
+        );
+        PgPoolOptions::new()
+            .max_connections(max_connections)
+            // Explicit, and load-bearing rather than cosmetic: `RepoWriteGuard::Drop`
+            // has a no-runtime branch that calls `PoolConnection::leak()` and relies
+            // on the husk's own drop doing nothing. With `min_connections > 0` that
+            // drop still spawns a pool-replenish task, and spawning without a runtime
+            // panics inside Drop, which aborts the process during unwind. It is 0 by
+            // default, so this line exists to keep a future tuning change from
+            // silently re-arming that panic.
+            .min_connections(0)
+            .acquire_timeout(acquire_timeout)
+            .connect_lazy(database_url)
+            .context("creating advisory-lock pool")
     }
 
     /// Cheap liveness probe against the pool, for readiness checks: one
@@ -1595,6 +1790,101 @@ const MIGRATIONS: &[Migration] = &[
         ],
     },
     Migration {
+        version: 30,
+        name: "repo_upstream_mirror_state",
+        stmts: &[
+            // Nullable, default-free columns keep this migration metadata-only
+            // for every existing non-mirror repository.
+            "ALTER TABLE repos ADD COLUMN IF NOT EXISTS upstream_url TEXT",
+            "ALTER TABLE repos ADD COLUMN IF NOT EXISTS mirror_status TEXT",
+            "ALTER TABLE repos ADD COLUMN IF NOT EXISTS mirror_transition_id UUID",
+            "ALTER TABLE repos ADD COLUMN IF NOT EXISTS mirror_transition_phase TEXT",
+            "ALTER TABLE repos ADD COLUMN IF NOT EXISTS mirror_updated_at TEXT",
+            // A constraint name does not prove its definition. Replace any
+            // same-named manual or partial-recovery artifact before installing
+            // the exact invariant this migration promises.
+            "ALTER TABLE repos DROP CONSTRAINT IF EXISTS repos_mirror_state_valid",
+            // PostgreSQL accepts a CHECK whose result is NULL. Wrap the complete
+            // invariant in IS TRUE so a missing status or phase cannot slip
+            // through three-valued logic.
+            r#"ALTER TABLE repos ADD CONSTRAINT repos_mirror_state_valid CHECK ((
+                           (
+                               upstream_url IS NULL
+                               AND mirror_status IS NULL
+                               AND mirror_transition_id IS NULL
+                               AND mirror_transition_phase IS NULL
+                               AND mirror_updated_at IS NULL
+                           )
+                           OR
+                           (
+                               upstream_url IS NOT NULL
+                               AND upstream_url LIKE 'https://%'
+                               AND upstream_url <> 'https://'
+                               AND mirror_updated_at IS NOT NULL
+                               AND (
+                                   (
+                                       mirror_status IN ('inbound', 'outbound')
+                                       AND (
+                                           (mirror_transition_id IS NULL AND mirror_transition_phase IS NULL)
+                                           OR
+                                           (mirror_transition_id IS NOT NULL AND mirror_transition_phase = 'completed')
+                                       )
+                                   )
+                                   OR
+                                   (
+                                       mirror_status IN (
+                                           'transitioning_inbound_to_outbound',
+                                           'transitioning_outbound_to_inbound'
+                                       )
+                                       AND mirror_transition_id IS NOT NULL
+                                       AND mirror_transition_phase IN (
+                                           'queued',
+                                           'starting',
+                                           'initializing_mirror_fetch',
+                                           'draining_writes',
+                                           'finalizing_mirror_fetch',
+                                           'finalizing_mirror_push',
+                                           'committing_target_status',
+                                           'rolling_back'
+                                       )
+                                   )
+                               )
+                           )
+                       ) IS TRUE) NOT VALID"#,
+        ],
+    },
+    Migration {
+        version: 31,
+        name: "validate_repo_upstream_mirror_state",
+        stmts: &["ALTER TABLE repos VALIDATE CONSTRAINT repos_mirror_state_valid"],
+    },
+    Migration {
+        version: 37,
+        name: "ref_certificates_version",
+        stmts: &[
+            // #26 Split PR 3 — certificate / CLI compatibility. The
+            // ref-cert wire format is versioned so future fields can
+            // be added without breaking old clients (which ignore
+            // the field) or old servers (which default the column
+            // to 1). New certificates are currently issued as v1,
+            // which is byte-for-byte identical to the pre-versioning
+            // shape: an old client reading a v1 cert from a new
+            // server sees the same payload, the same signature, and
+            // the same Ed25519 verify path. A new client reading an
+            // old server sees `version` defaulted to 1 and verifies
+            // against the v1 payload shape. v2 is reserved for a
+            // future shape that carries the version inside the
+            // signed bytes; it must not be stamped until a v2
+            // verifier ships.
+            //
+            // DEFAULT 1 so an existing row reads as v1 without a
+            // backfill migration. NOT NULL so a missing value is a
+            // hard error at insert time rather than a silent v0 that
+            // an old client would interpret as "no version field."
+            "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1",
+        ],
+    },
+    Migration {
         // #26 Split PR 1 round 6 — request-level data model.
         //
         // Reviewer finding: the request's push event was encoded into
@@ -1622,7 +1912,7 @@ const MIGRATIONS: &[Migration] = &[
         // highest here; the cert-compat branch had renumbered its
         // own v28 to v37 independently). Re-check the floor on
         // every push — the open PR list moves it.
-        version: 30,
+        version: 38,
         name: "receive_pack_requests",
         stmts: &[
             // The new request table. The push event and trust
@@ -1702,7 +1992,7 @@ const MIGRATIONS: &[Migration] = &[
         // does not need a CHECK constraint change because the
         // `state` column is TEXT; this migration is a comment +
         // index.
-        version: 31,
+        version: 39,
         name: "receive_pack_requests_quarantined",
         stmts: &[
             // Operator-attended state. Pinned in a comment so a
@@ -1723,7 +2013,7 @@ const MIGRATIONS: &[Migration] = &[
         // declared downstream consumer (cert/anchor in PR #386)
         // can use it. Nullable so pre-v32 rows remain valid; new
         // intents always populate all three.
-        version: 32,
+        version: 40,
         name: "receive_pack_requests_proof",
         stmts: &[
             "ALTER TABLE receive_pack_requests ADD COLUMN IF NOT EXISTS signature_header TEXT",
@@ -1735,7 +2025,7 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         // v33: occurrence lifecycle — proof record, landing history,
         // marker tombstones, occurrence-keyed anchors.
-        version: 33,
+        version: 41,
         name: "request_occurrence_lifecycle",
         stmts: &[
             r#"CREATE TABLE IF NOT EXISTS request_proofs (
@@ -1779,7 +2069,7 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         // v34: occurrence delivery ledger, marker cleanup scheduling.
-        version: 34,
+        version: 42,
         name: "occurrence_delivery_and_cleanup_progress",
         stmts: &[
             r#"CREATE TABLE IF NOT EXISTS webhook_deliveries (
@@ -1800,7 +2090,7 @@ const MIGRATIONS: &[Migration] = &[
         // delivery that never fired. Claim inserts pending; the sender
         // marks sent after the HTTP response; recovery re-fires stale
         // pending rows.
-        version: 35,
+        version: 43,
         name: "webhook_delivery_sent_state",
         stmts: &[
             "ALTER TABLE webhook_deliveries ADD COLUMN IF NOT EXISTS sent_at TEXT",
@@ -1832,6 +2122,16 @@ const OWNER_KEY_CASE_SQL: &str = "CASE WHEN owner_did LIKE 'did:key:%' AND posit
 /// SQL CASE expression byte-identical to `normalize_owner_key`, but for columns
 /// named `did` (like in agent_profiles) instead of `owner_did`.
 const PROFILE_DID_CASE_SQL: &str = "CASE WHEN did LIKE 'did:key:%' AND position(':' in substr(did, 9)) = 0 THEN substr(did, 9) ELSE did END";
+
+/// SQL CASE expression byte-identical to `normalize_owner_key`, but for columns
+/// named `repo_owner` (bounties table).  The bounties `repo_owner` is stored
+/// verbatim from the URL segment, so it may be either the full `did:key:` form
+/// or the bare key.
+const BOUNTY_OWNER_CASE_SQL: &str = "CASE WHEN repo_owner LIKE 'did:key:%' AND position(':' in substr(repo_owner, 9)) = 0 THEN substr(repo_owner, 9) ELSE repo_owner END";
+
+/// SQL CASE expression byte-identical to `normalize_owner_key`, but for columns
+/// named `claimant_did` (bounties table).
+const BOUNTY_CLAIMANT_CASE_SQL: &str = "CASE WHEN claimant_did LIKE 'did:key:%' AND position(':' in substr(claimant_did, 9)) = 0 THEN substr(claimant_did, 9) ELSE claimant_did END";
 
 #[cfg(test)]
 mod normalize_owner_key_tests {
@@ -1923,6 +2223,72 @@ impl Db {
         Ok(())
     }
 
+    /// Attach an external HTTPS upstream to a canonical repository in inbound
+    /// mode. This is deliberately idempotent only for the same untouched
+    /// inbound configuration; it never overwrites an existing upstream or
+    /// resets a transition that may be in progress.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn configure_inbound_mirror(
+        &self,
+        repo_id: &str,
+        upstream_url: &str,
+    ) -> Result<RepoMirrorState> {
+        Uuid::parse_str(repo_id)
+            .context("continuous mirrors require a canonical UUID repository id")?;
+        let upstream_url = validate_mirror_upstream_url(upstream_url)?.to_string();
+        let updated_at = Utc::now().to_rfc3339();
+
+        let row = sqlx::query(
+            "UPDATE repos
+             SET upstream_url = $2,
+                 mirror_status = 'inbound',
+                 mirror_transition_id = NULL,
+                 mirror_transition_phase = NULL,
+                 mirror_updated_at = COALESCE(mirror_updated_at, $3)
+             WHERE id = $1
+               AND (
+                   upstream_url IS NULL
+                   OR (
+                       upstream_url = $2
+                       AND mirror_status = 'inbound'
+                       AND mirror_transition_id IS NULL
+                       AND mirror_transition_phase IS NULL
+                   )
+               )
+             RETURNING id, upstream_url, mirror_status, mirror_transition_id,
+                       mirror_transition_phase, mirror_updated_at",
+        )
+        .bind(repo_id)
+        .bind(&upstream_url)
+        .bind(&updated_at)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let row = row.context(
+            "repository does not exist or already has a different/transitioning mirror configuration",
+        )?;
+        row_to_repo_mirror_state(row)
+    }
+
+    /// Return the durable mirror state, or `None` for a normal non-mirrored
+    /// repository (and for an unknown id). Callers that need to distinguish
+    /// those cases must resolve the repository first through the auth-gated
+    /// repository path.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn get_repo_mirror_state(&self, repo_id: &str) -> Result<Option<RepoMirrorState>> {
+        let row = sqlx::query(
+            "SELECT id, upstream_url, mirror_status, mirror_transition_id,
+                    mirror_transition_phase, mirror_updated_at
+             FROM repos
+             WHERE id = $1 AND upstream_url IS NOT NULL",
+        )
+        .bind(repo_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(row_to_repo_mirror_state).transpose()
+    }
+
     /// Register a mirrored repo from a peer in the local DB so git smart HTTP can serve it.
     /// Uses INSERT OR IGNORE (SQLite) / ON CONFLICT DO NOTHING (Postgres) so it's idempotent.
     pub async fn upsert_mirror_repo(
@@ -1933,6 +2299,16 @@ impl Db {
         machine_id: Option<&str>,
         quarantined: bool,
     ) -> Result<()> {
+        // Peer-supplied names are bound like the local write paths: an
+        // unbounded name would make reposPage emit a cursor longer than the
+        // 4096-byte parse limit, dead-ending pagination for every caller past
+        // that row (#465 4th round). The sync caller drops the error and skips
+        // the mirror.
+        if name.len() > MAX_REPO_NAME_LEN {
+            anyhow::bail!(
+                "mirror repo name exceeds {MAX_REPO_NAME_LEN} bytes: refusing to register"
+            );
+        }
         let now = Utc::now().to_rfc3339();
         let id = format!("{owner_short}/{name}");
         // `quarantined` is set only on first insert (the admission decision).
@@ -2221,6 +2597,73 @@ impl Db {
             .fetch_all(&self.pool)
             .await?;
 
+        Ok(rows.into_iter().map(row_to_repo).collect())
+    }
+
+    /// A bounded, mirror-deduplicated page ordered by owner key and repository
+    /// name. Apply root visibility before LIMIT: private rows must not consume
+    /// page slots or influence continuation metadata. The root-rule predicate
+    /// mirrors `visibility::listable_at_root`; a differential test pins it.
+    /// Malformed reader JSON denies that repo to non-owners without failing the page.
+    /// Cursors only select a position and never confer read authority.
+    ///
+    /// Performance note: the page orders and keyset-filters on
+    /// `(owner_key, name)` under `COLLATE "C"`, but the existing
+    /// `idx_repos_owner_key_name` index is built on the database default
+    /// collation and cannot serve that ordering, so each page sorts the full
+    /// deduped repo set before the keyset filter applies: O(total repos) work
+    /// per page. This is accepted (pages are capped at
+    /// `MAX_VISIBLE_REPO_PAGE_SIZE` rows over a narrow projection). A
+    /// C-collation expression index was deliberately not added in a migration:
+    /// versions 27-35 are claimed by other in-flight branches (Gitlawb/node#384
+    /// claims 27-35, #464 claims 27-28) and the runner keys applied migrations
+    /// on the version integer alone, so a colliding entry would be silently
+    /// skipped on whichever side merges second. Revisit once that range lands
+    /// or clears.
+    pub async fn list_visible_repos_page(
+        &self,
+        caller: Option<&str>,
+        after: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<Vec<RepoRecord>> {
+        let sql = format!(
+            "{}
+             SELECT d.id, d.name, d.owner_did, d.description, d.is_public,
+                 d.default_branch, d.created_at, d.updated_at, d.disk_path,
+                 d.forked_from, d.machine_id
+             FROM deduped d
+             LEFT JOIN LATERAL (
+                 SELECT reader_dids FROM visibility_rules v
+                 WHERE v.repo_id = d.id AND v.path_glob ~ '^/*([*][*])*$'
+                 ORDER BY v.path_glob DESC LIMIT 1
+             ) root_rule ON TRUE
+             WHERE (
+                 ($2::text IS NOT NULL AND ({key}) = $2)
+                 OR CASE WHEN root_rule.reader_dids IS NULL THEN d.is_public
+                    WHEN NOT pg_input_is_valid(root_rule.reader_dids, 'jsonb') THEN FALSE
+                    WHEN jsonb_typeof(root_rule.reader_dids::jsonb) = 'array' THEN
+                        COALESCE(root_rule.reader_dids::jsonb ? $3::text, FALSE)
+                        AND NOT EXISTS (
+                            SELECT 1 FROM jsonb_array_elements(root_rule.reader_dids::jsonb) reader
+                            WHERE jsonb_typeof(reader) <> 'string'
+                        )
+                    ELSE FALSE END
+             )
+             AND ($4::text IS NULL OR (({key}) COLLATE \"C\", d.name COLLATE \"C\") > ($4, $5::text))
+             ORDER BY ({key}) COLLATE \"C\", d.name COLLATE \"C\"
+             LIMIT $6",
+            Self::dedup_cte(),
+            key = OWNER_KEY_CASE_SQL,
+        );
+        let rows = sqlx::query(&sql)
+            .bind(None::<&str>)
+            .bind(caller.map(normalize_owner_key))
+            .bind(caller)
+            .bind(after.map(|(owner, _)| normalize_owner_key(owner)))
+            .bind(after.map(|(_, name)| name))
+            .bind(limit.min(MAX_VISIBLE_REPO_PAGE_SIZE + 1) as i64)
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows.into_iter().map(row_to_repo).collect())
     }
 
@@ -2901,13 +3344,13 @@ impl Db {
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn remove_label(&self, repo_id: &str, label: &str) -> Result<()> {
-        sqlx::query("DELETE FROM repo_labels WHERE repo_id = $1 AND label = $2")
+    pub async fn remove_label(&self, repo_id: &str, label: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM repo_labels WHERE repo_id = $1 AND label = $2")
             .bind(repo_id)
             .bind(label)
             .execute(&self.pool)
             .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn list_labels(&self, repo_id: &str) -> Result<Vec<String>> {
@@ -3022,8 +3465,8 @@ impl Db {
     pub async fn insert_ref_certificate(&self, cert: &RefCertificate) -> Result<RefCertificate> {
         let row = sqlx::query(
             "INSERT INTO ref_certificates
-             (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, version)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              ON CONFLICT (repo_id, ref_name) DO UPDATE SET
                 old_sha   = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
                                  THEN EXCLUDED.old_sha   ELSE ref_certificates.old_sha   END,
@@ -3036,8 +3479,10 @@ impl Db {
                 signature = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
                                  THEN EXCLUDED.signature ELSE ref_certificates.signature END,
                 issued_at = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
-                                 THEN EXCLUDED.issued_at ELSE ref_certificates.issued_at END
-             RETURNING id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at",
+                                 THEN EXCLUDED.issued_at ELSE ref_certificates.issued_at END,
+                version   = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
+                                 THEN EXCLUDED.version   ELSE ref_certificates.version   END
+             RETURNING id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, version",
         )
         .bind(&cert.id)
         .bind(&cert.repo_id)
@@ -3048,6 +3493,7 @@ impl Db {
         .bind(&cert.node_did)
         .bind(&cert.signature)
         .bind(&cert.issued_at)
+        .bind(cert.version as i32)
         .fetch_one(&self.pool)
         .await?;
         Ok(row_to_cert(row))
@@ -4802,7 +5248,7 @@ impl Db {
                (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                ON CONFLICT (repo_id, ref_name) DO NOTHING
-               RETURNING id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at"#,
+               RETURNING id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, version"#,
         )
         .bind(&cert.id)
         .bind(&cert.repo_id)
@@ -5355,7 +5801,7 @@ impl Db {
         // bounded even if a raw/negative value slips through the handler layer.
         let limit = limit.max(1);
         let rows = sqlx::query(
-            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, version
              FROM ref_certificates WHERE repo_id = $1 ORDER BY issued_at DESC LIMIT $2",
         )
         .bind(repo_id)
@@ -5394,7 +5840,7 @@ impl Db {
         let pattern = format!("{}%", escaped_prefix);
 
         let rows = sqlx::query(
-            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, version
              FROM ref_certificates WHERE repo_id = $1 AND id LIKE $2 ESCAPE '!' ORDER BY issued_at DESC LIMIT $3",
         )
         .bind(repo_id)
@@ -5407,7 +5853,7 @@ impl Db {
 
     pub async fn get_ref_certificate(&self, id: &str) -> Result<Option<RefCertificate>> {
         let row = sqlx::query(
-            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, version
              FROM ref_certificates WHERE id = $1",
         )
         .bind(id)
@@ -5550,15 +5996,7 @@ impl Db {
             // The read-then-write race is benign: if a row appears in between,
             // this write becomes an UPDATE and the UnprovenRepoint guard below
             // still refuses any http_url change.
-            PeerWriteAuthority::Unproven
-                if !sqlx::query_scalar::<_, bool>(
-                    "SELECT EXISTS(SELECT 1 FROM peers WHERE did = $1)",
-                )
-                .bind(did)
-                .fetch_one(&self.pool)
-                .await
-                .unwrap_or(false) =>
-            {
+            PeerWriteAuthority::Unproven if !self.peer_exists(did).await.unwrap_or(false) => {
                 match did.parse::<gitlawb_core::did::Did>() {
                     // Only reachable from the bootstrap announce-back in main.rs,
                     // which passes the contacted peer's raw JSON string; the
@@ -5686,6 +6124,41 @@ impl Db {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Whether a DID has a row in `peers`, by keyed lookup.
+    ///
+    /// For callers that only need the membership answer. `list_peers` fetches
+    /// and materializes every row, so using it as a membership test on a hot
+    /// path (the gossip ingest gate) makes the cost of one event grow with the
+    /// size of the table.
+    pub async fn peer_exists(&self, did: &str) -> Result<bool> {
+        Ok(
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM peers WHERE did = $1)")
+                .bind(did)
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
+    pub async fn list_federation_peers(&self, limit: i64) -> Result<Vec<PeerRecord>> {
+        let rows = sqlx::query(
+            "SELECT did, http_url, last_seen, last_ping_ok, announced_at
+             FROM peers WHERE last_ping_ok = TRUE AND http_url <> '' ORDER BY last_seen DESC NULLS LAST, did LIMIT $1",
+        )
+        .bind(limit.clamp(0, crate::api::repos::MAX_FEDERATED_PEERS as i64 + 1))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| PeerRecord {
+                did: r.get("did"),
+                http_url: r.get("http_url"),
+                last_seen: r.get("last_seen"),
+                last_ping_ok: r.get::<bool, _>("last_ping_ok"),
+                announced_at: r.get("announced_at"),
+            })
+            .collect())
     }
 
     pub async fn list_peers(&self) -> Result<Vec<PeerRecord>> {
@@ -6641,28 +7114,54 @@ impl Db {
 
 // ── Agent Tasks ───────────────────────────────────────────────────────────────
 
+/// Permanent authorization denial: the task is reserved for a different assignee.
+/// Handlers downcast this to return 403 (vs 409 for a lost claim race).
+#[derive(Debug, thiserror::Error)]
+#[error("task not claimable: reserved for another assignee")]
+pub struct TaskReservedForOtherAssignee;
+
+/// ASCII whitespace treated as blank for assignee slots — must stay in sync with
+/// `BTRIM(assignee_did, E' \t\n\r')` in `claim_task`'s SQL open-slot check.
+const ASSIGNEE_BLANK: &[char] = &[' ', '\t', '\n', '\r'];
+
+fn assignee_slot_blank(s: &str) -> bool {
+    s.trim_matches(ASSIGNEE_BLANK).is_empty()
+}
+
+/// Trim assignee DIDs for auth matching (same ASCII blank set as SQL/open checks).
+pub fn trim_assignee_did(s: &str) -> &str {
+    s.trim_matches(ASSIGNEE_BLANK)
+}
+
 impl Db {
-    pub async fn create_task(&self, task: &AgentTask) -> Result<()> {
+    /// Persist a task. Whitespace-only `assignee_did` is stored as `NULL` (open).
+    /// Returns the normalized row shape so REST/GraphQL create responses match GET.
+    pub async fn create_task(&self, task: &AgentTask) -> Result<AgentTask> {
+        let mut stored = task.clone();
+        stored.assignee_did = stored
+            .assignee_did
+            .take()
+            .filter(|s| !assignee_slot_blank(s));
         sqlx::query(
             "INSERT INTO agent_tasks (id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
         )
-        .bind(&task.id)
-        .bind(&task.repo_id)
-        .bind(&task.kind)
-        .bind(&task.status)
-        .bind(&task.delegator_did)
-        .bind(&task.assignee_did)
-        .bind(&task.capability)
-        .bind(&task.ucan_token)
-        .bind(&task.payload)
-        .bind(&task.result)
-        .bind(&task.created_at)
-        .bind(&task.updated_at)
-        .bind(&task.deadline)
+        .bind(&stored.id)
+        .bind(&stored.repo_id)
+        .bind(&stored.kind)
+        .bind(&stored.status)
+        .bind(&stored.delegator_did)
+        .bind(&stored.assignee_did)
+        .bind(&stored.capability)
+        .bind(&stored.ucan_token)
+        .bind(&stored.payload)
+        .bind(&stored.result)
+        .bind(&stored.created_at)
+        .bind(&stored.updated_at)
+        .bind(&stored.deadline)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(stored)
     }
 
     pub async fn get_task(&self, id: &str) -> Result<Option<AgentTask>> {
@@ -6719,38 +7218,102 @@ impl Db {
         Ok(rows.into_iter().map(row_to_task).collect())
     }
 
+    /// Claim a pending task for `assignee_did`.
+    ///
+    /// If the task was created with a non-blank pre-set `assignee_did`, only that
+    /// agent (DID-normalized via [`crate::api::did_matches`]) may claim it. Open
+    /// tasks (`NULL` / blank) remain first-claimer-wins. A reserved claim keeps
+    /// the **exact** stored DID form via `COALESCE($4, $2)` (no BTRIM rewrite) so
+    /// exact-match list filters still work. The UPDATE also re-checks the
+    /// assignee slot as defense-in-depth against a future writer racing the
+    /// pre-check.
     pub async fn claim_task(&self, id: &str, assignee_did: &str) -> Result<AgentTask> {
         let now = Utc::now().to_rfc3339();
+        // Denial path only needs status + assignee — do not load payload/UCAN
+        // for a permissionless caller who will be rejected.
+        let row = sqlx::query("SELECT status, assignee_did FROM agent_tasks WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("task not claimable: not found or already claimed"))?;
+        let status: String = row.get("status");
+        if status != "pending" {
+            return Err(anyhow::anyhow!(
+                "task not claimable: not found or already claimed"
+            ));
+        }
+        let stored: Option<String> = row.get("assignee_did");
+        // Blank reservations are treated as open. Keep the exact stored string
+        // for the UPDATE equality check and SET (do not BTRIM the reserved form).
+        // Blank definition matches SQL `BTRIM(..., E' \t\n\r')` (not space-only).
+        let reserved_exact = stored.as_deref().filter(|r| !assignee_slot_blank(r));
+        if let Some(reserved) = reserved_exact {
+            if !crate::api::did_matches(assignee_did, trim_assignee_did(reserved)) {
+                return Err(TaskReservedForOtherAssignee.into());
+            }
+        }
+        // Keep the exact reserved form ($4); only fill assignee on open claims ($2).
+        // Treat blank stored values as open for the SQL slot check.
         let row = sqlx::query(
-            "UPDATE agent_tasks SET status='claimed', assignee_did=$2, updated_at=$3
+            "UPDATE agent_tasks SET status='claimed',
+                 assignee_did = COALESCE($4, $2),
+                 updated_at=$3
              WHERE id=$1 AND status='pending'
+               AND (
+                 ($4::text IS NULL AND (assignee_did IS NULL OR BTRIM(assignee_did, E' \t\n\r') = ''))
+                 OR assignee_did = $4
+               )
              RETURNING id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline",
         )
         .bind(id)
         .bind(assignee_did)
         .bind(&now)
+        .bind(reserved_exact)
         .fetch_optional(&self.pool)
         .await?;
         row.map(row_to_task)
             .ok_or_else(|| anyhow::anyhow!("task not claimable: not found or already claimed"))
     }
 
+    /// Transition a claimed task to `new_status` (`completed` / `failed`).
+    ///
+    /// `actor_did` must be the task's assignee (DID-normalized). The UPDATE
+    /// binds the exact stored `assignee_did` so a concurrent reassignment /
+    /// re-claim cannot finish under a check-then-act race in the handler.
     pub async fn finish_task(
         &self,
         id: &str,
         new_status: &str,
         result: Option<&str>,
+        actor_did: &str,
     ) -> Result<AgentTask> {
         let now = Utc::now().to_rfc3339();
+        let existing = self
+            .get_task(id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("task not found or not in claimed state"))?;
+        if existing.status != "claimed" {
+            return Err(anyhow::anyhow!("task not found or not in claimed state"));
+        }
+        let Some(ref assigned) = existing.assignee_did else {
+            return Err(anyhow::anyhow!("task not found or not in claimed state"));
+        };
+        // Trim matches claim_task so tab-padded stored values can finish.
+        if !crate::api::did_matches(actor_did, trim_assignee_did(assigned)) {
+            return Err(anyhow::anyhow!(
+                "task not finishable: only the assignee may finish it"
+            ));
+        }
         let row = sqlx::query(
             "UPDATE agent_tasks SET status=$2, result=$3, updated_at=$4
-             WHERE id=$1 AND status='claimed'
+             WHERE id=$1 AND status='claimed' AND assignee_did=$5
              RETURNING id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline",
         )
         .bind(id)
         .bind(new_status)
         .bind(result)
         .bind(&now)
+        .bind(assigned.as_str())
         .fetch_optional(&self.pool)
         .await?;
         row.map(row_to_task)
@@ -6857,6 +7420,576 @@ impl Db {
 
 // ── Row helpers ───────────────────────────────────────────────────────────────
 
+#[cfg_attr(not(test), allow(dead_code))]
+fn row_to_repo_mirror_state(r: sqlx::postgres::PgRow) -> Result<RepoMirrorState> {
+    let repo_id = r
+        .try_get("id")
+        .context("reading mirror repository id from database")?;
+    let upstream_url = r
+        .try_get("upstream_url")
+        .context("reading mirror upstream URL from database")?;
+    let status = r
+        .try_get::<String, _>("mirror_status")
+        .context("reading mirror status from database")?;
+    let status = MirrorStatus::from_db(&status)?;
+    let transition_id = r
+        .try_get("mirror_transition_id")
+        .context("reading mirror transition id from database")?;
+    let transition_phase = r
+        .try_get::<Option<String>, _>("mirror_transition_phase")
+        .context("reading mirror transition phase from database")?
+        .as_deref()
+        .map(MirrorTransitionPhase::from_db)
+        .transpose()?;
+    let updated_at = r
+        .try_get::<String, _>("mirror_updated_at")
+        .context("reading mirror update timestamp from database")?
+        .parse::<DateTime<Utc>>()
+        .context("invalid mirror_updated_at stored in database")?;
+
+    let state = RepoMirrorState {
+        repo_id,
+        upstream_url,
+        status,
+        transition_id,
+        transition_phase,
+        updated_at,
+    };
+    state.validate()?;
+    Ok(state)
+}
+
+#[cfg(test)]
+mod mirror_state_tests {
+    use super::{
+        row_to_repo_mirror_state, validate_mirror_upstream_url, Db, MirrorStatus,
+        MirrorTransitionPhase, RepoMirrorState, RepoRecord,
+    };
+    use chrono::{DateTime, Utc};
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    fn ts(value: &str) -> DateTime<Utc> {
+        value.parse().unwrap()
+    }
+
+    fn repo(id: Uuid) -> RepoRecord {
+        RepoRecord {
+            id: id.to_string(),
+            name: "mirror-fixture".to_string(),
+            owner_did: "did:key:z6MkMirrorOwner".to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: ts("2026-08-14T00:00:00Z"),
+            updated_at: ts("2026-08-14T00:00:00Z"),
+            disk_path: format!("/srv/repos/{id}.git"),
+            forked_from: None,
+            machine_id: None,
+        }
+    }
+
+    async fn migrated_db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    #[test]
+    fn upstream_url_accepts_https_forges_without_credentials() {
+        for valid in [
+            "https://github.com/Gitlawb/node.git",
+            "https://gitlab.example.com/platform/subgroup/node",
+            "https://ghe.internal.example/org/repo.git",
+        ] {
+            validate_mirror_upstream_url(valid).unwrap();
+        }
+    }
+
+    #[test]
+    fn upstream_url_rejects_unsafe_or_ambiguous_forms() {
+        for invalid in [
+            "",
+            "http://github.com/Gitlawb/node.git",
+            "ssh://git@github.com/Gitlawb/node.git",
+            "file:///etc/passwd",
+            "https://user:secret@github.com/Gitlawb/node.git",
+            "https://github.com/Gitlawb/node.git?token=secret",
+            "https://github.com/Gitlawb/node.git#main",
+            "https://github.com/",
+            "https://github.com/Gitlawb/node.git\n",
+            "https://localhost/Gitlawb/node.git",
+            "https://forge.localhost/Gitlawb/node.git",
+            "https://127.0.0.1/Gitlawb/node.git",
+            "https://[::1]/Gitlawb/node.git",
+            "https://169.254.169.254/Gitlawb/node.git",
+            "https://10.0.0.5/Gitlawb/node.git",
+            "https://172.16.0.5/Gitlawb/node.git",
+            "https://192.168.1.5/Gitlawb/node.git",
+            "https://forge.internal/Gitlawb/node.git",
+            "https://[::ffff:127.0.0.1]/Gitlawb/node.git",
+            "https://[64:ff9b::7f00:1]/Gitlawb/node.git",
+        ] {
+            assert!(
+                validate_mirror_upstream_url(invalid).is_err(),
+                "unsafe mirror URL was accepted: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn transition_metadata_must_match_the_status() {
+        let base = RepoMirrorState {
+            repo_id: Uuid::new_v4().to_string(),
+            upstream_url: "https://github.com/Gitlawb/node.git".to_string(),
+            status: MirrorStatus::Inbound,
+            transition_id: None,
+            transition_phase: None,
+            updated_at: Utc::now(),
+        };
+        base.validate().unwrap();
+
+        let mut invalid = base.clone();
+        invalid.status = MirrorStatus::TransitioningInboundToOutbound;
+        assert!(invalid.validate().is_err());
+
+        invalid.transition_id = Some(Uuid::new_v4());
+        invalid.transition_phase = Some(MirrorTransitionPhase::DrainingWrites);
+        invalid.validate().unwrap();
+
+        invalid.transition_phase = Some(MirrorTransitionPhase::Completed);
+        assert!(invalid.validate().is_err());
+    }
+
+    #[sqlx::test]
+    async fn migrations_v30_v31_upgrade_an_existing_repo_without_rewriting_it(pool: PgPool) {
+        let db = migrated_db(pool).await;
+
+        // Recreate the pre-v30 shape, then add data written by the old node.
+        sqlx::query("ALTER TABLE repos DROP COLUMN upstream_url CASCADE")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        for column in [
+            "mirror_status",
+            "mirror_transition_id",
+            "mirror_transition_phase",
+            "mirror_updated_at",
+        ] {
+            sqlx::query(&format!("ALTER TABLE repos DROP COLUMN {column}"))
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query("DELETE FROM schema_migrations WHERE version IN (30, 31)")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let existing = repo(Uuid::new_v4());
+        db.create_repo(&existing).await.unwrap();
+
+        db.run_migrations().await.unwrap();
+
+        let still_there: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repos WHERE id = $1")
+            .bind(&existing.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            still_there, 1,
+            "the existing repository must survive v30/v31"
+        );
+
+        let mirror_values: (Option<String>, Option<String>, Option<Uuid>, Option<String>) =
+            sqlx::query_as(
+                "SELECT upstream_url, mirror_status, mirror_transition_id,
+                        mirror_transition_phase
+                 FROM repos WHERE id = $1",
+            )
+            .bind(&existing.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(mirror_values, (None, None, None, None));
+
+        let recorded: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT version, name FROM schema_migrations
+             WHERE version IN (30, 31) ORDER BY version",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            recorded,
+            vec![
+                (30, "repo_upstream_mirror_state".to_string()),
+                (31, "validate_repo_upstream_mirror_state".to_string()),
+            ]
+        );
+        let constraint_validated: bool = sqlx::query_scalar(
+            "SELECT convalidated FROM pg_constraint
+             WHERE conrelid = 'repos'::regclass
+               AND conname = 'repos_mirror_state_valid'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(constraint_validated, "v31 must validate the v30 constraint");
+
+        // Production entry point remains idempotent after the upgrade.
+        db.run_migrations().await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn migration_replaces_a_same_named_weaker_constraint(pool: PgPool) {
+        let db = migrated_db(pool).await;
+
+        sqlx::query("ALTER TABLE repos DROP CONSTRAINT repos_mirror_state_valid")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "ALTER TABLE repos ADD CONSTRAINT repos_mirror_state_valid CHECK (TRUE) NOT VALID",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version IN (30, 31)")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        db.run_migrations().await.unwrap();
+
+        let definition: String = sqlx::query_scalar(
+            "SELECT pg_get_constraintdef(oid)
+             FROM pg_constraint
+             WHERE conrelid = 'repos'::regclass
+               AND conname = 'repos_mirror_state_valid'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(
+            definition.contains("transitioning_inbound_to_outbound")
+                && !definition.eq_ignore_ascii_case("CHECK (true)"),
+            "migration preserved an impostor constraint: {definition}"
+        );
+
+        let existing = repo(Uuid::new_v4());
+        db.create_repo(&existing).await.unwrap();
+        let malformed = sqlx::query(
+            "UPDATE repos
+             SET upstream_url = 'https://github.com/Gitlawb/node.git',
+                 mirror_status = 'transitioning_inbound_to_outbound',
+                 mirror_updated_at = '2026-08-14T00:00:00Z'
+             WHERE id = $1",
+        )
+        .bind(&existing.id)
+        .execute(&db.pool)
+        .await;
+        assert!(
+            malformed.is_err(),
+            "replacement constraint accepted missing transition metadata"
+        );
+    }
+
+    #[sqlx::test]
+    async fn inbound_configuration_round_trips_without_overwriting_state(pool: PgPool) {
+        let db = migrated_db(pool).await;
+        let existing = repo(Uuid::new_v4());
+        db.create_repo(&existing).await.unwrap();
+
+        assert!(db
+            .get_repo_mirror_state(&existing.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        let first = db
+            .configure_inbound_mirror(&existing.id, "https://github.com/Gitlawb/node.git")
+            .await
+            .unwrap();
+        assert_eq!(first.status, MirrorStatus::Inbound);
+        assert_eq!(first.transition_id, None);
+        assert_eq!(first.transition_phase, None);
+
+        // An exact retry is safe, but a different source cannot replace it.
+        let original_updated_at = DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        sqlx::query("UPDATE repos SET mirror_updated_at = $2 WHERE id = $1")
+            .bind(&existing.id)
+            .bind(original_updated_at.to_rfc3339())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let retry = db
+            .configure_inbound_mirror(&existing.id, "https://github.com/Gitlawb/node.git")
+            .await
+            .unwrap();
+        assert_eq!(retry.updated_at, original_updated_at);
+        assert!(db
+            .configure_inbound_mirror(&existing.id, "https://github.com/Gitlawb/other.git",)
+            .await
+            .is_err());
+
+        let stored = db
+            .get_repo_mirror_state(&existing.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.upstream_url, first.upstream_url);
+        assert_eq!(stored.status, MirrorStatus::Inbound);
+        assert_eq!(stored.updated_at, original_updated_at);
+    }
+
+    #[sqlx::test]
+    async fn malformed_mirror_row_returns_an_error_instead_of_panicking(pool: PgPool) {
+        let row = sqlx::query(
+            "SELECT 'repo-id'::text AS id,
+                    'https://github.com/Gitlawb/node.git'::text AS upstream_url,
+                    'inbound'::text AS mirror_status,
+                    NULL::uuid AS mirror_transition_id,
+                    NULL::text AS mirror_transition_phase,
+                    NULL::text AS mirror_updated_at",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let error = row_to_repo_mirror_state(row).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("reading mirror update timestamp from database"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn inbound_configuration_never_resets_an_active_transition(pool: PgPool) {
+        let db = migrated_db(pool).await;
+        let existing = repo(Uuid::new_v4());
+        db.create_repo(&existing).await.unwrap();
+        db.configure_inbound_mirror(&existing.id, "https://github.com/Gitlawb/node.git")
+            .await
+            .unwrap();
+
+        let transition_id = Uuid::new_v4();
+        sqlx::query(
+            "UPDATE repos
+             SET mirror_status = 'transitioning_inbound_to_outbound',
+                 mirror_transition_id = $2,
+                 mirror_transition_phase = 'draining_writes'
+             WHERE id = $1",
+        )
+        .bind(&existing.id)
+        .bind(transition_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let retry = db
+            .configure_inbound_mirror(&existing.id, "https://github.com/Gitlawb/node.git")
+            .await;
+        assert!(retry.is_err(), "configuration must not reset a transition");
+
+        let stored = db
+            .get_repo_mirror_state(&existing.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, MirrorStatus::TransitioningInboundToOutbound);
+        assert_eq!(stored.transition_id, Some(transition_id));
+        assert_eq!(
+            stored.transition_phase,
+            Some(MirrorTransitionPhase::DrainingWrites)
+        );
+    }
+
+    #[sqlx::test]
+    async fn database_constraint_rejects_partial_or_insecure_mirror_state(pool: PgPool) {
+        let db = migrated_db(pool).await;
+        let existing = repo(Uuid::new_v4());
+        db.create_repo(&existing).await.unwrap();
+
+        let partial = sqlx::query(
+            "UPDATE repos
+             SET upstream_url = 'https://github.com/Gitlawb/node.git',
+                 mirror_status = 'transitioning_inbound_to_outbound',
+                 mirror_updated_at = '2026-08-14T00:00:00Z'
+             WHERE id = $1",
+        )
+        .bind(&existing.id)
+        .execute(&db.pool)
+        .await;
+        assert!(partial.is_err(), "transition metadata must be durable");
+
+        // PostgreSQL CHECK constraints accept NULL results. These cases pin
+        // the outer `IS TRUE` guard so SQL three-valued logic cannot admit a
+        // row that the Rust reader rejects or panics while decoding.
+        struct InvalidNullState<'a> {
+            case: &'a str,
+            status: Option<&'a str>,
+            transition_id: Option<Uuid>,
+            transition_phase: Option<&'a str>,
+        }
+        let invalid_null_states = [
+            InvalidNullState {
+                case: "missing mirror status",
+                status: None,
+                transition_id: None,
+                transition_phase: None,
+            },
+            InvalidNullState {
+                case: "stable status with job but no phase",
+                status: Some("inbound"),
+                transition_id: Some(Uuid::new_v4()),
+                transition_phase: None,
+            },
+            InvalidNullState {
+                case: "transition with job but no phase",
+                status: Some("transitioning_inbound_to_outbound"),
+                transition_id: Some(Uuid::new_v4()),
+                transition_phase: None,
+            },
+        ];
+        for invalid in invalid_null_states {
+            let result = sqlx::query(
+                "UPDATE repos
+                 SET upstream_url = 'https://github.com/Gitlawb/node.git',
+                     mirror_status = $2,
+                     mirror_transition_id = $3,
+                     mirror_transition_phase = $4,
+                     mirror_updated_at = '2026-08-14T00:00:00Z'
+                 WHERE id = $1",
+            )
+            .bind(&existing.id)
+            .bind(invalid.status)
+            .bind(invalid.transition_id)
+            .bind(invalid.transition_phase)
+            .execute(&db.pool)
+            .await;
+            assert!(result.is_err(), "constraint accepted {}", invalid.case);
+        }
+
+        let insecure = sqlx::query(
+            "UPDATE repos
+             SET upstream_url = 'http://github.com/Gitlawb/node.git',
+                 mirror_status = 'inbound',
+                 mirror_updated_at = '2026-08-14T00:00:00Z'
+             WHERE id = $1",
+        )
+        .bind(&existing.id)
+        .execute(&db.pool)
+        .await;
+        assert!(
+            insecure.is_err(),
+            "the database must reject non-HTTPS upstreams"
+        );
+    }
+
+    #[sqlx::test]
+    async fn database_constraint_accepts_the_complete_transition_vocabulary(pool: PgPool) {
+        let db = migrated_db(pool).await;
+        let existing = repo(Uuid::new_v4());
+        db.create_repo(&existing).await.unwrap();
+
+        let phases = [
+            "queued",
+            "starting",
+            "initializing_mirror_fetch",
+            "draining_writes",
+            "finalizing_mirror_fetch",
+            "finalizing_mirror_push",
+            "committing_target_status",
+            "rolling_back",
+        ];
+        for status in [
+            "transitioning_inbound_to_outbound",
+            "transitioning_outbound_to_inbound",
+        ] {
+            for phase in phases {
+                sqlx::query(
+                    "UPDATE repos
+                     SET upstream_url = 'https://github.com/Gitlawb/node.git',
+                         mirror_status = $2,
+                         mirror_transition_id = $3,
+                         mirror_transition_phase = $4,
+                         mirror_updated_at = '2026-08-14T00:00:00Z'
+                     WHERE id = $1",
+                )
+                .bind(&existing.id)
+                .bind(status)
+                .bind(Uuid::new_v4())
+                .bind(phase)
+                .execute(&db.pool)
+                .await
+                .unwrap_or_else(|error| panic!("{status}/{phase} was rejected: {error}"));
+            }
+        }
+
+        // A completed job remains auditable after authority reaches its stable
+        // target status; the initial never-transitioned state uses two NULLs.
+        sqlx::query(
+            "UPDATE repos
+             SET mirror_status = 'outbound',
+                 mirror_transition_id = $2,
+                 mirror_transition_phase = 'completed'
+             WHERE id = $1",
+        )
+        .bind(&existing.id)
+        .bind(Uuid::new_v4())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let stored = db
+            .get_repo_mirror_state(&existing.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, MirrorStatus::Outbound);
+        assert_eq!(
+            stored.transition_phase,
+            Some(MirrorTransitionPhase::Completed)
+        );
+    }
+
+    #[sqlx::test]
+    async fn continuous_mirror_uuid_gate_leaves_peer_rows_untouched(pool: PgPool) {
+        let db = migrated_db(pool).await;
+        db.upsert_mirror_repo("z6MkPeer", "repo", "/srv/peer/repo.git", None, false)
+            .await
+            .unwrap();
+
+        let error = db
+            .configure_inbound_mirror("z6MkPeer/repo", "https://github.com/Gitlawb/node.git")
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}")
+                .contains("continuous mirrors require a canonical UUID repository id"),
+            "unexpected error: {error:#}"
+        );
+
+        let unchanged: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT upstream_url, mirror_status FROM repos WHERE id = $1")
+                .bind("z6MkPeer/repo")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(unchanged, (None, None));
+        assert!(db
+            .get_repo_mirror_state("z6MkPeer/repo")
+            .await
+            .unwrap()
+            .is_none());
+    }
+}
+
 fn row_to_repo(r: sqlx::postgres::PgRow) -> RepoRecord {
     let created_str: String = r.get("created_at");
     let updated_str: String = r.get("updated_at");
@@ -6924,6 +8057,7 @@ fn row_to_cert(r: sqlx::postgres::PgRow) -> RefCertificate {
         node_did: r.get("node_did"),
         signature: r.get("signature"),
         issued_at: r.get("issued_at"),
+        version: r.get::<i32, _>("version") as u32,
     }
 }
 
@@ -7552,31 +8686,110 @@ impl Db {
         Ok(())
     }
 
-    pub async fn count_bounties_by_status(&self, status: &str) -> Result<i64> {
-        let row = sqlx::query("SELECT COUNT(*) as c FROM bounties WHERE status = $1")
+    // ── Visibility-filtered bounty aggregates (#477) ─────────────────────
+
+    /// Count bounties by status, restricted to repos whose `(owner_did, name)`
+    /// pairs are in `visible`.  Owner keys are normalized on both sides so
+    /// `did:key:` and bare-key forms match.  An empty set returns 0.
+    pub async fn count_bounties_by_status_visible(
+        &self,
+        status: &str,
+        visible: &[(String, String)],
+    ) -> Result<i64> {
+        if visible.is_empty() {
+            return Ok(0);
+        }
+        let owners: Vec<String> = visible.iter().map(|(o, _)| o.clone()).collect();
+        let names: Vec<String> = visible.iter().map(|(_, n)| n.clone()).collect();
+        let sql = format!(
+            "SELECT COUNT(*) as c FROM bounties b \
+             WHERE b.status = $1 \
+             AND EXISTS ( \
+                 SELECT 1 FROM unnest($2::text[], $3::text[]) AS v(o, n) \
+                 WHERE ({bounty_owner}) = v.o AND b.repo_name = v.n \
+             )",
+            bounty_owner = BOUNTY_OWNER_CASE_SQL,
+        );
+        let row = sqlx::query(&sql)
             .bind(status)
+            .bind(&owners)
+            .bind(&names)
             .fetch_one(&self.pool)
             .await?;
         Ok(row.get::<i64, _>("c"))
     }
 
-    pub async fn agent_bounty_stats(&self, agent_did: &str) -> Result<(i64, i64)> {
-        let row = sqlx::query(
-            "SELECT COUNT(*) as cnt, COALESCE(SUM(amount),0) as total FROM bounties WHERE claimant_did = $1 AND status = 'completed'",
-        )
-        .bind(agent_did)
-        .fetch_one(&self.pool)
-        .await?;
+    /// Per-agent bounty stats restricted to visible repos.  `b.repo_owner` is
+    /// normalized and `b.claimant_did` is matched against both spellings of the
+    /// agent key, so `did:key:` and bare-key forms match.
+    pub async fn agent_bounty_stats_visible(
+        &self,
+        agent_did: &str,
+        visible: &[(String, String)],
+    ) -> Result<(i64, i64)> {
+        if visible.is_empty() {
+            return Ok((0, 0));
+        }
+        // Index-friendly form of `normalize(claimant_did) = N`: a claimant
+        // normalizes to N only when stored as N or as `did:key:N` (the latter
+        // only when N has no ':', else the prefix is not stripped). Matching
+        // the raw column keeps `idx_bounties_claimant` usable.
+        let normalized_agent = normalize_owner_key(agent_did);
+        let mut claimants: Vec<String> = vec![normalized_agent.to_string()];
+        if !normalized_agent.contains(':') {
+            claimants.push(format!("did:key:{normalized_agent}"));
+        }
+        let owners: Vec<String> = visible.iter().map(|(o, _)| o.clone()).collect();
+        let names: Vec<String> = visible.iter().map(|(_, n)| n.clone()).collect();
+        let sql = format!(
+            "SELECT COUNT(*) as cnt, COALESCE(SUM(amount), 0)::BIGINT as total FROM bounties b \
+             WHERE b.claimant_did = ANY($1::text[]) \
+             AND b.status = 'completed' \
+             AND EXISTS ( \
+                 SELECT 1 FROM unnest($2::text[], $3::text[]) AS v(o, n) \
+                 WHERE ({bounty_owner}) = v.o AND b.repo_name = v.n \
+             )",
+            bounty_owner = BOUNTY_OWNER_CASE_SQL,
+        );
+        let row = sqlx::query(&sql)
+            .bind(&claimants)
+            .bind(&owners)
+            .bind(&names)
+            .fetch_one(&self.pool)
+            .await?;
         Ok((row.get::<i64, _>("cnt"), row.get::<i64, _>("total")))
     }
 
-    pub async fn bounty_leaderboard(&self, limit: i64) -> Result<Vec<(String, i64, i64)>> {
-        let rows = sqlx::query(
-            "SELECT claimant_did, COUNT(*) as cnt, COALESCE(SUM(amount),0) as total FROM bounties WHERE status='completed' AND claimant_did IS NOT NULL GROUP BY claimant_did ORDER BY total DESC LIMIT $1",
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+    /// Leaderboard restricted to visible repos.  Owner and claimant keys are
+    /// normalized so `did:key:` and bare-key forms match and group together.
+    pub async fn bounty_leaderboard_visible(
+        &self,
+        limit: i64,
+        visible: &[(String, String)],
+    ) -> Result<Vec<(String, i64, i64)>> {
+        if visible.is_empty() {
+            return Ok(Vec::new());
+        }
+        let owners: Vec<String> = visible.iter().map(|(o, _)| o.clone()).collect();
+        let names: Vec<String> = visible.iter().map(|(_, n)| n.clone()).collect();
+        let sql = format!(
+            "SELECT MIN(claimant_did) as claimant_did, COUNT(*) as cnt, COALESCE(SUM(amount), 0)::BIGINT as total \
+             FROM bounties b \
+             WHERE b.status = 'completed' AND b.claimant_did IS NOT NULL \
+             AND EXISTS ( \
+                 SELECT 1 FROM unnest($1::text[], $2::text[]) AS v(o, n) \
+                 WHERE ({bounty_owner}) = v.o AND b.repo_name = v.n \
+             ) \
+             GROUP BY ({claimant_case}) ORDER BY total DESC LIMIT $3",
+            claimant_case = BOUNTY_CLAIMANT_CASE_SQL,
+            bounty_owner = BOUNTY_OWNER_CASE_SQL,
+        );
+        let rows = sqlx::query(&sql)
+            .bind(&owners)
+            .bind(&names)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows
             .iter()
             .map(|r| {
@@ -9625,6 +10838,7 @@ mod ref_certificate_tests {
             node_did: "did:key:zNODE".to_string(),
             signature: "sig".to_string(),
             issued_at: issued_at.to_string(),
+            version: 1,
         }
     }
 
@@ -10469,10 +11683,6 @@ mod ref_certificate_tests {
         );
     }
 
-    /// INV-7: upgrade-path test — seed a database at v9 with duplicate
-    /// ref_certificates, then let the real v10 migration fire via
-    /// run_migrations().  This exercises the migration code path rather than
-    /// hand-copying its SQL, so the test stays in sync with MIGRATIONS[v10].
     #[sqlx::test]
     async fn v10_upgrade_dedup_via_migration(pool: PgPool) {
         // 1. Bootstrap schema via the full migration chain.
@@ -10695,6 +11905,7 @@ mod ref_certificate_tests {
         );
     }
 }
+#[cfg(test)]
 #[cfg(test)]
 mod ref_update_db_tests {
     use super::{Db, ReceivedRefUpdate};
@@ -11084,6 +12295,41 @@ mod peer_authority_tests {
         let db = Db::for_testing(pool);
         db.run_migrations().await.unwrap();
         db
+    }
+
+    /// `peer_exists` answers the membership question the gossip ingest gate
+    /// asks on every event, so both answers are pinned here: a registered DID
+    /// is true, and an unregistered one is false rather than an error or a
+    /// prefix match on a registered DID.
+    #[sqlx::test]
+    async fn peer_exists_answers_both_ways(pool: sqlx::PgPool) {
+        let db = db(pool).await;
+        let did = VICTIM_DID;
+
+        assert!(
+            !db.peer_exists(did).await.unwrap(),
+            "an empty peers table must answer false, not error"
+        );
+
+        db.upsert_peer(
+            did,
+            "https://peer.example.com",
+            PeerWriteAuthority::Proven(did),
+        )
+        .await
+        .unwrap();
+
+        assert!(db.peer_exists(did).await.unwrap());
+        assert!(
+            !db.peer_exists(OTHER_DID).await.unwrap(),
+            "a different DID must not match"
+        );
+        assert!(
+            !db.peer_exists(&VICTIM_DID[..VICTIM_DID.len() - 1])
+                .await
+                .unwrap(),
+            "the lookup is an equality test, not a prefix test"
+        );
     }
 
     /// The whole row, read back through `list_peers` rather than raw SQL, so a
@@ -11502,6 +12748,11 @@ mod peer_authority_tests {
 /// | `a_legacy_row_can_still_refresh_its_liveness` (db/mod.rs) | test-only. Seeds a PRE-GATE row by raw SQL on purpose: `upsert_peer` cannot create one, since the gate it is testing refuses exactly that DID. The fixture models what a deployed table already holds |
 /// | `gossip_ping_round_requires_two_failures_before_persisting_unreachable` (main.rs) | test-only fixture seed. Raw SQL because the test drives the readiness HYSTERESIS, which needs a row already at `last_ping_ok = TRUE` before the round runs; it never exercises the announce gate |
 /// | `manual_ping_uses_readiness_without_mutating_federation_gate` (api/peers.rs) | test-only fixture seed, same shape and same reason: the row under test must pre-exist so the assertion is about what the ping does NOT rewrite |
+/// | `seed_peer` (p2p/mod.rs) | test-only fixture seed. Raw SQL so the gossip ingest tests can drive the known-peer gate directly, including the did:web case `upsert_peer` would refuse |
+/// | `federated_peer_query_is_bounded` (api/repos.rs) | test-only fixture seed for the bounded federation query; inserts reachable rows without exercising peer admission |
+/// | `federated_route_annotates_peer_repos_on_real_200_body` (api/repos.rs) | test-only fixture seed; inserts the mock peer row the bounded federation query reads, so the response-envelope assertions run against a real HTTP 200 body |
+/// | `federated_route_reports_truncated_when_peer_fetch_fails` (api/repos.rs) | test-only fixture seed; seeds one unreachable peer so the fetch-failure path is the witness under test |
+/// | `federated_route_reports_truncated_when_peer_table_overflows` (api/repos.rs) | test-only fixture seed; overflows the peer table past `MAX_FEDERATED_PEERS` so the count bound is the only witness for `truncated` |
 ///
 /// And the `upsert_peer` CALL-SITE authority table, which the ledger above
 /// structurally cannot hold, because the bootstrap site issues no SQL of its own
@@ -11587,6 +12838,13 @@ mod peers_table_writer_guard {
     /// listed function that no longer has one.
     const LEDGER: &[(&str, usize)] = &[
         ("a_legacy_row_can_still_refresh_its_liveness", 1),
+        ("federated_peer_query_is_bounded", 1),
+        ("federated_route_annotates_peer_repos_on_real_200_body", 1),
+        ("federated_route_reports_truncated_when_peer_fetch_fails", 1),
+        (
+            "federated_route_reports_truncated_when_peer_table_overflows",
+            1,
+        ),
         (
             "gossip_ping_round_requires_two_failures_before_persisting_unreachable",
             1,
@@ -11599,6 +12857,7 @@ mod peers_table_writer_guard {
         ("prune_non_public_peers", 1),
         ("prune_self_peers", 1),
         ("seed_local_peer", 1),
+        ("seed_peer", 1),
         ("upsert_peer", 2),
     ];
 
