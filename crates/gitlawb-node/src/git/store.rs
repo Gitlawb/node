@@ -429,9 +429,12 @@ pub async fn list_refs_bounded(
         .collect())
 }
 
-/// Bounded [`read_ref`]: same absent-vs-error contract (any non-zero exit
-/// reads as absent for the reconcile gate's quarantine signal), through the
-/// configured binary with a timeout.
+/// Bounded [`read_ref`]: `rev-parse --verify --quiet` splits the three
+/// outcomes the reconcile gate needs — exit 0 plus the OID on stdout for a
+/// present ref, exit 1 for a proven-absent ref, and every other failure
+/// (128 on fatal errors, signal, I/O, timeout) as `Err` so an infra fault
+/// can never impersonate "the ref does not exist". `--quiet` suppresses
+/// only the missing-ref error message; the OID still prints on success.
 pub async fn read_ref_bounded(
     git_bin: &str,
     repo_path: &Path,
@@ -441,15 +444,14 @@ pub async fn read_ref_bounded(
     let output = run_git_bounded(
         git_bin,
         repo_path,
-        &["show-ref", "--verify", "--hash", "--quiet", ref_name],
+        &["rev-parse", "--verify", "--quiet", ref_name],
         b"",
         timeout,
-        "git show-ref",
+        "git rev-parse",
     )
     .await?;
     if !output.status.success() {
-        // `--quiet` maps a proven-absent ref to exit 1; every other
-        // failure (128 on fatal errors, signal, I/O) is UNPROVEN —
+        // Exit 1 is a proven-absent ref; every other failure is UNPROVEN —
         // surfacing it as Err is what keeps an infra fault from
         // impersonating "the ref does not exist" to the caller.
         return match output.status.code() {
@@ -457,14 +459,14 @@ pub async fn read_ref_bounded(
             _ => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 anyhow::bail!(
-                    "git show-ref --verify {ref_name} failed: {}",
+                    "git rev-parse --verify {ref_name} failed: {}",
                     stderr.chars().take(256).collect::<String>()
                 )
             }
         };
     }
     let sha = String::from_utf8(output.stdout)
-        .context("git show-ref output is not utf-8")?
+        .context("git rev-parse output is not utf-8")?
         .trim()
         .to_string();
     if sha.is_empty() {
