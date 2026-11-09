@@ -39,13 +39,29 @@ pub(crate) fn write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 pub(crate) fn create_dir(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(path)?;
-        if !std::fs::symlink_metadata(path)?.file_type().is_symlink() {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        // Re-pin through the opened directory, not the path: O_NOFOLLOW
+        // refuses a swapped-in symlink and fchmod acts on the checked inode,
+        // so a final-component swap between check and chmod cannot retarget
+        // the mode change at whatever the link points at.
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+        {
+            Ok(dir) => {
+                use std::os::unix::io::AsRawFd;
+                if unsafe { libc::fchmod(dir.as_raw_fd(), 0o700) } != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            // ELOOP: the path is a symlink and is left alone per contract.
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {}
+            Err(e) => return Err(e),
         }
     }
     #[cfg(not(unix))]

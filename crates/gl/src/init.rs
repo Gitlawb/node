@@ -1,7 +1,7 @@
 //! `gl init` — zero-to-push in one command.
 //!
 //! Detects or initializes a git repo, ensures an identity exists,
-//! registers with the node, creates a remote repo, adds the gitlawb
+//! registers with the node, creates a remote repo, adds the Twigpine
 //! remote, and pushes.
 
 use anyhow::{Context, Result};
@@ -19,7 +19,11 @@ pub struct InitArgs {
     pub name: Option<String>,
 
     /// Node URL to register with
-    #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+    #[arg(
+        long,
+        default_value = "https://node.twigpine.com",
+        env = "GITLAWB_NODE"
+    )]
     pub node: String,
 
     /// Identity directory (default: ~/.gitlawb)
@@ -151,7 +155,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
         println!("  Repository created.");
     }
 
-    // 5. Add gitlawb remote
+    // 5. Add Twigpine remote
     let did_short = did.to_string();
     let did_short = did_short.split(':').next_back().unwrap_or(&did_short);
     let remote_url = format!("gitlawb://{did_short}/{repo_name}");

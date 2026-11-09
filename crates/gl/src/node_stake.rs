@@ -72,7 +72,7 @@ pub async fn cmd_register(
     let token_addr: Address = token.parse().context("invalid token address")?;
     let contract_addr: Address = contract.parse().context("invalid contract address")?;
 
-    println!("Registering gitlawb node on Base L2...");
+    println!("Registering Twigpine node on Base L2...");
     println!("  DID:      {did}");
     println!("  Stake:    {stake} $GITLAWB");
     println!("  HTTP URL: {http_url}");

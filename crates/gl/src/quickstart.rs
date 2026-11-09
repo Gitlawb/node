@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use crate::http::NodeClient;
 use crate::identity::load_keypair_from_dir;
 
-const PUBLIC_NODE: &str = "https://node.gitlawb.com";
+const PUBLIC_NODE: &str = "https://node.twigpine.com";
 
 #[derive(Args)]
 pub struct QuickstartArgs {
