@@ -98,7 +98,7 @@ pub async fn set_profile(
                     &state.http_client,
                     &state.config.pinata_upload_url,
                     &state.config.pinata_jwt,
-                    &format!("profile-{}", &did),
+                    &format!("profile-{}", did),
                     &profile_json,
                 )
                 .await

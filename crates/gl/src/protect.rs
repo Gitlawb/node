@@ -2,7 +2,6 @@
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
-use serde_json::Value;
 use std::path::PathBuf;
 
 use crate::http::NodeClient;
@@ -23,7 +22,11 @@ pub enum ProtectCmd {
         /// Repository name or owner/repo
         #[arg(long)]
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -34,7 +37,11 @@ pub enum ProtectCmd {
         branch: String,
         #[arg(long)]
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -43,7 +50,11 @@ pub enum ProtectCmd {
     List {
         #[arg(long)]
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -82,12 +93,7 @@ async fn resolve_owner_repo(
         did.split(':').next_back().unwrap_or(&did).to_string()
     } else {
         let client = NodeClient::new(node, None);
-        let info: Value = client
-            .get("/")
-            .await?
-            .json()
-            .await
-            .context("failed to fetch node info")?;
+        let info = crate::http::read_json(client.get("/").await?, "node info").await?;
         let did = info["did"].as_str().context("node missing DID")?;
         did.split(':').next_back().unwrap_or(did).to_string()
     };
@@ -108,13 +114,7 @@ async fn cmd_set(branch: String, repo: String, node: String, dir: Option<PathBuf
         .await
         .context("failed to connect to node")?;
 
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or_default();
-
-    if !status.is_success() {
-        let msg = body["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("protect failed ({status}): {msg}");
-    }
+    let _ = crate::http::read_json(resp, "protect").await?;
 
     println!("✓ Branch '{branch}' is now protected in {owner}/{name}");
     println!("  Only the repo owner can push to this branch.");
@@ -140,13 +140,7 @@ async fn cmd_remove(
         .await
         .context("failed to connect to node")?;
 
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or_default();
-
-    if !status.is_success() {
-        let msg = body["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("unprotect failed ({status}): {msg}");
-    }
+    let _ = crate::http::read_json(resp, "unprotect").await?;
 
     println!("✓ Branch '{branch}' is no longer protected in {owner}/{name}");
     Ok(())
@@ -154,20 +148,16 @@ async fn cmd_remove(
 
 async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()> {
     let (owner, name) = resolve_owner_repo(&repo, &node, dir.as_deref()).await?;
-    let client = NodeClient::new(&node, None);
+    // Read-visibility-gated on the node: public repos list anonymously, private
+    // repos need the owner's signature. Sign when an identity is available.
+    let client = NodeClient::new(&node, load_keypair_from_dir(dir.as_deref()).ok());
 
     let resp = client
-        .get(&format!("/api/v1/repos/{owner}/{name}/branches/protected"))
+        .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}/branches/protected"))
         .await
         .context("failed to connect to node")?;
 
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or_default();
-
-    if !status.is_success() {
-        let msg = body["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("list protected branches failed ({status}): {msg}");
-    }
+    let body = crate::http::read_json(resp, "list protected branches").await?;
 
     let branches = body["protected_branches"]
         .as_array()
@@ -245,6 +235,7 @@ mod tests {
             .with_status(400)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"only the repo owner can protect branches"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -257,6 +248,8 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("protect failed"));
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy the error assertion vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -307,6 +300,9 @@ mod tests {
                 "GET",
                 mockito::Matcher::Regex(r"branches/protected".to_string()),
             )
+            // An identity is supplied, so get_maybe_signed must sign the request.
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"protected_branches":[],"count":0}"#)
@@ -338,6 +334,8 @@ mod tests {
                 "GET",
                 mockito::Matcher::Regex(r"branches/protected".to_string()),
             )
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"protected_branches":["main","release"],"count":2}"#)
@@ -362,5 +360,27 @@ mod tests {
             .unwrap();
         assert_eq!(owner, "alice");
         assert_eq!(name, "myrepo");
+    }
+
+    #[tokio::test]
+    async fn resolve_owner_repo_surfaces_denial() {
+        // A slash-free repo with an empty identity dir forces the GET / node-info
+        // fetch. A gated 404 there must Err (surfacing the status), proving the
+        // read_json conversion is load-bearing rather than silently ignored.
+        let mut server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap(); // empty, no identity.pem, forces the GET / branch
+        let _m = server
+            .mock("GET", "/")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"denied"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let err = resolve_owner_repo("noslash", &server.url(), Some(dir.path()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"), "got: {err}");
+        _m.assert_async().await;
     }
 }

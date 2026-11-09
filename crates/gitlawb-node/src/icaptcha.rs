@@ -237,9 +237,13 @@ impl ProofGuard {
         match self.0 {
             Some(p) => {
                 if !db.consume_proof_jti(&p.jti, p.exp).await? {
-                    return Err(AppError::IcaptchaProofRequired(
-                        "iCaptcha proof already used (replay); solve a fresh challenge".to_string(),
-                    ));
+                    let (url, level) = url_and_level();
+                    return Err(AppError::IcaptchaProofRequired {
+                        message: "iCaptcha proof already used (replay); solve a fresh challenge"
+                            .to_string(),
+                        url,
+                        level,
+                    });
                 }
                 Ok(Some(p))
             }
@@ -265,10 +269,23 @@ pub fn verify_request(headers: &HeaderMap, did: &str) -> Result<ProofGuard, AppE
 }
 
 fn reject_error(v: &Verifier, reason: &str) -> AppError {
-    AppError::IcaptchaProofRequired(format!(
-        "iCaptcha proof required ({reason}). Solve a challenge at {} for level >= {} and resend with the {} header.",
-        v.url, v.required_level, PROOF_HEADER
-    ))
+    AppError::IcaptchaProofRequired {
+        message: format!(
+            "iCaptcha proof required ({reason}). Solve a challenge at {} for level >= {} and resend with the {} header.",
+            v.url, v.required_level, PROOF_HEADER
+        ),
+        url: v.url.clone(),
+        level: v.required_level,
+    }
+}
+
+/// iCaptcha service url + required level for error responses, read from the
+/// initialized verifier (falls back to defaults if somehow uninitialized).
+fn url_and_level() -> (String, u32) {
+    VERIFIER
+        .get()
+        .map(|v| (v.url.clone(), v.required_level))
+        .unwrap_or_else(|| ("https://icaptcha.gitlawb.com".to_string(), 3))
 }
 
 /// Mode-aware decision. Pure and IO-free (no DB; clock injected via `now`) so it

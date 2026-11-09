@@ -10,7 +10,11 @@ use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
 pub struct StatusArgs {
-    #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+    #[arg(
+        long,
+        default_value = "https://node.twigpine.com",
+        env = "GITLAWB_NODE"
+    )]
     pub node: String,
     #[arg(long)]
     pub dir: Option<PathBuf>,
@@ -37,21 +41,13 @@ pub async fn run(args: StatusArgs) -> Result<()> {
     let client = NodeClient::new(&args.node, None);
     if let Some(ref did) = maybe_did {
         let short_key = did.split(':').next_back().unwrap_or(did);
-        match client.get(&format!("/api/v1/agents/{short_key}")).await {
-            Ok(resp) if resp.status().is_success() => {
-                if let Ok(body) = resp.json::<Value>().await {
-                    let score = body["trust_score"].as_f64().unwrap_or(0.0);
-                    let bar = trust_bar(score);
-                    println!("  trust     {score:.2}  {bar}");
-                }
-            }
-            _ => {
-                println!("  trust     — not registered (run `gl register`)");
-            }
+        let resp = client.get(&format!("/api/v1/agents/{short_key}")).await;
+        if let Some(line) = trust_line(resp).await {
+            println!("{line}");
         }
     }
 
-    // ── Current git repo + gitlawb remote ─────────────────────────────────
+    // ── Current git repo + Twigpine remote ─────────────────────────────────
     let remote = detect_gitlawb_remote();
     match &remote {
         Some((did, repo)) => {
@@ -59,7 +55,7 @@ pub async fn run(args: StatusArgs) -> Result<()> {
             println!("  repo      {short_did}/{repo}");
         }
         None => {
-            println!("  repo      (not in a gitlawb repo — no gitlawb:// origin)");
+            println!("  repo      (not in a Twigpine repo — no gitlawb:// remote)");
         }
     }
 
@@ -81,8 +77,10 @@ pub async fn run(args: StatusArgs) -> Result<()> {
         let pr_resp = client
             .get(&format!("/api/v1/repos/{short_owner}/{repo_name}/pulls"))
             .await;
-        if let Ok(r) = pr_resp {
-            if let Ok(body) = r.json::<Value>().await {
+        if let Some(line) = section_unavailable_line("PRs", &pr_resp) {
+            println!("{line}");
+        } else if let Ok(r) = pr_resp {
+            if let Ok(body) = crate::http::read_json(r, "pull requests").await {
                 let prs = body["pulls"].as_array().cloned().unwrap_or_default();
                 let open: Vec<_> = prs
                     .iter()
@@ -108,8 +106,10 @@ pub async fn run(args: StatusArgs) -> Result<()> {
         let issue_resp = client
             .get(&format!("/api/v1/repos/{short_owner}/{repo_name}/issues"))
             .await;
-        if let Ok(r) = issue_resp {
-            if let Ok(body) = r.json::<Value>().await {
+        if let Some(line) = section_unavailable_line("issues", &issue_resp) {
+            println!("{line}");
+        } else if let Ok(r) = issue_resp {
+            if let Ok(body) = crate::http::read_json(r, "issues").await {
                 let issues = body["issues"].as_array().cloned().unwrap_or_default();
                 let open: Vec<_> = issues
                     .iter()
@@ -136,6 +136,40 @@ pub async fn run(args: StatusArgs) -> Result<()> {
     Ok(())
 }
 
+/// The status line for a repo section (PRs / issues) whose gated read returned a
+/// non-2xx: the denial must surface, never render as "no open ...".
+/// Returns `None` for a success (the caller renders the body) or a transport error
+/// (the section degrades silently — R5 — so the multi-section `gl status` never
+/// hard-fails on one denied read).
+fn section_unavailable_line(label: &str, resp: &Result<reqwest::Response>) -> Option<String> {
+    match resp {
+        Ok(r) if !r.status().is_success() => {
+            Some(format!("  {label:<10}unavailable ({})", r.status()))
+        }
+        _ => None,
+    }
+}
+
+/// The `trust` status line for the caller's own identity. A genuine 404 means the
+/// identity is not registered; any OTHER non-2xx (403/429/5xx) is a failed lookup
+/// and must surface as unavailable rather than fabricating an unregistered state
+/// A transport error degrades silently — the node-unreachable line below
+/// already surfaces it — matching `section_unavailable_line`.
+async fn trust_line(resp: Result<reqwest::Response>) -> Option<String> {
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            let body = r.json::<Value>().await.ok()?;
+            let score = body["trust_score"].as_f64().unwrap_or(0.0);
+            Some(format!("  trust     {score:.2}  {}", trust_bar(score)))
+        }
+        Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
+            Some("  trust     — not registered (run `gl register`)".to_string())
+        }
+        Ok(r) => Some(format!("  trust     unavailable ({})", r.status())),
+        Err(_) => None,
+    }
+}
+
 /// Render a simple ASCII trust bar: 0.75 → "███░"
 fn trust_bar(score: f64) -> String {
     let filled = (score * 4.0).round() as usize;
@@ -143,29 +177,68 @@ fn trust_bar(score: f64) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(empty))
 }
 
-/// Parse `gitlawb://<did>/<repo>` from the git origin remote.
+/// Find a `gitlawb://<did>/<repo>` remote in the current repo.
+///
+/// Checks `origin` first (clones), then `gitlawb` (the name `gl init` adds),
+/// then any other remote with a gitlawb:// URL.
 fn detect_gitlawb_remote() -> Option<(String, String)> {
     let out = std::process::Command::new("git")
-        .args(["remote", "get-url", "origin"])
+        .args(["remote"])
         .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
     if !out.status.success() {
         return None;
     }
-    let url = String::from_utf8(out.stdout).ok()?;
-    let rest = url.trim().strip_prefix("gitlawb://")?;
-    let slash = rest.rfind('/')?;
-    let did = rest[..slash].to_string();
-    let repo = rest[slash + 1..].to_string();
-    if did.is_empty() || repo.is_empty() {
-        return None;
+    let names: Vec<String> = String::from_utf8(out.stdout)
+        .ok()?
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    let preferred = ["origin", "gitlawb"];
+    let ordered = preferred
+        .iter()
+        .filter(|p| names.iter().any(|n| n == *p))
+        .map(|p| p.to_string())
+        .chain(
+            names
+                .iter()
+                .filter(|n| !preferred.contains(&n.as_str()))
+                .cloned(),
+        );
+
+    for name in ordered {
+        // A remote can carry several URLs, and the gitlawb:// one may be a
+        // push URL behind an https fetch URL — check every fetch and push URL.
+        for extra in [&["--all"][..], &["--push", "--all"][..]] {
+            let mut args = vec!["remote", "get-url"];
+            args.extend_from_slice(extra);
+            args.push(&name);
+            let Ok(out) = std::process::Command::new("git")
+                .args(&args)
+                .stderr(std::process::Stdio::null())
+                .output()
+            else {
+                continue;
+            };
+            if !out.status.success() {
+                continue;
+            }
+            let Ok(urls) = String::from_utf8(out.stdout) else {
+                continue;
+            };
+            if let Some(parsed) = urls.lines().find_map(parse_gitlawb_url) {
+                return Some(parsed);
+            }
+        }
     }
-    Some((did, repo))
+    None
 }
 
-/// Parse a gitlawb:// URL string into (did, repo) — extracted for testing.
-#[cfg(test)]
+/// Parse a gitlawb:// URL string into (did, repo).
 fn parse_gitlawb_url(url: &str) -> Option<(String, String)> {
     let rest = url.trim().strip_prefix("gitlawb://")?;
     let slash = rest.rfind('/')?;
@@ -336,5 +409,126 @@ mod tests {
     #[test]
     fn trust_bar_quarter() {
         assert_eq!(trust_bar(0.25), "█░░░");
+    }
+
+    // ── gl status section denial surfacing (#123, R5) ────────────────────
+
+    async fn get_response(
+        server: &mut mockito::Server,
+        status: usize,
+    ) -> Result<reqwest::Response> {
+        let _m = server
+            .mock("GET", "/x")
+            .with_status(status)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"pulls":[]}"#)
+            .create_async()
+            .await;
+        NodeClient::new(server.url(), None).get("/x").await
+    }
+
+    #[tokio::test]
+    async fn gated_section_surfaces_unavailable_not_empty() {
+        // A gated 404 on a status section must surface "unavailable", never be
+        // treated as "no open PRs".
+        let mut server = mockito::Server::new_async().await;
+        let resp = get_response(&mut server, 404).await;
+        assert_eq!(
+            section_unavailable_line("PRs", &resp),
+            Some(format!("  {:<10}unavailable (404 Not Found)", "PRs"))
+        );
+    }
+
+    #[tokio::test]
+    async fn success_section_returns_none_for_body_render() {
+        // A 2xx returns None so the caller renders the body as before.
+        let mut server = mockito::Server::new_async().await;
+        let resp = get_response(&mut server, 200).await;
+        assert!(section_unavailable_line("issues", &resp).is_none());
+    }
+
+    #[test]
+    fn transport_error_degrades_silently() {
+        // A transport error (not a status) must NOT surface — the section
+        // degrades silently so gl status never hard-fails on one bad read (R5).
+        let err: Result<reqwest::Response> = Err(anyhow::anyhow!("connection refused"));
+        assert!(section_unavailable_line("PRs", &err).is_none());
+    }
+
+    // ── trust_line: a 404 means unregistered; any OTHER failure must surface as
+    //    unavailable, never fabricate an unregistered verdict. ───────────────
+    async fn agents_resp(
+        server: &mut mockito::Server,
+        status: usize,
+        body: &str,
+    ) -> Result<reqwest::Response> {
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/agents/".to_string()),
+            )
+            .with_status(status)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+        NodeClient::new(server.url(), None)
+            .get("/api/v1/agents/zTest")
+            .await
+    }
+
+    #[tokio::test]
+    async fn trust_line_registered_shows_score_only() {
+        let mut s = mockito::Server::new_async().await;
+        let line = trust_line(agents_resp(&mut s, 200, r#"{"trust_score":0.5}"#).await)
+            .await
+            .unwrap();
+        assert!(line.contains("0.50"), "line={line}");
+        assert!(!line.contains("not registered"), "line={line}");
+        assert!(!line.contains("unavailable"), "line={line}");
+    }
+
+    #[tokio::test]
+    async fn trust_line_404_is_not_registered() {
+        let mut s = mockito::Server::new_async().await;
+        let line = trust_line(agents_resp(&mut s, 404, r#"{"message":"agent not found"}"#).await)
+            .await
+            .unwrap();
+        assert!(line.contains("not registered"), "line={line}");
+        assert!(!line.contains("unavailable"), "line={line}");
+    }
+
+    // Load-bearing: a 403 for an existing identity is a denied lookup, not proof it is unregistered.
+    #[tokio::test]
+    async fn trust_line_403_is_unavailable_not_registered() {
+        let mut s = mockito::Server::new_async().await;
+        let line = trust_line(agents_resp(&mut s, 403, r#"{"message":"forbidden"}"#).await)
+            .await
+            .unwrap();
+        assert!(
+            line.contains("unavailable") && line.contains("403"),
+            "line={line}"
+        );
+        assert!(!line.contains("not registered"), "line={line}");
+    }
+
+    // Load-bearing: a 5xx is a failed lookup, not an unregistered verdict.
+    #[tokio::test]
+    async fn trust_line_500_is_unavailable_not_registered() {
+        let mut s = mockito::Server::new_async().await;
+        let line = trust_line(agents_resp(&mut s, 500, r#"{"message":"boom"}"#).await)
+            .await
+            .unwrap();
+        assert!(line.contains("unavailable"), "line={line}");
+        assert!(!line.contains("not registered"), "line={line}");
+    }
+
+    // Load-bearing: a transport error degrades silently, never fabricates unregistered.
+    #[tokio::test]
+    async fn trust_line_transport_error_is_silent() {
+        let resp = NodeClient::new("http://127.0.0.1:1", None)
+            .get("/api/v1/agents/zTest")
+            .await;
+        assert!(trust_line(resp).await.is_none());
     }
 }

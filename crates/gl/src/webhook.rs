@@ -31,7 +31,11 @@ pub enum WebhookCmd {
         /// Optional HMAC secret for payload signing (sets X-Gitlawb-Signature-256)
         #[arg(long)]
         secret: Option<String>,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -40,8 +44,14 @@ pub enum WebhookCmd {
     List {
         /// Repository name
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
     /// Delete a webhook
     Delete {
@@ -49,7 +59,11 @@ pub enum WebhookCmd {
         repo: String,
         /// Webhook ID
         id: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -66,7 +80,7 @@ pub async fn run(args: WebhookArgs) -> Result<()> {
             node,
             dir,
         } => cmd_create(repo, url, events, secret, node, dir).await,
-        WebhookCmd::List { repo, node } => cmd_list(repo, node).await,
+        WebhookCmd::List { repo, node, dir } => cmd_list(repo, node, dir).await,
         WebhookCmd::Delete {
             repo,
             id,
@@ -74,15 +88,6 @@ pub async fn run(args: WebhookArgs) -> Result<()> {
             dir,
         } => cmd_delete(repo, id, node, dir).await,
     }
-}
-
-async fn resolve_owner(client: &NodeClient) -> Result<String> {
-    let info: Value = client.get("/").await?.json().await?;
-    let did = info["did"]
-        .as_str()
-        .context("node missing DID")?
-        .to_string();
-    Ok(did.split(':').next_back().unwrap_or(&did).to_string())
 }
 
 async fn cmd_create(
@@ -94,8 +99,8 @@ async fn cmd_create(
     dir: Option<PathBuf>,
 ) -> Result<()> {
     let keypair = load_keypair_from_dir(dir.as_deref())?;
+    let (owner, name) = crate::repo::resolve_owner_repo_pair(&repo, &node, dir.as_deref()).await?;
     let client = NodeClient::new(&node, Some(keypair));
-    let owner = resolve_owner(&client).await?;
 
     let event_list: Vec<&str> = events.split(',').map(str::trim).collect();
 
@@ -105,17 +110,17 @@ async fn cmd_create(
         "events": event_list,
     }))?;
 
-    let resp = client
-        .post(&format!("/api/v1/repos/{owner}/{repo}/hooks"), &payload)
-        .await
-        .context("failed to connect to node")?;
-    let status = resp.status();
-    let hook: Value = resp.json().await.context("invalid JSON")?;
-
-    if !status.is_success() {
-        let msg = hook["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("create webhook failed ({status}): {msg}");
-    }
+    // #186: read_json status-checks before parsing and bounds the error body, so
+    // a denial (or a hostile oversized error) fails here instead of being parsed
+    // whole. `what` preserves main's "create webhook failed (...)" message prefix.
+    let hook = crate::http::read_json(
+        client
+            .post(&format!("/api/v1/repos/{owner}/{name}/hooks"), &payload)
+            .await
+            .context("failed to connect to node")?,
+        "create webhook",
+    )
+    .await?;
 
     let id = hook["id"].as_str().unwrap_or("?");
     let hook_events = hook["events"]
@@ -143,18 +148,30 @@ async fn cmd_create(
     Ok(())
 }
 
-async fn cmd_list(repo: String, node: String) -> Result<()> {
-    let client = NodeClient::new(&node, None);
-    let owner = resolve_owner(&client).await?;
+async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()> {
+    // The node owner-gates GET /hooks (callback URLs are owner-secret), so the
+    // list request must be signed — anonymous callers get 401.
+    let keypair = load_keypair_from_dir(dir.as_deref())?;
+    let (owner, name) = crate::repo::resolve_owner_repo_pair(&repo, &node, dir.as_deref()).await?;
+    let client = NodeClient::new(&node, Some(keypair));
 
-    let resp: Value = client
-        .get(&format!("/api/v1/repos/{owner}/{repo}/hooks"))
-        .await?
-        .json()
-        .await
-        .context("invalid JSON")?;
+    // get_signed (not get) attaches the RFC 9421 signature — plain get() never
+    // signs, and the node owner-gates this route, so an unsigned GET 401s.
+    // #186: read_json status-checks + bounds the error body; `what` preserves
+    // main's "list webhooks failed (...)" message prefix.
+    let body = crate::http::read_json(
+        client
+            .get_signed(&format!("/api/v1/repos/{owner}/{name}/hooks"))
+            .await?,
+        "list webhooks",
+    )
+    .await?;
 
-    let hooks = resp["webhooks"].as_array().cloned().unwrap_or_default();
+    let hooks = body
+        .get("webhooks")
+        .and_then(Value::as_array)
+        .cloned()
+        .context("node response missing webhooks array")?;
     if hooks.is_empty() {
         println!("No webhooks for {repo}");
         return Ok(());
@@ -185,24 +202,24 @@ async fn cmd_list(repo: String, node: String) -> Result<()> {
 
 async fn cmd_delete(repo: String, id: String, node: String, dir: Option<PathBuf>) -> Result<()> {
     let keypair = load_keypair_from_dir(dir.as_deref())?;
+    let (owner, name) = crate::repo::resolve_owner_repo_pair(&repo, &node, dir.as_deref()).await?;
     let client = NodeClient::new(&node, Some(keypair));
-    let owner = resolve_owner(&client).await?;
 
     let payload = serde_json::to_vec(&serde_json::json!({}))?;
-    let resp = client
-        .delete(
-            &format!("/api/v1/repos/{owner}/{repo}/hooks/{id}"),
-            &payload,
-        )
-        .await
-        .context("failed to connect to node")?;
-    let status = resp.status();
-    let result: Value = resp.json().await.context("invalid JSON")?;
-
-    if !status.is_success() {
-        let msg = result["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("delete webhook failed ({status}): {msg}");
-    }
+    // #186: read_json status-checks + bounds the error body; `what` preserves
+    // main's "delete webhook failed (...)" message prefix. The success body is
+    // unused, so discard it.
+    let _ = crate::http::read_json(
+        client
+            .delete(
+                &format!("/api/v1/repos/{owner}/{name}/hooks/{id}"),
+                &payload,
+            )
+            .await
+            .context("failed to connect to node")?,
+        "delete webhook",
+    )
+    .await?;
 
     println!("✓ Webhook {id} deleted");
     Ok(())
@@ -337,33 +354,170 @@ mod tests {
     #[tokio::test]
     async fn test_list_webhooks_empty() {
         let mut server = mockito::Server::new_async().await;
+        let (dir, _kp) = tmp_identity();
         let _root = mock_root(&mut server).await;
 
         let _m = server
             .mock("GET", mockito::Matcher::Regex(r"/hooks$".to_string()))
+            // The route is owner-gated, so the list request must be signed.
+            // Requiring the header here is what catches a regression to plain get().
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"webhooks":[]}"#)
             .create_async()
             .await;
 
-        cmd_list("my-repo".to_string(), server.url()).await.unwrap();
+        cmd_list(
+            "my-repo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn test_list_webhooks_with_items() {
         let mut server = mockito::Server::new_async().await;
+        let (dir, _kp) = tmp_identity();
         let _root = mock_root(&mut server).await;
 
         let _m = server
             .mock("GET", mockito::Matcher::Regex(r"/hooks$".to_string()))
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"webhooks":[{"id":"h1","url":"https://a.com","events":["push"],"active":true},{"id":"h2","url":"https://b.com","events":["*"],"active":false}]}"#)
             .create_async()
             .await;
 
-        cmd_list("my-repo".to_string(), server.url()).await.unwrap();
+        cmd_list(
+            "my-repo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_list_owner_comes_from_keypair_not_node_did() {
+        // The owner segment must be derived from the caller's keypair (loaded
+        // from --dir), NOT the node root DID. mock_root returns a different DID;
+        // if the code regressed to using it, this path mock would not match.
+        let mut server = mockito::Server::new_async().await;
+        let (dir, kp) = tmp_identity();
+        let _root = mock_root(&mut server).await;
+
+        let did = kp.did().to_string();
+        let short = did.split(':').next_back().unwrap_or(&did).to_string();
+
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(format!(r"/api/v1/repos/{short}/my-repo/hooks$")),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"webhooks":[]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        cmd_list(
+            "my-repo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_list_honors_owner_repo_arg() {
+        // An explicit `owner/repo` argument is split and used verbatim.
+        let mut server = mockito::Server::new_async().await;
+        let (dir, _kp) = tmp_identity();
+        let _root = mock_root(&mut server).await;
+
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/api/v1/repos/someoneelse/their-repo/hooks$".to_string()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"webhooks":[]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        cmd_list(
+            "someoneelse/their-repo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_list_webhooks_non_success_status_errors() {
+        // A 403 (or any non-2xx) JSON body has no `webhooks` field; cmd_list must
+        // surface the failure, not print "No webhooks" and exit 0.
+        let mut server = mockito::Server::new_async().await;
+        let (dir, _kp) = tmp_identity();
+        let _root = mock_root(&mut server).await;
+
+        let _m = server
+            .mock("GET", mockito::Matcher::Regex(r"/hooks$".to_string()))
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"not the owner"}"#)
+            .create_async()
+            .await;
+
+        let err = cmd_list(
+            "my-repo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("not the owner"));
+    }
+
+    #[tokio::test]
+    async fn test_list_webhooks_2xx_missing_array_errors() {
+        // A 2xx body without a `webhooks` array signals a node/API contract
+        // regression. cmd_list must error rather than print "No webhooks".
+        let mut server = mockito::Server::new_async().await;
+        let (dir, _kp) = tmp_identity();
+        let _root = mock_root(&mut server).await;
+
+        let _m = server
+            .mock("GET", mockito::Matcher::Regex(r"/hooks$".to_string()))
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"ok":true}"#)
+            .create_async()
+            .await;
+
+        let err = cmd_list(
+            "my-repo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("missing webhooks array"));
     }
 
     // ── delete ───────────────────────────────────────────────────────

@@ -1,0 +1,1023 @@
+//! Client for the iCaptcha proof-of-intelligence service.
+//!
+//! The node gates spam-prone writes (repo create / fork / register) behind an
+//! iCaptcha proof. This crate implements the *sanctioned client flow*: on a
+//! `403 icaptcha_proof_required`, request a challenge for the required level,
+//! solve the deterministic computational types locally, obtain the signed
+//! proof, and hand it back so the caller can retry the original signed request
+//! with the `x-icaptcha-proof` header.
+//!
+//! `requesterId` is always the caller's DID, so the proof's `sub` claim matches
+//! the authenticated signer (the node enforces `sub == authenticated DID`).
+//!
+//! Blocking HTTP (reqwest::blocking) so the git remote helper can use it
+//! directly; `gl` (async) calls it via `tokio::task::spawn_blocking`.
+
+use std::io::Read;
+
+use anyhow::{anyhow, bail, Context, Result};
+use serde::Deserialize;
+use serde_json::json;
+
+pub mod pow;
+pub mod solvers;
+
+/// Default iCaptcha service base URL (used when the node doesn't advertise one).
+pub const DEFAULT_URL: &str = "https://icaptcha.gitlawb.com";
+/// Default required level (the node's default floor).
+pub const DEFAULT_LEVEL: u32 = 3;
+/// Header the gated write must echo the proof back in.
+pub const PROOF_HEADER: &str = "x-icaptcha-proof";
+
+/// Cap on bytes read from an error response, and characters kept in the excerpt.
+/// The iCaptcha origin is only as trusted as the node that advertised it (a MITM
+/// on the default transport qualifies), so its error bodies are attacker-
+/// influenceable bytes that reach the TTY — they must be bounded and stripped of
+/// control characters before printing (CWE-150, same treatment as #137).
+const MAX_ERR_BYTES: u64 = 4096;
+const MAX_ERR_CHARS: usize = 500;
+
+/// Read a bounded error body and return a control-char-stripped, length-capped
+/// single-line excerpt safe to print to a terminal.
+fn error_excerpt(resp: reqwest::blocking::Response) -> String {
+    let mut buf = Vec::new();
+    if resp.take(MAX_ERR_BYTES).read_to_end(&mut buf).is_err() {
+        return String::new();
+    }
+    sanitize_excerpt(&String::from_utf8_lossy(&buf))
+}
+
+/// Strip C0/C1 control characters, collapse whitespace runs to single spaces,
+/// and cap the length — so a hostile response body cannot inject terminal
+/// escapes or flood the TTY.
+fn sanitize_excerpt(s: &str) -> String {
+    let mut out = String::new();
+    let mut pending_space = false;
+    let mut kept = 0;
+    for ch in s.trim().chars() {
+        if kept >= MAX_ERR_CHARS {
+            break;
+        }
+        if ch.is_control() {
+            if matches!(ch, '\n' | '\r' | '\t') {
+                pending_space = true;
+            }
+            continue;
+        }
+        if gitlawb_core::sanitize::is_bidi_format(ch) {
+            // Drop Cf bidi/format controls (INV-6, #183) without setting
+            // pending_space: they are not whitespace, so stripping leaves no
+            // phantom gap.
+            continue;
+        }
+        if ch.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if pending_space && !out.is_empty() {
+            out.push(' ');
+            kept += 1;
+            if kept >= MAX_ERR_CHARS {
+                break;
+            }
+        }
+        out.push(ch);
+        kept += 1;
+        pending_space = false;
+    }
+    out
+}
+
+/// Fixed warning when `GITLAWB_ICAPTCHA_INSECURE` is present but not an
+/// explicit truthy value. Does not include the raw env value (arbitrary
+/// deployment input — secrets / terminal controls).
+fn warn_icaptcha_insecure_non_truthy() {
+    // One literal line on purpose: a continuation escape here keeps emitting
+    // correct prose (Rust strips the next line's leading whitespace), but the
+    // single-line form makes that property visible without knowing the escape
+    // semantics, which is what the review asked for.
+    tracing::warn!(
+        "GITLAWB_ICAPTCHA_INSECURE is set but not truthy (expected 1 or true); loopback HTTP trust relaxation remains disabled"
+    );
+}
+
+/// Parse a possibly-present `GITLAWB_ICAPTCHA_INSECURE` string.
+///
+/// Only an explicit truthy value (`1` / `true`, case-insensitive, after trim)
+/// enables the loopback-HTTP trust relaxation. Presence alone is not enough:
+/// `=0`, `=false`, or an empty value leave it off. A non-empty non-truthy
+/// value emits [`warn_icaptcha_insecure_non_truthy`].
+fn icaptcha_insecure_from_str(raw: Option<&str>) -> bool {
+    let Some(v) = raw else {
+        return false;
+    };
+    let t = v.trim();
+    if t.eq_ignore_ascii_case("1") || t.eq_ignore_ascii_case("true") {
+        true
+    } else {
+        if !t.is_empty() {
+            warn_icaptcha_insecure_non_truthy();
+        }
+        false
+    }
+}
+
+/// Interpret `std::env::var("GITLAWB_ICAPTCHA_INSECURE")` without reading the
+/// environment again — used by production and by unit tests.
+///
+/// `NotPresent` → disabled. `NotUnicode` → disabled + the same fixed warning
+/// as a present non-truthy value (fail closed; do not treat as unset).
+fn icaptcha_insecure_from_var(result: Result<String, std::env::VarError>) -> bool {
+    match result {
+        Ok(v) => icaptcha_insecure_from_str(Some(&v)),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            warn_icaptcha_insecure_non_truthy();
+            false
+        }
+        Err(std::env::VarError::NotPresent) => false,
+    }
+}
+
+/// Whether `GITLAWB_ICAPTCHA_INSECURE` explicitly enables the loopback-HTTP
+/// trust relaxation used by integration tests.
+///
+/// Only an explicit truthy value (`1` / `true`, case-insensitive, after trim)
+/// enables it. Presence alone is not enough: `=0`, `=false`, or an empty
+/// value leave the relaxation off. A non-empty non-truthy value (including a
+/// present non-Unicode value) emits a `tracing::warn!` (visible when the
+/// `icaptcha_client` target is at WARN+, e.g. `RUST_LOG=icaptcha_client=warn`).
+fn icaptcha_insecure_enabled() -> bool {
+    icaptcha_insecure_from_var(std::env::var("GITLAWB_ICAPTCHA_INSECURE"))
+}
+
+/// Whether `u` parses as a trusted URL, given a pre-parsed insecure flag.
+///
+/// Production trusts only `https`. When `insecure` is true the function also
+/// trusts `http://127.0.0.1` and `http://localhost` so the full iCaptcha retry
+/// path can be exercised against a local mockito server.
+fn is_https_with(u: &str, insecure: bool) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(u) else {
+        return false;
+    };
+    if parsed.scheme() == "https" {
+        return true;
+    }
+    if insecure
+        && parsed.scheme() == "http"
+        && matches!(parsed.host_str(), Some("127.0.0.1" | "localhost"))
+    {
+        return true;
+    }
+    false
+}
+
+/// Lowercased origin string (`scheme://host[:port]`) of a URL.
+///
+/// Includes the effective port so that `http://localhost:3000` and
+/// `http://localhost:9000` are treated as distinct origins — a hostile node
+/// cannot redirect the iCaptcha solve to a different loopback port.
+fn origin_key(u: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(u).ok()?;
+    let scheme = parsed.scheme();
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let port = parsed
+        .port_or_known_default()
+        .map(|p| format!(":{p}"))
+        .unwrap_or_default();
+    Some(format!("{scheme}://{host}{port}"))
+}
+
+/// Decide which iCaptcha origin to actually talk to, and whether it is trusted
+/// enough to receive the operator's API key.
+///
+/// The node-advertised `x-icaptcha-url` is untrusted: a hostile node could point
+/// it at an attacker origin (client-side SSRF) or capture a bearer token on the
+/// first hop. So an advertised URL is honored only when it is `https` AND its
+/// host is allowlisted — the public default host, or the operator's own
+/// `GITLAWB_ICAPTCHA_URL`. Otherwise we fall back to the operator/default origin.
+///
+/// The API key is attached only when the resolved origin is the operator's
+/// explicitly-configured host (never a node-discovered one), so a key is never
+/// exfiltrated to an origin the operator did not choose.
+fn resolve_solver_url(advertised: Option<&str>, operator: Option<&str>) -> (String, bool) {
+    resolve_solver_url_with(advertised, operator, icaptcha_insecure_enabled())
+}
+
+fn resolve_solver_url_with(
+    advertised: Option<&str>,
+    operator: Option<&str>,
+    insecure: bool,
+) -> (String, bool) {
+    let operator = operator.filter(|u| is_https_with(u, insecure));
+    let operator_origin = operator.as_ref().and_then(|u| origin_key(u));
+    let default_origin = origin_key(DEFAULT_URL);
+
+    let allowed = |origin: &Option<String>| -> bool {
+        origin
+            .as_ref()
+            .map(|o| Some(o) == default_origin.as_ref() || Some(o) == operator_origin.as_ref())
+            .unwrap_or(false)
+    };
+
+    let fallback = || {
+        operator
+            .map(String::from)
+            .unwrap_or_else(|| DEFAULT_URL.to_string())
+    };
+
+    let chosen = match advertised {
+        Some(a) if is_https_with(a, insecure) && allowed(&origin_key(a)) => a.to_string(),
+        Some(a) => {
+            tracing::warn!(
+                advertised = %a,
+                "ignoring iCaptcha URL advertised by node (must be https with an allowlisted host); using trusted origin"
+            );
+            fallback()
+        }
+        None => fallback(),
+    };
+
+    // Key goes only to the operator's own configured origin.
+    let key_trusted = operator_origin.is_some() && origin_key(&chosen) == operator_origin;
+    (chosen, key_trusted)
+}
+
+/// Computational challenge types this client solves locally. Restricting the
+/// request to these avoids dictionary (anagram/logic) and LLM (wordproblem/
+/// riddle) types, which can't be auto-solved.
+const SOLVABLE_TYPES: [&str; 3] = ["arithmetic", "algebra", "sequence"];
+
+/// Bound on challenge/answer rounds (the service escalates difficulty on a miss;
+/// correct solvers shouldn't escalate, but cap it regardless).
+const MAX_ROUNDS: usize = 8;
+
+/// Where + at what level to solve. `did` becomes the proof's `sub`.
+#[derive(Debug, Clone)]
+pub struct IcaptchaCfg {
+    pub url: String,
+    pub did: String,
+    pub level: u32,
+    /// Optional bearer token for an API-key-protected iCaptcha deployment.
+    pub api_key: Option<String>,
+}
+
+impl IcaptchaCfg {
+    /// Build config from the caller DID plus an optionally node-advertised
+    /// url/level (e.g. the `x-icaptcha-url` / `x-icaptcha-level` headers) and
+    /// optional level.
+    ///
+    /// The advertised URL is validated and allowlisted (see [`resolve_solver_url`])
+    /// so a hostile node cannot redirect the solve to an attacker origin. The
+    /// `GITLAWB_ICAPTCHA_API_KEY` bearer token is attached only when the resolved
+    /// origin is the operator's own `GITLAWB_ICAPTCHA_URL`, never a
+    /// node-discovered one.
+    pub fn new(did: impl Into<String>, url: Option<String>, level: Option<u32>) -> Self {
+        let operator = std::env::var("GITLAWB_ICAPTCHA_URL")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let (resolved_url, key_trusted) = resolve_solver_url(url.as_deref(), operator.as_deref());
+        let api_key = if key_trusted {
+            std::env::var("GITLAWB_ICAPTCHA_API_KEY")
+                .ok()
+                .filter(|s| !s.is_empty())
+        } else {
+            None
+        };
+        Self {
+            url: resolved_url,
+            did: did.into(),
+            level: level.unwrap_or(DEFAULT_LEVEL),
+            api_key,
+        }
+    }
+}
+
+/// A challenge handed back by the service (mirrors `icaptcha` `Challenge`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Challenge {
+    pub challenge_id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub difficulty: u32,
+    pub prompt: String,
+    pub token: String,
+    /// Proof-of-work to solve and echo back as `powNonce` on the answer. Present
+    /// only when the service has PoW enabled; absent/None means no PoW required.
+    #[serde(default)]
+    pub pow: Option<pow::PowChallenge>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+enum AnswerResult {
+    Passed { proof: String },
+    Continue { challenge: Challenge },
+    Failed { reason: String },
+}
+
+/// Solver callback for types this crate can't solve deterministically.
+pub type Solver<'a> = dyn Fn(&Challenge) -> Option<String> + 'a;
+
+/// Run the full challenge → solve → answer loop and return a fresh proof token.
+///
+/// `solver` is consulted for challenge types the built-in solvers don't handle
+/// (anagram/logic/LLM); pass `None` to fall back to an interactive stdin prompt.
+pub fn obtain_proof(cfg: &IcaptchaCfg, solver: Option<&Solver>) -> Result<String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("build iCaptcha http client")?;
+
+    let mut challenge = request_challenge(&client, cfg)?;
+    for _ in 0..MAX_ROUNDS {
+        let answer = solvers::solve(&challenge.kind, &challenge.prompt)
+            .or_else(|| solver.and_then(|s| s(&challenge)))
+            .or_else(|| interactive_prompt(&challenge))
+            .ok_or_else(|| {
+                anyhow!(
+                    "cannot solve iCaptcha challenge type '{}' automatically; \
+                     set GITLAWB_ICAPTCHA_API_KEY/solver or solve interactively",
+                    challenge.kind
+                )
+            })?;
+
+        // Solve the proof-of-work bound to this challenge, if the service
+        // requires one. A required-but-unsolvable PoW (unknown algorithm or a
+        // difficulty above our cap) is a hard error — submitting without it
+        // would just be rejected.
+        let pow_nonce = match &challenge.pow {
+            Some(p) => Some(pow::solve(p).ok_or_else(|| {
+                anyhow!(
+                    "cannot solve iCaptcha proof-of-work (algorithm '{}', difficulty {})",
+                    p.algorithm,
+                    p.difficulty
+                )
+            })?),
+            None => None,
+        };
+
+        match submit_answer(
+            &client,
+            cfg,
+            &challenge.token,
+            &answer,
+            pow_nonce.as_deref(),
+        )? {
+            AnswerResult::Passed { proof } => return Ok(proof),
+            AnswerResult::Continue { challenge: next } => challenge = next,
+            AnswerResult::Failed { reason } => {
+                bail!("iCaptcha challenge failed: {}", sanitize_excerpt(&reason))
+            }
+        }
+    }
+    bail!("iCaptcha not solved within {MAX_ROUNDS} rounds")
+}
+
+fn request_challenge(client: &reqwest::blocking::Client, cfg: &IcaptchaCfg) -> Result<Challenge> {
+    let url = format!("{}/v1/challenge", cfg.url.trim_end_matches('/'));
+    let body = json!({
+        "requesterId": cfg.did,
+        "requiredLevel": cfg.level,
+        "types": SOLVABLE_TYPES,
+    });
+    let mut req = client.post(&url).json(&body);
+    if let Some(key) = &cfg.api_key {
+        req = req.bearer_auth(key);
+    }
+    let resp = req.send().with_context(|| format!("POST {url}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = error_excerpt(resp);
+        bail!("iCaptcha challenge request failed ({status}): {text}");
+    }
+    resp.json::<Challenge>().context("parse iCaptcha challenge")
+}
+
+fn submit_answer(
+    client: &reqwest::blocking::Client,
+    cfg: &IcaptchaCfg,
+    token: &str,
+    answer: &str,
+    pow_nonce: Option<&str>,
+) -> Result<AnswerResult> {
+    let url = format!("{}/v1/answer", cfg.url.trim_end_matches('/'));
+    let mut body = json!({ "token": token, "answer": answer });
+    if let Some(nonce) = pow_nonce {
+        body["powNonce"] = json!(nonce);
+    }
+    let mut req = client.post(&url).json(&body);
+    if let Some(key) = &cfg.api_key {
+        req = req.bearer_auth(key);
+    }
+    let resp = req.send().with_context(|| format!("POST {url}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = error_excerpt(resp);
+        bail!("iCaptcha answer request failed ({status}): {text}");
+    }
+    resp.json::<AnswerResult>()
+        .context("parse iCaptcha answer result")
+}
+
+/// Last-resort fallback: show the prompt and read an answer from the terminal.
+/// Returns `None` when stdin isn't a usable interactive source (e.g. an agent),
+/// so the caller surfaces a clear "couldn't auto-solve" error instead.
+fn interactive_prompt(challenge: &Challenge) -> Option<String> {
+    use std::io::{stderr, stdin, IsTerminal, Write};
+    // An open but silent stdin (a pipe an orchestrator holds open, an agent
+    // harness) has no one to answer: `read_line` would block forever. Only a
+    // terminal can be interactive.
+    if !stdin().is_terminal() {
+        return None;
+    }
+    let mut err = stderr();
+    let _ = writeln!(
+        err,
+        "iCaptcha challenge ({}, level {}): {}\nAnswer: ",
+        challenge.kind, challenge.difficulty, challenge.prompt
+    );
+    let _ = err.flush();
+    let mut line = String::new();
+    match stdin().read_line(&mut line) {
+        Ok(0) | Err(_) => None,
+        Ok(_) => {
+            let a = line.trim().to_string();
+            if a.is_empty() {
+                None
+            } else {
+                Some(a)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Serializes the real-env reader test so it never races with other
+    /// process-global env mutations (and recovers from a poisoned lock).
+    static ICAPTCHA_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        prev: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn lock() -> MutexGuard<'static, ()> {
+            ICAPTCHA_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        fn with_value(val: &str) -> Self {
+            let lock = Self::lock();
+            let prev = std::env::var_os("GITLAWB_ICAPTCHA_INSECURE");
+            std::env::set_var("GITLAWB_ICAPTCHA_INSECURE", val);
+            EnvGuard { _lock: lock, prev }
+        }
+
+        fn unset() -> Self {
+            let lock = Self::lock();
+            let prev = std::env::var_os("GITLAWB_ICAPTCHA_INSECURE");
+            std::env::remove_var("GITLAWB_ICAPTCHA_INSECURE");
+            EnvGuard { _lock: lock, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("GITLAWB_ICAPTCHA_INSECURE", v),
+                None => std::env::remove_var("GITLAWB_ICAPTCHA_INSECURE"),
+            }
+        }
+    }
+
+    /// #227 / #246: cover the production env read in `icaptcha_insecure_enabled`.
+    /// Pure-helper tests alone leave mutations of this function green.
+    #[test]
+    fn icaptcha_insecure_enabled_reads_real_env() {
+        {
+            let _g = EnvGuard::unset();
+            assert!(!icaptcha_insecure_enabled(), "unset must disable");
+        }
+        {
+            let _g = EnvGuard::with_value("0");
+            assert!(!icaptcha_insecure_enabled(), "=0 must disable");
+        }
+        {
+            let _g = EnvGuard::with_value("false");
+            assert!(!icaptcha_insecure_enabled(), "=false must disable");
+        }
+        {
+            let _g = EnvGuard::with_value("");
+            assert!(!icaptcha_insecure_enabled(), "empty must disable");
+        }
+        {
+            let _g = EnvGuard::with_value("1");
+            assert!(icaptcha_insecure_enabled(), "=1 must enable");
+        }
+        {
+            let _g = EnvGuard::with_value("true");
+            assert!(icaptcha_insecure_enabled(), "=true must enable");
+        }
+        {
+            let _g = EnvGuard::with_value("TRUE");
+            assert!(icaptcha_insecure_enabled(), "=TRUE must enable");
+        }
+        {
+            let _g = EnvGuard::with_value(" 1 ");
+            assert!(icaptcha_insecure_enabled(), "\" 1 \" (trimmed) must enable");
+        }
+    }
+
+    /// #227: `=0` / `=false` / empty / unset must NOT enable loopback HTTP;
+    /// only explicit truthy `1` / `true` may. Uses pure helpers so tests do
+    /// not mutate process-global environment (avoids races with parallel
+    /// resolver tests that also call `resolve_solver_url`).
+    #[test]
+    fn insecure_env_only_truthy_enables_loopback_http() {
+        assert!(
+            !is_https_with("http://127.0.0.1", icaptcha_insecure_from_str(Some("0"))),
+            "=0 must leave loopback HTTP disabled"
+        );
+        assert!(!icaptcha_insecure_from_str(Some("0")));
+
+        assert!(
+            !is_https_with(
+                "http://127.0.0.1",
+                icaptcha_insecure_from_str(Some("false"))
+            ),
+            "=false must leave loopback HTTP disabled"
+        );
+        assert!(!icaptcha_insecure_from_str(Some("false")));
+
+        assert!(
+            !is_https_with("http://127.0.0.1", icaptcha_insecure_from_str(Some(""))),
+            "empty value must leave loopback HTTP disabled"
+        );
+        assert!(!icaptcha_insecure_from_str(Some("")));
+
+        assert!(
+            !is_https_with("http://127.0.0.1", icaptcha_insecure_from_str(None)),
+            "unset must leave loopback HTTP disabled"
+        );
+        assert!(!icaptcha_insecure_from_str(None));
+        assert!(!icaptcha_insecure_from_var(Err(
+            std::env::VarError::NotPresent
+        )));
+
+        assert!(
+            is_https_with("http://127.0.0.1", icaptcha_insecure_from_str(Some("1"))),
+            "=1 must enable loopback HTTP"
+        );
+        assert!(is_https_with(
+            "http://localhost",
+            icaptcha_insecure_from_str(Some("1"))
+        ));
+        assert!(icaptcha_insecure_from_str(Some("1")));
+
+        assert!(
+            is_https_with("http://127.0.0.1", icaptcha_insecure_from_str(Some("true"))),
+            "=true must enable loopback HTTP"
+        );
+        assert!(icaptcha_insecure_from_str(Some("true")));
+
+        assert!(
+            is_https_with("http://127.0.0.1", icaptcha_insecure_from_str(Some("TRUE"))),
+            "=TRUE (case-insensitive) must enable loopback HTTP"
+        );
+
+        // Trim is load-bearing: whitespace around a truthy token must still enable.
+        assert!(
+            is_https_with("http://127.0.0.1", icaptcha_insecure_from_str(Some(" 1 "))),
+            "\" 1 \" (trimmed) must enable loopback HTTP"
+        );
+        assert!(icaptcha_insecure_from_str(Some(" 1 ")));
+
+        // Present non-Unicode: fail closed + same fixed warning path as non-truthy.
+        assert!(!icaptcha_insecure_from_var(Err(
+            std::env::VarError::NotUnicode(OsString::from("x"))
+        )));
+
+        // https remains trusted regardless of the insecure flag.
+        assert!(is_https_with("https://icaptcha.gitlawb.com", false));
+        assert!(is_https_with("https://icaptcha.gitlawb.com", true));
+    }
+
+    // ── P1: hostile error bodies must not reach the terminal raw ──────────
+
+    #[test]
+    fn sanitize_strips_control_chars_and_escapes() {
+        // ESC-based terminal escape + NUL + bell must all be removed.
+        let hostile = "\x1b[2J\x1b[31mowned\x07\0 done";
+        let clean = sanitize_excerpt(hostile);
+        assert!(!clean.contains('\x1b'), "ESC survived: {clean:?}");
+        assert!(
+            !clean.chars().any(|c| c.is_control()),
+            "control survived: {clean:?}"
+        );
+        assert!(clean.contains("owned") && clean.contains("done"));
+    }
+
+    #[test]
+    fn sanitize_strips_bidi_format_controls() {
+        // The Cc-only test above is vacuous for Cf: it passes whether or not bidi
+        // controls survive, which is why this gap shipped (#183). Here every Cf
+        // bidi class is stripped — override (RLO), embedding + pop (LRE/PDF),
+        // isolate (LRI/PDI), marks (LRM/ALM) — asserted per code point, and the
+        // visible words JOIN with no phantom space (a bidi char is dropped like a
+        // control byte, but unlike a newline/tab it is not whitespace). The leading
+        // bidi char (index 0) also exercises the empty-out path.
+        let out = sanitize_excerpt("\u{202e}err\u{202a}\u{202c}\u{2066}\u{2069}\u{200e}\u{061c}ok");
+        for c in [
+            '\u{202e}', '\u{202a}', '\u{202c}', '\u{2066}', '\u{2069}', '\u{200e}', '\u{061c}',
+        ] {
+            assert!(!out.contains(c), "bidi U+{:04X} leaked: {out:?}", c as u32);
+        }
+        assert_eq!(out, "errok");
+    }
+
+    #[test]
+    fn sanitize_preserves_legitimate_and_rtl_text() {
+        // Must not over-strip: plain text, a genuine RTL SCRIPT letter (Arabic
+        // U+0627, category Lo), and ZWJ (U+200D, a legitimate Cf char) survive.
+        assert_eq!(
+            sanitize_excerpt("ok \u{0627}\u{200D}b"),
+            "ok \u{0627}\u{200D}b"
+        );
+    }
+
+    #[test]
+    fn sanitize_collapses_whitespace_and_caps_length() {
+        let collapsed = sanitize_excerpt("a\n\n\t  b");
+        assert_eq!(collapsed, "a b");
+        let long = "x".repeat(MAX_ERR_CHARS + 500);
+        assert_eq!(sanitize_excerpt(&long).chars().count(), MAX_ERR_CHARS);
+    }
+
+    #[test]
+    fn sanitize_bidi_chars_do_not_consume_the_length_cap() {
+        // A dropped bidi char must not count toward MAX_ERR_CHARS: it is dropped
+        // before `kept` increments, so interleaving bidi controls cannot truncate
+        // the visible output early. MAX_ERR_CHARS + 100 visible 'x', each trailed by
+        // a bidi override, must still yield exactly MAX_ERR_CHARS visible 'x' with
+        // no phantom spaces. (Would regress to fewer 'x' if bidi consumed budget, or
+        // to spaces if the drop branch wrongly set pending_space.)
+        let body = "x\u{202e}".repeat(MAX_ERR_CHARS + 100);
+        assert_eq!(sanitize_excerpt(&body), "x".repeat(MAX_ERR_CHARS));
+    }
+
+    // ── P2: never talk to (or hand a key to) an untrusted node-chosen URL ──
+
+    #[test]
+    fn rejects_non_https_advertised_url() {
+        // A plaintext node-advertised URL is ignored; we fall back to default.
+        let (url, key_trusted) = resolve_solver_url(Some("http://evil.example/x"), None);
+        assert_eq!(url, DEFAULT_URL);
+        assert!(!key_trusted);
+    }
+
+    #[test]
+    fn rejects_https_url_with_non_allowlisted_host() {
+        let (url, key_trusted) = resolve_solver_url(Some("https://evil.example"), None);
+        assert_eq!(url, DEFAULT_URL, "attacker host must not be honored");
+        assert!(!key_trusted);
+    }
+
+    #[test]
+    fn honors_advertised_default_host_but_withholds_key_without_operator() {
+        // Default public host is allowlisted for talking, but with no operator
+        // origin configured the API key has no trusted destination.
+        let (url, key_trusted) = resolve_solver_url(Some("https://icaptcha.gitlawb.com/v2"), None);
+        assert_eq!(url, "https://icaptcha.gitlawb.com/v2");
+        assert!(!key_trusted);
+    }
+
+    #[test]
+    fn key_trusted_only_for_operator_configured_origin() {
+        let op = "https://icap.mynode.example";
+        // Node advertises the operator's own origin → talk there, key allowed.
+        let (url, key_trusted) =
+            resolve_solver_url(Some("https://icap.mynode.example/v1"), Some(op));
+        assert_eq!(url, "https://icap.mynode.example/v1");
+        assert!(key_trusted);
+
+        // Node advertises an attacker origin while an operator is configured →
+        // ignore the advert, fall back to the operator origin, key stays with it.
+        let (url, key_trusted) = resolve_solver_url(Some("https://evil.example"), Some(op));
+        assert_eq!(url, op);
+        assert!(key_trusted);
+    }
+
+    #[test]
+    fn no_advert_uses_operator_or_default() {
+        let op = "https://icap.mynode.example";
+        assert_eq!(resolve_solver_url(None, Some(op)), (op.to_string(), true));
+        assert_eq!(
+            resolve_solver_url(None, None),
+            (DEFAULT_URL.to_string(), false)
+        );
+    }
+
+    #[test]
+    fn non_https_operator_is_not_trusted() {
+        // A misconfigured plaintext operator URL is not a valid key destination.
+        let (url, key_trusted) = resolve_solver_url(None, Some("http://icap.mynode.example"));
+        assert_eq!(url, DEFAULT_URL);
+        assert!(!key_trusted);
+    }
+
+    #[test]
+    fn rejects_insecure_advertised_url_on_different_port() {
+        // With insecure mode enabled, two loopback URLs on different
+        // ports must be treated as distinct origins so a hostile node cannot
+        // redirect the bearer key to a different listener on localhost.
+        let op = "http://localhost:3000";
+        let (url, key_trusted) =
+            resolve_solver_url_with(Some("http://localhost:9000"), Some(op), true);
+        assert_eq!(
+            url, op,
+            "must fall back to operator origin, not use different port"
+        );
+        assert!(key_trusted, "key stays trusted with operator origin");
+    }
+
+    #[test]
+    fn new_withholds_key_from_untrusted_origin_but_attaches_for_operator() {
+        let guard = ICAPTCHA_ENV_LOCK.lock().unwrap();
+        let prev_key = std::env::var_os("GITLAWB_ICAPTCHA_API_KEY");
+        let prev_op = std::env::var_os("GITLAWB_ICAPTCHA_URL");
+        std::env::set_var("GITLAWB_ICAPTCHA_API_KEY", "secret-bearer");
+
+        // Arm 1: No operator configured, node advertises an attacker origin.
+        // The key has no trusted destination; the advert is rejected.
+        std::env::remove_var("GITLAWB_ICAPTCHA_URL");
+        let untrusted =
+            IcaptchaCfg::new("did:key:zTEST", Some("https://evil.example".into()), None);
+
+        // Arm 1b: No operator configured, no URL advertised. The fallback goes
+        // to the default public origin, and with no operator to trust, the key
+        // must not ride.
+        let no_operator_no_advert = IcaptchaCfg::new("did:key:zTEST", None, None);
+
+        // Arm 2: Operator origin configured and advertised — key attached.
+        std::env::set_var("GITLAWB_ICAPTCHA_URL", "https://icap.mynode.example");
+        let operator_match = IcaptchaCfg::new(
+            "did:key:zTEST",
+            Some("https://icap.mynode.example/v1".into()),
+            None,
+        );
+
+        // Arm 3: Operator configured, default host advertised. The default host
+        // is allowlisted and selected, but its origin differs from the
+        // operator's, so key must not ride.
+        let default_advert = IcaptchaCfg::new(
+            "did:key:zTEST",
+            Some("https://icaptcha.gitlawb.com/v2".into()),
+            None,
+        );
+
+        // Arm 4: Operator configured, no URL advertised (the node sent only
+        // x-icaptcha-level, not x-icaptcha-url). resolve_solver_url falls back
+        // to the operator origin and marks the key trusted. This is the common
+        // API-key deployment path — a regression that additionally required
+        // url.is_some() for key attachment would leave all current tests green
+        // but make these fallback challenge/answer requests omit Authorization
+        // and fail against the protected operator service.
+        let operator_fallback = IcaptchaCfg::new("did:key:zTEST", None, Some(3));
+
+        // Arm 5: Operator configured, node advertises an attacker origin.
+        // The advert is rejected and the solver falls back to the operator's
+        // own origin, which keeps the key trusted — this is the exfiltration
+        // scenario the test name describes (withhold key from *untrusted*
+        // origin, not from the operator's fallback).
+        let operator_hostile_advert =
+            IcaptchaCfg::new("did:key:zTEST", Some("https://evil.example".into()), None);
+
+        // Arm 6: Operator configured, same host but different port.
+        // origin_key includes the port, so :8443 must not match the
+        // operator origin at the default :443 — the advert is rejected
+        // and the solver falls back to the operator origin.
+        let operator_diff_port = IcaptchaCfg::new(
+            "did:key:zTEST",
+            Some("https://icap.mynode.example:8443/evil".into()),
+            None,
+        );
+
+        // Restore env and release the lock BEFORE asserting, so a failing
+        // assertion can't poison the shared lock or cascade into a sibling.
+        match prev_key {
+            Some(v) => std::env::set_var("GITLAWB_ICAPTCHA_API_KEY", v),
+            None => std::env::remove_var("GITLAWB_ICAPTCHA_API_KEY"),
+        }
+        match prev_op {
+            Some(v) => std::env::set_var("GITLAWB_ICAPTCHA_URL", v),
+            None => std::env::remove_var("GITLAWB_ICAPTCHA_URL"),
+        }
+        drop(guard);
+
+        let mut failures: Vec<String> = Vec::new();
+
+        if untrusted.api_key.is_some() {
+            failures.push(format!(
+                "arm 1 (no operator, attacker advert): expected api_key=None, got {:?}",
+                untrusted.api_key
+            ));
+        }
+        if untrusted.url != DEFAULT_URL {
+            failures.push(format!(
+                "arm 1 (no operator, attacker advert): expected url={DEFAULT_URL}, got {}",
+                untrusted.url
+            ));
+        }
+
+        if no_operator_no_advert.api_key.is_some() {
+            failures.push(format!(
+                "arm 1b (no operator, no advert): expected api_key=None, got {:?}",
+                no_operator_no_advert.api_key
+            ));
+        }
+        if no_operator_no_advert.url != DEFAULT_URL {
+            failures.push(format!(
+                "arm 1b (no operator, no advert): expected url={DEFAULT_URL}, got {}",
+                no_operator_no_advert.url
+            ));
+        }
+
+        if operator_match.api_key.as_deref() != Some("secret-bearer") {
+            failures.push(format!(
+                "arm 2 (operator match): expected api_key=Some(\"secret-bearer\"), got {:?}",
+                operator_match.api_key
+            ));
+        }
+        if operator_match.url != "https://icap.mynode.example/v1" {
+            failures.push(format!(
+                "arm 2 (operator match): expected url=https://icap.mynode.example/v1, got {}",
+                operator_match.url
+            ));
+        }
+
+        if default_advert.api_key.is_some() {
+            failures.push(format!(
+                "arm 3 (operator + default advert): expected api_key=None, got {:?}",
+                default_advert.api_key
+            ));
+        }
+        if default_advert.url != "https://icaptcha.gitlawb.com/v2" {
+            failures.push(format!(
+                "arm 3 (operator + default advert): expected url=https://icaptcha.gitlawb.com/v2, got {}",
+                default_advert.url
+            ));
+        }
+
+        if operator_fallback.api_key.as_deref() != Some("secret-bearer") {
+            failures.push(format!(
+                "arm 4 (operator fallback, no advert): expected api_key=Some(\"secret-bearer\"), got {:?}",
+                operator_fallback.api_key
+            ));
+        }
+        if operator_fallback.url != "https://icap.mynode.example" {
+            failures.push(format!(
+                "arm 4 (operator fallback, no advert): expected url=https://icap.mynode.example, got {}",
+                operator_fallback.url
+            ));
+        }
+
+        if operator_hostile_advert.api_key.as_deref() != Some("secret-bearer") {
+            failures.push(format!(
+                "arm 5 (operator + hostile advert): expected api_key=Some(\"secret-bearer\"), got {:?}",
+                operator_hostile_advert.api_key
+            ));
+        }
+        if operator_hostile_advert.url != "https://icap.mynode.example" {
+            failures.push(format!(
+                "arm 5 (operator + hostile advert): expected url=https://icap.mynode.example, got {}",
+                operator_hostile_advert.url
+            ));
+        }
+
+        if operator_diff_port.api_key.as_deref() != Some("secret-bearer") {
+            failures.push(format!(
+                "arm 6 (operator + different port advert): expected api_key=Some(\"secret-bearer\"), got {:?}",
+                operator_diff_port.api_key
+            ));
+        }
+        if operator_diff_port.url != "https://icap.mynode.example" {
+            failures.push(format!(
+                "arm 6 (operator + different port advert): expected url=https://icap.mynode.example, got {}",
+                operator_diff_port.url
+            ));
+        }
+
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn new_normalizes_empty_api_key_to_none_on_trusted_origin() {
+        let guard = ICAPTCHA_ENV_LOCK.lock().unwrap();
+        let prev_key = std::env::var_os("GITLAWB_ICAPTCHA_API_KEY");
+        let prev_op = std::env::var_os("GITLAWB_ICAPTCHA_URL");
+
+        // Operator origin configured and resolved as trusted (no advert), so
+        // api_key reaches the env read and the emptiness filter is the only
+        // thing standing between a blank var and an empty bearer token.
+        std::env::set_var("GITLAWB_ICAPTCHA_URL", "https://icap.mynode.example");
+
+        // "Operator set the var but left it blank" must stay keyless: a
+        // Some("") would attach `Authorization: Bearer ` (empty token) to the
+        // challenge and answer requests instead of omitting the header.
+        std::env::set_var("GITLAWB_ICAPTCHA_API_KEY", "");
+        let empty = IcaptchaCfg::new("did:key:zTEST", None, None);
+
+        // Contrast arm: a real key on the same trusted path must survive the
+        // filter, so the filter can't regress to dropping every key.
+        std::env::set_var("GITLAWB_ICAPTCHA_API_KEY", "secret-bearer");
+        let non_empty = IcaptchaCfg::new("did:key:zTEST", None, None);
+
+        // Restore env and release the lock BEFORE asserting, so a failing
+        // assertion can't poison the shared lock or cascade into a sibling.
+        match prev_key {
+            Some(v) => std::env::set_var("GITLAWB_ICAPTCHA_API_KEY", v),
+            None => std::env::remove_var("GITLAWB_ICAPTCHA_API_KEY"),
+        }
+        match prev_op {
+            Some(v) => std::env::set_var("GITLAWB_ICAPTCHA_URL", v),
+            None => std::env::remove_var("GITLAWB_ICAPTCHA_URL"),
+        }
+        drop(guard);
+
+        assert_eq!(
+            empty.api_key, None,
+            "empty GITLAWB_ICAPTCHA_API_KEY must normalize to None"
+        );
+        assert_eq!(non_empty.api_key.as_deref(), Some("secret-bearer"));
+    }
+
+    /// #345: an open-but-silent non-TTY stdin must not hang the prompt. The
+    /// child runs `interactive_prompt` with a held-open, empty pipe as stdin:
+    /// without the terminal check `read_line` blocks forever; with it the
+    /// child returns `None` and exits.
+    #[test]
+    fn interactive_prompt_skips_open_silent_pipe() {
+        const CHILD_ENV: &str = "ICAPTCHA_PROMPT_PIPE_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let ch = Challenge {
+                challenge_id: "c".into(),
+                kind: "arithmetic".into(),
+                difficulty: 1,
+                prompt: "What is 1 + 1?".into(),
+                token: "t".into(),
+                pow: None,
+            };
+            assert!(interactive_prompt(&ch).is_none());
+            println!("prompt-skipped");
+            return;
+        }
+        let exe = std::env::current_exe().expect("current test binary");
+        let mut child = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "tests::interactive_prompt_skips_open_silent_pipe",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn child test");
+        // The parent keeps the write end open with no data, which is exactly
+        // the shape that hung: an open, silent, non-terminal stdin.
+        let _held_stdin = child.stdin.take();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match child.try_wait().expect("poll child") {
+                Some(status) => {
+                    assert!(status.success(), "child exited with {status}");
+                    let mut out = String::new();
+                    std::io::Read::read_to_string(
+                        &mut child.stdout.take().expect("child stdout"),
+                        &mut out,
+                    )
+                    .expect("read child stdout");
+                    assert!(
+                        out.contains("prompt-skipped"),
+                        "child test body did not run: {out}"
+                    );
+                    return;
+                }
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                None => {
+                    let _ = child.kill();
+                    panic!("interactive_prompt blocked on an open, silent non-TTY stdin");
+                }
+            }
+        }
+    }
+}

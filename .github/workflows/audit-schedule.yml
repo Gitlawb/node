@@ -37,7 +37,18 @@ jobs:
         with:
           key: audit-schedule
 
-      - name: Install cargo-audit
+      - name: Install cargo-audit (floating; drift canary)
+        # Deliberately UNPINNED, unlike the blocking gate in pr-checks.yml. This
+        # job is cron-only (weekly); it is never pull_request- or push-triggered,
+        # so it NEVER gates a merge no matter what it does. Floating the scanner
+        # here is the drift canary: if a newer cargo-audit regresses, at worst
+        # this weekly run reds (the install step below is unguarded) or its
+        # visibility report changes, and that is exactly the signal that latest
+        # has moved and the pinned gate should not be bumped yet. The scan result
+        # itself never fails the run (the "Full audit report" step is `|| true`
+        # and the only other hard-fail is a Cargo.lock grep). The point is that
+        # drift surfaces here without ever blocking a PR. Do NOT pin to match
+        # pr-checks.yml.
         run: cargo install --locked cargo-audit
 
       # Full advisory report with NO suppressions. Run from a scratch dir that

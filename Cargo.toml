@@ -6,6 +6,7 @@ members = [
     "crates/gl",
     "crates/git-remote-gitlawb",
     "crates/gitlawb-attest",
+    "crates/icaptcha-client",
 ]
 
 [workspace.package]
@@ -19,8 +20,8 @@ members = [
 edition = "2021"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
-authors = ["gitlawb contributors"]
-repository = "https://github.com/gitlawb/node"
+authors = ["Twigpine contributors"]
+repository = "https://github.com/Twigpine/node"
 
 [workspace.dependencies]
 # async
@@ -52,6 +53,11 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 # http client
 reqwest = { version = "0.12", features = ["blocking", "json", "multipart", "rustls-tls"], default-features = false }
+# URL parsing (what reqwest::Url re-exports, so the shared redirect predicate can
+# take a parsed URL without pulling reqwest into gitlawb-core; also used for the
+# absolute-browser-url validation on GITLAWB_WEB_URL in the node and CLI)
+url = "2"
+percent-encoding = "2"
 # HMAC
 hmac = "0.12"
 

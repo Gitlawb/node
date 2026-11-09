@@ -46,7 +46,7 @@ build_darwin_arm64() {
   echo "==> Building darwin-arm64 (native cargo)..."
   cd "$ROOT"
   export PATH="$HOME/.cargo/bin:$PATH"
-  cargo build --release -p gl -p git-remote-gitlawb
+  cargo build --release --locked -p gl -p git-remote-gitlawb
   cp target/release/gl "$OUT/gl-darwin-arm64"
   cp target/release/git-remote-gitlawb "$OUT/git-remote-gitlawb-darwin-arm64"
   chmod +x "$OUT/gl-darwin-arm64" "$OUT/git-remote-gitlawb-darwin-arm64"

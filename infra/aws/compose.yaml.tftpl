@@ -58,6 +58,12 @@ services:
       GITLAWB_P2P_PORT: "${p2p_port}"
       GITLAWB_REPOS_DIR: /data/repos
       GITLAWB_KEY: /data/keys/identity.pem
+      # Only trust X-Forwarded-For when the Caddy sidecar above is actually
+      # deployed (domain_name != ""). Caddy appends the real client as the
+      # rightmost hop, letting the push rate limiter key on the true client IP
+      # rather than Caddy's container address. Without Caddy, this header is
+      # fully client-controlled and must not be trusted.
+      GITLAWB_TRUSTED_PROXY: "${domain_name != "" ? "x-forwarded-for" : ""}"
       # iCaptcha proof-of-intelligence gate (spam protection on create/fork/register)
       ICAPTCHA_MODE: ${icaptcha_mode}
       ICAPTCHA_PUBKEY: ${icaptcha_pubkey}
@@ -66,6 +72,9 @@ services:
       GITLAWB_BOOTSTRAP_PEERS: $${GITLAWB_BOOTSTRAP_PEERS}
       GITLAWB_AUTO_SYNC: $${GITLAWB_AUTO_SYNC}
       GITLAWB_MAX_PACK_BYTES: $${GITLAWB_MAX_PACK_BYTES}
+      # Owner-only push. Matches the node's own default; forwarding it is what makes
+      # the documented rolling-upgrade opt-out reachable on the container path.
+      GITLAWB_ENFORCE_OWNER_PUSH: $${GITLAWB_ENFORCE_OWNER_PUSH:-true}
       # On-chain PoS (optional — empty unless set in terraform.tfvars)
       GITLAWB_CHAIN_RPC_URL: $${GITLAWB_CHAIN_RPC_URL}
       GITLAWB_CONTRACT_NODE_STAKING: $${GITLAWB_CONTRACT_NODE_STAKING}

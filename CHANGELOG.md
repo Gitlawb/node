@@ -1,5 +1,99 @@
 # Changelog
 
+## [0.7.1](https://github.com/Gitlawb/node/compare/v0.7.0...v0.7.1) (2026-08-03)
+
+
+### Bug Fixes
+
+* **ci:** make the docker dependency cache work and unbreak Dockerfile.bins ([99b2b9a](https://github.com/Gitlawb/node/commit/99b2b9a16662761a3959a2941798e6823621bda5))
+* **ci:** make the docker dependency cache work and unbreak Dockerfile.bins ([a49e04d](https://github.com/Gitlawb/node/commit/a49e04ddcd23f3b666421486ae60c3c4329e2242)), closes [#265](https://github.com/Gitlawb/node/issues/265) [#266](https://github.com/Gitlawb/node/issues/266)
+* **db:** pin profile DID matching with lone non-key fixture and boundary matrix ([b4016dc](https://github.com/Gitlawb/node/commit/b4016dce9d1fe450603173f9d92bd880127620fa)), closes [#298](https://github.com/Gitlawb/node/issues/298)
+* **node:** add a shared owner/name slug validator ([#272](https://github.com/Gitlawb/node/issues/272)) ([51d82de](https://github.com/Gitlawb/node/commit/51d82ded57a776d9c7e2fe65895efdbf9e227dc8))
+* **node:** bound the slug owner by NAME_MAX, not the DID limit ([#272](https://github.com/Gitlawb/node/issues/272)) ([27b0495](https://github.com/Gitlawb/node/commit/27b0495a6f7edeecddbe62b0f075a7e3b1ef5053))
+* **node:** fail a sync row terminally when a non-directory holds the owner path ([2e664b7](https://github.com/Gitlawb/node/commit/2e664b7885036ee72ce175af95bb567b18222583))
+* **node:** make a stalled sync queue visible, and fix two test claims ([9aa4c17](https://github.com/Gitlawb/node/commit/9aa4c17aefd1885d134b1334b54551366cdd8ef0))
+* **node:** move the attempted_at migration to v17, clear of two open branches ([fbc5868](https://github.com/Gitlawb/node/commit/fbc5868bd16946ea184dad26abcdb0e89d68e99a))
+* **node:** prove the mirror path is inside repos_dir before running git ([#272](https://github.com/Gitlawb/node/issues/272)) ([3ca9473](https://github.com/Gitlawb/node/commit/3ca94739ed7b90e4c265a0947025dc3b50e7583b))
+* **node:** reject a malformed slug at the notify boundary ([#272](https://github.com/Gitlawb/node/issues/272)) ([c587a40](https://github.com/Gitlawb/node/commit/c587a40a508acea9f74c3468d42ff037397c75d0))
+* **node:** reset a peer's reachability gate when an announce changes its http_url ([#270](https://github.com/Gitlawb/node/issues/270)) ([1964f88](https://github.com/Gitlawb/node/commit/1964f88378fe6942ffca5836de3a092b5b8f67b4))
+* **node:** reset a peer's reachability gate when an announce changes its http_url ([#270](https://github.com/Gitlawb/node/issues/270)) ([e2560ee](https://github.com/Gitlawb/node/commit/e2560ee46c28e4e966d87867a86dc4bad4ca7a3a))
+* **node:** stamp every dequeued sync row so a stuck one yields the batch ([6e64d0d](https://github.com/Gitlawb/node/commit/6e64d0d0a7fdd38ef3a56820c1808dd7c9bbd658))
+* **node:** stop a peer-supplied repo slug from escaping repos_dir ([#272](https://github.com/Gitlawb/node/issues/272)) ([c70b1df](https://github.com/Gitlawb/node/commit/c70b1df42d5c3f70ec4c272886c85fcc16ed92d1))
+* **node:** validate the queued slug before the worker derives a path ([#272](https://github.com/Gitlawb/node/issues/272)) ([9f00e24](https://github.com/Gitlawb/node/commit/9f00e24aec217e4b8256dd437cff4741b1478b96))
+* **review:** correct two comment claims and guard two more wrong shapes ([#270](https://github.com/Gitlawb/node/issues/270)) ([811ad50](https://github.com/Gitlawb/node/commit/811ad504bc268c8e9cddac93822adcd00bfe9ff8))
+* **review:** stop the dequeue overclaiming, and pin the starvation premise ([457be11](https://github.com/Gitlawb/node/commit/457be11d728a2a34775cf96be2bc5af9a58cb250))
+* strict DID matching in get_profile ([acb4714](https://github.com/Gitlawb/node/commit/acb47145beec8ce7b20b7a2479f7a55ed68e2a89))
+* strict DID matching in get_profile ([13b565b](https://github.com/Gitlawb/node/commit/13b565bcac09f075a7fd555a6e9acdd27de6c7bb))
+* target stored did on profile update aliases ([9836c3a](https://github.com/Gitlawb/node/commit/9836c3a21bc96a2ce95cb1fd12bd84b22142787d))
+
+## [0.7.0](https://github.com/Gitlawb/node/compare/v0.6.0...v0.7.0) (2026-07-22)
+
+
+### Features
+
+* **gl:** actually verify certificate signatures in gl cert show ([b0a2ed8](https://github.com/Gitlawb/node/commit/b0a2ed830821b5a77b0dafdcf5ce4b1ad904ec25))
+* **gl:** doctor warns when a shell alias shadows the gl binary ([0765c42](https://github.com/Gitlawb/node/commit/0765c42feff47b29054b9a277881a7cd5bfd9135))
+
+
+### Bug Fixes
+
+* **gl:** address review findings — non-fatal DID check, exact-host loopback, detached HEAD, multi-URL remotes, command-aware unalias ([3fa38dc](https://github.com/Gitlawb/node/commit/3fa38dce4e435ef017f607d355266c2892161f8d))
+* **gl:** anchor cert --verify to a trusted issuer; pin canonical payload form ([c681af7](https://github.com/Gitlawb/node/commit/c681af70dba3a76b11795d324f2ca0fecf7e42fd))
+* **gl:** detect gitlawb remotes beyond origin in gl status ([2d88937](https://github.com/Gitlawb/node/commit/2d88937fbabf21013f28debb4d4f93270a4bb8cd))
+* **gl:** doctor treats a reachable local node as configuration, not failure ([94c61f7](https://github.com/Gitlawb/node/commit/94c61f79421fa26ecc1bdf7c255e0c48e66a2048))
+* **gl:** make gl init's push guidance match the repo's actual state ([cb42a48](https://github.com/Gitlawb/node/commit/cb42a4830d0d070165e2212f316d009ec716dbee))
+* warn about the oh-my-zsh gl alias at install time ([e3df51d](https://github.com/Gitlawb/node/commit/e3df51d76c0275fde33954ff0af0aab95fd0cb7d))
+
+## [0.6.0](https://github.com/Gitlawb/node/compare/v0.5.1...v0.6.0) (2026-07-22)
+
+
+### Features
+
+* **icaptcha-client:** solve the iCaptcha proof-of-work on answer ([#181](https://github.com/Gitlawb/node/issues/181)) ([c98b503](https://github.com/Gitlawb/node/commit/c98b503f90cade54ce9c588bd2373a4e3486f2fc))
+
+
+### Bug Fixes
+
+* **core:** honor wildcard capabilities in Ucan::can, matching is_attenuated_by ([#200](https://github.com/Gitlawb/node/issues/200)) ([b6877a6](https://github.com/Gitlawb/node/commit/b6877a65981dbf41c4a7838971eb5c826c7fcaf2))
+* **gl:** point doctor's version check at Gitlawb/node, not the frozen Gitlawb/releases repo ([#198](https://github.com/Gitlawb/node/issues/198)) ([98d728c](https://github.com/Gitlawb/node/commit/98d728c325f68f0ee4a62e473dc484b7dd627504))
+* **node:** carry full owner DID on ref-update wire event ([#144](https://github.com/Gitlawb/node/issues/144)) ([#145](https://github.com/Gitlawb/node/issues/145)) ([69a62e5](https://github.com/Gitlawb/node/commit/69a62e51c2d2f090f9cae88f4d8ce3b9017b7149))
+* **node:** gate /hooks and sibling read surfaces leaking private repo metadata ([#94](https://github.com/Gitlawb/node/issues/94)) ([#113](https://github.com/Gitlawb/node/issues/113)) ([ee8d7c0](https://github.com/Gitlawb/node/commit/ee8d7c03b26a0b678cc90b8801aa340fe81da700))
+* strip Cf bidi/format controls in terminal-bound error sanitizers ([#183](https://github.com/Gitlawb/node/issues/183)) ([#188](https://github.com/Gitlawb/node/issues/188)) ([b07d41e](https://github.com/Gitlawb/node/commit/b07d41ea97569d79d3f545ae5d43c373cd6f0f33))
+
+## [0.5.1](https://github.com/Gitlawb/node/compare/v0.5.0...v0.5.1) (2026-07-10)
+
+
+### Bug Fixes
+
+* **bounties:** add tests for claim_bounty repo-read gate ([#160](https://github.com/Gitlawb/node/issues/160)) ([#169](https://github.com/Gitlawb/node/issues/169)) ([6bafaa6](https://github.com/Gitlawb/node/commit/6bafaa6dc5f05c0dcd61c708397afddbcf8c2e3f))
+* **deps:** bump crossbeam-epoch to 0.9.20 for RUSTSEC-2026-0204 ([#162](https://github.com/Gitlawb/node/issues/162)) ([#163](https://github.com/Gitlawb/node/issues/163)) ([67ad2b8](https://github.com/Gitlawb/node/commit/67ad2b876c8d9a336219d1016968de7a88fc4e75))
+* **node,git:** bound a hung served git with a total-duration timeout ([#62](https://github.com/Gitlawb/node/issues/62)) ([#165](https://github.com/Gitlawb/node/issues/165)) ([cd67718](https://github.com/Gitlawb/node/commit/cd67718f49ec38726a40f6bcf36f539ccdb42969))
+* **node:** bound list_ref_certificates with LIMIT and add upsert to prevent unbounded growth ([#147](https://github.com/Gitlawb/node/issues/147)) ([#149](https://github.com/Gitlawb/node/issues/149)) ([6b5e5bc](https://github.com/Gitlawb/node/commit/6b5e5bc7aee00a2d03295d3620df1ee4d8c024a2))
+* **node:** gate POST /api/v1/sync/trigger and rate-limit the peer-sync routes ([#82](https://github.com/Gitlawb/node/issues/82)) ([#161](https://github.com/Gitlawb/node/issues/161)) ([d00d89a](https://github.com/Gitlawb/node/commit/d00d89ae5be992d1f63e95b714ae1bd3735e8457))
+* **node:** rate-limit repo/agent creation per client IP to stop DID-farm spam floods ([#180](https://github.com/Gitlawb/node/issues/180)) ([dfcaa22](https://github.com/Gitlawb/node/commit/dfcaa22b23ec91be4c75926956aa994ca89de8d5))
+* **release:** build aarch64-musl natively on arm64 runners, replace retired macos-13 ([#155](https://github.com/Gitlawb/node/issues/155)) ([6cff528](https://github.com/Gitlawb/node/commit/6cff5286b436fdee44ad881999e2a5f4bdba18f9))
+* **visibility:** gate repo-scoped read surfaces on visibility ([#120](https://github.com/Gitlawb/node/issues/120)) ([#157](https://github.com/Gitlawb/node/issues/157)) ([26bc3f6](https://github.com/Gitlawb/node/commit/26bc3f69870aa77e43c0d92115a5aa59555b7d88))
+
+## [0.5.0](https://github.com/Gitlawb/node/compare/v0.4.0...v0.5.0) (2026-07-05)
+
+
+### Features
+
+* **gl:** sanctioned iCaptcha client flow + secure git lifecycle ([#138](https://github.com/Gitlawb/node/issues/138)) ([06388ec](https://github.com/Gitlawb/node/commit/06388ec26aa29d356ae311276fdb91be054e9ecc))
+
+
+### Bug Fixes
+
+* **gl:** sign the CLI's /ipfs/pins reads under the [#134](https://github.com/Gitlawb/node/issues/134) auth gate ([#146](https://github.com/Gitlawb/node/issues/146)) ([20d6848](https://github.com/Gitlawb/node/commit/20d6848846b3a988d604208833167a528b7d8820))
+* **node,git-remote:** gate receive-pack advertisement, sign client fetch/push ([#119](https://github.com/Gitlawb/node/issues/119)) ([6f36fc0](https://github.com/Gitlawb/node/commit/6f36fc07b8e10a650c5948b269feac1cb25cae2a))
+* **node,gossip:** route gossip HTTP through the no-redirect client ([#93](https://github.com/Gitlawb/node/issues/93)) ([#140](https://github.com/Gitlawb/node/issues/140)) ([563c456](https://github.com/Gitlawb/node/commit/563c456803bf3e958d63869db424b3940472bc3d))
+* **node:** close two spam-vector root causes (trust upsert + ungated push) ([#152](https://github.com/Gitlawb/node/issues/152)) ([2df6ff9](https://github.com/Gitlawb/node/commit/2df6ff9d30de62f754fa41473e85db316021718e))
+* **node:** gate GET /ipfs/{cid} on reachable allowed-set, not deny-set ([#126](https://github.com/Gitlawb/node/issues/126)) ([#133](https://github.com/Gitlawb/node/issues/133)) ([466a550](https://github.com/Gitlawb/node/commit/466a550915edd711856ef32035f9f474e2577c4f))
+* **node:** gate the ref-updates feeds on read visibility ([#112](https://github.com/Gitlawb/node/issues/112), [#114](https://github.com/Gitlawb/node/issues/114)) ([#143](https://github.com/Gitlawb/node/issues/143)) ([4891db3](https://github.com/Gitlawb/node/commit/4891db38892663326ee0c1417a2db931988be4b5))
+* **node:** prefer canonical repo row over mirror row in get_repo ([#124](https://github.com/Gitlawb/node/issues/124)) ([#141](https://github.com/Gitlawb/node/issues/141)) ([6c95592](https://github.com/Gitlawb/node/commit/6c95592d188222ac3446dc23ef8d9befbf82ad6f))
+* **remote:** include HTTP error response body ([#137](https://github.com/Gitlawb/node/issues/137)) ([09a0cb2](https://github.com/Gitlawb/node/commit/09a0cb23b9f284ccbd69aca6958b70671f3bfb46))
+* **repos:** log the cause when repo create fails ([#103](https://github.com/Gitlawb/node/issues/103)) ([2620e97](https://github.com/Gitlawb/node/commit/2620e973e3cd4835ed42ddd4adcd8183b5b3080e))
+
 ## [0.4.0](https://github.com/Gitlawb/node/compare/v0.3.9...v0.4.0) (2026-06-30)
 
 

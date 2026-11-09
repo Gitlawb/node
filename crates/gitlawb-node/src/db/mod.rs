@@ -1,9 +1,24 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, Row};
+use sqlx::{postgres::PgPoolOptions, PgPool, Row};
+use std::time::Duration;
 use tracing::info;
 use uuid::Uuid;
+
+/// Maximum visible repositories per page, plus one internal look-ahead row.
+pub(crate) const MAX_VISIBLE_REPO_PAGE_SIZE: usize = 200;
+
+/// Maximum repository name length in bytes. `repo_cursor` embeds the name in
+/// a base64(JSON) cursor that `parse_repo_cursor` rejects over 4096 bytes, so
+/// every write path must bound the name: a cursor the server emits must
+/// always parse back (#465 4th round). 100 bytes keeps the longest possible
+/// cursor an order of magnitude under the parse limit.
+pub(crate) const MAX_REPO_NAME_LEN: usize = 100;
+
+/// Maximum agent tasks returned per query. Shared by the GraphQL `tasks`
+/// complexity meter and the resolver clamp so they can't drift.
+pub(crate) const MAX_VISIBLE_TASK_PAGE_SIZE: i64 = 200;
 
 // ── Public data types ─────────────────────────────────────────────────────────
 
@@ -20,6 +35,148 @@ pub struct RepoRecord {
     pub disk_path: String,
     pub forked_from: Option<String>,
     pub machine_id: Option<String>,
+}
+
+/// Which side is authoritative for a continuously mirrored repository.
+///
+/// A repository without an `upstream_url` has no mirror status. Transitioning
+/// states always carry a durable job id and phase so a node restart can resume
+/// or roll back instead of guessing which side owns writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(not(test), allow(dead_code))]
+pub enum MirrorStatus {
+    Inbound,
+    TransitioningInboundToOutbound,
+    Outbound,
+    TransitioningOutboundToInbound,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl MirrorStatus {
+    fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "inbound" => Ok(Self::Inbound),
+            "transitioning_inbound_to_outbound" => Ok(Self::TransitioningInboundToOutbound),
+            "outbound" => Ok(Self::Outbound),
+            "transitioning_outbound_to_inbound" => Ok(Self::TransitioningOutboundToInbound),
+            _ => anyhow::bail!("invalid mirror status stored in database"),
+        }
+    }
+
+    fn is_transitioning(self) -> bool {
+        matches!(
+            self,
+            Self::TransitioningInboundToOutbound | Self::TransitioningOutboundToInbound
+        )
+    }
+}
+
+/// Durable progress marker for a mirror-authority transition job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(not(test), allow(dead_code))]
+pub enum MirrorTransitionPhase {
+    Queued,
+    Starting,
+    InitializingMirrorFetch,
+    DrainingWrites,
+    FinalizingMirrorFetch,
+    FinalizingMirrorPush,
+    CommittingTargetStatus,
+    Completed,
+    RollingBack,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl MirrorTransitionPhase {
+    fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "queued" => Ok(Self::Queued),
+            "starting" => Ok(Self::Starting),
+            "initializing_mirror_fetch" => Ok(Self::InitializingMirrorFetch),
+            "draining_writes" => Ok(Self::DrainingWrites),
+            "finalizing_mirror_fetch" => Ok(Self::FinalizingMirrorFetch),
+            "finalizing_mirror_push" => Ok(Self::FinalizingMirrorPush),
+            "committing_target_status" => Ok(Self::CommittingTargetStatus),
+            "completed" => Ok(Self::Completed),
+            "rolling_back" => Ok(Self::RollingBack),
+            _ => anyhow::bail!("invalid mirror transition phase stored in database"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct RepoMirrorState {
+    pub repo_id: String,
+    pub upstream_url: String,
+    pub status: MirrorStatus,
+    pub transition_id: Option<Uuid>,
+    pub transition_phase: Option<MirrorTransitionPhase>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl RepoMirrorState {
+    fn validate(&self) -> Result<()> {
+        validate_mirror_upstream_url(&self.upstream_url)?;
+
+        match (
+            self.status.is_transitioning(),
+            self.transition_id,
+            self.transition_phase,
+        ) {
+            (true, Some(_), Some(phase)) if phase != MirrorTransitionPhase::Completed => Ok(()),
+            (false, None, None) => Ok(()),
+            (false, Some(_), Some(MirrorTransitionPhase::Completed)) => Ok(()),
+            _ => anyhow::bail!("mirror status and transition metadata are inconsistent"),
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn validate_mirror_upstream_url(raw: &str) -> Result<reqwest::Url> {
+    if raw.is_empty() || raw.len() > 2048 {
+        anyhow::bail!("mirror upstream URL must contain 1 to 2048 bytes");
+    }
+    if raw.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        anyhow::bail!("mirror upstream URL contains whitespace or control characters");
+    }
+
+    let url = reqwest::Url::parse(raw).context("parsing mirror upstream URL")?;
+    if url.scheme() != "https" {
+        anyhow::bail!("mirror upstream URL must use HTTPS");
+    }
+    if !crate::api::peers::is_public_http_url(raw) {
+        anyhow::bail!("mirror upstream URL must use a public host");
+    }
+    if url.host_str().is_none() || url.path().trim_matches('/').is_empty() {
+        anyhow::bail!("mirror upstream URL must include a host and repository path");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("mirror upstream URL must not embed credentials");
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        anyhow::bail!("mirror upstream URL must not contain a query or fragment");
+    }
+
+    Ok(url)
+}
+
+/// One row of a keyset page from [`Db::list_repos_page_for_scan`].
+///
+/// Carries the row's quarantine flag inline (so the IPFS scan needs no separate
+/// whole-node quarantine query) and the RAW stored `created_at` text, which is
+/// the first half of the keyset cursor. The raw text is kept because the keyset
+/// comparison is a text comparison and re-serializing the parsed `DateTime` is
+/// not guaranteed to reproduce the stored bytes — a cursor that differs from the
+/// stored value by one character skips or repeats rows.
+#[derive(Debug, Clone)]
+pub struct ScanRepoRow {
+    pub repo: RepoRecord,
+    pub quarantined: bool,
+    pub created_at_key: String,
 }
 
 /// Per-rule replication mode for a visibility rule.
@@ -135,6 +292,14 @@ pub struct RefCertificate {
     pub node_did: String,
     pub signature: String,
     pub issued_at: String,
+    /// #26 Split PR 3 — the wire-format version of this cert. v1 is
+    /// the pre-versioning 7-field payload (no `version` key in the
+    /// signed bytes). v2+ is reserved for a new signed payload shape
+    /// that carries the version inside the signed bytes; it is not
+    /// v1 plus unsigned fields, because flipping this column must
+    /// invalidate the signature. Clients refuse to verify versions
+    /// they cannot represent rather than guessing.
+    pub version: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,6 +339,9 @@ pub struct ReceivedRefUpdate {
     pub cert_id: Option<String>,
     pub received_at: String,
     pub from_peer: String,
+    /// Full owner DID — populated by new peers; None for events from older
+    /// peers that predate the wire-format change (#144).
+    pub owner_did: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,14 +414,20 @@ pub struct Db {
 }
 
 impl Db {
-    /// Access the underlying Postgres connection pool.
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
-    }
-
     #[cfg(test)]
     pub fn for_testing(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// Test-only: access the underlying Postgres connection pool.
+    ///
+    /// The production accessor was removed on main (ed76adf) once every
+    /// production caller had migrated to typed `Db` methods; this restores
+    /// it for tests only, for the raw-SQL fixtures and closed-pool cases in
+    /// this change that have no typed equivalent.
+    #[cfg(test)]
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
     }
 
     /// Test-only: apply the full schema to a fresh pool. `#[sqlx::test]`
@@ -265,11 +439,80 @@ impl Db {
         self.migrate().await
     }
 
-    pub async fn connect(database_url: &str) -> Result<Self> {
-        let pool = PgPool::connect(database_url).await?;
+    /// Connect the pool and run migrations. The initial connection is bounded
+    /// by `acquire_timeout` (sqlx routes pool connects through the acquire
+    /// path); migrations are unbounded here — the caller wraps the whole call
+    /// in its own attempt timeout, since the migration advisory lock can
+    /// legitimately block while another instance migrates.
+    pub async fn connect(
+        database_url: &str,
+        max_connections: u32,
+        acquire_timeout: Duration,
+    ) -> Result<Self> {
+        info!(
+            max_connections,
+            acquire_timeout_secs = acquire_timeout.as_secs(),
+            "connecting to postgres"
+        );
+        let pool = PgPoolOptions::new()
+            .max_connections(max_connections)
+            .acquire_timeout(acquire_timeout)
+            .connect(database_url)
+            .await
+            .context("connecting to postgres")?;
         let db = Self { pool };
         db.migrate().await?;
         Ok(db)
+    }
+
+    /// Build the dedicated pool that advisory-lock connections come from.
+    ///
+    /// Deliberately **lazy**: connections open on first use rather than at boot.
+    /// The main pool has to connect eagerly because it runs migrations, which is
+    /// why it needs `connect_db_with_retry`'s backoff and degraded-server
+    /// handoff. This pool has no startup work at all, so an eager connect would
+    /// only add a new way for the process to fail to boot, and would need a
+    /// second copy of that retry machinery to be safe. Being lazy removes the
+    /// failure mode instead of handling it: if Postgres is unreachable when the
+    /// first write arrives, that write fails on the pool's own acquire timeout,
+    /// the same way any other database-backed request already does.
+    ///
+    /// Kept separate from the main pool so a burst of lock-holding connections
+    /// cannot starve ordinary request handlers. See
+    /// `GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS` for the sizing tradeoff.
+    pub fn lock_pool(
+        database_url: &str,
+        max_connections: u32,
+        acquire_timeout: Duration,
+    ) -> Result<PgPool> {
+        info!(
+            max_connections,
+            acquire_timeout_secs = acquire_timeout.as_secs(),
+            "creating dedicated advisory-lock pool (lazy)"
+        );
+        PgPoolOptions::new()
+            .max_connections(max_connections)
+            // Explicit, and load-bearing rather than cosmetic: `RepoWriteGuard::Drop`
+            // has a no-runtime branch that calls `PoolConnection::leak()` and relies
+            // on the husk's own drop doing nothing. With `min_connections > 0` that
+            // drop still spawns a pool-replenish task, and spawning without a runtime
+            // panics inside Drop, which aborts the process during unwind. It is 0 by
+            // default, so this line exists to keep a future tuning change from
+            // silently re-arming that panic.
+            .min_connections(0)
+            .acquire_timeout(acquire_timeout)
+            .connect_lazy(database_url)
+            .context("creating advisory-lock pool")
+    }
+
+    /// Cheap liveness probe against the pool, for readiness checks: one
+    /// `SELECT 1` that fails fast when the database is unreachable.
+    pub async fn ping(&self) -> Result<()> {
+        sqlx::query("SELECT 1")
+            .execute(&self.pool)
+            .await
+            .context("db ping")?;
+        Ok(())
     }
 
     /// Run all pending versioned migrations in order, inside a single
@@ -778,6 +1021,7 @@ const MIGRATIONS: &[Migration] = &[
             // the matching expression index. The CASE must stay byte-for-byte in
             // sync with DEDUP_CTE / count_repos_deduped or Postgres won't use it.
             "DROP INDEX IF EXISTS idx_repos_owner_short_name",
+            // Keep byte-identical to OWNER_KEY_CASE_SQL so Postgres uses the index.
             "CREATE INDEX IF NOT EXISTS idx_repos_owner_key_name ON repos ((CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END), name)",
         ],
     },
@@ -822,9 +1066,459 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE repos ADD COLUMN IF NOT EXISTS quarantined BOOLEAN NOT NULL DEFAULT FALSE",
         ],
     },
+    Migration {
+        version: 10,
+        name: "ref_cert_unique_per_ref",
+        stmts: &[
+            // Dedup before the unique index: keep only the most recent row per
+            // (repo_id, ref_name) so the CREATE UNIQUE INDEX below does not fail
+            // on existing databases that accumulated duplicates.
+            r#"DELETE FROM ref_certificates
+               WHERE id IN (
+                   SELECT id FROM (
+                        SELECT id, ROW_NUMBER() OVER (
+                            PARTITION BY repo_id, ref_name ORDER BY issued_at DESC, id DESC
+                        ) AS rn
+                       FROM ref_certificates
+                   ) dups WHERE dups.rn > 1
+               )"#,
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_ref_certs_repo_ref ON ref_certificates(repo_id, ref_name)",
+        ],
+    },
+    Migration {
+        version: 11,
+        name: "ref_update_owner_did",
+        stmts: &[
+            // Index deferred: the feed gate (#144) does not read owner_did yet.
+            "ALTER TABLE received_ref_updates ADD COLUMN IF NOT EXISTS owner_did TEXT",
+        ],
+    },
+    // Reservation: v17 is deliberately not main's current_max + 1. The runner keys the
+    // applied set on the integer alone, so a version another in-flight branch also
+    // claims is skipped in full on whichever side merges second: no error, no warning,
+    // and schema_migrations still reads healthy while the column is simply absent.
+    // #253 took 16, and the pin-provenance work below took 18-23 when it merged, so 17
+    // sits between them. Gaps are harmless: the runner iterates the array and never
+    // requires contiguity.
+    Migration {
+        version: 17,
+        name: "sync_queue_attempted_at",
+        stmts: &[
+            // Scheduling key for dequeue_pending_syncs: when the row was last
+            // handed to a worker. Null until first dequeued, which is why the
+            // ordering coalesces onto enqueued_at.
+            "ALTER TABLE sync_queue ADD COLUMN IF NOT EXISTS attempted_at TEXT",
+        ],
+    },
+    // The six pin-provenance migrations below were numbered 11-16 while this work was
+    // in flight and moved to 18-23 on merge, because 11 and 16 were claimed elsewhere.
+    // A database that ran an earlier commit of this branch therefore has schema_migrations
+    // rows for the old numbers. Those rows are orphans: the runner skips on `version`
+    // alone and never reads `name`, so nothing detects them, and the DDL below re-runs
+    // as a no-op against objects that already exist. Recreate any such database rather
+    // than upgrading it in place.
+    Migration {
+        version: 18,
+        name: "pinned_cids_cid_index",
+        stmts: &[
+            // GET /ipfs/{cid} resolves an incoming CID -> git oid via pinned_cids.cid
+            // (#173); index it so the per-request lookup is not a table scan. This is
+            // a NEW versioned migration (not appended to the applied v1 bundle) so a
+            // node already past v1 actually gets the index. Non-unique on purpose: cid
+            // is a function of raw content, so a UNIQUE index could reject a legitimate
+            // record_pinned_cid insert, and colliding rows serve byte-identical content.
+            "CREATE INDEX IF NOT EXISTS idx_pinned_cids_cid ON pinned_cids(cid)",
+        ],
+    },
+    Migration {
+        version: 19,
+        name: "pinned_cids_repo_provenance",
+        stmts: &[
+            // Record the repository a pin came from so GET /ipfs/{cid} resolves a
+            // provenanced pin straight to its ONE source repo instead of scanning every
+            // repo (#173, jatmn round 2 — bounds the anonymous fan-out and removes the
+            // updated_at-ordering false-404). NEW versioned migration (never appended to
+            // the applied v1 pinned_cids table) so a node past v1 gets the column.
+            // Nullable: pins recorded before this migration have no provenance and fall
+            // back to the legacy repo scan; new pins carry repo_id and resolve to one
+            // repo. Indexed for the resolver's oid -> repo_id lookup.
+            "ALTER TABLE pinned_cids ADD COLUMN IF NOT EXISTS repo_id TEXT",
+            "CREATE INDEX IF NOT EXISTS idx_pinned_cids_repo_id ON pinned_cids(repo_id)",
+        ],
+    },
+    Migration {
+        version: 20,
+        name: "pin_repo_sources",
+        stmts: &[
+            // F1 (#173, jatmn round 8): a shared object (a blob/tree/commit common to
+            // forks and mirrors) can be pinned from more than one repo. `pinned_cids`
+            // keeps only the FIRST pinner's `repo_id`, so a shared object first pinned
+            // from a private/quarantined repo 404s by CID even when a later PUBLIC repo
+            // also pinned it. Record EVERY pin-path source so `GET /ipfs/{cid}` can try
+            // each. NEW versioned migration (never appended to an applied block, INV-7).
+            // Bounded per object at insert time (MAX_PIN_SOURCES) so an adversary pushing
+            // one object from N repos cannot make resolution O(repos) (R2, INV-10).
+            "CREATE TABLE IF NOT EXISTS pin_repo_sources (
+                 sha256_hex TEXT NOT NULL,
+                 repo_id    TEXT NOT NULL,
+                 PRIMARY KEY (sha256_hex, repo_id)
+             )",
+            "CREATE INDEX IF NOT EXISTS idx_pin_repo_sources_sha ON pin_repo_sources(sha256_hex)",
+        ],
+    },
+    Migration {
+        version: 21,
+        name: "pinned_cids_legacy_provider_cid",
+        stmts: &[
+            // R8 (#173, jatmn round 10): the opportunistic legacy provider-CID repair
+            // rewrites `pinned_cids.cid` from a stored PROVIDER CID (Kubo dag-pb /
+            // Pinata CIDv0) to the raw-content resolver key and stashes the OLD value
+            // here, so the rewrite is auditable and the row's legacy origin survives.
+            // Distinct from `pinata_cid` on purpose: `has_pinata_cid` gates the Pinata
+            // pin-skip, so parking a Kubo-legacy CID there would make Pinata forever
+            // skip re-pinning that object. NEW versioned migration (never appended to an
+            // applied block, INV-7) so a node past v13 actually gets the column.
+            // Nullable: only a repaired row sets it.
+            "ALTER TABLE pinned_cids ADD COLUMN IF NOT EXISTS legacy_provider_cid TEXT",
+        ],
+    },
+    Migration {
+        version: 22,
+        name: "pinned_cids_sources_incomplete",
+        stmts: &[
+            // U3 (#173): `record_pin_source` is BEST EFFORT at every call site, so a
+            // non-empty, below-cap source set is not proof that every source was
+            // recorded. An object first pinned from a private repo and later pushed
+            // from a PUBLIC repo whose record failed keeps a set naming only the
+            // private source, and the resolver used to call that set complete and 404
+            // an object the public repo would serve. Record the miss DURABLY here so
+            // `GET /ipfs/{cid}` keeps the bounded scan fallback for exactly those
+            // objects. Not inferable from row counts or timestamps: neither can tell
+            // "no other source exists" from "a source failed to record", which is the
+            // whole distinction. NEW versioned migration (never appended to an applied
+            // block, INV-7). NOT NULL DEFAULT FALSE so every pre-existing row reads as
+            // complete and ordinary denials stay off the O(repos) path (INV-10).
+            "ALTER TABLE pinned_cids ADD COLUMN IF NOT EXISTS pin_sources_incomplete BOOLEAN NOT NULL DEFAULT FALSE",
+        ],
+    },
+    Migration {
+        version: 23,
+        name: "pin_repair_sweep_cursor",
+        stmts: &[
+            // U4 (#173): the legacy provider-CID repair sweep walks `pinned_cids` in
+            // bounded batches over an ordered `sha256_hex` cursor. The cursor has to be
+            // DURABLE, or a restart rewinds the walk to the start of the table and an
+            // upgraded node with a large pin set never finishes repairing it. One row
+            // (`id = 1`, enforced by the CHECK) rather than a key-value table: there is
+            // exactly one sweep and no second consumer, and a real constraint beats a
+            // convention nobody can enforce. NEW versioned migration (never appended to
+            // an applied block, INV-7). No default row is inserted: an absent row is the
+            // "never swept" state, which the empty-string cursor start already means, so
+            // there is no first-run special case to get wrong.
+            "CREATE TABLE IF NOT EXISTS pin_repair_sweep (
+                 id     INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
+                 cursor TEXT NOT NULL
+             )",
+        ],
+    },
+    Migration {
+        version: 24,
+        name: "pin_source_failures",
+        stmts: &[
+            // #173 round 12 (jatmn): v22's `pin_sources_incomplete` is one boolean per
+            // OBJECT, so any successful source record cleared it, including one from a
+            // repo unrelated to the failure. The resolver then read the set as fully
+            // enumerated, dropped the scan fallback, and 404'd an anonymous caller whose
+            // only servable copy was the unrecorded public one. The missing source is a
+            // property of an (object, repo) PAIR, so it is stored as one.
+            //
+            // NEW versioned migration (never appended to an applied block, INV-7). A new
+            // table rather than a column on `pinned_cids`: the relation is many-per-object
+            // and `CREATE TABLE` takes no lock on the pin table a live node is reading.
+            "CREATE TABLE IF NOT EXISTS pin_source_failures (
+                 sha256_hex TEXT NOT NULL,
+                 repo_id    TEXT NOT NULL,
+                 PRIMARY KEY (sha256_hex, repo_id)
+             )",
+            // Carry the pre-upgrade markers over. Which repo failed was never recorded,
+            // so they get the empty sentinel, which no real `repo_id` equals: those
+            // objects keep the scan fallback until something repairs them, rather than
+            // being cleared by the next unrelated record the way they would have been
+            // before. Strictly safer than the behavior being replaced, and bounded by how
+            // rare an exhausted record is.
+            "INSERT INTO pin_source_failures (sha256_hex, repo_id)
+                  SELECT sha256_hex, '' FROM pinned_cids WHERE pin_sources_incomplete
+                  ON CONFLICT DO NOTHING",
+            // `pinned_cids.pin_sources_incomplete` is deliberately NOT dropped. Nothing
+            // reads it after this migration, and leaving it costs one unused boolean,
+            // whereas dropping it makes a rollback to the previous release lose the
+            // markers it still reads.
+        ],
+    },
+    Migration {
+        version: 25,
+        name: "repos_created_at_id_index",
+        stmts: &[
+            // #173 (jatmn): backs the keyset order of the paged legacy CID scan
+            // (`list_repos_page_for_scan`, `ORDER BY created_at ASC, id ASC` with a
+            // `(created_at, id) > (...)` cursor). The scan replaced a whole-table
+            // preload precisely to stop one anonymous `GET /ipfs/{cid}` from costing
+            // work proportional to the node's repo inventory (INV-10), and without this
+            // index that bound is only half real: `repos` carries no index on
+            // `(created_at, id)`, so Postgres seq-scans the whole table and top-N sorts
+            // it to return EVERY page, while the scarce IPFS walk admission is held.
+            // Measured on a 50k-row fixture: 954 shared buffers and ~47ms per page
+            // without it, versus an Index Only Scan at 4-5 buffers, ~0.08ms, and
+            // `Heap Fetches: 0` with it — and the keyset predicate is pushed down as an
+            // `Index Cond` instead of filtering after a scan.
+            //
+            // Column order and direction are load-bearing and must match the query
+            // exactly; `idx_repos_updated_at` (the order the scan used to use) cannot
+            // serve this one. NOTHING NAMES THIS INDEX IN ANY QUERY TEXT, so a
+            // grep-driven "unused index" cleanup will not see its consumer: it is
+            // reachable from an unauthenticated route and dropping it reopens the
+            // amplification, so treat it as part of the resolver, not as tuning.
+            //
+            // NEW versioned migration (never appended to an applied block, INV-7).
+            "CREATE INDEX IF NOT EXISTS idx_repos_created_at_id ON repos (created_at ASC, id ASC)",
+        ],
+    },
+    Migration {
+        version: 26,
+        name: "pin_repair_sweep_discovery_cursor",
+        stmts: &[
+            // #173 round 13 (F5): discovery probes at most
+            // `MAX_LEGACY_DISCOVERY_PROBES` warm candidates per source-less row, taken
+            // from a list ordered `(created_at, id)`. That order is stable, so without a
+            // continuation every traversal probed the same oldest sixteen and a holder
+            // at position seventeen was never reached by anything, on any node, ever.
+            // These two columns are the boundary the next traversal's window starts
+            // after, so coverage becomes a bounded number of traversals rather than
+            // unreachable.
+            //
+            // STEERABILITY is why this is a keyset KEY and not an offset into the list.
+            // `repo_id` derives from a grindable owner DID, so the one thing an attacker
+            // must not be able to do is move the window off the true holder. Candidates
+            // enter and leave the warm list between traversals (a cold repo warming on a
+            // Tigris-backed node, a fresh registration, a deletion), and every such
+            // change silently renumbers an offset while leaving a key's boundary exactly
+            // where it was. Fresh registrations sort LAST under `created_at` and cannot
+            // be backdated, so they can only ever be appended behind the window.
+            //
+            // RESIDUAL, stated rather than implied: an operator who can insert repos
+            // with an arbitrary `created_at` can still place candidates between the
+            // continuation and the holder and delay it by a traversal per sixteen rows
+            // inserted. That is a privileged write, it costs a real repo row each, and
+            // it delays rather than prevents, since the window keeps advancing.
+            //
+            // NEW versioned migration (never appended to an applied block, INV-7). NOT
+            // NULL DEFAULT '' so an existing `pin_repair_sweep` row reads as "start at
+            // the head of the list", which is the same thing a never-swept node reads.
+            "ALTER TABLE pin_repair_sweep ADD COLUMN IF NOT EXISTS discovery_cursor_created_at TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE pin_repair_sweep ADD COLUMN IF NOT EXISTS discovery_cursor_id TEXT NOT NULL DEFAULT ''",
+        ],
+    },
+    // Reservation: open branches currently claim migration versions through
+    // v29. Gaps are valid, while reusing a version can silently skip one
+    // branch's schema when both eventually land. v30 and v31 are intentionally
+    // separate so validation does not inherit v30's stronger table lock.
+    Migration {
+        version: 30,
+        name: "repo_upstream_mirror_state",
+        stmts: &[
+            // Nullable, default-free columns keep this migration metadata-only
+            // for every existing non-mirror repository.
+            "ALTER TABLE repos ADD COLUMN IF NOT EXISTS upstream_url TEXT",
+            "ALTER TABLE repos ADD COLUMN IF NOT EXISTS mirror_status TEXT",
+            "ALTER TABLE repos ADD COLUMN IF NOT EXISTS mirror_transition_id UUID",
+            "ALTER TABLE repos ADD COLUMN IF NOT EXISTS mirror_transition_phase TEXT",
+            "ALTER TABLE repos ADD COLUMN IF NOT EXISTS mirror_updated_at TEXT",
+            // A constraint name does not prove its definition. Replace any
+            // same-named manual or partial-recovery artifact before installing
+            // the exact invariant this migration promises.
+            "ALTER TABLE repos DROP CONSTRAINT IF EXISTS repos_mirror_state_valid",
+            // PostgreSQL accepts a CHECK whose result is NULL. Wrap the complete
+            // invariant in IS TRUE so a missing status or phase cannot slip
+            // through three-valued logic.
+            r#"ALTER TABLE repos ADD CONSTRAINT repos_mirror_state_valid CHECK ((
+                           (
+                               upstream_url IS NULL
+                               AND mirror_status IS NULL
+                               AND mirror_transition_id IS NULL
+                               AND mirror_transition_phase IS NULL
+                               AND mirror_updated_at IS NULL
+                           )
+                           OR
+                           (
+                               upstream_url IS NOT NULL
+                               AND upstream_url LIKE 'https://%'
+                               AND upstream_url <> 'https://'
+                               AND mirror_updated_at IS NOT NULL
+                               AND (
+                                   (
+                                       mirror_status IN ('inbound', 'outbound')
+                                       AND (
+                                           (mirror_transition_id IS NULL AND mirror_transition_phase IS NULL)
+                                           OR
+                                           (mirror_transition_id IS NOT NULL AND mirror_transition_phase = 'completed')
+                                       )
+                                   )
+                                   OR
+                                   (
+                                       mirror_status IN (
+                                           'transitioning_inbound_to_outbound',
+                                           'transitioning_outbound_to_inbound'
+                                       )
+                                       AND mirror_transition_id IS NOT NULL
+                                       AND mirror_transition_phase IN (
+                                           'queued',
+                                           'starting',
+                                           'initializing_mirror_fetch',
+                                           'draining_writes',
+                                           'finalizing_mirror_fetch',
+                                           'finalizing_mirror_push',
+                                           'committing_target_status',
+                                           'rolling_back'
+                                       )
+                                   )
+                               )
+                           )
+                       ) IS TRUE) NOT VALID"#,
+        ],
+    },
+    Migration {
+        version: 31,
+        name: "validate_repo_upstream_mirror_state",
+        stmts: &["ALTER TABLE repos VALIDATE CONSTRAINT repos_mirror_state_valid"],
+    },
+    Migration {
+        version: 37,
+        name: "ref_certificates_version",
+        stmts: &[
+            // #26 Split PR 3 — certificate / CLI compatibility. The
+            // ref-cert wire format is versioned so future fields can
+            // be added without breaking old clients (which ignore
+            // the field) or old servers (which default the column
+            // to 1). New certificates are currently issued as v1,
+            // which is byte-for-byte identical to the pre-versioning
+            // shape: an old client reading a v1 cert from a new
+            // server sees the same payload, the same signature, and
+            // the same Ed25519 verify path. A new client reading an
+            // old server sees `version` defaulted to 1 and verifies
+            // against the v1 payload shape. v2 is reserved for a
+            // future shape that carries the version inside the
+            // signed bytes; it must not be stamped until a v2
+            // verifier ships.
+            //
+            // DEFAULT 1 so an existing row reads as v1 without a
+            // backfill migration. NOT NULL so a missing value is a
+            // hard error at insert time rather than a silent v0 that
+            // an old client would interpret as "no version field."
+            "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1",
+        ],
+    },
 ];
 
+/// Max distinct source repos recorded per pinned object (F1, #173 jatmn round 8).
+/// Bounds both the resolver's per-OID source loop and the `pin_repo_sources` growth,
+/// so an adversary re-pushing one object from many repos cannot make resolution
+/// O(repos) (R2, INV-10).
+pub const MAX_PIN_SOURCES: i64 = 16;
+
 // ── Repos ─────────────────────────────────────────────────────────────────────
+
+pub(crate) fn normalize_owner_key(did: &str) -> &str {
+    match did.strip_prefix("did:key:") {
+        Some(rest) if !rest.contains(':') => rest,
+        _ => did,
+    }
+}
+
+/// SQL CASE expression byte-identical to `normalize_owner_key`. All queries that
+/// filter or group by owner key use this const so the Rust and SQL sides cannot
+/// drift apart. If you change `normalize_owner_key`, update this const too.
+const OWNER_KEY_CASE_SQL: &str = "CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END";
+
+/// SQL CASE expression byte-identical to `normalize_owner_key`, but for columns
+/// named `did` (like in agent_profiles) instead of `owner_did`.
+const PROFILE_DID_CASE_SQL: &str = "CASE WHEN did LIKE 'did:key:%' AND position(':' in substr(did, 9)) = 0 THEN substr(did, 9) ELSE did END";
+
+/// SQL CASE expression byte-identical to `normalize_owner_key`, but for columns
+/// named `repo_owner` (bounties table).  The bounties `repo_owner` is stored
+/// verbatim from the URL segment, so it may be either the full `did:key:` form
+/// or the bare key.
+const BOUNTY_OWNER_CASE_SQL: &str = "CASE WHEN repo_owner LIKE 'did:key:%' AND position(':' in substr(repo_owner, 9)) = 0 THEN substr(repo_owner, 9) ELSE repo_owner END";
+
+/// SQL CASE expression byte-identical to `normalize_owner_key`, but for columns
+/// named `claimant_did` (bounties table).
+const BOUNTY_CLAIMANT_CASE_SQL: &str = "CASE WHEN claimant_did LIKE 'did:key:%' AND position(':' in substr(claimant_did, 9)) = 0 THEN substr(claimant_did, 9) ELSE claimant_did END";
+
+#[cfg(test)]
+mod normalize_owner_key_tests {
+    use super::normalize_owner_key;
+
+    // Boundary set matching the SQL CASE: did:key short/full, empty residual,
+    // did:key:z:extra, non-key, bare, empty, uppercase.
+    #[test]
+    fn strips_did_key_prefix() {
+        assert_eq!(normalize_owner_key("did:key:z6Mkfoo"), "z6Mkfoo");
+    }
+
+    #[test]
+    fn keeps_full_did_key_unchanged_when_not_a_prefix() {
+        assert_eq!(normalize_owner_key("z6Mkfoo"), "z6Mkfoo");
+    }
+
+    #[test]
+    fn leaves_non_key_did_intact() {
+        assert_eq!(
+            normalize_owner_key("did:gitlawb:z6Mkfoo"),
+            "did:gitlawb:z6Mkfoo"
+        );
+    }
+
+    #[test]
+    fn leaves_web_did_intact() {
+        assert_eq!(
+            normalize_owner_key("did:web:example.com:alice"),
+            "did:web:example.com:alice"
+        );
+    }
+
+    #[test]
+    fn does_not_strip_did_key_with_extra_colon() {
+        // did:key:did:gitlawb:z6... — the remainder contains ':', so it's left whole.
+        assert_eq!(
+            normalize_owner_key("did:key:did:gitlawb:z6Mkfoo"),
+            "did:key:did:gitlawb:z6Mkfoo"
+        );
+    }
+
+    #[test]
+    fn empty_string_returns_empty() {
+        assert_eq!(normalize_owner_key(""), "");
+    }
+
+    #[test]
+    fn bare_did_key_colon_becomes_empty() {
+        // did:key: with nothing after still has the prefix stripped.
+        assert_eq!(normalize_owner_key("did:key:"), "");
+    }
+
+    #[test]
+    fn uppercase_prefix_is_untouched() {
+        assert_eq!(normalize_owner_key("DID:KEY:z6Mkfoo"), "DID:KEY:z6Mkfoo");
+    }
+
+    #[test]
+    fn strips_did_key_even_with_trailing_slash() {
+        // did:key:z6Mkfoo/extra has no ':' in the remainder, so it strips.
+        assert_eq!(
+            normalize_owner_key("did:key:z6Mkfoo/extra"),
+            "z6Mkfoo/extra"
+        );
+    }
+}
 
 impl Db {
     pub async fn create_repo(&self, repo: &RepoRecord) -> Result<()> {
@@ -849,6 +1543,72 @@ impl Db {
         Ok(())
     }
 
+    /// Attach an external HTTPS upstream to a canonical repository in inbound
+    /// mode. This is deliberately idempotent only for the same untouched
+    /// inbound configuration; it never overwrites an existing upstream or
+    /// resets a transition that may be in progress.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn configure_inbound_mirror(
+        &self,
+        repo_id: &str,
+        upstream_url: &str,
+    ) -> Result<RepoMirrorState> {
+        Uuid::parse_str(repo_id)
+            .context("continuous mirrors require a canonical UUID repository id")?;
+        let upstream_url = validate_mirror_upstream_url(upstream_url)?.to_string();
+        let updated_at = Utc::now().to_rfc3339();
+
+        let row = sqlx::query(
+            "UPDATE repos
+             SET upstream_url = $2,
+                 mirror_status = 'inbound',
+                 mirror_transition_id = NULL,
+                 mirror_transition_phase = NULL,
+                 mirror_updated_at = COALESCE(mirror_updated_at, $3)
+             WHERE id = $1
+               AND (
+                   upstream_url IS NULL
+                   OR (
+                       upstream_url = $2
+                       AND mirror_status = 'inbound'
+                       AND mirror_transition_id IS NULL
+                       AND mirror_transition_phase IS NULL
+                   )
+               )
+             RETURNING id, upstream_url, mirror_status, mirror_transition_id,
+                       mirror_transition_phase, mirror_updated_at",
+        )
+        .bind(repo_id)
+        .bind(&upstream_url)
+        .bind(&updated_at)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let row = row.context(
+            "repository does not exist or already has a different/transitioning mirror configuration",
+        )?;
+        row_to_repo_mirror_state(row)
+    }
+
+    /// Return the durable mirror state, or `None` for a normal non-mirrored
+    /// repository (and for an unknown id). Callers that need to distinguish
+    /// those cases must resolve the repository first through the auth-gated
+    /// repository path.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn get_repo_mirror_state(&self, repo_id: &str) -> Result<Option<RepoMirrorState>> {
+        let row = sqlx::query(
+            "SELECT id, upstream_url, mirror_status, mirror_transition_id,
+                    mirror_transition_phase, mirror_updated_at
+             FROM repos
+             WHERE id = $1 AND upstream_url IS NOT NULL",
+        )
+        .bind(repo_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(row_to_repo_mirror_state).transpose()
+    }
+
     /// Register a mirrored repo from a peer in the local DB so git smart HTTP can serve it.
     /// Uses INSERT OR IGNORE (SQLite) / ON CONFLICT DO NOTHING (Postgres) so it's idempotent.
     pub async fn upsert_mirror_repo(
@@ -859,6 +1619,16 @@ impl Db {
         machine_id: Option<&str>,
         quarantined: bool,
     ) -> Result<()> {
+        // Peer-supplied names are bound like the local write paths: an
+        // unbounded name would make reposPage emit a cursor longer than the
+        // 4096-byte parse limit, dead-ending pagination for every caller past
+        // that row (#465 4th round). The sync caller drops the error and skips
+        // the mirror.
+        if name.len() > MAX_REPO_NAME_LEN {
+            anyhow::bail!(
+                "mirror repo name exceeds {MAX_REPO_NAME_LEN} bytes: refusing to register"
+            );
+        }
         let now = Utc::now().to_rfc3339();
         let id = format!("{owner_short}/{name}");
         // `quarantined` is set only on first insert (the admission decision).
@@ -887,17 +1657,49 @@ impl Db {
     }
 
     pub async fn get_repo(&self, owner_did: &str, name: &str) -> Result<Option<RepoRecord>> {
-        let row = sqlx::query(
+        // Normalize owner_did to its did:key short form, mirroring did_matches and
+        // the DEDUP_CTE's owner-key CASE: strip `did:key:` only when the remainder
+        // is a bare key id (no further `:`). This keeps `did:key:z...` and bare
+        // `z...` interchangeable while `did:gitlawb:z...` / `did:web:z...` stay
+        // distinct — the old LIKE '%:' || $1 || '%' was too broad (issue #124 P2).
+        let owner_key = normalize_owner_key(owner_did);
+        let sql = format!(
             "SELECT id, name, owner_did, description, is_public, default_branch,
                     created_at, updated_at, disk_path, forked_from, machine_id
              FROM repos
-             WHERE (owner_did = $1 OR owner_did LIKE '%:' || $1 || '%') AND name = $2",
+              WHERE ({key}) = $1
+                AND name = $2
+             -- Prefer canonical rows (UUID id, no slash) over mirror rows (slash id).
+             -- Mirror rows are inserted by upsert_mirror_repo with is_public=true and
+             -- no visibility rules; using them for visibility checks would bypass the
+             -- canonical row's gate (issue #124).
+             ORDER BY CASE WHEN position('/' in id) > 0 THEN 1 ELSE 0 END,
+                      created_at ASC, id ASC
+             LIMIT 1",
+            key = OWNER_KEY_CASE_SQL
+        );
+        let row = sqlx::query(&sql)
+            .bind(owner_key)
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(row.map(row_to_repo))
+    }
+
+    /// Fetch a repo by its stable `id`. Used by the `/ipfs/{cid}` provenance path,
+    /// which resolves a pin straight to its ONE source repo (#173) instead of
+    /// paging the whole repo table. `id` is exact, so unlike `get_repo`'s fuzzy
+    /// owner/name match there is no mirror-vs-canonical disambiguation.
+    pub async fn get_repo_by_id(&self, id: &str) -> Result<Option<RepoRecord>> {
+        let row = sqlx::query(
+            "SELECT id, name, owner_did, description, is_public, default_branch,
+                    created_at, updated_at, disk_path, forked_from, machine_id
+             FROM repos WHERE id = $1 LIMIT 1",
         )
-        .bind(owner_did)
-        .bind(name)
+        .bind(id)
         .fetch_optional(&self.pool)
         .await?;
-
         Ok(row.map(row_to_repo))
     }
 
@@ -915,21 +1717,68 @@ impl Db {
         Ok(rows.into_iter().map(row_to_repo).collect())
     }
 
-    /// Raw list of every repo row — NOT deduped (a mirror row and its canonical
-    /// row both appear) and without stars. For enumeration callers that must see
-    /// every physical row (e.g. the IPFS object scan in `api::ipfs`), not for
-    /// listing surfaces. Listing surfaces dedupe via `list_all_repos_deduped` or
-    /// `list_all_repos_with_stars` + `dedupe_canonical_repos`.
-    pub async fn list_all_repos(&self) -> Result<Vec<RepoRecord>> {
+    /// One keyset page of raw repo rows for the IPFS object scan (`api::ipfs`) —
+    /// NOT deduped (a mirror row and its canonical row both appear), since that
+    /// scan must see every physical row. Listing surfaces dedupe via
+    /// `list_all_repos_deduped` or `list_all_repos_with_stars` +
+    /// `dedupe_canonical_repos` and must not use this.
+    ///
+    /// Paged rather than whole-table because the scan runs on an anonymously
+    /// reachable route while holding scarce walk admission: materializing the
+    /// node's entire repo inventory (plus its rules) before the per-probe budget
+    /// has spent a single probe is an amplification sink (INV-10). The caller
+    /// stops asking for pages once its budgets are spent.
+    ///
+    /// Ordered on `(created_at, id)` ASC, both IMMUTABLE, so keyset paging is
+    /// exact: no row is visited twice and none is skipped. `updated_at` would be
+    /// wrong twice over — a repo touched mid-scan can cross a page boundary and go
+    /// unvisited (a servable public object misreported as a 404), and it is
+    /// attacker-bumpable, which would let a caller sort their own repos ahead of
+    /// the true holder and bury it past the probe budget.
+    ///
+    /// `after` is the raw `(created_at, id)` of the last row of the previous page,
+    /// `None` for the first page. It carries the STORED `created_at` text, not a
+    /// re-serialized `DateTime`: the comparison is a text comparison and a
+    /// round-trip through `to_rfc3339` is not guaranteed to reproduce the stored
+    /// bytes.
+    ///
+    /// Each row carries its own `quarantined` flag so the scan needs no separate
+    /// whole-node quarantine query (INV-11's hard drop stays per row).
+    pub async fn list_repos_page_for_scan(
+        &self,
+        after: Option<(&str, &str)>,
+        limit: i64,
+    ) -> Result<Vec<ScanRepoRow>> {
+        let (after_created, after_id) = match after {
+            Some((created_at, id)) => (Some(created_at), Some(id)),
+            None => (None, None),
+        };
         let rows = sqlx::query(
             "SELECT id, name, owner_did, description, is_public, default_branch,
-                    created_at, updated_at, disk_path, forked_from, machine_id
-             FROM repos ORDER BY updated_at DESC",
+                    created_at, updated_at, disk_path, forked_from, machine_id, quarantined
+             FROM repos
+             WHERE $1::text IS NULL OR (created_at, id) > ($1::text, $2::text)
+             ORDER BY created_at ASC, id ASC
+             LIMIT $3",
         )
+        .bind(after_created)
+        .bind(after_id)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows.into_iter().map(row_to_repo).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let quarantined: bool = r.get("quarantined");
+                let created_at_key: String = r.get("created_at");
+                ScanRepoRow {
+                    quarantined,
+                    created_at_key,
+                    repo: row_to_repo(r),
+                }
+            })
+            .collect())
     }
 
     pub async fn list_all_repos_with_stars(&self) -> Result<Vec<(RepoRecord, i64)>> {
@@ -969,15 +1818,17 @@ impl Db {
     /// full tie still picks a deterministic survivor. `list_all_repos_deduped_with_stars`,
     /// `list_all_repos_deduped`, and the marker logic in
     /// `crate::api::repos::dedupe_canonical_repos` must stay in sync.
-    const DEDUP_CTE: &'static str = "WITH deduped AS (
-                 SELECT DISTINCT ON (CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END, name)
+    fn dedup_cte() -> String {
+        format!(
+            "WITH deduped AS (
+                 SELECT DISTINCT ON ({key}, name)
                      id, name, owner_did, description, is_public, default_branch,
                      created_at,
                      -- group MAX, not the canonical row's own value: pushes that
                      -- arrive via gossip touch only the mirror row, so the
                      -- canonical updated_at goes stale
                      MAX(updated_at) OVER (
-                         PARTITION BY CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END, name
+                         PARTITION BY {key}, name
                      ) AS updated_at,
                      disk_path, forked_from, machine_id
                  FROM repos
@@ -987,15 +1838,18 @@ impl Db {
                  -- does. Callers bind the already-normalized key ($1).
                  -- Quarantined mirrors (admitted but unvalidated by the iCaptcha
                  -- propagation gate) are withheld from every listing surface.
-                 WHERE quarantined = FALSE AND ($1::text IS NULL OR (CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END) = $1)
-                 ORDER BY CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END, name,
-                     -- mirror rows carry a slash-form id (\"{owner_short}/{name}\"),
+                 WHERE quarantined = FALSE AND ($1::text IS NULL OR ({key}) = $1)
+                 ORDER BY {key}, name,
+                     -- mirror rows carry a slash-form id (\"{{owner_short}}/{{name}}\"),
                      -- written only by upsert_mirror_repo; canonical ids are UUIDs.
                      -- Rank canonical (no slash) ahead of the mirror in each group,
                      -- keyed on the structural id, not the user-settable description.
                      CASE WHEN position('/' in id) > 0 THEN 1 ELSE 0 END,
                      created_at ASC, id ASC
-             )";
+             )",
+            key = OWNER_KEY_CASE_SQL
+        )
+    }
 
     /// All repos with star counts, mirror-deduplicated via `DEDUP_CTE` and
     /// ordered newest-first, optionally filtered to one owner. Returns the full
@@ -1015,10 +1869,7 @@ impl Db {
         // Mirror did_matches: strip `did:key:` only when the remainder is a bare
         // key id (no further `:`). The DEDUP_CTE applies the identical CASE to
         // owner_did, so the two compare on the same normalized key.
-        let owner_key = owner_filter.map(|o| match o.strip_prefix("did:key:") {
-            Some(rest) if !rest.contains(':') => rest,
-            _ => o,
-        });
+        let owner_key = owner_filter.map(normalize_owner_key);
         let sql = format!(
             "{}
              SELECT
@@ -1031,7 +1882,7 @@ impl Db {
                  SELECT repo_id, COUNT(*) AS cnt FROM repo_stars GROUP BY repo_id
              ) s ON s.repo_id = d.id
              ORDER BY d.updated_at DESC",
-            Self::DEDUP_CTE
+            Self::dedup_cte()
         );
         let rows = sqlx::query(&sql)
             .bind(owner_key)
@@ -1049,7 +1900,7 @@ impl Db {
 
     /// Deduped repo list (no stars, no paging) for the unfiltered read surfaces
     /// (GraphQL `repos`). One logical repo per mirror+canonical group, ordered by
-    /// the group's most recent activity. Shares `DEDUP_CTE` with the paged path so
+    /// the group's most recent activity. Shares `dedup_cte()` with the paged path so
     /// the dedup rule cannot drift; binds a NULL owner filter (all rows).
     pub async fn list_all_repos_deduped(&self) -> Result<Vec<RepoRecord>> {
         let sql = format!(
@@ -1059,13 +1910,96 @@ impl Db {
                  d.forked_from, d.machine_id
              FROM deduped d
              ORDER BY d.updated_at DESC",
-            Self::DEDUP_CTE
+            Self::dedup_cte()
         );
         let rows = sqlx::query(&sql)
             .bind(None::<&str>)
             .fetch_all(&self.pool)
             .await?;
 
+        Ok(rows.into_iter().map(row_to_repo).collect())
+    }
+
+    /// A bounded, mirror-deduplicated page ordered by owner key and repository
+    /// name. Apply root visibility before LIMIT: private rows must not consume
+    /// page slots or influence continuation metadata. The root-rule predicate
+    /// mirrors `visibility::listable_at_root`; a differential test pins it.
+    /// Malformed reader JSON denies that repo to non-owners without failing the page.
+    /// Cursors only select a position and never confer read authority.
+    ///
+    /// Performance note: the page orders and keyset-filters on
+    /// `(owner_key, name)` under `COLLATE "C"`, but the existing
+    /// `idx_repos_owner_key_name` index is built on the database default
+    /// collation and cannot serve that ordering, so each page sorts the full
+    /// deduped repo set before the keyset filter applies: O(total repos) work
+    /// per page. This is accepted (pages are capped at
+    /// `MAX_VISIBLE_REPO_PAGE_SIZE` rows over a narrow projection). A
+    /// C-collation expression index was deliberately not added in a migration:
+    /// versions 27-35 are claimed by other in-flight branches (Gitlawb/node#384
+    /// claims 27-35, #464 claims 27-28) and the runner keys applied migrations
+    /// on the version integer alone, so a colliding entry would be silently
+    /// skipped on whichever side merges second. Revisit once that range lands
+    /// or clears.
+    pub async fn list_visible_repos_page(
+        &self,
+        caller: Option<&str>,
+        after: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<Vec<RepoRecord>> {
+        let sql = format!(
+            "{}
+             SELECT d.id, d.name, d.owner_did, d.description, d.is_public,
+                 d.default_branch, d.created_at, d.updated_at, d.disk_path,
+                 d.forked_from, d.machine_id
+             FROM deduped d
+             LEFT JOIN LATERAL (
+                 SELECT reader_dids FROM visibility_rules v
+                 WHERE v.repo_id = d.id AND v.path_glob ~ '^/*([*][*])*$'
+                 ORDER BY v.path_glob DESC LIMIT 1
+             ) root_rule ON TRUE
+             WHERE (
+                 ($2::text IS NOT NULL AND ({key}) = $2)
+                 OR CASE WHEN root_rule.reader_dids IS NULL THEN d.is_public
+                    WHEN NOT pg_input_is_valid(root_rule.reader_dids, 'jsonb') THEN FALSE
+                    WHEN jsonb_typeof(root_rule.reader_dids::jsonb) = 'array' THEN
+                        COALESCE(root_rule.reader_dids::jsonb ? $3::text, FALSE)
+                        AND NOT EXISTS (
+                            SELECT 1 FROM jsonb_array_elements(root_rule.reader_dids::jsonb) reader
+                            WHERE jsonb_typeof(reader) <> 'string'
+                        )
+                    ELSE FALSE END
+             )
+             AND ($4::text IS NULL OR (({key}) COLLATE \"C\", d.name COLLATE \"C\") > ($4, $5::text))
+             ORDER BY ({key}) COLLATE \"C\", d.name COLLATE \"C\"
+             LIMIT $6",
+            Self::dedup_cte(),
+            key = OWNER_KEY_CASE_SQL,
+        );
+        let rows = sqlx::query(&sql)
+            .bind(None::<&str>)
+            .bind(caller.map(normalize_owner_key))
+            .bind(caller)
+            .bind(after.map(|(owner, _)| normalize_owner_key(owner)))
+            .bind(after.map(|(_, name)| name))
+            .bind(limit.min(MAX_VISIBLE_REPO_PAGE_SIZE + 1) as i64)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(row_to_repo).collect())
+    }
+
+    /// Repos currently quarantined (admitted as mirrors but withheld from every
+    /// listing surface). `list_all_repos_deduped` excludes these (its `DEDUP_CTE`
+    /// filters `quarantined = FALSE`), so a gate that resolves a slug against the
+    /// deduped set must also match against these and fail closed, or a quarantined
+    /// repo's row is misclassified as remote/gossip-only and served.
+    pub async fn list_quarantined_repos(&self) -> Result<Vec<RepoRecord>> {
+        let rows = sqlx::query(
+            "SELECT id, name, owner_did, description, is_public, default_branch,
+                    created_at, updated_at, disk_path, forked_from, machine_id
+             FROM repos WHERE quarantined = TRUE",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows.into_iter().map(row_to_repo).collect())
     }
 
@@ -1080,11 +2014,11 @@ impl Db {
     /// CASE that the live list paths depend on. Allowed dead outside tests.
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn count_repos_deduped(&self) -> Result<i64> {
-        let row = sqlx::query(
-            "SELECT COUNT(DISTINCT (CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END, name)) AS cnt FROM repos",
-        )
-        .fetch_one(&self.pool)
-        .await?;
+        let sql = format!(
+            "SELECT COUNT(DISTINCT ({key}, name)) AS cnt FROM repos",
+            key = OWNER_KEY_CASE_SQL
+        );
+        let row = sqlx::query(&sql).fetch_one(&self.pool).await?;
         Ok(row.get::<i64, _>("cnt"))
     }
 
@@ -1258,18 +2192,18 @@ impl Db {
         Ok(row.map(|r| r.get::<f64, _>("trust_score")).unwrap_or(0.0))
     }
 
+    /// Update an EXISTING agent's trust score; a no-op for unregistered DIDs.
+    /// Deliberately never inserts: the only path into the agents table is
+    /// `register_agent`, which sits behind the iCaptcha gate on /api/register.
+    /// This used to be an upsert, which let any authenticated push/issue/PR
+    /// re-create a deregistered DID's row with a fresh `registered_at`,
+    /// bypassing the registration gate entirely.
     pub async fn update_trust_score(&self, agent_did: &str, score: f64) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            "INSERT INTO agents (did, trust_score, capabilities, registered_at)
-             VALUES ($1, $2, '[]', $3)
-             ON CONFLICT(did) DO UPDATE SET trust_score = $2",
-        )
-        .bind(agent_did)
-        .bind(score)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE agents SET trust_score = $2 WHERE did = $1")
+            .bind(agent_did)
+            .bind(score)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -1463,13 +2397,46 @@ impl Db {
         Ok(())
     }
 
+    /// Take up to `limit` pending syncs — the least recently attempted ones —
+    /// and stamp each with the time it was handed out.
+    ///
+    /// Selecting and stamping in one statement is deliberate. A row the worker
+    /// cannot make progress on stays `pending` so it is retried, and if its
+    /// ordering key never moved it would remain among the oldest rows forever,
+    /// holding a fixed-size window against every healthy repo behind it.
+    /// Stamping on the way out makes the key "least recently handed out", so a
+    /// stuck row rotates to the back instead. Doing it here rather than at each
+    /// deferral branch in the worker is what makes that hold by construction:
+    /// no call site can forget it, and a batch that dies mid-loop still leaves
+    /// its rows stamped. `enqueued_at` is left alone so backlog age stays
+    /// measurable.
+    ///
+    /// Two things this deliberately does not promise. The returned rows are the
+    /// right *set*, in no particular order — `RETURNING` does not sort, and
+    /// nothing in `process_batch` depends on the order within a batch. And this
+    /// is not a claim: the rows stay `pending` with no row lock held past the
+    /// statement, so two workers against one database can still be handed the
+    /// same batch. Single-worker deployment is the existing assumption;
+    /// `FOR UPDATE SKIP LOCKED` is what would change that, and it is not here.
+    ///
+    /// Errors surface to the caller, which logs and skips the poll. That is
+    /// worth knowing now that this writes: it can fail for reasons a plain
+    /// SELECT could not, such as a read-only transaction or a lock timeout.
     pub async fn dequeue_pending_syncs(&self, limit: i64) -> Result<Vec<SyncQueueItem>> {
         let rows = sqlx::query(
-            "SELECT id, repo, node_did, ref_name, new_sha, cid, status, enqueued_at
-             FROM sync_queue WHERE status = 'pending'
-             ORDER BY enqueued_at ASC LIMIT $1",
+            // The outer `status = 'pending'` is not redundant with the
+            // subquery's: between the two, a concurrent worker can settle a row,
+            // and without it the UPDATE would still stamp and return a row that
+            // had already left the pending set.
+            "UPDATE sync_queue SET attempted_at = $2
+             WHERE status = 'pending' AND id IN (
+                 SELECT id FROM sync_queue WHERE status = 'pending'
+                 ORDER BY COALESCE(attempted_at, enqueued_at) ASC LIMIT $1
+             )
+             RETURNING id, repo, node_did, ref_name, new_sha, cid, status, enqueued_at",
         )
         .bind(limit)
+        .bind(Utc::now().to_rfc3339())
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -1696,13 +2663,13 @@ impl Db {
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn remove_label(&self, repo_id: &str, label: &str) -> Result<()> {
-        sqlx::query("DELETE FROM repo_labels WHERE repo_id = $1 AND label = $2")
+    pub async fn remove_label(&self, repo_id: &str, label: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM repo_labels WHERE repo_id = $1 AND label = $2")
             .bind(repo_id)
             .bind(label)
             .execute(&self.pool)
             .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn list_labels(&self, repo_id: &str) -> Result<Vec<String>> {
@@ -1807,11 +2774,33 @@ impl Db {
 // ── Ref Certificates ──────────────────────────────────────────────────────────
 
 impl Db {
-    pub async fn insert_ref_certificate(&self, cert: &RefCertificate) -> Result<()> {
-        sqlx::query(
+    /// Insert a ref certificate, or update it if a row for `(repo_id, ref_name)`
+    /// already exists.  The update only applies when the incoming row is newer
+    /// (compared by `issued_at`, which assumes a monotonic wall clock), so a
+    /// late-landing older cert cannot regress a ref's persisted state.  Returns
+    /// the full row as it now exists in the database (the original row on a
+    /// rejected upsert; the passed row on insert).
+    pub async fn insert_ref_certificate(&self, cert: &RefCertificate) -> Result<RefCertificate> {
+        let row = sqlx::query(
             "INSERT INTO ref_certificates
-             (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+             (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, version)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             ON CONFLICT (repo_id, ref_name) DO UPDATE SET
+                old_sha   = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
+                                 THEN EXCLUDED.old_sha   ELSE ref_certificates.old_sha   END,
+                new_sha   = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
+                                 THEN EXCLUDED.new_sha   ELSE ref_certificates.new_sha   END,
+                pusher_did = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
+                                  THEN EXCLUDED.pusher_did ELSE ref_certificates.pusher_did END,
+                node_did  = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
+                                 THEN EXCLUDED.node_did  ELSE ref_certificates.node_did  END,
+                signature = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
+                                 THEN EXCLUDED.signature ELSE ref_certificates.signature END,
+                issued_at = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
+                                 THEN EXCLUDED.issued_at ELSE ref_certificates.issued_at END,
+                version   = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
+                                 THEN EXCLUDED.version   ELSE ref_certificates.version   END
+             RETURNING id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, version",
         )
         .bind(&cert.id)
         .bind(&cert.repo_id)
@@ -1822,17 +2811,66 @@ impl Db {
         .bind(&cert.node_did)
         .bind(&cert.signature)
         .bind(&cert.issued_at)
-        .execute(&self.pool)
+        .bind(cert.version as i32)
+        .fetch_one(&self.pool)
         .await?;
-        Ok(())
+        Ok(row_to_cert(row))
     }
 
-    pub async fn list_ref_certificates(&self, repo_id: &str) -> Result<Vec<RefCertificate>> {
+    pub async fn list_ref_certificates(
+        &self,
+        repo_id: &str,
+        limit: i64,
+    ) -> Result<Vec<RefCertificate>> {
+        // Clamp at the DB boundary so every caller (present and future) stays
+        // bounded even if a raw/negative value slips through the handler layer.
+        let limit = limit.max(1);
         let rows = sqlx::query(
-            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at
-             FROM ref_certificates WHERE repo_id = $1 ORDER BY issued_at DESC",
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, version
+             FROM ref_certificates WHERE repo_id = $1 ORDER BY issued_at DESC LIMIT $2",
         )
         .bind(repo_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(row_to_cert).collect())
+    }
+
+    /// Look up ref certificates whose id starts with the given prefix.
+    /// Used by the CLI for short-ID resolution where the caller does not know
+    /// the full UUID.  Bounded by `limit` for safety — the caller should pass a
+    /// generous cap (e.g. 200) since prefix-matching narrows the result set.
+    pub async fn list_ref_certificates_by_prefix(
+        &self,
+        repo_id: &str,
+        prefix: &str,
+        limit: i64,
+    ) -> Result<Vec<RefCertificate>> {
+        let limit = limit.max(1);
+
+        // `!` is the LIKE escape character rather than the backslash default: a
+        // backslash in the SQL text would be an escape inside the string literal
+        // when the session runs with the legacy `standard_conforming_strings=off`,
+        // leaving `ESCAPE '\'` unterminated and failing every prefix lookup. The
+        // pool is opened from externally supplied connection settings, so that
+        // mode can arrive from a database- or role-level setting. `!` keeps the
+        // statement free of backslashes and parses the same either way.
+        let mut escaped_prefix = String::with_capacity(prefix.len() + 4);
+        for c in prefix.chars() {
+            if c == '%' || c == '_' || c == '!' {
+                escaped_prefix.push('!');
+            }
+            escaped_prefix.push(c);
+        }
+        let pattern = format!("{}%", escaped_prefix);
+
+        let rows = sqlx::query(
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, version
+             FROM ref_certificates WHERE repo_id = $1 AND id LIKE $2 ESCAPE '!' ORDER BY issued_at DESC LIMIT $3",
+        )
+        .bind(repo_id)
+        .bind(&pattern)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(row_to_cert).collect())
@@ -1840,7 +2878,7 @@ impl Db {
 
     pub async fn get_ref_certificate(&self, id: &str) -> Result<Option<RefCertificate>> {
         let row = sqlx::query(
-            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, version
              FROM ref_certificates WHERE id = $1",
         )
         .bind(id)
@@ -1852,8 +2890,85 @@ impl Db {
 
 // ── Peers ─────────────────────────────────────────────────────────────────────
 
+/// What a caller of [`Db::upsert_peer`] can prove about the DID it is writing.
+///
+/// An enum rather than a bool, and the proven variant carries a payload rather
+/// than being a bare unit, for two separate reasons.
+///
+/// It is not a bool because a bool at a call site reads as `true`/`false` with
+/// nothing at the call site saying what was proven, and because the default a
+/// bool invites (`false` meaning "no proof") is exactly the permissive value
+/// this gate exists to withhold. Passed as a real parameter with no default, so
+/// a new writer of the peers table cannot reach the update path by omission.
+///
+/// It carries the DID because "something was proven" is not the question. The
+/// boundary needs to know WHICH DID was proven, and compare it against the row
+/// being written. A bare proven/unproven flag leaves that comparison in the
+/// handler, which is the shape of RUSTSEC-2022-0009 (libp2p-core accepted a
+/// valid signature without checking it derived the claimed peer id) and leaves
+/// the second writer, the bootstrap announce-back in main.rs, outside the gate
+/// entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerWriteAuthority<'a> {
+    /// The caller has no proof of control over the DID it is writing. May
+    /// insert an unseen `did:key` row; may never change an existing row's
+    /// `http_url`.
+    Unproven,
+    /// The caller verified a signature, and the DID carried here is the one
+    /// that signature proved control of. `upsert_peer` checks it against the
+    /// row being written; a mismatch is a denial, not a warning.
+    Proven(&'a str),
+}
+
+/// A write refused by [`Db::upsert_peer`]'s authority gate.
+///
+/// A distinct type rather than a bare `anyhow::bail!` because `upsert_peer`
+/// returns `anyhow::Result` and `From<anyhow::Error> for AppError` routes
+/// anything it cannot downcast to `AppError::Internal`, so an untyped rejection
+/// would reach the client as a 500. The announce handler downcasts this out of
+/// the anyhow chain the same way the error module already recovers sqlx errors.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum PeerWriteDenied {
+    /// An unproven write tried to change an existing row's `http_url`.
+    #[error("unproven announce cannot change an existing peer's http_url: {did}")]
+    UnprovenRepoint { did: String },
+
+    /// The signature proved control of one DID and the write targeted another.
+    #[error("signature proves control of {proven}, but the write targets {target}")]
+    ProofDidMismatch { proven: String, target: String },
+
+    /// An unproven write named a DID method that can never authenticate, so the
+    /// row it would create could never be corrected by anyone.
+    #[error(
+        "methodNotSupported: only did:key peers can be registered without a proof of control: {did}"
+    )]
+    UnsupportedDidMethod { did: String },
+
+    /// The value is a did:key (or never parsed as a DID at all), but no
+    /// verifying key can be resolved from it. Distinct from
+    /// `UnsupportedDidMethod`, which is a true statement about a foreign
+    /// method; this one carries the underlying resolution failure instead of
+    /// claiming did:key is unsupported. The wording mirrors the signed path in
+    /// auth/mod.rs, and peer_write_error maps it to the same `unresolvable_did`
+    /// code that path returns, so the two surfaces that judge the same input
+    /// answer with the same sentence under the same name.
+    #[error("cannot resolve DID '{did}': {reason}")]
+    UnresolvableDid { did: String, reason: String },
+}
+
 impl Db {
-    pub async fn upsert_peer(&self, did: &str, http_url: &str) -> Result<()> {
+    /// Insert or refresh a peer row, bounded by what the caller can prove.
+    ///
+    /// See [`PeerWriteAuthority`] for why the authority is a parameter with no
+    /// default. The rule: an unproven caller may INSERT an unseen `did:key`
+    /// row, but may never UPDATE an existing row's `http_url`. Changing an
+    /// existing row requires a verified signature from that row's own DID.
+    pub async fn upsert_peer(
+        &self,
+        did: &str,
+        http_url: &str,
+        authority: PeerWriteAuthority<'_>,
+    ) -> Result<()> {
         // Defense-in-depth at the DB boundary: both writers funnel through here
         // — the announce handler and the bootstrap announce-back in main.rs.
         // The latter has no announce-time check, so validating here is what
@@ -1862,17 +2977,167 @@ impl Db {
         if !crate::api::peers::is_public_http_url(http_url) {
             anyhow::bail!("refusing to register non-public peer http_url: {http_url}");
         }
+        match authority {
+            // The proof has to name the row being written. Checking it here and
+            // not only in the announce handler is the whole point of putting
+            // the gate at this boundary: a caller could otherwise hold a valid
+            // signature for its own DID and spend it on someone else's row,
+            // which is RUSTSEC-2022-0009 exactly.
+            PeerWriteAuthority::Proven(proven) if proven != did => {
+                return Err(PeerWriteDenied::ProofDidMismatch {
+                    proven: proven.to_string(),
+                    target: did.to_string(),
+                }
+                .into());
+            }
+            // Only a DID whose verifying key resolves can ever authenticate:
+            // auth/mod.rs resolves the key from the keyid DID itself and
+            // rejects everything else. A row seeded here that cannot yield a
+            // key would therefore be unwritable by anyone forever, since no
+            // proof could ever satisfy the branch above, while still steering
+            // the sync origin resolve, the notify fan-out, and the public
+            // resolve route.
+            //
+            // The check is key derivability, NOT the method label. `Did`'s
+            // FromStr only runs validate(), which accepts key/web/gitlawb and
+            // never looks at the key material, so `did:key:notarealkey` passes
+            // is_did_key() and creates exactly the permanently uncorrectable
+            // row this gate exists to prevent. to_verifying_key() is the same
+            // resolution auth/mod.rs performs on the keyid.
+            //
+            // The refusal is split by cause, because methodNotSupported is only
+            // a true statement about a foreign method: a did:key whose key
+            // material does not resolve gets the resolution failure instead.
+            // Scoped to the INSERT, not to the DID. The check exists to stop a
+            // permanently uncorrectable row being CREATED; applied to a row that
+            // already exists it prevents nothing and freezes it instead. Before
+            // this gate, upsert_peer validated nothing and the handler accepted
+            // any parseable DID, so deployed tables hold did:web rows and
+            // did:key rows whose key never resolved. Judging the DID first made
+            // every one of those permanently unrefreshable: the unsigned
+            // announce is refused, and a signed one cannot exist because no key
+            // resolves. The row stays and keeps steering fan-out either way.
+            //
+            // The read-then-write race is benign: if a row appears in between,
+            // this write becomes an UPDATE and the UnprovenRepoint guard below
+            // still refuses any http_url change.
+            PeerWriteAuthority::Unproven if !self.peer_exists(did).await.unwrap_or(false) => {
+                match did.parse::<gitlawb_core::did::Did>() {
+                    // Only reachable from the bootstrap announce-back in main.rs,
+                    // which passes the contacted peer's raw JSON string; the
+                    // announce handler parses req.did before calling here.
+                    Err(e) => {
+                        return Err(PeerWriteDenied::UnresolvableDid {
+                            did: did.to_string(),
+                            reason: e.to_string(),
+                        }
+                        .into());
+                    }
+                    Ok(d) if !d.is_did_key() => {
+                        return Err(PeerWriteDenied::UnsupportedDidMethod {
+                            did: did.to_string(),
+                        }
+                        .into());
+                    }
+                    Ok(d) => {
+                        if let Err(e) = d.to_verifying_key() {
+                            return Err(PeerWriteDenied::UnresolvableDid {
+                                did: did.to_string(),
+                                reason: e.to_string(),
+                            }
+                            .into());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
         let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            "INSERT INTO peers (did, http_url, last_seen, last_ping_ok, announced_at)
-             VALUES ($1, $2, $3, FALSE, $3)
-             ON CONFLICT(did) DO UPDATE SET http_url = $2, last_seen = $3",
-        )
-        .bind(did)
-        .bind(http_url)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?;
+        // A changed URL drops the reachability gate, so a repointed peer does
+        // not inherit a probe the previous host earned. In the DO UPDATE branch
+        // `peers.http_url` is the existing pre-update row (the proposed value is
+        // $2), and the comparison runs under the conflict row lock, so
+        // concurrent announces for one DID serialize instead of racing a
+        // read-then-write. That orders announces against each other and nothing
+        // more: mark_peer_ping writes by DID with no http_url predicate, so a
+        // probe of the previous URL that lands after a reset can still re-grant
+        // the flag until the next round.
+        //
+        // Comparison is exact. http_url is stored as announced, so a cosmetic
+        // difference such as a trailing slash also clears the flag; the peer
+        // re-earns it on a later gossip round, provided no further announce
+        // lands first. Normalizing instead would mean canonicalizing the stored
+        // value, this comparison, and the existing trim_end_matches call sites.
+        //
+        // last_ping_ok is NOT a trust signal. An unauthenticated caller can
+        // clear it by announcing a different URL, and until #248 lands can also
+        // set it through the unauthenticated GET /api/v1/peers/{did}/ping, which
+        // writes mark_peer_ping from the stored URL's own probe response. Do not
+        // build a new consumer on this flag as if it were attacker-resistant.
+        //
+        // Only the federated repo fan-out in api/repos.rs gates on this flag.
+        // Four consumers act on a repointed http_url regardless of it (sync.rs's
+        // origin resolve, the post-receive notify fan-out, trigger_sync, and the
+        // public resolve route), and two read surfaces republish it as
+        // `reachable` (api/resolve.rs, api/peers.rs), which is where a reset
+        // becomes externally visible. So this bounds the automatic inheritance
+        // rather than closing the rewrite. Binding a DID to its first-seen
+        // announcing key is what closes it: #273.
+        //
+        // The two statements below differ only in what the conflict branch may
+        // touch. The proven one keeps the form above verbatim. The unproven one
+        // never assigns http_url at all and guards the whole DO UPDATE on the
+        // stored URL being byte-identical, so an unproven caller can refresh
+        // liveness and nothing else. last_ping_ok needs no CASE there, because
+        // the guard already restricts the branch to the URL-unchanged case the
+        // CASE would have preserved.
+        match authority {
+            PeerWriteAuthority::Proven(_) => {
+                sqlx::query(
+                    "INSERT INTO peers (did, http_url, last_seen, last_ping_ok, announced_at)
+                     VALUES ($1, $2, $3, FALSE, $3)
+                     ON CONFLICT(did) DO UPDATE SET
+                       http_url = $2,
+                       last_seen = $3,
+                       last_ping_ok = CASE
+                         WHEN peers.http_url IS DISTINCT FROM $2 THEN FALSE
+                         ELSE peers.last_ping_ok
+                       END",
+                )
+                .bind(did)
+                .bind(http_url)
+                .bind(&now)
+                .execute(&self.pool)
+                .await?;
+            }
+            PeerWriteAuthority::Unproven => {
+                let rows = sqlx::query(
+                    "INSERT INTO peers (did, http_url, last_seen, last_ping_ok, announced_at)
+                     VALUES ($1, $2, $3, FALSE, $3)
+                     ON CONFLICT(did) DO UPDATE SET
+                       last_seen = $3
+                     WHERE peers.http_url IS NOT DISTINCT FROM $2",
+                )
+                .bind(did)
+                .bind(http_url)
+                .bind(&now)
+                .execute(&self.pool)
+                .await?;
+                // A guarded ON CONFLICT DO UPDATE whose WHERE fails reports
+                // zero rows affected; it does NOT raise. So the refusal has to
+                // be derived from rows_affected, or the "an unproven repoint is
+                // an error, not a silent no-op" decision quietly becomes the
+                // no-op it was chosen to avoid. Zero rows here means exactly
+                // one thing, since the insert branch always affects a row: the
+                // DID exists and the announced URL is not the stored one.
+                if rows.rows_affected() == 0 {
+                    return Err(PeerWriteDenied::UnprovenRepoint {
+                        did: did.to_string(),
+                    }
+                    .into());
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1884,6 +3149,41 @@ impl Db {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Whether a DID has a row in `peers`, by keyed lookup.
+    ///
+    /// For callers that only need the membership answer. `list_peers` fetches
+    /// and materializes every row, so using it as a membership test on a hot
+    /// path (the gossip ingest gate) makes the cost of one event grow with the
+    /// size of the table.
+    pub async fn peer_exists(&self, did: &str) -> Result<bool> {
+        Ok(
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM peers WHERE did = $1)")
+                .bind(did)
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
+    pub async fn list_federation_peers(&self, limit: i64) -> Result<Vec<PeerRecord>> {
+        let rows = sqlx::query(
+            "SELECT did, http_url, last_seen, last_ping_ok, announced_at
+             FROM peers WHERE last_ping_ok = TRUE AND http_url <> '' ORDER BY last_seen DESC NULLS LAST, did LIMIT $1",
+        )
+        .bind(limit.clamp(0, crate::api::repos::MAX_FEDERATED_PEERS as i64 + 1))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| PeerRecord {
+                did: r.get("did"),
+                http_url: r.get("http_url"),
+                last_seen: r.get("last_seen"),
+                last_ping_ok: r.get::<bool, _>("last_ping_ok"),
+                announced_at: r.get("announced_at"),
+            })
+            .collect())
     }
 
     pub async fn list_peers(&self) -> Result<Vec<PeerRecord>> {
@@ -1951,18 +3251,530 @@ impl Db {
         Ok(row.get::<i64, _>("cnt") > 0)
     }
 
-    pub async fn record_pinned_cid(&self, sha256_hex: &str, cid: &str) -> Result<()> {
+    /// Every git oid a pinned CID maps to (`pinned_cids.cid` -> `sha256_hex`).
+    /// `GET /ipfs/{cid}` resolves the content-addressed CID a client sends back to
+    /// the object's git oid this way: a real pin CID digests the raw object
+    /// content, not the git oid, so the digest cannot be `git cat-file`d directly
+    /// (#173). The index is unique on the git oid but NON-unique on cid, so two
+    /// distinct oids can share one content-CID (a tree and a blob whose raw bytes
+    /// collide, or byte-identical content pinned under two oids). Returning every
+    /// candidate lets the handler try each rather than pick one arbitrarily and
+    /// false-404 when the chosen one is withheld or absent while another is
+    /// readable (#173). Empty when the CID was never pinned on this node.
+    ///
+    /// ORDERED, for the same reason `pin_sources_for_oid` orders its union: the handler
+    /// walks these candidates under ONE shared probe budget, visit budget and pager, so
+    /// whichever comes back first is the one that spends the request's budget. Left
+    /// unordered this is a bare sequential scan returning heap order, which an unpin and
+    /// re-pin of any one object rewrites, so two nodes holding identical data could
+    /// resolve the same CID differently and one could 503 where the other serves.
+    pub async fn oids_for_cid(&self, cid: &str) -> Result<Vec<String>> {
+        let rows =
+            sqlx::query("SELECT sha256_hex FROM pinned_cids WHERE cid = $1 ORDER BY sha256_hex")
+                .bind(cid)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| r.get::<String, _>("sha256_hex"))
+            .collect())
+    }
+
+    /// Record a pinned object's CID and the repository it was pinned from
+    /// (`repo_id`, #173). On conflict the `COALESCE` backfills a NULL provenance
+    /// from a known source while keeping first-pinner-owns: an existing non-NULL
+    /// `repo_id` is never rewritten by a later push of the same oid, but a legacy
+    /// pin (or a pin recorded before provenance existed) whose `repo_id` is NULL
+    /// gets it filled the next time the object is re-pinned with a known source.
+    /// `cid`/`pinned_at` are left untouched on conflict. `repo_id` is `None` only
+    /// for a legacy pin with no known source; those fall back to the resolver's scan.
+    ///
+    /// The production first-pin path now goes through [`Self::record_pinned_cid_with_source`]
+    /// (U3, #173) so the pin and its source land atomically; this remains the seam for
+    /// seeding legacy, source-less rows in tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn record_pinned_cid(
+        &self,
+        sha256_hex: &str,
+        cid: &str,
+        repo_id: Option<&str>,
+    ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at)
-             VALUES ($1, $2, $3)
-             ON CONFLICT(sha256_hex) DO NOTHING",
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo_id)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT(sha256_hex) DO UPDATE SET
+                 repo_id = COALESCE(pinned_cids.repo_id, EXCLUDED.repo_id)",
         )
         .bind(sha256_hex)
         .bind(cid)
         .bind(Utc::now().to_rfc3339())
+        .bind(repo_id)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// The resolver key currently stored for a pinned object (`pinned_cids.cid`),
+    /// or `None` for an unpinned oid. The opportunistic legacy-repair path reads
+    /// it to decide candidacy from the codec of the string alone (no object bytes)
+    /// before it recomputes anything.
+    pub async fn cid_for_oid(&self, sha256_hex: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT cid FROM pinned_cids WHERE sha256_hex = $1")
+            .bind(sha256_hex)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get::<String, _>("cid")))
+    }
+
+    /// Rewrite a legacy provider-CID row to the raw-content resolver key, stashing
+    /// the old provider value in `legacy_provider_cid` (#173 R8, KTD8). Before this
+    /// branch the pin path stored the PROVIDER CID (Kubo dag-pb / Pinata CIDv0) in
+    /// `cid`; the `/ipfs` resolver recomputes the raw CID and 404s a mismatched key
+    /// even though `list_pinned_cids` still advertises it. The `WHERE cid =
+    /// $old_provider_cid` guard makes a concurrent double-repair a no-op (the second
+    /// writer sees the already-rewritten key and matches nothing) and never touches
+    /// a row keyed on a different value. Stashed in `legacy_provider_cid`, NOT
+    /// `pinata_cid`: the latter gates the Pinata pin-skip (`has_pinata_cid`), so a
+    /// Kubo-legacy CID parked there would make Pinata permanently skip the object.
+    pub async fn repair_legacy_provider_cid(
+        &self,
+        sha256_hex: &str,
+        raw_cid: &str,
+        old_provider_cid: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE pinned_cids
+                SET cid = $2, legacy_provider_cid = $3
+              WHERE sha256_hex = $1 AND cid = $3",
+        )
+        .bind(sha256_hex)
+        .bind(raw_cid)
+        .bind(old_provider_cid)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// One ordered batch of `pinned_cids` rows strictly after `cursor`, for the U4
+    /// legacy provider-CID repair sweep. Returns `(sha256_hex, cid)` ordered by
+    /// `sha256_hex` (the table's primary key, so the walk rides the PK index) and
+    /// capped at `limit` rows, which is what BOUNDS the sweep: one pass can never read
+    /// more than a batch, however large the pin set is.
+    ///
+    /// Deliberately NOT filtered to legacy rows in SQL. "Is this a raw CIDv1" is a
+    /// multibase+codec decode (`is_raw_cidv1`), which Postgres cannot express, and a
+    /// prefix-match approximation would silently mis-classify keys under a different
+    /// multihash. The caller applies the real predicate, so `limit` bounds rows READ
+    /// (the DB cost), not rows repaired.
+    pub async fn pinned_cids_after(
+        &self,
+        cursor: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, String)>> {
+        let rows = sqlx::query(
+            "SELECT sha256_hex, cid FROM pinned_cids
+              WHERE sha256_hex > $1
+              ORDER BY sha256_hex
+              LIMIT $2",
+        )
+        .bind(cursor)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<String, _>("sha256_hex"), r.get::<String, _>("cid")))
+            .collect())
+    }
+
+    /// Where the U4 repair sweep's walk left off, or `""` before it has ever run.
+    /// Empty string sorts below every hex oid, so a first run and a rewound run are
+    /// the same code path (`sha256_hex > ''` is the whole table).
+    pub async fn pin_repair_cursor(&self) -> Result<String> {
+        let row = sqlx::query("SELECT cursor FROM pin_repair_sweep WHERE id = 1")
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row
+            .map(|r| r.get::<String, _>("cursor"))
+            .unwrap_or_default())
+    }
+
+    /// Persist the sweep's walk position. Written after every batch, so a restart
+    /// resumes rather than re-walking the table from the beginning. A rewrite is a
+    /// plain upsert: the sweep is the single writer, and re-repairing an
+    /// already-repaired row is a no-op anyway (the codec cost gate spares it).
+    pub async fn set_pin_repair_cursor(&self, cursor: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO pin_repair_sweep (id, cursor) VALUES (1, $1)
+             ON CONFLICT (id) DO UPDATE SET cursor = EXCLUDED.cursor",
+        )
+        .bind(cursor)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Where the sweep's DISCOVERY window left off, as a `(created_at, id)` keyset
+    /// key, or `("", "")` before any traversal has completed one.
+    ///
+    /// A second, independent position from [`Db::pin_repair_cursor`]: that one walks
+    /// `pinned_cids` rows, this one walks the warm CANDIDATE list a source-less row is
+    /// probed against. Both are per-TRAVERSAL, and the candidate one only ever moves
+    /// at the end of a completed traversal, so every pass of one traversal reads the
+    /// same value and every source-less row in it shares one window.
+    ///
+    /// A key rather than an offset. Repos enter and leave the warm candidate list
+    /// between traversals (a cold repo warming on a Tigris-backed node, a fresh
+    /// registration, a deletion), and an offset silently means a different candidate
+    /// once anything below it moves, which slides the window off the row it was about
+    /// to reach. A key names the boundary itself, so an insert below it is invisible.
+    /// The key is the RAW stored `created_at` text (`ScanRepoRow::created_at_key`),
+    /// never a re-serialized `DateTime`, for the reason that struct's own doc gives.
+    pub async fn discovery_continuation(&self) -> Result<(String, String)> {
+        let row = sqlx::query(
+            "SELECT discovery_cursor_created_at, discovery_cursor_id
+               FROM pin_repair_sweep WHERE id = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row
+            .map(|r| {
+                (
+                    r.get::<String, _>("discovery_cursor_created_at"),
+                    r.get::<String, _>("discovery_cursor_id"),
+                )
+            })
+            .unwrap_or_default())
+    }
+
+    /// Persist the discovery window's continuation at the end of a completed traversal.
+    ///
+    /// The INSERT arm names `cursor` explicitly with `''`. v23 declares that column
+    /// `NOT NULL` and seeds NO row, so a never-swept node has nothing to update and an
+    /// upsert naming only the continuation columns would fail its NOT NULL check.
+    /// Every caller treats a failed persist as warn-only, so that failure would be
+    /// SILENT and the window would never rotate on exactly the nodes this sweep exists
+    /// for. `''` is the same value `pin_repair_cursor` reads as "never swept", so
+    /// seeding it here starts no walk anywhere but the top of the table.
+    ///
+    /// The UPDATE arm touches ONLY the two continuation columns. Writing `cursor` there
+    /// too would clobber a live row-walk position with `''` every time the window
+    /// rotated, rewinding the `pinned_cids` walk to the start of the table.
+    pub async fn set_discovery_continuation(&self, created_at_key: &str, id: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO pin_repair_sweep (id, cursor, discovery_cursor_created_at, discovery_cursor_id)
+             VALUES (1, '', $1, $2)
+             ON CONFLICT (id) DO UPDATE SET
+                 discovery_cursor_created_at = EXCLUDED.discovery_cursor_created_at,
+                 discovery_cursor_id = EXCLUDED.discovery_cursor_id",
+        )
+        .bind(created_at_key)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The repository a pinned object was recorded from (`pinned_cids.repo_id`),
+    /// or `None` for a legacy pin (recorded before provenance existed) or an
+    /// unpinned oid. `GET /ipfs/{cid}` uses this to gate+serve the ONE source
+    /// repo instead of scanning every repo (#173).
+    pub async fn provenance_for_oid(&self, sha256_hex: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT repo_id FROM pinned_cids WHERE sha256_hex = $1")
+            .bind(sha256_hex)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.and_then(|r| r.get::<Option<String>, _>("repo_id")))
+    }
+
+    /// Backfill the source repo on an already-pinned object whose provenance is
+    /// NULL (a legacy pin recorded before provenance existed, #173, jatmn). The
+    /// `AND repo_id IS NULL` guard keeps first-pinner-owns: an existing non-NULL
+    /// provenance is left untouched. Touches only `repo_id` and never re-pins the
+    /// object's bytes, so it is safe to call on the already-pinned skip path.
+    pub async fn backfill_pin_provenance(&self, sha256_hex: &str, repo_id: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE pinned_cids SET repo_id = $2 WHERE sha256_hex = $1 AND repo_id IS NULL",
+        )
+        .bind(sha256_hex)
+        .bind(repo_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Record a repository as a source for a pinned object (F1, #173 jatmn round 8),
+    /// bounded to about `MAX_PIN_SOURCES` distinct repos per object. The count guard
+    /// lives inside the INSERT (a single statement), which suppresses a re-push of the
+    /// SAME `(oid, repo)` via `ON CONFLICT DO NOTHING`. It does NOT hard-serialize
+    /// concurrent inserts of DIFFERENT repos for the same object: under Postgres READ
+    /// COMMITTED each concurrent writer's count subquery reads a snapshot that omits the
+    /// others' uncommitted rows, so N concurrent pushers can each see `count < cap` and
+    /// overshoot by up to N-1 rows. The overshoot is a small constant (bounded by
+    /// concurrent-pusher count, never O(repos)), and the RESOLVER read side
+    /// (`pin_sources_for_oid`) caps the ADDITIONAL sources at `MAX_PIN_SOURCES` (always
+    /// keeping the first-pinner), so the INV-10 bound on serve-time work holds at
+    /// `O(MAX_PIN_SOURCES + 1)` regardless of a table overshoot.
+    ///
+    /// A record that ACTUALLY ADDS a source row also CLEARS the
+    /// `pin_sources_incomplete` marker for the object, in the SAME transaction as the
+    /// insert (U3, #173), so the clear cannot drift across the four call sites or land
+    /// without the row it describes.
+    ///
+    /// The clear is gated on `rows_affected() > 0` because the INSERT is a no-op in two
+    /// ordinary cases: the `(oid, repo)` pair already exists (`ON CONFLICT DO NOTHING`)
+    /// and the source set is at cap (the count guard). The skip path calls this for
+    /// EVERY already-pinned object, and on a requeue pass that list is the whole-repo
+    /// enumeration, so an unconditional clear meant the next coalesced push from a repo
+    /// already in the set wiped the marker for every object in the repo without
+    /// recording anything (round 11 regression). The residual, which the gate does not
+    /// close: the marker is per-object, not per-(object, repo), so a GENUINE record from
+    /// a third repo C still clears a marker that repo A's failed record set. That is the
+    /// deliberate cost of a single boolean; closing it needs a per-(oid, repo) marker
+    /// table, and it fails in the safe direction (the marker only ever ADDS the scan
+    /// fallback, never removes a source the resolver already tries).
+    pub async fn record_pin_source(&self, sha256_hex: &str, repo_id: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let inserted = sqlx::query(
+            "INSERT INTO pin_repo_sources (sha256_hex, repo_id)
+             SELECT $1, $2
+             WHERE (SELECT count(*) FROM pin_repo_sources WHERE sha256_hex = $1) < $3
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(sha256_hex)
+        .bind(repo_id)
+        .bind(MAX_PIN_SOURCES)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if inserted > 0 {
+            // Clears THIS repo's failure only (#173 round 12). A boolean per object meant
+            // repo C's genuine record wiped the marker repo B's failure set, and the
+            // resolver then dropped the scan fallback while B's copy was still unrecorded.
+            sqlx::query("DELETE FROM pin_source_failures WHERE sha256_hex = $1 AND repo_id = $2")
+                .bind(sha256_hex)
+                .bind(repo_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Record a first pin and its source ATOMICALLY (U3, #173). The first-pin path
+    /// used to run `record_pinned_cid` and `record_pin_source` as two independent
+    /// best-effort calls, so the pin could land while its source did not, leaving a
+    /// source set that is silently missing its own first pinner. One transaction
+    /// removes that window entirely: either both rows land or neither does, and a
+    /// total failure leaves the object unpinned so the next push retries it.
+    ///
+    /// The marker clear carries the same `rows_affected` gate as `record_pin_source`.
+    /// It is not load-bearing here: this path runs only when `is_pinned` said no row
+    /// exists, and `mark_pin_sources_incomplete` is a no-op without a `pinned_cids` row,
+    /// so there is no marker to wrongly clear. The gate is kept for the one window that
+    /// is not covered by that argument, a concurrent pinner landing the row between the
+    /// `is_pinned` check and this upsert, and so the two clears cannot drift apart.
+    pub async fn record_pinned_cid_with_source(
+        &self,
+        sha256_hex: &str,
+        cid: &str,
+        repo_id: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo_id)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT(sha256_hex) DO UPDATE SET
+                 repo_id = COALESCE(pinned_cids.repo_id, EXCLUDED.repo_id)",
+        )
+        .bind(sha256_hex)
+        .bind(cid)
+        .bind(Utc::now().to_rfc3339())
+        .bind(repo_id)
+        .execute(&mut *tx)
+        .await?;
+        let inserted = sqlx::query(
+            "INSERT INTO pin_repo_sources (sha256_hex, repo_id)
+             SELECT $1, $2
+             WHERE (SELECT count(*) FROM pin_repo_sources WHERE sha256_hex = $1) < $3
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(sha256_hex)
+        .bind(repo_id)
+        .bind(MAX_PIN_SOURCES)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if inserted > 0 {
+            // Clears THIS repo's failure only (#173 round 12). A boolean per object meant
+            // repo C's genuine record wiped the marker repo B's failure set, and the
+            // resolver then dropped the scan fallback while B's copy was still unrecorded.
+            sqlx::query("DELETE FROM pin_source_failures WHERE sha256_hex = $1 AND repo_id = $2")
+                .bind(sha256_hex)
+                .bind(repo_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Record a DISCOVERED holder and arm the resolver's fallback ATOMICALLY (U5, #173).
+    /// The sweep's discovery arm used to call `record_pin_source` and then, separately,
+    /// `mark_pin_sources_incomplete`. Two best-effort writes, so a transient failure of
+    /// the second one left the row with a nonempty, below-cap, UNMARKED source set: the
+    /// resolver's `needs_scan` is `sources.is_empty() || at_cap || incomplete`, so all
+    /// three signals were off, the bounded legacy scan was dropped, and an unrecorded
+    /// public duplicate stayed 404'd for good once the DB error cleared (no later sweep
+    /// revisits a raw-CIDv1 row). One transaction removes that state entirely: either the
+    /// source row and the sentinel both land or neither does, and neither-lands is the
+    /// benign end (an empty set is itself a `needs_scan` signal).
+    ///
+    /// The sentinel insert is UNCONDITIONAL, unlike the marker clear's `rows_affected`
+    /// gate: discovery probes a bounded, warm-only candidate set and stops at the first
+    /// holder, so finding one holder is never evidence the set is complete, whether or
+    /// not this particular call added a row. It names the empty-string UNKNOWN-repo
+    /// sentinel (the same one the v24 migration carries pre-upgrade markers under), so no
+    /// real per-repo record can clear it, and it carries the same
+    /// `WHERE EXISTS (pinned_cids row)` guard as [`Self::mark_pin_sources_incomplete`]
+    /// so a marker never sits in the table for an object this node never pinned.
+    ///
+    /// Commit-terminated, like [`Self::record_pin_source`], so a caller that wraps this
+    /// in `db_bounded` may read `BoundedDbError::Elapsed` as "definitely did not land":
+    /// the cancelled future never reaches `tx.commit()`, no COMMIT is sent, and Postgres
+    /// discards the transaction when the connection resets.
+    pub async fn record_discovered_pin_source(
+        &self,
+        sha256_hex: &str,
+        repo_id: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let inserted = sqlx::query(
+            "INSERT INTO pin_repo_sources (sha256_hex, repo_id)
+             SELECT $1, $2
+             WHERE (SELECT count(*) FROM pin_repo_sources WHERE sha256_hex = $1) < $3
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(sha256_hex)
+        .bind(repo_id)
+        .bind(MAX_PIN_SOURCES)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if inserted > 0 {
+            // Clears THIS repo's failure only, the same gate and reason as
+            // `record_pin_source`: a per-object clear let one repo's genuine record wipe
+            // a marker another repo's failure set.
+            sqlx::query("DELETE FROM pin_source_failures WHERE sha256_hex = $1 AND repo_id = $2")
+                .bind(sha256_hex)
+                .bind(repo_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query(
+            "INSERT INTO pin_source_failures (sha256_hex, repo_id)
+                  SELECT $1, '' WHERE EXISTS (SELECT 1 FROM pinned_cids WHERE sha256_hex = $1)
+                  ON CONFLICT DO NOTHING",
+        )
+        .bind(sha256_hex)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Mark this object's pin-source set as KNOWN INCOMPLETE for `repo_id` (U3, #173).
+    /// Called when a `record_pin_source` exhausts its retries, which is the only moment
+    /// the node knows a source it meant to record is missing. `GET /ipfs/{cid}` reads it
+    /// to keep the bounded scan fallback for that object, so a public copy that would
+    /// serve is no longer 404'd.
+    ///
+    /// The marker names the PAIR, so only a later successful record from the same repo
+    /// clears it (#173 round 12). A no-op when no `pinned_cids` row exists: the first-pin
+    /// path is transactional, so there is no half-recorded pin to describe, and without
+    /// the guard a marker for an object this node never pinned would sit in the table
+    /// arming a fallback for nothing.
+    pub async fn mark_pin_sources_incomplete(&self, sha256_hex: &str, repo_id: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO pin_source_failures (sha256_hex, repo_id)
+                  SELECT $1, $2 WHERE EXISTS (SELECT 1 FROM pinned_cids WHERE sha256_hex = $1)
+                  ON CONFLICT DO NOTHING",
+        )
+        .bind(sha256_hex)
+        .bind(repo_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Whether this object's pin-source set is KNOWN INCOMPLETE (U3, #173): a
+    /// `record_pin_source` for it failed outright and no later record from the same repo
+    /// has repaired it. `false` for an unpinned oid and for every object with no recorded
+    /// failure, so the common path is unchanged and an ordinary denial never fans out
+    /// (INV-10).
+    pub async fn pin_sources_incomplete(&self, sha256_hex: &str) -> Result<bool> {
+        let found: Option<i32> =
+            sqlx::query_scalar("SELECT 1 FROM pin_source_failures WHERE sha256_hex = $1 LIMIT 1")
+                .bind(sha256_hex)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(found.is_some())
+    }
+
+    /// Every source repository recorded for a pinned object (F1, #173 jatmn round 8):
+    /// the union of the first-pinner `pinned_cids.repo_id` and the `pin_repo_sources`
+    /// rows, deduped and ordered for a deterministic resolver walk.
+    ///
+    /// The first-pinner (a single row by `pinned_cids`' PK on `sha256_hex`) is ALWAYS
+    /// included; the `LIMIT MAX_PIN_SOURCES` caps only the ADDITIONAL `pin_repo_sources`
+    /// rows. This keeps the resolver's per-source work a bounded `O(MAX_PIN_SOURCES + 1)`
+    /// ceiling (INV-10) while never letting the cap evict the original source. A prior
+    /// version applied the `LIMIT` to the whole UNION with a lexicographic `ORDER BY`,
+    /// which let an attacker 404 a legacy public CID (first-pinner in `pinned_cids` but
+    /// not yet in `pin_repo_sources`) by pushing the same object from `MAX_PIN_SOURCES`
+    /// repos whose grindable ids sort before it, evicting the public source from the
+    /// window. Empty for a legacy pin with no known source (it falls back to the repo
+    /// scan) or an unpinned oid.
+    pub async fn pin_sources_for_oid(&self, sha256_hex: &str) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT repo_id FROM pinned_cids
+                 WHERE sha256_hex = $1 AND repo_id IS NOT NULL
+             UNION
+             SELECT repo_id FROM (
+                 SELECT repo_id FROM pin_repo_sources
+                     WHERE sha256_hex = $1
+                 ORDER BY repo_id
+                 LIMIT $2
+             ) capped
+             ORDER BY repo_id",
+        )
+        .bind(sha256_hex)
+        .bind(MAX_PIN_SOURCES)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| r.get::<String, _>("repo_id"))
+            .collect())
+    }
+
+    /// Whether `pin_repo_sources` is at the `MAX_PIN_SOURCES` cap for this oid, i.e.
+    /// the provenance source set returned by [`Self::pin_sources_for_oid`] may be
+    /// INCOMPLETE. `record_pin_source` stops inserting at exactly `MAX_PIN_SOURCES`
+    /// rows and drops later sources silently, so a full table is the only observable
+    /// signal that a servable source (e.g. a later public pinner) may have been
+    /// dropped. `get_by_cid` uses this to decide whether a provenance miss should fall
+    /// back to the bounded legacy scan (which gates every repo through the real
+    /// visibility gate and so finds a dropped public source) rather than 404 — closing
+    /// the pin-source griefing hole where 16 attacker sources bury a public one. `>=`
+    /// (not `==`) is defensive against any future overshoot.
+    pub async fn pin_sources_at_cap(&self, sha256_hex: &str) -> Result<bool> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM pin_repo_sources WHERE sha256_hex = $1")
+                .bind(sha256_hex)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(count >= MAX_PIN_SOURCES)
     }
 
     pub async fn record_encrypted_blob(
@@ -2035,6 +3847,17 @@ impl Db {
         Ok(row.map(|r| r.get("recipients_tag")))
     }
 
+    /// Every pinned object this node ADVERTISES (`GET /api/v1/ipfs/pins`).
+    ///
+    /// U4 (#173): rows still keyed on a legacy PROVIDER CID (Kubo dag-pb / Pinata
+    /// CIDv0, written by releases before this branch) are withheld from the listing.
+    /// The `/ipfs/{cid}` resolver recomputes the raw-content CID from the object bytes
+    /// and refuses any row whose stored key does not match, so advertising the legacy
+    /// key hands a client a CID this node deliberately will not serve. The background
+    /// repair sweep rewrites those rows to the raw key, and each one reappears here the
+    /// moment it is repaired. Filtering is done in Rust because the raw-CIDv1 test is a
+    /// multibase+codec decode (`is_raw_cidv1`), not something SQL can express; it is the
+    /// SAME predicate the repair path uses as its cost gate, so the two cannot drift.
     pub async fn list_pinned_cids(&self) -> Result<Vec<PinnedCidRecord>> {
         let rows = sqlx::query(
             "SELECT sha256_hex, cid, pinned_at, pinata_cid FROM pinned_cids ORDER BY pinned_at DESC",
@@ -2043,6 +3866,7 @@ impl Db {
         .await?;
         Ok(rows
             .into_iter()
+            .filter(|r| gitlawb_core::cid::is_raw_cidv1(r.get::<&str, _>("cid")))
             .map(|r| PinnedCidRecord {
                 sha256_hex: r.get("sha256_hex"),
                 cid: r.get("cid"),
@@ -2064,18 +3888,34 @@ impl Db {
     }
 
     /// Record the Pinata CID for a git object.
-    /// Inserts the row if it doesn't exist (objects pinned directly to Pinata
-    /// without a prior local IPFS pin get cid = pinata_cid).
-    pub async fn record_pinata_cid(&self, sha256_hex: &str, pinata_cid: &str) -> Result<()> {
+    ///
+    /// `raw_cid` is the locally-computed raw-content CID (`Cid::from_git_object_bytes`,
+    /// CIDv1/raw/sha2-256), the resolver key `GET /ipfs/{cid}` looks up; `pinata_cid`
+    /// is the provider CID Pinata returned (a dag-pb/UnixFS CID for gateway retrieval).
+    /// Inserts the row if it doesn't exist (an object pinned directly to Pinata with
+    /// no prior local IPFS pin gets `cid = raw_cid`, never the provider CID — a dag-pb
+    /// provider CID must never become an alias that serves raw bytes that do not hash
+    /// to it, #173). On conflict `cid` is left untouched: a prior local pin already
+    /// stored the correct raw CID, and the COALESCE backfills a NULL provenance from a
+    /// known source while keeping first-pinner-owns.
+    pub async fn record_pinata_cid(
+        &self,
+        sha256_hex: &str,
+        raw_cid: &str,
+        pinata_cid: &str,
+        repo_id: Option<&str>,
+    ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, pinata_cid)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT(sha256_hex) DO UPDATE SET pinata_cid = EXCLUDED.pinata_cid",
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, pinata_cid, repo_id)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT(sha256_hex) DO UPDATE SET pinata_cid = EXCLUDED.pinata_cid,
+                 repo_id = COALESCE(pinned_cids.repo_id, EXCLUDED.repo_id)",
         )
         .bind(sha256_hex)
-        .bind(pinata_cid) // fallback local cid if row is new
+        .bind(raw_cid) // resolver-key cid: locally-computed raw CID, never the provider CID
         .bind(Utc::now().to_rfc3339())
         .bind(pinata_cid)
+        .bind(repo_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -2089,8 +3929,8 @@ impl Db {
         sqlx::query(
             "INSERT INTO received_ref_updates
              (id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, timestamp,
-              cert_id, received_at, from_peer)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+              cert_id, received_at, from_peer, owner_did)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
              ON CONFLICT(id) DO NOTHING",
         )
         .bind(&update.id)
@@ -2104,94 +3944,249 @@ impl Db {
         .bind(&update.cert_id)
         .bind(&update.received_at)
         .bind(&update.from_peer)
+        .bind(&update.owner_did)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    pub async fn list_ref_updates(&self, limit: i64) -> Result<Vec<ReceivedRefUpdate>> {
-        let rows = sqlx::query(
-            "SELECT id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, timestamp,
-                    cert_id, received_at, from_peer
-             FROM received_ref_updates ORDER BY timestamp DESC LIMIT $1",
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(row_to_ref_update).collect())
-    }
-
-    pub async fn list_repo_ref_updates(
+    /// Resolve the trusted display `owner_did` for every ref-update row in a page,
+    /// issuing at most one query per *unique* local repo so the cost scales with
+    /// the number of distinct repos in the page rather than the page size.
+    ///
+    /// The stored `owner_did` (and the `repo` slug) arrive over gossipsub or the
+    /// unsigned peer-notify HTTP path, so neither is trusted. This method binds
+    /// the wire `owner_did` to the local repo the slug names before it is ever
+    /// surfaced:
+    ///
+    /// * **P1 (untrusted wire value):** a peer-supplied `owner_did` is only
+    ///   echoed when it normalizes equal to the canonical owner of the *actual
+    ///   local repo* at that slug. A caller asserting `did:key:zVictim` on a
+    ///   `zAlice/widget` row is dropped, because `zVictim` does not own the
+    ///   local `zAlice/widget` repo. The canonical DID is returned (not the raw
+    ///   wire bytes), so the projection is always the local source of truth.
+    /// * **P3 (legacy fallback):** a row stored with `owner_did = None` is
+    ///   attributed only via an *exact, normalized, unique* local match —
+    ///   `get_repo` matches the slug's owner key and name exactly (`LIMIT 1`,
+    ///   preferring canonical rows). The loose prefix-tolerant drop gate
+    ///   (`ref_update_row_names_repo`) is never used for attribution, so a
+    ///   cross-method slug collision cannot synthesize the wrong owner. When no
+    ///   unique local repo proves the owner, `None` is returned.
+    ///
+    /// # P2 mirror-only fallback
+    ///
+    /// Mirror-only repos store their owner as the bare normalized key (no DID
+    /// method prefix).  When a validated wire DID carries a full prefix (e.g.
+    /// `did:key:z…`) and the matching repo is a mirror, the full wire value is
+    /// returned so the API contract preserves the DID method for these rows.
+    ///
+    /// The slug must be `"{owner}/{name}"`; a slug without a `/` cannot be
+    /// attributed and yields `None`.
+    pub async fn resolve_ref_update_owner_dids(
         &self,
-        repo: &str,
-        limit: i64,
-    ) -> Result<Vec<ReceivedRefUpdate>> {
-        let rows = sqlx::query(
-            "SELECT id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, timestamp,
-                    cert_id, received_at, from_peer
-             FROM received_ref_updates WHERE repo = $1 ORDER BY timestamp DESC LIMIT $2",
-        )
-        .bind(repo)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(row_to_ref_update).collect())
+        rows: &[(&str, Option<&str>)],
+    ) -> Result<Vec<Option<String>>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // ── 1.  Collect unique lookup keys ────────────────────────────────
+        let mut slug_parts: Vec<Option<String>> = Vec::with_capacity(rows.len());
+        // Keys are stored as `format!("{normalized_key}\0{name}")` for cheap
+        // HashMap lookup.
+        let mut unique_keys: Vec<String> = Vec::new();
+
+        for (slug, _wire) in rows {
+            if let Some((owner_part, name)) = slug.rsplit_once('/') {
+                let normalized = normalize_owner_key(owner_part);
+                let key = format!("{normalized}\0{name}");
+                if !unique_keys.contains(&key) {
+                    unique_keys.push(key.clone());
+                }
+                slug_parts.push(Some(key));
+            } else {
+                slug_parts.push(None);
+            }
+        }
+
+        // ── 2.  Fetch all matching repos in one set-based query ──────────
+        // Build a single SQL with one OR condition per unique key so every
+        // distinct slug is resolved in one round-trip regardless of how many
+        // unique repos the page names.
+        let mut repo_map: std::collections::HashMap<String, RepoRecord> =
+            std::collections::HashMap::new();
+
+        if !unique_keys.is_empty() {
+            let mut sql = String::from(
+                "SELECT id, name, owner_did, description, is_public, default_branch,
+                        created_at, updated_at, disk_path, forked_from, machine_id
+                 FROM repos WHERE (",
+            );
+            let mut conds: Vec<String> = Vec::with_capacity(unique_keys.len());
+            for i in 0..unique_keys.len() {
+                let p = (2 * i + 1) as i64;
+                let q = (2 * i + 2) as i64;
+                conds.push(format!("({}) = ${p} AND name = ${q}", OWNER_KEY_CASE_SQL));
+            }
+            sql.push_str(&conds.join(" OR "));
+            sql.push_str(
+                ") ORDER BY CASE WHEN position('/' in id) > 0 THEN 1 ELSE 0 END, \
+                 created_at ASC, id ASC",
+            );
+
+            let mut q = sqlx::query(&sql);
+            for key in &unique_keys {
+                if let Some((owner_part, name)) = key.split_once('\0') {
+                    q = q.bind(owner_part).bind(name);
+                }
+            }
+
+            for row in q.fetch_all(&self.pool).await? {
+                let repo = row_to_repo(row);
+                let key = format!("{}\0{}", normalize_owner_key(&repo.owner_did), repo.name);
+                repo_map.entry(key).or_insert(repo);
+            }
+        }
+
+        // ── 3.  Resolve every input row ──────────────────────────────────
+        let mut results = Vec::with_capacity(rows.len());
+        for (i, (_slug, wire_owner_did)) in rows.iter().enumerate() {
+            let Some(repo) = slug_parts[i].as_ref().and_then(|k| repo_map.get(k)) else {
+                results.push(None);
+                continue;
+            };
+
+            match (wire_owner_did, repo) {
+                (Some(wire), repo)
+                    if normalize_owner_key(wire) == normalize_owner_key(&repo.owner_did) =>
+                {
+                    if repo.id.contains('/') && *wire != repo.owner_did {
+                        results.push(Some((*wire).to_string()));
+                    } else {
+                        results.push(Some(repo.owner_did.clone()));
+                    }
+                }
+                (None, _) => {
+                    results.push(Some(repo.owner_did.clone()));
+                }
+                _ => results.push(None),
+            }
+        }
+
+        Ok(results)
     }
 
-    /// Filtered ref updates — optionally scoped to a specific repo.
-    pub async fn list_ref_updates_filtered(
+    /// One page of ref updates (newest first), optionally scoped to one repo.
+    /// The `(timestamp DESC, id DESC)` order gives a stable tiebreak so offset
+    /// paging does not skip or duplicate rows when timestamps collide. Used by
+    /// the visibility-gated feed collector, which pages past dropped private rows
+    /// so a small limit still returns the latest visible events (#114).
+    /// One page of ref updates for the visibility collector, ordered
+    /// `timestamp DESC, id DESC`, using a **keyset** cursor rather than
+    /// `LIMIT/OFFSET`.
+    ///
+    /// `after` is the `(timestamp, id)` of the last row of the previous page;
+    /// the next page reads rows strictly older than it via the row-value
+    /// predicate `(timestamp, id) < (after_ts, after_id)`, which matches the
+    /// `ORDER BY` exactly (same id tie-break). Because a concurrently inserted
+    /// row is newer (larger `timestamp`) and so sorts to the front, it lands
+    /// *above* the window we are paging through and cannot shift it. That keeps
+    /// a single multi-page scan free of the duplicate/skip that OFFSET paging
+    /// suffers when `received_ref_updates` is written between page reads.
+    pub async fn list_ref_updates_keyset(
         &self,
         repo: Option<&str>,
         limit: i64,
+        after: Option<(&str, &str)>,
     ) -> Result<Vec<ReceivedRefUpdate>> {
-        let rows = if let Some(r) = repo {
-            sqlx::query(
-                "SELECT id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, timestamp,
-                        cert_id, received_at, from_peer
-                 FROM received_ref_updates WHERE repo=$1 ORDER BY timestamp DESC LIMIT $2",
-            )
-            .bind(r)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?
+        const COLS: &str = "id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, \
+                            timestamp, cert_id, received_at, from_peer, owner_did";
+
+        // Positional params in bind order: repo?, after_ts?, after_id?, limit.
+        let mut conds: Vec<String> = Vec::new();
+        let mut n = 0;
+        if repo.is_some() {
+            n += 1;
+            conds.push(format!("repo = ${n}"));
+        }
+        if after.is_some() {
+            let (a, b) = (n + 1, n + 2);
+            n += 2;
+            conds.push(format!("(timestamp, id) < (${a}, ${b})"));
+        }
+        let where_clause = if conds.is_empty() {
+            String::new()
         } else {
-            sqlx::query(
-                "SELECT id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, timestamp,
-                        cert_id, received_at, from_peer
-                 FROM received_ref_updates ORDER BY timestamp DESC LIMIT $1",
-            )
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?
+            format!(" WHERE {}", conds.join(" AND "))
         };
+        let sql = format!(
+            "SELECT {COLS} FROM received_ref_updates{where_clause} \
+             ORDER BY timestamp DESC, id DESC LIMIT ${}",
+            n + 1
+        );
+
+        let mut q = sqlx::query(&sql);
+        if let Some(r) = repo {
+            q = q.bind(r.to_string());
+        }
+        if let Some((ts, id)) = after {
+            q = q.bind(ts.to_string()).bind(id.to_string());
+        }
+        let rows = q.bind(limit).fetch_all(&self.pool).await?;
         Ok(rows.into_iter().map(row_to_ref_update).collect())
     }
 }
 
 // ── Agent Tasks ───────────────────────────────────────────────────────────────
 
+/// Permanent authorization denial: the task is reserved for a different assignee.
+/// Handlers downcast this to return 403 (vs 409 for a lost claim race).
+#[derive(Debug, thiserror::Error)]
+#[error("task not claimable: reserved for another assignee")]
+pub struct TaskReservedForOtherAssignee;
+
+/// ASCII whitespace treated as blank for assignee slots — must stay in sync with
+/// `BTRIM(assignee_did, E' \t\n\r')` in `claim_task`'s SQL open-slot check.
+const ASSIGNEE_BLANK: &[char] = &[' ', '\t', '\n', '\r'];
+
+fn assignee_slot_blank(s: &str) -> bool {
+    s.trim_matches(ASSIGNEE_BLANK).is_empty()
+}
+
+/// Trim assignee DIDs for auth matching (same ASCII blank set as SQL/open checks).
+pub fn trim_assignee_did(s: &str) -> &str {
+    s.trim_matches(ASSIGNEE_BLANK)
+}
+
 impl Db {
-    pub async fn create_task(&self, task: &AgentTask) -> Result<()> {
+    /// Persist a task. Whitespace-only `assignee_did` is stored as `NULL` (open).
+    /// Returns the normalized row shape so REST/GraphQL create responses match GET.
+    pub async fn create_task(&self, task: &AgentTask) -> Result<AgentTask> {
+        let mut stored = task.clone();
+        stored.assignee_did = stored
+            .assignee_did
+            .take()
+            .filter(|s| !assignee_slot_blank(s));
         sqlx::query(
             "INSERT INTO agent_tasks (id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
         )
-        .bind(&task.id)
-        .bind(&task.repo_id)
-        .bind(&task.kind)
-        .bind(&task.status)
-        .bind(&task.delegator_did)
-        .bind(&task.assignee_did)
-        .bind(&task.capability)
-        .bind(&task.ucan_token)
-        .bind(&task.payload)
-        .bind(&task.result)
-        .bind(&task.created_at)
-        .bind(&task.updated_at)
-        .bind(&task.deadline)
+        .bind(&stored.id)
+        .bind(&stored.repo_id)
+        .bind(&stored.kind)
+        .bind(&stored.status)
+        .bind(&stored.delegator_did)
+        .bind(&stored.assignee_did)
+        .bind(&stored.capability)
+        .bind(&stored.ucan_token)
+        .bind(&stored.payload)
+        .bind(&stored.result)
+        .bind(&stored.created_at)
+        .bind(&stored.updated_at)
+        .bind(&stored.deadline)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(stored)
     }
 
     pub async fn get_task(&self, id: &str) -> Result<Option<AgentTask>> {
@@ -2248,38 +4243,102 @@ impl Db {
         Ok(rows.into_iter().map(row_to_task).collect())
     }
 
+    /// Claim a pending task for `assignee_did`.
+    ///
+    /// If the task was created with a non-blank pre-set `assignee_did`, only that
+    /// agent (DID-normalized via [`crate::api::did_matches`]) may claim it. Open
+    /// tasks (`NULL` / blank) remain first-claimer-wins. A reserved claim keeps
+    /// the **exact** stored DID form via `COALESCE($4, $2)` (no BTRIM rewrite) so
+    /// exact-match list filters still work. The UPDATE also re-checks the
+    /// assignee slot as defense-in-depth against a future writer racing the
+    /// pre-check.
     pub async fn claim_task(&self, id: &str, assignee_did: &str) -> Result<AgentTask> {
         let now = Utc::now().to_rfc3339();
+        // Denial path only needs status + assignee — do not load payload/UCAN
+        // for a permissionless caller who will be rejected.
+        let row = sqlx::query("SELECT status, assignee_did FROM agent_tasks WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("task not claimable: not found or already claimed"))?;
+        let status: String = row.get("status");
+        if status != "pending" {
+            return Err(anyhow::anyhow!(
+                "task not claimable: not found or already claimed"
+            ));
+        }
+        let stored: Option<String> = row.get("assignee_did");
+        // Blank reservations are treated as open. Keep the exact stored string
+        // for the UPDATE equality check and SET (do not BTRIM the reserved form).
+        // Blank definition matches SQL `BTRIM(..., E' \t\n\r')` (not space-only).
+        let reserved_exact = stored.as_deref().filter(|r| !assignee_slot_blank(r));
+        if let Some(reserved) = reserved_exact {
+            if !crate::api::did_matches(assignee_did, trim_assignee_did(reserved)) {
+                return Err(TaskReservedForOtherAssignee.into());
+            }
+        }
+        // Keep the exact reserved form ($4); only fill assignee on open claims ($2).
+        // Treat blank stored values as open for the SQL slot check.
         let row = sqlx::query(
-            "UPDATE agent_tasks SET status='claimed', assignee_did=$2, updated_at=$3
+            "UPDATE agent_tasks SET status='claimed',
+                 assignee_did = COALESCE($4, $2),
+                 updated_at=$3
              WHERE id=$1 AND status='pending'
+               AND (
+                 ($4::text IS NULL AND (assignee_did IS NULL OR BTRIM(assignee_did, E' \t\n\r') = ''))
+                 OR assignee_did = $4
+               )
              RETURNING id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline",
         )
         .bind(id)
         .bind(assignee_did)
         .bind(&now)
+        .bind(reserved_exact)
         .fetch_optional(&self.pool)
         .await?;
         row.map(row_to_task)
             .ok_or_else(|| anyhow::anyhow!("task not claimable: not found or already claimed"))
     }
 
+    /// Transition a claimed task to `new_status` (`completed` / `failed`).
+    ///
+    /// `actor_did` must be the task's assignee (DID-normalized). The UPDATE
+    /// binds the exact stored `assignee_did` so a concurrent reassignment /
+    /// re-claim cannot finish under a check-then-act race in the handler.
     pub async fn finish_task(
         &self,
         id: &str,
         new_status: &str,
         result: Option<&str>,
+        actor_did: &str,
     ) -> Result<AgentTask> {
         let now = Utc::now().to_rfc3339();
+        let existing = self
+            .get_task(id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("task not found or not in claimed state"))?;
+        if existing.status != "claimed" {
+            return Err(anyhow::anyhow!("task not found or not in claimed state"));
+        }
+        let Some(ref assigned) = existing.assignee_did else {
+            return Err(anyhow::anyhow!("task not found or not in claimed state"));
+        };
+        // Trim matches claim_task so tab-padded stored values can finish.
+        if !crate::api::did_matches(actor_did, trim_assignee_did(assigned)) {
+            return Err(anyhow::anyhow!(
+                "task not finishable: only the assignee may finish it"
+            ));
+        }
         let row = sqlx::query(
             "UPDATE agent_tasks SET status=$2, result=$3, updated_at=$4
-             WHERE id=$1 AND status='claimed'
+             WHERE id=$1 AND status='claimed' AND assignee_did=$5
              RETURNING id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline",
         )
         .bind(id)
         .bind(new_status)
         .bind(result)
         .bind(&now)
+        .bind(assigned.as_str())
         .fetch_optional(&self.pool)
         .await?;
         row.map(row_to_task)
@@ -2386,6 +4445,576 @@ impl Db {
 
 // ── Row helpers ───────────────────────────────────────────────────────────────
 
+#[cfg_attr(not(test), allow(dead_code))]
+fn row_to_repo_mirror_state(r: sqlx::postgres::PgRow) -> Result<RepoMirrorState> {
+    let repo_id = r
+        .try_get("id")
+        .context("reading mirror repository id from database")?;
+    let upstream_url = r
+        .try_get("upstream_url")
+        .context("reading mirror upstream URL from database")?;
+    let status = r
+        .try_get::<String, _>("mirror_status")
+        .context("reading mirror status from database")?;
+    let status = MirrorStatus::from_db(&status)?;
+    let transition_id = r
+        .try_get("mirror_transition_id")
+        .context("reading mirror transition id from database")?;
+    let transition_phase = r
+        .try_get::<Option<String>, _>("mirror_transition_phase")
+        .context("reading mirror transition phase from database")?
+        .as_deref()
+        .map(MirrorTransitionPhase::from_db)
+        .transpose()?;
+    let updated_at = r
+        .try_get::<String, _>("mirror_updated_at")
+        .context("reading mirror update timestamp from database")?
+        .parse::<DateTime<Utc>>()
+        .context("invalid mirror_updated_at stored in database")?;
+
+    let state = RepoMirrorState {
+        repo_id,
+        upstream_url,
+        status,
+        transition_id,
+        transition_phase,
+        updated_at,
+    };
+    state.validate()?;
+    Ok(state)
+}
+
+#[cfg(test)]
+mod mirror_state_tests {
+    use super::{
+        row_to_repo_mirror_state, validate_mirror_upstream_url, Db, MirrorStatus,
+        MirrorTransitionPhase, RepoMirrorState, RepoRecord,
+    };
+    use chrono::{DateTime, Utc};
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    fn ts(value: &str) -> DateTime<Utc> {
+        value.parse().unwrap()
+    }
+
+    fn repo(id: Uuid) -> RepoRecord {
+        RepoRecord {
+            id: id.to_string(),
+            name: "mirror-fixture".to_string(),
+            owner_did: "did:key:z6MkMirrorOwner".to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: ts("2026-08-14T00:00:00Z"),
+            updated_at: ts("2026-08-14T00:00:00Z"),
+            disk_path: format!("/srv/repos/{id}.git"),
+            forked_from: None,
+            machine_id: None,
+        }
+    }
+
+    async fn migrated_db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    #[test]
+    fn upstream_url_accepts_https_forges_without_credentials() {
+        for valid in [
+            "https://github.com/Gitlawb/node.git",
+            "https://gitlab.example.com/platform/subgroup/node",
+            "https://ghe.internal.example/org/repo.git",
+        ] {
+            validate_mirror_upstream_url(valid).unwrap();
+        }
+    }
+
+    #[test]
+    fn upstream_url_rejects_unsafe_or_ambiguous_forms() {
+        for invalid in [
+            "",
+            "http://github.com/Gitlawb/node.git",
+            "ssh://git@github.com/Gitlawb/node.git",
+            "file:///etc/passwd",
+            "https://user:secret@github.com/Gitlawb/node.git",
+            "https://github.com/Gitlawb/node.git?token=secret",
+            "https://github.com/Gitlawb/node.git#main",
+            "https://github.com/",
+            "https://github.com/Gitlawb/node.git\n",
+            "https://localhost/Gitlawb/node.git",
+            "https://forge.localhost/Gitlawb/node.git",
+            "https://127.0.0.1/Gitlawb/node.git",
+            "https://[::1]/Gitlawb/node.git",
+            "https://169.254.169.254/Gitlawb/node.git",
+            "https://10.0.0.5/Gitlawb/node.git",
+            "https://172.16.0.5/Gitlawb/node.git",
+            "https://192.168.1.5/Gitlawb/node.git",
+            "https://forge.internal/Gitlawb/node.git",
+            "https://[::ffff:127.0.0.1]/Gitlawb/node.git",
+            "https://[64:ff9b::7f00:1]/Gitlawb/node.git",
+        ] {
+            assert!(
+                validate_mirror_upstream_url(invalid).is_err(),
+                "unsafe mirror URL was accepted: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn transition_metadata_must_match_the_status() {
+        let base = RepoMirrorState {
+            repo_id: Uuid::new_v4().to_string(),
+            upstream_url: "https://github.com/Gitlawb/node.git".to_string(),
+            status: MirrorStatus::Inbound,
+            transition_id: None,
+            transition_phase: None,
+            updated_at: Utc::now(),
+        };
+        base.validate().unwrap();
+
+        let mut invalid = base.clone();
+        invalid.status = MirrorStatus::TransitioningInboundToOutbound;
+        assert!(invalid.validate().is_err());
+
+        invalid.transition_id = Some(Uuid::new_v4());
+        invalid.transition_phase = Some(MirrorTransitionPhase::DrainingWrites);
+        invalid.validate().unwrap();
+
+        invalid.transition_phase = Some(MirrorTransitionPhase::Completed);
+        assert!(invalid.validate().is_err());
+    }
+
+    #[sqlx::test]
+    async fn migrations_v30_v31_upgrade_an_existing_repo_without_rewriting_it(pool: PgPool) {
+        let db = migrated_db(pool).await;
+
+        // Recreate the pre-v30 shape, then add data written by the old node.
+        sqlx::query("ALTER TABLE repos DROP COLUMN upstream_url CASCADE")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        for column in [
+            "mirror_status",
+            "mirror_transition_id",
+            "mirror_transition_phase",
+            "mirror_updated_at",
+        ] {
+            sqlx::query(&format!("ALTER TABLE repos DROP COLUMN {column}"))
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query("DELETE FROM schema_migrations WHERE version IN (30, 31)")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let existing = repo(Uuid::new_v4());
+        db.create_repo(&existing).await.unwrap();
+
+        db.run_migrations().await.unwrap();
+
+        let still_there: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repos WHERE id = $1")
+            .bind(&existing.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            still_there, 1,
+            "the existing repository must survive v30/v31"
+        );
+
+        let mirror_values: (Option<String>, Option<String>, Option<Uuid>, Option<String>) =
+            sqlx::query_as(
+                "SELECT upstream_url, mirror_status, mirror_transition_id,
+                        mirror_transition_phase
+                 FROM repos WHERE id = $1",
+            )
+            .bind(&existing.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(mirror_values, (None, None, None, None));
+
+        let recorded: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT version, name FROM schema_migrations
+             WHERE version IN (30, 31) ORDER BY version",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            recorded,
+            vec![
+                (30, "repo_upstream_mirror_state".to_string()),
+                (31, "validate_repo_upstream_mirror_state".to_string()),
+            ]
+        );
+        let constraint_validated: bool = sqlx::query_scalar(
+            "SELECT convalidated FROM pg_constraint
+             WHERE conrelid = 'repos'::regclass
+               AND conname = 'repos_mirror_state_valid'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(constraint_validated, "v31 must validate the v30 constraint");
+
+        // Production entry point remains idempotent after the upgrade.
+        db.run_migrations().await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn migration_replaces_a_same_named_weaker_constraint(pool: PgPool) {
+        let db = migrated_db(pool).await;
+
+        sqlx::query("ALTER TABLE repos DROP CONSTRAINT repos_mirror_state_valid")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "ALTER TABLE repos ADD CONSTRAINT repos_mirror_state_valid CHECK (TRUE) NOT VALID",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version IN (30, 31)")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        db.run_migrations().await.unwrap();
+
+        let definition: String = sqlx::query_scalar(
+            "SELECT pg_get_constraintdef(oid)
+             FROM pg_constraint
+             WHERE conrelid = 'repos'::regclass
+               AND conname = 'repos_mirror_state_valid'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(
+            definition.contains("transitioning_inbound_to_outbound")
+                && !definition.eq_ignore_ascii_case("CHECK (true)"),
+            "migration preserved an impostor constraint: {definition}"
+        );
+
+        let existing = repo(Uuid::new_v4());
+        db.create_repo(&existing).await.unwrap();
+        let malformed = sqlx::query(
+            "UPDATE repos
+             SET upstream_url = 'https://github.com/Gitlawb/node.git',
+                 mirror_status = 'transitioning_inbound_to_outbound',
+                 mirror_updated_at = '2026-08-14T00:00:00Z'
+             WHERE id = $1",
+        )
+        .bind(&existing.id)
+        .execute(&db.pool)
+        .await;
+        assert!(
+            malformed.is_err(),
+            "replacement constraint accepted missing transition metadata"
+        );
+    }
+
+    #[sqlx::test]
+    async fn inbound_configuration_round_trips_without_overwriting_state(pool: PgPool) {
+        let db = migrated_db(pool).await;
+        let existing = repo(Uuid::new_v4());
+        db.create_repo(&existing).await.unwrap();
+
+        assert!(db
+            .get_repo_mirror_state(&existing.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        let first = db
+            .configure_inbound_mirror(&existing.id, "https://github.com/Gitlawb/node.git")
+            .await
+            .unwrap();
+        assert_eq!(first.status, MirrorStatus::Inbound);
+        assert_eq!(first.transition_id, None);
+        assert_eq!(first.transition_phase, None);
+
+        // An exact retry is safe, but a different source cannot replace it.
+        let original_updated_at = DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        sqlx::query("UPDATE repos SET mirror_updated_at = $2 WHERE id = $1")
+            .bind(&existing.id)
+            .bind(original_updated_at.to_rfc3339())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let retry = db
+            .configure_inbound_mirror(&existing.id, "https://github.com/Gitlawb/node.git")
+            .await
+            .unwrap();
+        assert_eq!(retry.updated_at, original_updated_at);
+        assert!(db
+            .configure_inbound_mirror(&existing.id, "https://github.com/Gitlawb/other.git",)
+            .await
+            .is_err());
+
+        let stored = db
+            .get_repo_mirror_state(&existing.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.upstream_url, first.upstream_url);
+        assert_eq!(stored.status, MirrorStatus::Inbound);
+        assert_eq!(stored.updated_at, original_updated_at);
+    }
+
+    #[sqlx::test]
+    async fn malformed_mirror_row_returns_an_error_instead_of_panicking(pool: PgPool) {
+        let row = sqlx::query(
+            "SELECT 'repo-id'::text AS id,
+                    'https://github.com/Gitlawb/node.git'::text AS upstream_url,
+                    'inbound'::text AS mirror_status,
+                    NULL::uuid AS mirror_transition_id,
+                    NULL::text AS mirror_transition_phase,
+                    NULL::text AS mirror_updated_at",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let error = row_to_repo_mirror_state(row).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("reading mirror update timestamp from database"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn inbound_configuration_never_resets_an_active_transition(pool: PgPool) {
+        let db = migrated_db(pool).await;
+        let existing = repo(Uuid::new_v4());
+        db.create_repo(&existing).await.unwrap();
+        db.configure_inbound_mirror(&existing.id, "https://github.com/Gitlawb/node.git")
+            .await
+            .unwrap();
+
+        let transition_id = Uuid::new_v4();
+        sqlx::query(
+            "UPDATE repos
+             SET mirror_status = 'transitioning_inbound_to_outbound',
+                 mirror_transition_id = $2,
+                 mirror_transition_phase = 'draining_writes'
+             WHERE id = $1",
+        )
+        .bind(&existing.id)
+        .bind(transition_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let retry = db
+            .configure_inbound_mirror(&existing.id, "https://github.com/Gitlawb/node.git")
+            .await;
+        assert!(retry.is_err(), "configuration must not reset a transition");
+
+        let stored = db
+            .get_repo_mirror_state(&existing.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, MirrorStatus::TransitioningInboundToOutbound);
+        assert_eq!(stored.transition_id, Some(transition_id));
+        assert_eq!(
+            stored.transition_phase,
+            Some(MirrorTransitionPhase::DrainingWrites)
+        );
+    }
+
+    #[sqlx::test]
+    async fn database_constraint_rejects_partial_or_insecure_mirror_state(pool: PgPool) {
+        let db = migrated_db(pool).await;
+        let existing = repo(Uuid::new_v4());
+        db.create_repo(&existing).await.unwrap();
+
+        let partial = sqlx::query(
+            "UPDATE repos
+             SET upstream_url = 'https://github.com/Gitlawb/node.git',
+                 mirror_status = 'transitioning_inbound_to_outbound',
+                 mirror_updated_at = '2026-08-14T00:00:00Z'
+             WHERE id = $1",
+        )
+        .bind(&existing.id)
+        .execute(&db.pool)
+        .await;
+        assert!(partial.is_err(), "transition metadata must be durable");
+
+        // PostgreSQL CHECK constraints accept NULL results. These cases pin
+        // the outer `IS TRUE` guard so SQL three-valued logic cannot admit a
+        // row that the Rust reader rejects or panics while decoding.
+        struct InvalidNullState<'a> {
+            case: &'a str,
+            status: Option<&'a str>,
+            transition_id: Option<Uuid>,
+            transition_phase: Option<&'a str>,
+        }
+        let invalid_null_states = [
+            InvalidNullState {
+                case: "missing mirror status",
+                status: None,
+                transition_id: None,
+                transition_phase: None,
+            },
+            InvalidNullState {
+                case: "stable status with job but no phase",
+                status: Some("inbound"),
+                transition_id: Some(Uuid::new_v4()),
+                transition_phase: None,
+            },
+            InvalidNullState {
+                case: "transition with job but no phase",
+                status: Some("transitioning_inbound_to_outbound"),
+                transition_id: Some(Uuid::new_v4()),
+                transition_phase: None,
+            },
+        ];
+        for invalid in invalid_null_states {
+            let result = sqlx::query(
+                "UPDATE repos
+                 SET upstream_url = 'https://github.com/Gitlawb/node.git',
+                     mirror_status = $2,
+                     mirror_transition_id = $3,
+                     mirror_transition_phase = $4,
+                     mirror_updated_at = '2026-08-14T00:00:00Z'
+                 WHERE id = $1",
+            )
+            .bind(&existing.id)
+            .bind(invalid.status)
+            .bind(invalid.transition_id)
+            .bind(invalid.transition_phase)
+            .execute(&db.pool)
+            .await;
+            assert!(result.is_err(), "constraint accepted {}", invalid.case);
+        }
+
+        let insecure = sqlx::query(
+            "UPDATE repos
+             SET upstream_url = 'http://github.com/Gitlawb/node.git',
+                 mirror_status = 'inbound',
+                 mirror_updated_at = '2026-08-14T00:00:00Z'
+             WHERE id = $1",
+        )
+        .bind(&existing.id)
+        .execute(&db.pool)
+        .await;
+        assert!(
+            insecure.is_err(),
+            "the database must reject non-HTTPS upstreams"
+        );
+    }
+
+    #[sqlx::test]
+    async fn database_constraint_accepts_the_complete_transition_vocabulary(pool: PgPool) {
+        let db = migrated_db(pool).await;
+        let existing = repo(Uuid::new_v4());
+        db.create_repo(&existing).await.unwrap();
+
+        let phases = [
+            "queued",
+            "starting",
+            "initializing_mirror_fetch",
+            "draining_writes",
+            "finalizing_mirror_fetch",
+            "finalizing_mirror_push",
+            "committing_target_status",
+            "rolling_back",
+        ];
+        for status in [
+            "transitioning_inbound_to_outbound",
+            "transitioning_outbound_to_inbound",
+        ] {
+            for phase in phases {
+                sqlx::query(
+                    "UPDATE repos
+                     SET upstream_url = 'https://github.com/Gitlawb/node.git',
+                         mirror_status = $2,
+                         mirror_transition_id = $3,
+                         mirror_transition_phase = $4,
+                         mirror_updated_at = '2026-08-14T00:00:00Z'
+                     WHERE id = $1",
+                )
+                .bind(&existing.id)
+                .bind(status)
+                .bind(Uuid::new_v4())
+                .bind(phase)
+                .execute(&db.pool)
+                .await
+                .unwrap_or_else(|error| panic!("{status}/{phase} was rejected: {error}"));
+            }
+        }
+
+        // A completed job remains auditable after authority reaches its stable
+        // target status; the initial never-transitioned state uses two NULLs.
+        sqlx::query(
+            "UPDATE repos
+             SET mirror_status = 'outbound',
+                 mirror_transition_id = $2,
+                 mirror_transition_phase = 'completed'
+             WHERE id = $1",
+        )
+        .bind(&existing.id)
+        .bind(Uuid::new_v4())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let stored = db
+            .get_repo_mirror_state(&existing.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, MirrorStatus::Outbound);
+        assert_eq!(
+            stored.transition_phase,
+            Some(MirrorTransitionPhase::Completed)
+        );
+    }
+
+    #[sqlx::test]
+    async fn continuous_mirror_uuid_gate_leaves_peer_rows_untouched(pool: PgPool) {
+        let db = migrated_db(pool).await;
+        db.upsert_mirror_repo("z6MkPeer", "repo", "/srv/peer/repo.git", None, false)
+            .await
+            .unwrap();
+
+        let error = db
+            .configure_inbound_mirror("z6MkPeer/repo", "https://github.com/Gitlawb/node.git")
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}")
+                .contains("continuous mirrors require a canonical UUID repository id"),
+            "unexpected error: {error:#}"
+        );
+
+        let unchanged: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT upstream_url, mirror_status FROM repos WHERE id = $1")
+                .bind("z6MkPeer/repo")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(unchanged, (None, None));
+        assert!(db
+            .get_repo_mirror_state("z6MkPeer/repo")
+            .await
+            .unwrap()
+            .is_none());
+    }
+}
+
 fn row_to_repo(r: sqlx::postgres::PgRow) -> RepoRecord {
     let created_str: String = r.get("created_at");
     let updated_str: String = r.get("updated_at");
@@ -2453,6 +5082,7 @@ fn row_to_cert(r: sqlx::postgres::PgRow) -> RefCertificate {
         node_did: r.get("node_did"),
         signature: r.get("signature"),
         issued_at: r.get("issued_at"),
+        version: r.get::<i32, _>("version") as u32,
     }
 }
 
@@ -2469,6 +5099,7 @@ fn row_to_ref_update(r: sqlx::postgres::PgRow) -> ReceivedRefUpdate {
         cert_id: r.get("cert_id"),
         received_at: r.get("received_at"),
         from_peer: r.get("from_peer"),
+        owner_did: r.get("owner_did"),
     }
 }
 
@@ -2659,6 +5290,113 @@ impl Db {
         }
         Ok(out)
     }
+
+    /// Visibility rules for one scan page, bounded IN THE QUERY by a byte budget.
+    ///
+    /// The unbounded sibling above is right for the listing surfaces: they read a page
+    /// the caller is already authorized for. It is wrong for the resolver's legacy scan,
+    /// which runs on an anonymously reachable route while holding scarce walk admission.
+    /// A repo owner controls both how many rules their repos carry and how long each
+    /// `reader_dids` list is, so summing the bytes AFTER the rows arrive truncates the
+    /// request without bounding the work: the oversized page has already been transferred
+    /// and allocated by the time the sum is taken (INV-10 bounds work done, never results
+    /// measured afterwards).
+    ///
+    /// The cut lands on a REPO boundary, never inside one. A partially loaded rule set is
+    /// indistinguishable at the gate from a repo with no rules at all, so a mid-repo cut
+    /// would FAIL OPEN and serve a path-scoped object the missing rules would have
+    /// denied. Every repo this returns is therefore complete, and the caller drops the
+    /// page's tail from the cut onward rather than gating it against rules it does not
+    /// have.
+    ///
+    /// `repo_ids` must be in the page's `(created_at, id)` order; the returned cut is the
+    /// 0-based index into that slice of the first repo whose rules did NOT fit, or `None`
+    /// when the whole page fit. Repos carrying no rules never cut.
+    ///
+    /// The FIRST rule-carrying repo of a page is admitted whatever its size, so a page
+    /// always makes progress. Without that a repo whose rules alone exceed the remaining
+    /// budget would put the cut at the cursor, the caller's next request would reproduce
+    /// it exactly, and the ladder would be wedged on a permanent 503. One repo's rule set
+    /// is the residual bound this leaves; the whole page's was the bound before.
+    pub async fn list_visibility_rules_for_repos_bounded(
+        &self,
+        repo_ids: &[String],
+        byte_budget: usize,
+    ) -> Result<(
+        std::collections::HashMap<String, Vec<VisibilityRule>>,
+        Option<usize>,
+    )> {
+        use std::collections::HashMap;
+        if repo_ids.is_empty() {
+            return Ok((HashMap::new(), None));
+        }
+        // `running` is a sum of non-negative per-repo sizes over the page order, so it is
+        // monotonic: once it passes the budget every later repo is excluded too, which is
+        // what makes "the kept set is a prefix" true and the single cut index meaningful.
+        // `rn = 1` is the always-admit escape for the first rule-carrying repo.
+        let rows = sqlx::query(
+            "WITH sized AS (
+                 SELECT v.id, v.repo_id, v.path_glob, v.mode, v.reader_dids, v.created_by,
+                        v.created_at,
+                        octet_length(v.id) + octet_length(v.repo_id)
+                          + octet_length(v.path_glob) + octet_length(v.created_by)
+                          + octet_length(v.reader_dids) AS b,
+                        array_position($1::text[], v.repo_id) AS pos
+                 FROM visibility_rules v
+                 WHERE v.repo_id = ANY($1::text[])
+             ),
+             per_repo AS (
+                 SELECT repo_id, pos, SUM(b) AS repo_bytes FROM sized GROUP BY repo_id, pos
+             ),
+             cum AS (
+                 SELECT repo_id, pos,
+                        SUM(repo_bytes) OVER (ORDER BY pos ROWS UNBOUNDED PRECEDING) AS running,
+                        ROW_NUMBER() OVER (ORDER BY pos) AS rn
+                 FROM per_repo
+             ),
+             kept AS (
+                 SELECT repo_id, pos FROM cum WHERE running <= $2::bigint OR rn = 1
+             ),
+             cut AS (
+                 SELECT MIN(pos) AS cut_pos FROM cum WHERE running > $2::bigint AND rn > 1
+             )
+             SELECT s.id, s.repo_id, s.path_glob, s.mode, s.reader_dids, s.created_by,
+                    s.created_at, cut.cut_pos
+             FROM sized s
+             JOIN kept k ON k.repo_id = s.repo_id
+             CROSS JOIN cut
+             ORDER BY k.pos, s.path_glob",
+        )
+        .bind(repo_ids)
+        .bind(byte_budget.min(i64::MAX as usize) as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        // `array_position` is 1-based and the caller indexes a slice. No rows means no
+        // rules matched the page at all, which is also no cut.
+        let cut_at = rows
+            .first()
+            .and_then(|r| r.get::<Option<i32>, _>("cut_pos"))
+            .map(|pos| (pos as usize).saturating_sub(1));
+        let mut out: HashMap<String, Vec<VisibilityRule>> = HashMap::new();
+        for r in rows {
+            let readers: String = r.get("reader_dids");
+            let created_at: String = r.get("created_at");
+            let rule = VisibilityRule {
+                id: r.get("id"),
+                repo_id: r.get("repo_id"),
+                path_glob: r.get("path_glob"),
+                mode: VisibilityMode::from_db(&r.get::<String, _>("mode")),
+                reader_dids: serde_json::from_str(&readers).unwrap_or_default(),
+                created_by: r.get("created_by"),
+                created_at: created_at
+                    .parse::<DateTime<Utc>>()
+                    .unwrap_or_else(|_| Utc::now()),
+            };
+            out.entry(rule.repo_id.clone()).or_default().push(rule);
+        }
+        Ok((out, cut_at))
+    }
 }
 
 // ── Repo Stars ────────────────────────────────────────────────────────────────
@@ -2819,6 +5557,8 @@ impl Db {
         repo_name: Option<&str>,
         status: Option<&str>,
         limit: i64,
+        after_created_at: Option<&str>,
+        after_id: Option<&str>,
     ) -> Result<Vec<BountyRecord>> {
         let mut sql = String::from("SELECT * FROM bounties WHERE 1=1");
         let mut binds: Vec<String> = Vec::new();
@@ -2839,7 +5579,15 @@ impl Db {
             binds.push(s.to_string());
             idx += 1;
         }
-        sql.push_str(&format!(" ORDER BY created_at DESC LIMIT ${idx}"));
+        if let Some(ts) = after_created_at {
+            let id = after_id.unwrap_or("");
+            sql.push_str(&format!(" AND (created_at, id) < (${idx}, ${})", idx + 1));
+            binds.push(ts.to_string());
+            idx += 1;
+            binds.push(id.to_string());
+            idx += 1;
+        }
+        sql.push_str(&format!(" ORDER BY created_at DESC, id DESC LIMIT ${idx}"));
 
         let mut q = sqlx::query(&sql);
         for b in &binds {
@@ -2917,31 +5665,110 @@ impl Db {
         Ok(())
     }
 
-    pub async fn count_bounties_by_status(&self, status: &str) -> Result<i64> {
-        let row = sqlx::query("SELECT COUNT(*) as c FROM bounties WHERE status = $1")
+    // ── Visibility-filtered bounty aggregates (#477) ─────────────────────
+
+    /// Count bounties by status, restricted to repos whose `(owner_did, name)`
+    /// pairs are in `visible`.  Owner keys are normalized on both sides so
+    /// `did:key:` and bare-key forms match.  An empty set returns 0.
+    pub async fn count_bounties_by_status_visible(
+        &self,
+        status: &str,
+        visible: &[(String, String)],
+    ) -> Result<i64> {
+        if visible.is_empty() {
+            return Ok(0);
+        }
+        let owners: Vec<String> = visible.iter().map(|(o, _)| o.clone()).collect();
+        let names: Vec<String> = visible.iter().map(|(_, n)| n.clone()).collect();
+        let sql = format!(
+            "SELECT COUNT(*) as c FROM bounties b \
+             WHERE b.status = $1 \
+             AND EXISTS ( \
+                 SELECT 1 FROM unnest($2::text[], $3::text[]) AS v(o, n) \
+                 WHERE ({bounty_owner}) = v.o AND b.repo_name = v.n \
+             )",
+            bounty_owner = BOUNTY_OWNER_CASE_SQL,
+        );
+        let row = sqlx::query(&sql)
             .bind(status)
+            .bind(&owners)
+            .bind(&names)
             .fetch_one(&self.pool)
             .await?;
         Ok(row.get::<i64, _>("c"))
     }
 
-    pub async fn agent_bounty_stats(&self, agent_did: &str) -> Result<(i64, i64)> {
-        let row = sqlx::query(
-            "SELECT COUNT(*) as cnt, COALESCE(SUM(amount),0) as total FROM bounties WHERE claimant_did = $1 AND status = 'completed'",
-        )
-        .bind(agent_did)
-        .fetch_one(&self.pool)
-        .await?;
+    /// Per-agent bounty stats restricted to visible repos.  `b.repo_owner` is
+    /// normalized and `b.claimant_did` is matched against both spellings of the
+    /// agent key, so `did:key:` and bare-key forms match.
+    pub async fn agent_bounty_stats_visible(
+        &self,
+        agent_did: &str,
+        visible: &[(String, String)],
+    ) -> Result<(i64, i64)> {
+        if visible.is_empty() {
+            return Ok((0, 0));
+        }
+        // Index-friendly form of `normalize(claimant_did) = N`: a claimant
+        // normalizes to N only when stored as N or as `did:key:N` (the latter
+        // only when N has no ':', else the prefix is not stripped). Matching
+        // the raw column keeps `idx_bounties_claimant` usable.
+        let normalized_agent = normalize_owner_key(agent_did);
+        let mut claimants: Vec<String> = vec![normalized_agent.to_string()];
+        if !normalized_agent.contains(':') {
+            claimants.push(format!("did:key:{normalized_agent}"));
+        }
+        let owners: Vec<String> = visible.iter().map(|(o, _)| o.clone()).collect();
+        let names: Vec<String> = visible.iter().map(|(_, n)| n.clone()).collect();
+        let sql = format!(
+            "SELECT COUNT(*) as cnt, COALESCE(SUM(amount), 0)::BIGINT as total FROM bounties b \
+             WHERE b.claimant_did = ANY($1::text[]) \
+             AND b.status = 'completed' \
+             AND EXISTS ( \
+                 SELECT 1 FROM unnest($2::text[], $3::text[]) AS v(o, n) \
+                 WHERE ({bounty_owner}) = v.o AND b.repo_name = v.n \
+             )",
+            bounty_owner = BOUNTY_OWNER_CASE_SQL,
+        );
+        let row = sqlx::query(&sql)
+            .bind(&claimants)
+            .bind(&owners)
+            .bind(&names)
+            .fetch_one(&self.pool)
+            .await?;
         Ok((row.get::<i64, _>("cnt"), row.get::<i64, _>("total")))
     }
 
-    pub async fn bounty_leaderboard(&self, limit: i64) -> Result<Vec<(String, i64, i64)>> {
-        let rows = sqlx::query(
-            "SELECT claimant_did, COUNT(*) as cnt, COALESCE(SUM(amount),0) as total FROM bounties WHERE status='completed' AND claimant_did IS NOT NULL GROUP BY claimant_did ORDER BY total DESC LIMIT $1",
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+    /// Leaderboard restricted to visible repos.  Owner and claimant keys are
+    /// normalized so `did:key:` and bare-key forms match and group together.
+    pub async fn bounty_leaderboard_visible(
+        &self,
+        limit: i64,
+        visible: &[(String, String)],
+    ) -> Result<Vec<(String, i64, i64)>> {
+        if visible.is_empty() {
+            return Ok(Vec::new());
+        }
+        let owners: Vec<String> = visible.iter().map(|(o, _)| o.clone()).collect();
+        let names: Vec<String> = visible.iter().map(|(_, n)| n.clone()).collect();
+        let sql = format!(
+            "SELECT MIN(claimant_did) as claimant_did, COUNT(*) as cnt, COALESCE(SUM(amount), 0)::BIGINT as total \
+             FROM bounties b \
+             WHERE b.status = 'completed' AND b.claimant_did IS NOT NULL \
+             AND EXISTS ( \
+                 SELECT 1 FROM unnest($1::text[], $2::text[]) AS v(o, n) \
+                 WHERE ({bounty_owner}) = v.o AND b.repo_name = v.n \
+             ) \
+             GROUP BY ({claimant_case}) ORDER BY total DESC LIMIT $3",
+            claimant_case = BOUNTY_CLAIMANT_CASE_SQL,
+            bounty_owner = BOUNTY_OWNER_CASE_SQL,
+        );
+        let rows = sqlx::query(&sql)
+            .bind(&owners)
+            .bind(&names)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows
             .iter()
             .map(|r| {
@@ -3001,6 +5828,9 @@ impl Db {
             let new_website = website.or(existing.website.as_deref());
             let new_socials = socials.or(existing.socials.as_deref());
 
+            // get_profile equates bare short ids with did:key:<id>. UPDATE must target
+            // the stored row identity (existing.did), not the caller's raw input form,
+            // or a did:key: alias against a bare-stored profile updates zero rows.
             sqlx::query(
                 "UPDATE agent_profiles
                  SET display_name=$1, bio=$2, avatar_url=$3, website=$4, socials=$5, updated_at=$6
@@ -3012,12 +5842,12 @@ impl Db {
             .bind(new_website)
             .bind(new_socials)
             .bind(&now)
-            .bind(did)
+            .bind(&existing.did)
             .execute(&self.pool)
             .await?;
 
             Ok(ProfileRecord {
-                did: did.to_string(),
+                did: existing.did,
                 display_name: new_name.map(String::from),
                 bio: new_bio.map(String::from),
                 avatar_url: new_avatar.map(String::from),
@@ -3058,14 +5888,20 @@ impl Db {
     }
 
     pub async fn get_profile(&self, did: &str) -> Result<Option<ProfileRecord>> {
-        let row = sqlx::query(
+        // Same owner-key contract as get_repo: strip `did:key:` only when the
+        // remainder is a bare key id. The old `LIKE '%:' || $1` matched any DID
+        // method that shared a suffix and could resolve the wrong profile.
+        let did_key = normalize_owner_key(did);
+        let sql = format!(
             "SELECT did, display_name, bio, avatar_url, website, socials, profile_cid, created_at, updated_at
              FROM agent_profiles
-             WHERE did = $1 OR did LIKE '%:' || $1",
-        )
-        .bind(did)
-        .fetch_optional(&self.pool)
-        .await?;
+             WHERE ({key}) = $1",
+            key = PROFILE_DID_CASE_SQL
+        );
+        let row = sqlx::query(&sql)
+            .bind(did_key)
+            .fetch_optional(&self.pool)
+            .await?;
 
         Ok(row.map(|r| ProfileRecord {
             did: r.get("did"),
@@ -3081,10 +5917,17 @@ impl Db {
     }
 
     pub async fn set_profile_cid(&self, did: &str, cid: &str) -> Result<()> {
-        sqlx::query("UPDATE agent_profiles SET profile_cid = $1, updated_at = $2 WHERE did = $3")
+        // Same did:key / bare equivalence as get_profile so a full did:key: form
+        // updates a profile stored under the bare short id.
+        let did_key = normalize_owner_key(did);
+        let sql = format!(
+            "UPDATE agent_profiles SET profile_cid = $1, updated_at = $2 WHERE ({key}) = $3",
+            key = PROFILE_DID_CASE_SQL
+        );
+        sqlx::query(&sql)
             .bind(cid)
             .bind(Utc::now().to_rfc3339())
-            .bind(did)
+            .bind(did_key)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -3178,6 +6021,295 @@ mod migration_tests {
         // `schema_migrations` when an existing node upgrades. If you rename
         // it, you must also update the backfill.
         assert_eq!(MIGRATIONS[0].name, MIGRATION_V1_NAME);
+    }
+
+    /// Simulate an existing node at v9 with populated received_ref_updates,
+    /// then apply the v11 migration and verify (a) owner_did IS NULL on
+    /// existing rows, (b) the column exists and is nullable TEXT, and
+    /// (c) idempotent re-run does not error.
+    #[sqlx::test]
+    async fn migration_v11_creates_owner_did_column(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+
+        // Create all tables by running the full migration chain from scratch,
+        // then drop the owner_did column to simulate a pre-v10 schema.
+        db.migrate().await.unwrap();
+        sqlx::query("ALTER TABLE received_ref_updates DROP COLUMN owner_did")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Truncate schema_migrations and re-seed at v9 — simulate an existing
+        // node that has run v1..v9 but not yet v10.
+        sqlx::query("DELETE FROM schema_migrations")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        for m in MIGRATIONS.iter().take_while(|m| m.version < 10) {
+            sqlx::query(
+                "INSERT INTO schema_migrations (version, name, applied_at)
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(m.version)
+            .bind(m.name)
+            .bind("2026-07-01T00:00:00Z")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+
+        // ── Simulate an existing node with rows recorded before v11 ────────
+        // The owner_did column does not exist yet, so we INSERT without it.
+        let row_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO received_ref_updates
+             (id, node_did, pusher_did, repo, ref_name, old_sha, new_sha,
+              timestamp, cert_id, received_at, from_peer)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+        )
+        .bind(&row_id)
+        .bind("did:key:zNode")
+        .bind("did:key:zPusher")
+        .bind("z6MkOwner/myrepo")
+        .bind("refs/heads/main")
+        .bind("0000000000000000000000000000000000000000")
+        .bind("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .bind("2026-07-01T12:00:00Z")
+        .bind::<Option<String>>(None)
+        .bind("2026-07-01T12:00:01Z")
+        .bind("12D3KooWPeer")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM received_ref_updates")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap(),
+            1,
+            "pre-migration row must exist"
+        );
+
+        // ── Apply pending migrations (v10 ref_cert_unique_per_ref, v11 owner_did) ──
+        db.migrate().await.unwrap();
+
+        // ── Assertions ────────────────────────────────────────────────────
+
+        // (a) Existing row has owner_did IS NULL (not overwritten).
+        let owner: Option<String> =
+            sqlx::query_scalar("SELECT owner_did FROM received_ref_updates WHERE id = $1")
+                .bind(&row_id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(owner, None, "existing row's owner_did must be NULL");
+
+        // (b) Column exists and is nullable TEXT.
+        let col: (String, String, String) = sqlx::query_as(
+            "SELECT column_name, data_type, is_nullable
+             FROM information_schema.columns
+             WHERE table_name = 'received_ref_updates' AND column_name = 'owner_did'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(col.0, "owner_did");
+        assert_eq!(col.1, "text");
+        assert_eq!(col.2, "YES", "owner_did must be nullable");
+
+        // (c) Version 11 is recorded as applied.
+        let v11_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM schema_migrations WHERE version = 11")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            v11_count.0, 1,
+            "migration v11 must be recorded in schema_migrations"
+        );
+
+        // (d) Re-run: idempotent — ADD COLUMN IF NOT EXISTS must not error.
+        db.migrate().await.unwrap();
+    }
+
+    // ── sync_queue scheduling (attempted_at, v17) ────────────────────────────
+
+    async fn enqueue_one(db: &super::Db, repo: &str) {
+        db.enqueue_sync(
+            repo,
+            "did:key:zPEER",
+            "refs/heads/main",
+            &"0".repeat(40),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn attempted_at_of(db: &super::Db, repo: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT attempted_at FROM sync_queue WHERE repo = $1")
+            .bind(repo)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+    }
+
+    /// Upgrade-path test: simulate a node already at v11 and let the real
+    /// migration entry point apply v17, rather than hand-copying its SQL.
+    ///
+    /// This is the test that catches the column being added to the v1
+    /// statement array instead of a new migration. v1 never re-runs on an
+    /// existing install, so that mistake breaks every deployed node's dequeue
+    /// while staying invisible to every other test here, since `#[sqlx::test]`
+    /// hands out a fresh database that runs the whole chain.
+    #[sqlx::test]
+    async fn migration_v17_adds_sync_queue_attempted_at(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        // Roll back to v11: drop the column and forget the version.
+        sqlx::query("ALTER TABLE sync_queue DROP COLUMN attempted_at")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 17")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // A row written by the old node, before the column existed.
+        enqueue_one(&db, "z6Mkfoo/legacy").await;
+
+        db.migrate().await.unwrap();
+
+        let col: (String, String) = sqlx::query_as(
+            "SELECT data_type, is_nullable
+             FROM information_schema.columns
+             WHERE table_name = 'sync_queue' AND column_name = 'attempted_at'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(col.0, "text");
+        assert_eq!(col.1, "YES", "attempted_at must be nullable");
+
+        let recorded: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM schema_migrations WHERE version = 17")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(recorded.0, 1, "v17 must be recorded as applied");
+
+        // The pre-existing row survives with a null key and is still dequeued.
+        assert_eq!(attempted_at_of(&db, "z6Mkfoo/legacy").await, None);
+        let items = db.dequeue_pending_syncs(10).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].repo, "z6Mkfoo/legacy");
+
+        // Idempotent re-run.
+        db.migrate().await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn dequeue_stamps_attempted_at_on_every_row_it_hands_out(pool: sqlx::PgPool) {
+        // The stamp is what stops a deferred row from holding the window, and
+        // it happens here rather than at the deferral branches so no call site
+        // can forget it.
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        enqueue_one(&db, "z6Mkfoo/a").await;
+        assert_eq!(
+            attempted_at_of(&db, "z6Mkfoo/a").await,
+            None,
+            "a freshly enqueued row has no attempt yet"
+        );
+
+        let items = db.dequeue_pending_syncs(10).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(
+            attempted_at_of(&db, "z6Mkfoo/a").await.is_some(),
+            "dequeue must stamp the row it returns, whatever the worker does next"
+        );
+    }
+
+    #[sqlx::test]
+    async fn dequeue_orders_by_last_attempt_then_enqueue_time(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        enqueue_one(&db, "z6Mkfoo/older").await;
+        enqueue_one(&db, "z6Mkfoo/newer").await;
+        sqlx::query("UPDATE sync_queue SET enqueued_at = $1 WHERE repo = $2")
+            .bind("2026-07-29T00:00:00Z")
+            .bind("z6Mkfoo/older")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE sync_queue SET enqueued_at = $1 WHERE repo = $2")
+            .bind("2026-07-29T00:00:01Z")
+            .bind("z6Mkfoo/newer")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Never-attempted rows fall back to enqueue order.
+        let first = db.dequeue_pending_syncs(1).await.unwrap();
+        assert_eq!(first[0].repo, "z6Mkfoo/older");
+
+        // Having been attempted, it now sorts behind the untried row.
+        let second = db.dequeue_pending_syncs(1).await.unwrap();
+        assert_eq!(
+            second[0].repo, "z6Mkfoo/newer",
+            "an attempted row must yield to one that has never been tried"
+        );
+    }
+
+    #[sqlx::test]
+    async fn dequeue_leaves_enqueued_at_untouched(pool: sqlx::PgPool) {
+        // enqueued_at keeps meaning enqueue time, so backlog age stays
+        // measurable; that is the reason attempted_at is a separate column.
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        enqueue_one(&db, "z6Mkfoo/a").await;
+        let before: String =
+            sqlx::query_scalar("SELECT enqueued_at FROM sync_queue WHERE repo = 'z6Mkfoo/a'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+
+        db.dequeue_pending_syncs(10).await.unwrap();
+
+        let after: String =
+            sqlx::query_scalar("SELECT enqueued_at FROM sync_queue WHERE repo = 'z6Mkfoo/a'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[sqlx::test]
+    async fn dequeue_does_not_touch_settled_rows(pool: sqlx::PgPool) {
+        // The stamping UPDATE must not reach a row that already left the
+        // pending set, or a terminal row could be dragged back into rotation.
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        enqueue_one(&db, "z6Mkfoo/failed").await;
+        enqueue_one(&db, "z6Mkfoo/done").await;
+        let ids: Vec<(String, String)> =
+            sqlx::query_as("SELECT repo, id FROM sync_queue ORDER BY repo")
+                .fetch_all(&db.pool)
+                .await
+                .unwrap();
+        for (repo, id) in &ids {
+            if repo.ends_with("failed") {
+                db.mark_sync_failed(id).await.unwrap();
+            } else {
+                db.mark_sync_done(id).await.unwrap();
+            }
+        }
+
+        assert!(db.dequeue_pending_syncs(10).await.unwrap().is_empty());
+        assert_eq!(attempted_at_of(&db, "z6Mkfoo/failed").await, None);
+        assert_eq!(attempted_at_of(&db, "z6Mkfoo/done").await, None);
     }
 }
 
@@ -3343,6 +6475,42 @@ mod dedup_db_tests {
             out[0].updated_at,
             ts("2026-03-01T00:00:00Z"),
             "survivor inherits the group's MAX(updated_at)"
+        );
+    }
+
+    /// A PRIVATE canonical repo and a PUBLIC mirror row for the same
+    /// (owner, name) collapse to a single survivor whose `is_public` is the
+    /// canonical `false`, not the mirror's `true`. `upsert_mirror_repo` always
+    /// writes `is_public=true`, so without this the deduped set could carry a
+    /// public flag for a locally-private repo and the ref-updates feed gate
+    /// would over-serve. Pins the DEDUP_CTE tiebreak so a future regression
+    /// that flips the survivor can't leak silently.
+    #[sqlx::test]
+    async fn deduped_private_canonical_beats_public_mirror(pool: PgPool) {
+        let db = db(pool).await;
+        // Private canonical row (rec() forces is_public=true, so build inline).
+        let mut canonical = rec(
+            "uuid-private-canonical",
+            "did:key:z6Mkwbud",
+            "nipmod",
+            "private canonical",
+            "2026-01-15T00:00:00Z",
+            "2026-01-15T00:00:00Z",
+        );
+        canonical.is_public = false;
+        db.create_repo(&canonical).await.unwrap();
+        // Public mirror row for the same (owner, name): id = "z6Mkwbud/nipmod",
+        // is_public = true.
+        db.upsert_mirror_repo("z6Mkwbud", "nipmod", "/srv/mirror", None, false)
+            .await
+            .unwrap();
+
+        let out = db.list_all_repos_deduped().await.unwrap();
+        assert_eq!(out.len(), 1, "the pair collapses to one logical repo");
+        assert_eq!(out[0].owner_did, "did:key:z6Mkwbud", "canonical row wins");
+        assert!(
+            !out[0].is_public,
+            "survivor keeps the canonical private is_public=false, not the mirror's true"
         );
     }
 
@@ -3700,6 +6868,388 @@ mod dedup_db_tests {
         assert_eq!(list_len, 2);
         assert_eq!(count, list_len, "count must equal the deduped list length");
     }
+
+    /// get_repo must prefer the canonical row over the mirror row when both match,
+    /// so the visibility gate keys off the canonical row's rules and is_public flag
+    /// rather than the mirror's hardcoded public-with-no-rules (issue #124).
+    #[sqlx::test]
+    async fn get_repo_prefers_canonical_over_mirror(pool: PgPool) {
+        let db = db(pool).await;
+        let short = "z6Mkwbud";
+        let owner_did = "did:key:z6Mkwbud";
+
+        // Mirror row seeded FIRST — hardcoded is_public=true, no visibility rules.
+        // Without the ORDER BY fix, fetch_optional returns this row by insertion order,
+        // so the test fails (proving it locks in the fix).
+        db.upsert_mirror_repo(short, "secret-repo", "/srv/mirror", None, false)
+            .await
+            .unwrap();
+
+        // Canonical row with is_public=false.
+        let canonical = RepoRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "secret-repo".into(),
+            owner_did: owner_did.to_string(),
+            description: None,
+            is_public: false,
+            default_branch: "main".into(),
+            // Date after the mirror (Utc::now()) so that created_at ASC alone
+            // would pick the mirror; the CASE WHEN position('/' in id) > 0 term
+            // is what makes the canonical row win.
+            created_at: ts("2126-01-01T00:00:00Z"),
+            updated_at: ts("2126-01-01T00:00:00Z"),
+            disk_path: "/srv/secret".into(),
+            forked_from: None,
+            machine_id: None,
+        };
+        db.create_repo(&canonical).await.unwrap();
+
+        // Querying with bare short DID should return the canonical row.
+        let got = db
+            .get_repo(short, "secret-repo")
+            .await
+            .unwrap()
+            .expect("get_repo should find the repo");
+
+        assert_eq!(
+            got.owner_did, owner_did,
+            "canonical row (did:key: form) must win over mirror row (bare short DID)"
+        );
+        assert!(
+            !got.id.contains('/'),
+            "canonical row id must not contain a slash"
+        );
+        assert!(
+            !got.is_public,
+            "canonical row's is_public must be preserved"
+        );
+
+        // Querying with full did:key: form should also return the canonical row.
+        let got_full = db
+            .get_repo(owner_did, "secret-repo")
+            .await
+            .unwrap()
+            .expect("get_repo should find the repo with full did:key");
+
+        assert_eq!(
+            got_full.owner_did, owner_did,
+            "canonical row must be found using full did:key: form"
+        );
+        assert!(
+            !got_full.id.contains('/'),
+            "canonical row id must not contain a slash"
+        );
+        assert!(
+            !got_full.is_public,
+            "canonical row's is_public must be preserved"
+        );
+    }
+
+    /// Seed a private canonical plus a public mirror twin for the same owner+name
+    /// (mirror inserted first), call authorize_repo_read with caller=None, and
+    /// assert Err(RepoNotFound). That locks the property at the gate.
+    #[sqlx::test]
+    async fn authorize_repo_read_denies_private_canonical_even_with_public_mirror(pool: PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let short = "z6Mkwbud";
+        let owner_did = "did:key:z6Mkwbud";
+
+        // Mirror row seeded FIRST — hardcoded is_public=true, no visibility rules.
+        state
+            .db
+            .upsert_mirror_repo(short, "secret-repo", "/srv/mirror", None, false)
+            .await
+            .unwrap();
+
+        // Canonical row with is_public=false.
+        let canonical = RepoRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "secret-repo".into(),
+            owner_did: owner_did.to_string(),
+            description: None,
+            is_public: false,
+            default_branch: "main".into(),
+            created_at: ts("2126-01-01T00:00:00Z"),
+            updated_at: ts("2126-01-01T00:00:00Z"),
+            disk_path: "/srv/secret".into(),
+            forked_from: None,
+            machine_id: None,
+        };
+        state.db.create_repo(&canonical).await.unwrap();
+
+        // call authorize_repo_read with caller=None, and assert Err(RepoNotFound)
+        let res = crate::api::authorize_repo_read(&state, short, "secret-repo", None, "/").await;
+        assert!(
+            matches!(res, Err(crate::error::AppError::RepoNotFound(_))),
+            "expected Err(RepoNotFound), got {res:?}"
+        );
+    }
+
+    /// get_repo still returns the mirror row when no canonical row exists
+    /// (mirror-only group), so sync and read paths remain functional.
+    #[sqlx::test]
+    async fn get_repo_returns_mirror_when_no_canonical(pool: PgPool) {
+        let db = db(pool).await;
+        db.upsert_mirror_repo("z6Lonely", "orphan", "/srv/m", None, false)
+            .await
+            .unwrap();
+
+        let got = db
+            .get_repo("z6Lonely", "orphan")
+            .await
+            .unwrap()
+            .expect("get_repo should find the mirror");
+
+        assert_eq!(got.id, "z6Lonely/orphan", "mirror row is returned");
+        assert!(got.is_public, "mirror row's is_public should be true");
+    }
+
+    /// get_repo must NOT match a non-key DID row (e.g. did:gitlawb:) when queried
+    /// with the bare short DID — the old LIKE '%:' || $1 || '%' was too broad and
+    /// could rank a non-key canonical row ahead of the exact mirror.
+    #[sqlx::test]
+    async fn get_repo_does_not_match_non_key_did(pool: PgPool) {
+        let db = db(pool).await;
+        let short = "z6Mkwbud";
+
+        // Mirror row for the bare short DID.
+        db.upsert_mirror_repo(short, "shared-name", "/srv/m", None, false)
+            .await
+            .unwrap();
+
+        // Non-key DID row sharing the same trailing id — must stay distinct.
+        let non_key = RepoRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "shared-name".into(),
+            owner_did: format!("did:gitlawb:{short}"),
+            description: None,
+            is_public: false,
+            default_branch: "main".into(),
+            created_at: ts("2126-01-01T00:00:00Z"),
+            updated_at: ts("2126-01-01T00:00:00Z"),
+            disk_path: "/srv/other".into(),
+            forked_from: None,
+            machine_id: None,
+        };
+        db.create_repo(&non_key).await.unwrap();
+
+        // Querying with the bare short DID must return the mirror, NOT the
+        // did:gitlawb row (different DID method, separate owner).
+        let got = db
+            .get_repo(short, "shared-name")
+            .await
+            .unwrap()
+            .expect("get_repo should find the mirror row");
+
+        assert!(
+            got.id.contains('/'),
+            "must return the mirror (slash id), not a non-key canonical row"
+        );
+        assert!(got.is_public, "mirror row's is_public should be true");
+
+        // Querying with the full non-key DID must return that exact row.
+        let got = db
+            .get_repo(&format!("did:gitlawb:{short}"), "shared-name")
+            .await
+            .unwrap()
+            .expect("get_repo should find the non-key DID row");
+
+        assert!(
+            !got.id.contains('/'),
+            "must return the non-key canonical row (UUID id)"
+        );
+        assert!(!got.is_public, "non-key row's is_public must be preserved");
+    }
+
+    /// get_profile must not resolve a non-key DID (e.g. did:gitlawb:) when
+    /// queried with the bare short id. The old `LIKE '%:' || $1` clause was too
+    /// broad and could return the wrong profile row.
+    #[sqlx::test]
+    async fn get_profile_does_not_match_non_key_did(pool: PgPool) {
+        let db = db(pool).await;
+        let short = "z6Mkprof1";
+
+        // Seed only a non-key DID row first. When queried with the bare short ID,
+        // get_profile must return None (lone non-key fixture test).
+        db.upsert_profile(
+            &format!("did:gitlawb:{short}"),
+            Some("other-method"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let got = db.get_profile(short).await.unwrap();
+        assert!(
+            got.is_none(),
+            "bare short id must not resolve a lone non-key DID profile"
+        );
+
+        // Now seed the canonical bare key profile row as well.
+        db.upsert_profile(short, Some("canonical"), None, None, None, None)
+            .await
+            .unwrap();
+
+        let got = db
+            .get_profile(short)
+            .await
+            .unwrap()
+            .expect("bare short id should resolve the key-form profile");
+        assert_eq!(got.did, short);
+        assert_eq!(got.display_name.as_deref(), Some("canonical"));
+
+        let got = db
+            .get_profile(&format!("did:key:{short}"))
+            .await
+            .unwrap()
+            .expect("did:key form should also resolve the key-form profile");
+        assert_eq!(got.did, short);
+
+        let got = db
+            .get_profile(&format!("did:gitlawb:{short}"))
+            .await
+            .unwrap()
+            .expect("full non-key DID should resolve its own profile");
+        assert_eq!(got.did, format!("did:gitlawb:{short}"));
+        assert_eq!(got.display_name.as_deref(), Some("other-method"));
+    }
+
+    /// upsert_profile must update a bare-stored profile when called with the
+    /// full did:key: form. get_profile equates the two, so the UPDATE has to
+    /// target existing.did rather than the raw input.
+    #[sqlx::test]
+    async fn upsert_profile_updates_via_did_key_alias(pool: PgPool) {
+        let db = db(pool).await;
+        let short = "z6Mkprof2";
+
+        db.upsert_profile(short, Some("before"), None, None, None, None)
+            .await
+            .unwrap();
+
+        let updated = db
+            .upsert_profile(
+                &format!("did:key:{short}"),
+                Some("after"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.did, short, "preserve the stored did form on update");
+        assert_eq!(updated.display_name.as_deref(), Some("after"));
+
+        let got = db
+            .get_profile(short)
+            .await
+            .unwrap()
+            .expect("profile should still resolve by bare short id");
+        assert_eq!(got.did, short);
+        assert_eq!(got.display_name.as_deref(), Some("after"));
+
+        db.set_profile_cid(&format!("did:key:{short}"), "bafytestcid")
+            .await
+            .unwrap();
+        let got = db.get_profile(short).await.unwrap().unwrap();
+        assert_eq!(got.profile_cid.as_deref(), Some("bafytestcid"));
+    }
+
+    /// Verify that the Rust `normalize_owner_key` and the `OWNER_KEY_CASE_SQL`
+    /// expression agree on every boundary value in the owner-key normalization
+    /// set. A mismatch would let the Rust code bind a different key than the SQL
+    /// predicate filters on, silently breaking the did:key-only matching contract.
+    #[sqlx::test]
+    async fn normalize_owner_key_matches_sql_case(pool: PgPool) {
+        // The full boundary set: did:key short/full, bare, non-key DIDs,
+        // did:key with extra colon, empty, empty residual, uppercase.
+        let boundary_values = [
+            "did:key:z6Mkfoo",
+            "z6Mkfoo",
+            "did:gitlawb:z6Mkfoo",
+            "did:web:example.com:alice",
+            "did:key:did:gitlawb:z6Mkfoo",
+            "",
+            "did:key:",
+            "DID:KEY:z6Mkfoo",
+        ];
+
+        // Build a VALUES list with the column aliased as `owner_did` so the
+        // OWNER_KEY_CASE_SQL expression (which references `owner_did`) works
+        // verbatim — no search-and-replace that could hide a drift.
+        let values_sql: String = boundary_values
+            .iter()
+            .map(|v| format!("('{}'::text)", v))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "WITH data(owner_did) AS (VALUES {values_sql})
+             SELECT owner_did, ({key}) AS normalized FROM data ORDER BY owner_did",
+            key = super::OWNER_KEY_CASE_SQL
+        );
+
+        let rows: Vec<(String, String)> = sqlx::query_as(&sql).fetch_all(&pool).await.unwrap();
+
+        assert_eq!(
+            rows.len(),
+            boundary_values.len(),
+            "every boundary value must produce a row"
+        );
+
+        for (val, sql_result) in &rows {
+            let rust_result = super::normalize_owner_key(val);
+            assert_eq!(
+                sql_result, rust_result,
+                "normalize_owner_key(\"{val}\") mismatch: Rust = \"{rust_result}\", SQL CASE = \"{sql_result}\""
+            );
+        }
+    }
+
+    /// Verify that `PROFILE_DID_CASE_SQL` (which aliases the column `did`) also
+    /// agrees with Rust `normalize_owner_key` across the full boundary matrix.
+    #[sqlx::test]
+    async fn profile_did_case_sql_matches_normalize_owner_key(pool: PgPool) {
+        let boundary_values = [
+            "did:key:z6Mkfoo",
+            "z6Mkfoo",
+            "did:gitlawb:z6Mkfoo",
+            "did:web:example.com:alice",
+            "did:key:did:gitlawb:z6Mkfoo",
+            "",
+            "did:key:",
+            "DID:KEY:z6Mkfoo",
+        ];
+
+        let values_sql: String = boundary_values
+            .iter()
+            .map(|v| format!("('{}'::text)", v))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "WITH data(did) AS (VALUES {values_sql})
+             SELECT did, ({key}) AS normalized FROM data ORDER BY did",
+            key = super::PROFILE_DID_CASE_SQL
+        );
+
+        let rows: Vec<(String, String)> = sqlx::query_as(&sql).fetch_all(&pool).await.unwrap();
+
+        assert_eq!(
+            rows.len(),
+            boundary_values.len(),
+            "every boundary value must produce a row"
+        );
+
+        for (val, sql_result) in &rows {
+            let rust_result = super::normalize_owner_key(val);
+            assert_eq!(
+                sql_result, rust_result,
+                "PROFILE_DID_CASE_SQL(\"{val}\") mismatch: Rust = \"{rust_result}\", SQL CASE = \"{sql_result}\""
+            );
+        }
+    }
 }
 
 /// Exercises the iCaptcha single-use proof ledger (`icaptcha_consumed_proofs`),
@@ -3907,5 +7457,2488 @@ mod icaptcha_quarantine_tests {
 
         let with_stars = db.list_all_repos_deduped_with_stars(None).await.unwrap();
         assert!(with_stars.iter().all(|(r, _)| r.name != "spam"));
+    }
+
+    /// `update_trust_score` must never create an agent row. Registration (behind
+    /// the iCaptcha gate) is the only way in; otherwise a push/issue/PR from a
+    /// deregistered DID would silently re-register it and bypass the gate.
+    #[sqlx::test]
+    async fn update_trust_score_never_creates_agent(pool: PgPool) {
+        let db = db(pool).await;
+        let did = "did:key:zNeverRegistered";
+
+        // Unregistered DID: updating its score is a no-op, not an insert.
+        db.update_trust_score(did, 0.9).await.unwrap();
+        assert!(
+            db.get_agent(did).await.unwrap().is_none(),
+            "update_trust_score must not resurrect an unregistered DID"
+        );
+
+        // Once genuinely registered, the score updates in place.
+        db.register_agent(did, &[]).await.unwrap();
+        db.update_trust_score(did, 0.9).await.unwrap();
+        assert_eq!(db.get_trust_score(did).await.unwrap(), 0.9);
+    }
+}
+
+#[cfg(test)]
+mod ref_update_keyset_paging_tests {
+    use super::{Db, ReceivedRefUpdate};
+    use sqlx::PgPool;
+
+    fn rru(id: &str, ts: &str) -> ReceivedRefUpdate {
+        ReceivedRefUpdate {
+            id: id.into(),
+            node_did: "did:key:zN".into(),
+            pusher_did: "did:key:zP".into(),
+            repo: "z6MkOwner/openrepo".into(),
+            ref_name: "refs/heads/main".into(),
+            old_sha: "0".into(),
+            new_sha: "1".into(),
+            timestamp: ts.into(),
+            cert_id: None,
+            received_at: ts.into(),
+            from_peer: "peer".into(),
+            owner_did: None,
+        }
+    }
+
+    async fn seed_r1_to_r4(db: &Db) {
+        for i in 1..=4 {
+            db.insert_ref_update(&rru(
+                &format!("r{i}"),
+                &format!("2026-07-01T10:00:0{i}+00:00"),
+            ))
+            .await
+            .unwrap();
+        }
+    }
+
+    // Documents the bug jatmn flagged: OFFSET paging re-reads a page-1 row when a
+    // newer row is inserted between page reads (the newer row shifts every offset).
+    #[sqlx::test]
+    async fn offset_paging_duplicates_a_row_under_concurrent_insert(pool: PgPool) {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        seed_r1_to_r4(&db).await;
+
+        let offset_page = |limit: i64, offset: i64| {
+            let pool = db.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT id FROM received_ref_updates \
+                     ORDER BY timestamp DESC, id DESC LIMIT $1 OFFSET $2",
+                )
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+            }
+        };
+
+        let p1 = offset_page(2, 0).await;
+        assert_eq!(p1, vec!["r4", "r3"], "offset page 1");
+        // concurrent insert of a newer row shifts every later offset by one
+        db.insert_ref_update(&rru("r5", "2026-07-01T10:00:09+00:00"))
+            .await
+            .unwrap();
+        let p2 = offset_page(2, 2).await;
+        assert!(
+            p2.contains(&"r3".to_string()),
+            "OFFSET paging re-reads r3 after the concurrent insert (the bug keyset fixes); got {p2:?}"
+        );
+    }
+
+    // The fix: keyset paging on (timestamp, id) reads strictly older rows each
+    // page, so a concurrent newer insert cannot duplicate or skip a row.
+    #[sqlx::test]
+    async fn keyset_paging_is_stable_under_concurrent_insert(pool: PgPool) {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        seed_r1_to_r4(&db).await;
+
+        let p1 = db.list_ref_updates_keyset(None, 2, None).await.unwrap();
+        let p1_ids: Vec<String> = p1.iter().map(|u| u.id.clone()).collect();
+        assert_eq!(p1_ids, vec!["r4", "r3"], "keyset page 1");
+        let last = p1.last().unwrap();
+        let cursor = (last.timestamp.clone(), last.id.clone());
+
+        // concurrent insert of a newer row between page reads
+        db.insert_ref_update(&rru("r5", "2026-07-01T10:00:09+00:00"))
+            .await
+            .unwrap();
+
+        let p2 = db
+            .list_ref_updates_keyset(None, 2, Some((cursor.0.as_str(), cursor.1.as_str())))
+            .await
+            .unwrap();
+        let p2_ids: Vec<String> = p2.iter().map(|u| u.id.clone()).collect();
+        assert_eq!(
+            p2_ids,
+            vec!["r2", "r1"],
+            "keyset page 2 reads strictly older rows, unaffected by the concurrent insert"
+        );
+
+        let all: Vec<String> = p1_ids.into_iter().chain(p2_ids).collect();
+        let uniq: std::collections::HashSet<&String> = all.iter().collect();
+        assert_eq!(uniq.len(), 4, "no row appears twice across pages");
+        assert!(
+            !all.iter().any(|id| id == "r5"),
+            "a row inserted above the scan window is not folded in mid-scan"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ref_update_keyset_repo_filtered_tests {
+    use super::{Db, ReceivedRefUpdate};
+    use sqlx::PgPool;
+
+    fn rru_repo(id: &str, ts: &str, repo: &str) -> ReceivedRefUpdate {
+        ReceivedRefUpdate {
+            id: id.into(),
+            node_did: "did:key:zN".into(),
+            pusher_did: "did:key:zP".into(),
+            repo: repo.into(),
+            ref_name: "refs/heads/main".into(),
+            old_sha: "0".into(),
+            new_sha: "1".into(),
+            timestamp: ts.into(),
+            cert_id: None,
+            received_at: ts.into(),
+            from_peer: "peer".into(),
+            owner_did: None,
+        }
+    }
+
+    // Exercises the (Some(repo), Some(after)) keyset branch: a repo-filtered
+    // multi-page continuation that emits `WHERE repo=$1 AND (timestamp,id)<($2,$3)`
+    // with four binds. Also confirms the repo filter holds across pages, noise
+    // rows are excluded, and a concurrent insert does not duplicate or skip.
+    #[sqlx::test]
+    async fn keyset_repo_filtered_multipage_stable_under_concurrent_insert(pool: PgPool) {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        let target = "z6MkOwner/target";
+        let other = "z6MkOwner/other";
+
+        // 3 target rows (older) + 2 noise rows for another repo (newer, so they
+        // sort to the front of the global order and must be filtered out).
+        for (id, ts) in [("T1", "01"), ("T2", "02"), ("T3", "03")] {
+            db.insert_ref_update(&rru_repo(
+                id,
+                &format!("2026-07-01T10:00:{ts}+00:00"),
+                target,
+            ))
+            .await
+            .unwrap();
+        }
+        for (id, ts) in [("O1", "04"), ("O2", "05")] {
+            db.insert_ref_update(&rru_repo(
+                id,
+                &format!("2026-07-01T10:00:{ts}+00:00"),
+                other,
+            ))
+            .await
+            .unwrap();
+        }
+
+        // page 1: (Some(repo), None) -> two newest TARGET rows only
+        let p1 = db
+            .list_ref_updates_keyset(Some(target), 2, None)
+            .await
+            .unwrap();
+        let p1_ids: Vec<String> = p1.iter().map(|u| u.id.clone()).collect();
+        assert_eq!(
+            p1_ids,
+            vec!["T3", "T2"],
+            "repo-filtered page 1 excludes other-repo rows"
+        );
+        assert!(
+            p1.iter().all(|u| u.repo == target),
+            "no noise rows on page 1"
+        );
+        let last = p1.last().unwrap();
+        let cursor = (last.timestamp.clone(), last.id.clone());
+
+        // concurrent insert of a newer TARGET row between page reads
+        db.insert_ref_update(&rru_repo("T4", "2026-07-01T10:00:06+00:00", target))
+            .await
+            .unwrap();
+
+        // page 2: (Some(repo), Some(after)) -> the four-bind continuation branch
+        let p2 = db
+            .list_ref_updates_keyset(
+                Some(target),
+                2,
+                Some((cursor.0.as_str(), cursor.1.as_str())),
+            )
+            .await
+            .unwrap();
+        let p2_ids: Vec<String> = p2.iter().map(|u| u.id.clone()).collect();
+        assert_eq!(
+            p2_ids,
+            vec!["T1"],
+            "repo-filtered keyset page 2 reads only older target rows"
+        );
+        assert!(
+            p2.iter().all(|u| u.repo == target),
+            "no noise rows on page 2"
+        );
+
+        let all: Vec<String> = p1_ids.into_iter().chain(p2_ids).collect();
+        let uniq: std::collections::HashSet<&String> = all.iter().collect();
+        assert_eq!(uniq.len(), 3, "each target row exactly once across pages");
+        assert!(
+            !all.iter().any(|id| id == "T4"),
+            "concurrent newer row not folded in mid-scan"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ref_update_keyset_same_timestamp_tests {
+    use super::{Db, ReceivedRefUpdate};
+    use sqlx::PgPool;
+
+    fn row(id: &str, ts: &str) -> ReceivedRefUpdate {
+        ReceivedRefUpdate {
+            id: id.into(),
+            node_did: "did:key:zN".into(),
+            pusher_did: "did:key:zP".into(),
+            repo: "z6MkOwner/openrepo".into(),
+            ref_name: "refs/heads/main".into(),
+            old_sha: "0".into(),
+            new_sha: "1".into(),
+            timestamp: ts.into(),
+            cert_id: None,
+            received_at: ts.into(),
+            from_peer: "peer".into(),
+            owner_did: None,
+        }
+    }
+
+    // Load-bearing for the `id` half of the (timestamp, id) keyset cursor: all
+    // rows share ONE timestamp, so ordering and the page boundary fall entirely
+    // on `id DESC`. A timestamp-only cursor would return nothing for page 2 and
+    // silently skip b and a; the (timestamp, id) tie-break must advance instead.
+    #[sqlx::test]
+    async fn keyset_advances_within_an_equal_timestamp_run(pool: PgPool) {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        let ts = "2026-07-01T10:00:00+00:00";
+        for id in ["a", "b", "c", "d"] {
+            db.insert_ref_update(&row(id, ts)).await.unwrap();
+        }
+
+        // id DESC over equal timestamps: d, c, b, a
+        let p1 = db.list_ref_updates_keyset(None, 2, None).await.unwrap();
+        let p1_ids: Vec<String> = p1.iter().map(|u| u.id.clone()).collect();
+        assert_eq!(p1_ids, vec!["d", "c"], "page 1 by id DESC");
+        let last = p1.last().unwrap();
+
+        // page boundary lands INSIDE the equal-timestamp group (cursor = (ts, "c"))
+        let p2 = db
+            .list_ref_updates_keyset(None, 2, Some((last.timestamp.as_str(), last.id.as_str())))
+            .await
+            .unwrap();
+        let p2_ids: Vec<String> = p2.iter().map(|u| u.id.clone()).collect();
+        assert_eq!(
+            p2_ids,
+            vec!["b", "a"],
+            "keyset must advance by id within an equal-timestamp run (a timestamp-only cursor would skip these)"
+        );
+
+        let all: Vec<String> = p1_ids.into_iter().chain(p2_ids).collect();
+        let uniq: std::collections::HashSet<&String> = all.iter().collect();
+        assert_eq!(
+            uniq.len(),
+            4,
+            "no dup or skip across a same-timestamp page boundary"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ref_certificate_tests {
+    use super::{Db, RefCertificate, RepoRecord};
+    use chrono::Utc;
+    use sqlx::postgres::PgPoolOptions;
+    use sqlx::PgPool;
+
+    async fn db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    fn make_cert(
+        id: &str,
+        repo_id: &str,
+        ref_name: &str,
+        old_sha: &str,
+        new_sha: &str,
+        issued_at: &str,
+    ) -> RefCertificate {
+        RefCertificate {
+            id: id.to_string(),
+            repo_id: repo_id.to_string(),
+            ref_name: ref_name.to_string(),
+            old_sha: old_sha.to_string(),
+            new_sha: new_sha.to_string(),
+            pusher_did: "did:key:zPUSHER".to_string(),
+            node_did: "did:key:zNODE".to_string(),
+            signature: "sig".to_string(),
+            issued_at: issued_at.to_string(),
+            version: 1,
+        }
+    }
+
+    #[sqlx::test]
+    async fn list_ref_certificates_respects_limit(pool: PgPool) {
+        let db = db(pool).await;
+        let repo_id = uuid::Uuid::new_v4().to_string();
+
+        // Create a repo to satisfy FK
+        db.create_repo(&RepoRecord {
+            id: repo_id.clone(),
+            name: "limit-test".into(),
+            owner_did: "did:key:zOWNER".into(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            disk_path: "/tmp/limit-test".into(),
+            forked_from: None,
+            machine_id: None,
+        })
+        .await
+        .unwrap();
+
+        // Insert 5 certs with descending issued_at
+        for i in 0..5 {
+            db.insert_ref_certificate(&make_cert(
+                &format!("cert-{i}"),
+                &repo_id,
+                &format!("refs/heads/feature-{i}"),
+                "0000",
+                "1111",
+                &format!("2026-07-03T20:0{i}:00Z"),
+            ))
+            .await
+            .unwrap();
+        }
+
+        // limit=2 returns only 2
+        let certs = db.list_ref_certificates(&repo_id, 2).await.unwrap();
+        assert_eq!(certs.len(), 2, "LIMIT 2 must return exactly 2 certs");
+        assert_eq!(certs[0].id, "cert-4", "most recent first");
+        assert_eq!(certs[1].id, "cert-3", "second most recent");
+
+        // limit=10 returns all 5 (no padding)
+        let all = db.list_ref_certificates(&repo_id, 10).await.unwrap();
+        assert_eq!(all.len(), 5, "LIMIT >= row count returns all rows");
+    }
+
+    #[sqlx::test]
+    async fn insert_ref_certificate_upserts_on_repo_ref(pool: PgPool) {
+        let db = db(pool).await;
+        let repo_id = uuid::Uuid::new_v4().to_string();
+
+        db.create_repo(&RepoRecord {
+            id: repo_id.clone(),
+            name: "upsert-test".into(),
+            owner_did: "did:key:zOWNER".into(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            disk_path: "/tmp/upsert-test".into(),
+            forked_from: None,
+            machine_id: None,
+        })
+        .await
+        .unwrap();
+
+        // First insert
+        db.insert_ref_certificate(&make_cert(
+            "cert-original",
+            &repo_id,
+            "refs/heads/main",
+            "0000",
+            "1111",
+            "2026-07-03T20:00:00Z",
+        ))
+        .await
+        .unwrap();
+
+        // Upsert same ref with new values
+        db.insert_ref_certificate(&make_cert(
+            "cert-upserted",
+            &repo_id,
+            "refs/heads/main",
+            "aaaa",
+            "bbbb",
+            "2026-07-03T21:00:00Z",
+        ))
+        .await
+        .unwrap();
+
+        // Only one row exists for this ref
+        let certs = db.list_ref_certificates(&repo_id, 10).await.unwrap();
+        assert_eq!(certs.len(), 1, "upsert must not create a duplicate row");
+        assert_eq!(
+            certs[0].id, "cert-original",
+            "upsert must preserve the original ID across re-pushes"
+        );
+        assert_eq!(certs[0].old_sha, "aaaa", "old_sha updated");
+        assert_eq!(certs[0].new_sha, "bbbb", "new_sha updated");
+        assert_eq!(
+            certs[0].issued_at, "2026-07-03T21:00:00Z",
+            "newer issued_at overwrites older"
+        );
+
+        // Now try to overwrite with an OLDER cert — the guard must reject it.
+        db.insert_ref_certificate(&make_cert(
+            "stale-id",
+            &repo_id,
+            "refs/heads/main",
+            "stale",
+            "stale",
+            "2026-07-03T19:00:00Z",
+        ))
+        .await
+        .unwrap();
+        let certs = db.list_ref_certificates(&repo_id, 10).await.unwrap();
+        assert_eq!(certs.len(), 1, "no extra row from stale cert");
+        assert_eq!(
+            certs[0].id, "cert-original",
+            "stale cert does not change the original id"
+        );
+        assert_eq!(
+            certs[0].old_sha, "aaaa",
+            "stale cert does not regress old_sha"
+        );
+        assert_eq!(
+            certs[0].new_sha, "bbbb",
+            "stale cert does not regress new_sha"
+        );
+        assert_eq!(
+            certs[0].issued_at, "2026-07-03T21:00:00Z",
+            "stale cert does not regress issued_at"
+        );
+    }
+
+    #[sqlx::test]
+    async fn list_ref_certificates_clamps_negative_limit(pool: PgPool) {
+        let db = db(pool).await;
+        let repo_id = uuid::Uuid::new_v4().to_string();
+
+        db.create_repo(&RepoRecord {
+            id: repo_id.clone(),
+            name: "clamp-test".into(),
+            owner_did: "did:key:zOWNER".into(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            disk_path: "/tmp/clamp-test".into(),
+            forked_from: None,
+            machine_id: None,
+        })
+        .await
+        .unwrap();
+
+        db.insert_ref_certificate(&make_cert(
+            "clamp-1",
+            &repo_id,
+            "refs/heads/main",
+            "0000",
+            "1111",
+            "2026-07-03T20:00:00Z",
+        ))
+        .await
+        .unwrap();
+
+        // Negative limit is clamped to 1 at the DB boundary
+        let certs = db.list_ref_certificates(&repo_id, -5).await.unwrap();
+        assert_eq!(certs.len(), 1, "negative limit clamped to min 1");
+        assert_eq!(certs[0].id, "clamp-1");
+
+        // Zero limit also clamped to 1
+        let certs = db.list_ref_certificates(&repo_id, 0).await.unwrap();
+        assert_eq!(certs.len(), 1, "zero limit clamped to min 1");
+        assert_eq!(certs[0].id, "clamp-1");
+    }
+
+    #[sqlx::test]
+    async fn list_ref_certificates_empty_repo_returns_empty(pool: PgPool) {
+        let db = db(pool).await;
+        let certs = db
+            .list_ref_certificates("nonexistent-repo-id", 10)
+            .await
+            .unwrap();
+        assert!(certs.is_empty());
+    }
+
+    /// Certificate ids covering every character the prefix search has to treat
+    /// literally: the two LIKE wildcards, the escape character itself, and a
+    /// backslash (the default escape, which must stay an ordinary character).
+    const PREFIX_CERT_IDS: [&str; 5] = ["cert-a", "cert%b", "cert_c", "cert\\d", "cert!e"];
+
+    /// Seed one repo holding `PREFIX_CERT_IDS` and return the repo id.
+    async fn seed_prefix_certs(db: &Db) -> String {
+        let repo_id = uuid::Uuid::new_v4().to_string();
+
+        db.create_repo(&RepoRecord {
+            id: repo_id.clone(),
+            name: "prefix-test".into(),
+            owner_did: "did:key:zOWNER".into(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            disk_path: "/tmp/prefix-test".into(),
+            forked_from: None,
+            machine_id: None,
+        })
+        .await
+        .unwrap();
+
+        for (i, id) in PREFIX_CERT_IDS.iter().enumerate() {
+            db.insert_ref_certificate(&make_cert(
+                id,
+                &repo_id,
+                &format!("refs/heads/branch-{i}"),
+                "0000",
+                "1111",
+                &format!("2026-07-03T20:0{i}:00Z"),
+            ))
+            .await
+            .unwrap();
+        }
+
+        repo_id
+    }
+
+    #[sqlx::test]
+    async fn list_ref_certificates_by_prefix_treats_wildcards_literally(pool: PgPool) {
+        let db = db(pool).await;
+        let repo_id = seed_prefix_certs(&db).await;
+
+        // A plain prefix still matches every id that starts with it.
+        let all = db
+            .list_ref_certificates_by_prefix(&repo_id, "cert", 10)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 5, "plain prefix matches all five certs");
+
+        // `%` in the prefix must match a literal percent sign, not act as a
+        // wildcard that would also return every other seeded id.
+        let pct = db
+            .list_ref_certificates_by_prefix(&repo_id, "cert%", 10)
+            .await
+            .unwrap();
+        assert_eq!(pct.len(), 1, "percent prefix matches only literal id");
+        assert_eq!(pct[0].id, "cert%b");
+
+        // `_` must match a literal underscore, not any single character.
+        let under = db
+            .list_ref_certificates_by_prefix(&repo_id, "cert_", 10)
+            .await
+            .unwrap();
+        assert_eq!(under.len(), 1, "underscore prefix matches only literal id");
+        assert_eq!(under[0].id, "cert_c");
+
+        // `!` carries the escape role, so a caller-supplied `!` must itself be
+        // escaped and match a literal exclamation mark.
+        let bang = db
+            .list_ref_certificates_by_prefix(&repo_id, "cert!", 10)
+            .await
+            .unwrap();
+        assert_eq!(bang.len(), 1, "escape-char prefix matches only literal id");
+        assert_eq!(bang[0].id, "cert!e");
+
+        // A backslash is an ordinary character once `!` is the escape, so it must
+        // match a literal backslash rather than escaping the character after it.
+        let bs = db
+            .list_ref_certificates_by_prefix(&repo_id, "cert\\", 10)
+            .await
+            .unwrap();
+        assert_eq!(bs.len(), 1, "backslash prefix matches only literal id");
+        assert_eq!(bs[0].id, "cert\\d");
+    }
+
+    /// The prefix query must parse under either `standard_conforming_strings`
+    /// mode. Spelling the LIKE escape as a backslash SQL literal (`ESCAPE '\'`)
+    /// leaves the statement unterminated when a session runs with the legacy
+    /// `off` value, which breaks *every* prefix lookup, not only the ones that
+    /// contain a metacharacter. Connection settings come from outside the
+    /// process, so that mode can arrive from database- or role-level config.
+    #[sqlx::test]
+    async fn list_ref_certificates_by_prefix_parses_under_legacy_string_mode(pool: PgPool) {
+        let db = db(pool.clone()).await;
+        let repo_id = seed_prefix_certs(&db).await;
+
+        // Request the legacy parser mode at connection startup, the same way
+        // `PGOPTIONS` or a `ALTER ROLE ... SET` would deliver it.
+        let legacy_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                (*pool.connect_options())
+                    .clone()
+                    .options([("standard_conforming_strings", "off")]),
+            )
+            .await
+            .unwrap();
+
+        let mode: String = sqlx::query_scalar("SHOW standard_conforming_strings")
+            .fetch_one(&legacy_pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            mode, "off",
+            "test session must be in the legacy parser mode"
+        );
+
+        let legacy_db = Db::for_testing(legacy_pool.clone());
+
+        // A prefix with no metacharacters at all: this is what a backslash
+        // literal would break first, since the parse fails before the bound
+        // parameters are ever considered.
+        let all = legacy_db
+            .list_ref_certificates_by_prefix(&repo_id, "cert", 10)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 5, "plain prefix still resolves in legacy mode");
+
+        // Escaping still holds under the legacy mode.
+        let pct = legacy_db
+            .list_ref_certificates_by_prefix(&repo_id, "cert%", 10)
+            .await
+            .unwrap();
+        assert_eq!(pct.len(), 1, "percent prefix matches only literal id");
+        assert_eq!(pct[0].id, "cert%b");
+
+        let bs = legacy_db
+            .list_ref_certificates_by_prefix(&repo_id, "cert\\", 10)
+            .await
+            .unwrap();
+        assert_eq!(bs.len(), 1, "backslash prefix matches only literal id");
+        assert_eq!(bs[0].id, "cert\\d");
+
+        // Release the extra session so it can't hold the per-test database open
+        // against the harness's cleanup.
+        legacy_pool.close().await;
+    }
+
+    /// NOTE: this test hand-copies the migration SQL as string literals and will
+    /// silently drift if the v10 migration block changes.  The load-bearing
+    /// upgrade-path test is `v10_upgrade_dedup_via_migration`, which fires the
+    /// real MIGRATIONS[v10] entry via run_migrations().
+    #[sqlx::test]
+    async fn v10_dedup_removes_old_duplicates(pool: PgPool) {
+        let db = db(pool.clone()).await;
+
+        // Drop the unique index so we can simulate pre-v10 duplicate rows.
+        sqlx::query("DROP INDEX IF EXISTS idx_ref_certs_repo_ref")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let repo_id = uuid::Uuid::new_v4().to_string();
+        db.create_repo(&RepoRecord {
+            id: repo_id.clone(),
+            name: "dedup-test".into(),
+            owner_did: "did:key:zOWNER".into(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            disk_path: "/tmp/dedup-test".into(),
+            forked_from: None,
+            machine_id: None,
+        })
+        .await
+        .unwrap();
+
+        // Insert two rows for the same (repo_id, ref_name) with raw INSERT
+        // (no ON CONFLICT — the unique index was dropped above to simulate a
+        // pre-v10 database). The second row has the newer timestamp and should
+        // survive the dedup.
+        sqlx::query(
+            "INSERT INTO ref_certificates
+             (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind("keep-id")
+        .bind(&repo_id)
+        .bind("refs/heads/main")
+        .bind("0000")
+        .bind("1111")
+        .bind("did:key:zPUSHER")
+        .bind("did:key:zNODE")
+        .bind("sig-first")
+        .bind("2026-07-03T20:00:00Z")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO ref_certificates
+             (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind("remove-id")
+        .bind(&repo_id)
+        .bind("refs/heads/main")
+        .bind("aaaa")
+        .bind("bbbb")
+        .bind("did:key:zPUSHER")
+        .bind("did:key:zNODE")
+        .bind("sig-dup")
+        .bind("2026-07-03T19:00:00Z") // older timestamp → should be removed
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Apply the v10 dedup logic: keep the most recent per (repo_id, ref_name).
+        sqlx::query(
+            "DELETE FROM ref_certificates
+             WHERE id IN (
+                 SELECT id FROM (
+                     SELECT id, ROW_NUMBER() OVER (
+                         PARTITION BY repo_id, ref_name ORDER BY issued_at DESC, id DESC
+                     ) AS rn
+                     FROM ref_certificates
+                 ) dups WHERE dups.rn > 1
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Re-create the unique index — must succeed after dedup.
+        sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_ref_certs_repo_ref ON ref_certificates(repo_id, ref_name)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Only the most recent row survives.
+        let certs = db.list_ref_certificates(&repo_id, 10).await.unwrap();
+        assert_eq!(certs.len(), 1, "dedup leaves one row per ref");
+        assert_eq!(
+            certs[0].id, "keep-id",
+            "dedup keeps the most recent (later issued_at)"
+        );
+    }
+
+    /// INV-7: upgrade-path test — an existing node already past v1 must still get
+    /// the `pinned_cids.cid` index. It ships as its OWN v11 migration (not appended
+    /// to the applied v1 bundle), so dropping the index + its `schema_migrations`
+    /// row and re-running migrations must recreate it, exercising the real code
+    /// path rather than hand-copying the SQL.
+    #[sqlx::test]
+    async fn v18_pinned_cids_cid_index_applies_on_upgrade(pool: PgPool) {
+        async fn index_exists(pool: &PgPool) -> bool {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM pg_indexes WHERE indexname = 'idx_pinned_cids_cid')",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+
+        let db = Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+        assert!(
+            index_exists(&pool).await,
+            "fresh migration chain creates the index"
+        );
+
+        // Simulate a node at pre-v18: drop the index and its migration record.
+        sqlx::query("DROP INDEX IF EXISTS idx_pinned_cids_cid")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 18")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !index_exists(&pool).await,
+            "precondition: index and its migration record removed"
+        );
+
+        // Re-run migrations: v11 re-applies and recreates the index on the upgrade.
+        db.run_migrations().await.unwrap();
+        assert!(
+            index_exists(&pool).await,
+            "v11 must recreate idx_pinned_cids_cid on an upgrading node"
+        );
+    }
+
+    /// #173 (jatmn), INV-7 + INV-10: the paged legacy CID scan orders on
+    /// `(created_at, id)` ASC, and `repos` had no index in that order — only
+    /// `idx_repos_updated_at`, which backed the order the paging REPLACED. Without a
+    /// matching index Postgres seq-scans `repos` and top-N sorts it to return every
+    /// page (measured: 954 shared buffers, ~47ms per page on 50k rows) while the
+    /// scarce IPFS walk admission is held, so the application-side bound the paging
+    /// buys is cancelled by an O(rows) database cost on an anonymously reachable
+    /// route. With the index each page is an Index Only Scan at 4-5 buffers with the
+    /// keyset predicate pushed down as an `Index Cond`.
+    ///
+    /// PRESENCE is the whole property, so this asserts it structurally rather than by
+    /// name: some index on `repos` must lead with `created_at` then `id`, in that
+    /// order and ascending. A rename is fine; a reorder, a direction flip, or a drop
+    /// is not. Nothing names this index in any query text, so nothing else would
+    /// notice its removal.
+    ///
+    /// Also the INV-7 upgrade path, in the shape of the v18 test above: an existing
+    /// node past v1 gets the index from its OWN v25 entry, proven by dropping the
+    /// index plus its `schema_migrations` row and re-running the real migration code.
+    /// MUTATION (RED): delete the v25 entry from `MIGRATIONS` and the fresh-chain
+    /// assertion fails.
+    #[sqlx::test]
+    async fn v25_repos_created_at_id_index_applies_on_upgrade(pool: PgPool) {
+        // Structural, not by name: the leading two columns must be `created_at` then
+        // `id`, ascending (ASC is the default, so it renders with no DESC).
+        async fn keyset_index_exists(pool: &PgPool) -> bool {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(
+                     SELECT 1
+                     FROM pg_index i
+                     JOIN pg_class t ON t.oid = i.indrelid
+                     WHERE t.relname = 'repos'
+                       AND i.indnatts >= 2
+                       AND (SELECT a.attname FROM pg_attribute a
+                            WHERE a.attrelid = t.oid AND a.attnum = i.indkey[0]) = 'created_at'
+                       AND (SELECT a.attname FROM pg_attribute a
+                            WHERE a.attrelid = t.oid AND a.attnum = i.indkey[1]) = 'id'
+                       AND pg_get_indexdef(i.indexrelid) NOT LIKE '%DESC%'
+                 )",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+
+        let db = Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+        assert!(
+            keyset_index_exists(&pool).await,
+            "the paged legacy CID scan's ORDER BY created_at ASC, id ASC must be \
+             index-backed, or every page seq-scans and sorts the whole repos table \
+             while the IPFS walk admission is held (INV-10)"
+        );
+
+        // Simulate a node at pre-v25: drop the index and its migration record.
+        sqlx::query("DROP INDEX IF EXISTS idx_repos_created_at_id")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 25")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !keyset_index_exists(&pool).await,
+            "precondition: index and its migration record removed"
+        );
+
+        db.run_migrations().await.unwrap();
+        assert!(
+            keyset_index_exists(&pool).await,
+            "v25 must recreate the keyset index on an upgrading node"
+        );
+    }
+
+    /// U4 (#173 round 13, F5, INV-7 upgrade path): an existing node past v1 gets the
+    /// discovery-continuation columns from its OWN v26 entry, proven by dropping the
+    /// columns plus their `schema_migrations` row and re-running the real migration
+    /// code.
+    ///
+    /// The round-trip runs on a NEVER-SWEPT database, with no `pin_repair_sweep` row at
+    /// all, because that is the state the setter's insert arm is written for. v23
+    /// declares `cursor` NOT NULL and seeds no row, so an upsert naming only the two new
+    /// columns fails its NOT NULL check on exactly the nodes this sweep exists for, and
+    /// every caller of the setter treats a failure as warn-only, so the window would
+    /// simply never rotate and nothing would say so. Asserting the read-back is what
+    /// makes that failure visible here.
+    ///
+    /// MUTATION (RED): delete the v26 entry from `MIGRATIONS` and the fresh-chain
+    /// round-trip fails on the missing columns.
+    #[sqlx::test]
+    async fn v26_discovery_continuation_applies_on_upgrade(pool: PgPool) {
+        async fn continuation_columns_exist(pool: &PgPool) -> bool {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM information_schema.columns
+                  WHERE table_name = 'pin_repair_sweep'
+                    AND column_name IN ('discovery_cursor_created_at', 'discovery_cursor_id')",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap()
+                == 2
+        }
+
+        let db = Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+        assert!(
+            continuation_columns_exist(&pool).await,
+            "the fresh migration chain must carry the discovery continuation columns"
+        );
+
+        // Simulate a node at pre-v26: drop the columns and their migration record.
+        sqlx::query(
+            "ALTER TABLE pin_repair_sweep
+                 DROP COLUMN IF EXISTS discovery_cursor_created_at,
+                 DROP COLUMN IF EXISTS discovery_cursor_id",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 26")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !continuation_columns_exist(&pool).await,
+            "precondition: columns and their migration record removed"
+        );
+
+        db.run_migrations().await.unwrap();
+        assert!(
+            continuation_columns_exist(&pool).await,
+            "v26 must add the continuation columns on an upgrading node"
+        );
+
+        // NEVER SWEPT: no `pin_repair_sweep` row exists, so the setter has to INSERT and
+        // its insert arm has to satisfy v23's NOT NULL `cursor`.
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM pin_repair_sweep")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0,
+            "precondition: the sweep has never run on this node"
+        );
+        assert_eq!(
+            db.discovery_continuation().await.unwrap(),
+            (String::new(), String::new()),
+            "an unswept node reads the empty continuation, which means the head of the list"
+        );
+        db.set_discovery_continuation("2020-01-01T00:00:00+00:00", "repo-42")
+            .await
+            .expect("the continuation persists on a never-swept node");
+        assert_eq!(
+            db.discovery_continuation().await.unwrap(),
+            (
+                "2020-01-01T00:00:00+00:00".to_string(),
+                "repo-42".to_string()
+            ),
+            "the continuation round-trips"
+        );
+        assert_eq!(
+            db.pin_repair_cursor().await.unwrap(),
+            "",
+            "the insert arm seeds the row-walk cursor at the head of the table"
+        );
+
+        // A rotation must never move the row walk. Park the row cursor, rotate again,
+        // and read it back.
+        db.set_pin_repair_cursor("ff00").await.unwrap();
+        db.set_discovery_continuation("2021-06-01T00:00:00+00:00", "repo-99")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.pin_repair_cursor().await.unwrap(),
+            "ff00",
+            "the update arm touches only the continuation columns, so an in-progress \
+             table walk is never rewound by a window rotation"
+        );
+    }
+
+    /// #26 Split PR 3 (INV-7): an existing node past v1 gets the
+    /// `ref_certificates.version` column from its OWN v37 entry, proven
+    /// by dropping the column plus its `schema_migrations` row and
+    /// re-running the real migration code. The migration is the only
+    /// place the column is added (v37 — the v1 bundle no longer
+    /// carries it), so a deletion of v37 must be visible as a missing
+    /// column on a v27 node.
+    ///
+    /// DEFAULT 1 is what makes an existing pre-v37 cert row read as
+    /// v1 without a backfill migration. An upgraded node reads
+    /// every legacy row as version 1 — the same payload the old
+    /// code signed — so a v1 verify path on a new client still
+    /// works against an upgraded database.
+    ///
+    /// MUTATION (RED): delete the v37 entry from `MIGRATIONS` and the
+    /// upgrade path leaves the column missing.
+    #[sqlx::test]
+    async fn v37_ref_certificates_version_applies_on_upgrade(pool: PgPool) {
+        async fn version_column_default(pool: &PgPool) -> Option<String> {
+            // fetch_optional (not fetch_one) so a missing column
+            // returns Ok(None) instead of RowNotFound. The whole
+            // point of the precondition assertion below is to
+            // detect a missing column, and RowNotFound would mask
+            // the difference between "the helper is wrong" and
+            // "the migration is wrong".
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT column_default
+                   FROM information_schema.columns
+                  WHERE table_name = 'ref_certificates'
+                    AND column_name = 'version'",
+            )
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+            .flatten()
+        }
+
+        async fn seed_pre_v37_cert(pool: &PgPool) {
+            // The pre-v37 schema has no `version` column, so a raw
+            // INSERT omitting it is the legacy code path. The node
+            // did not write a version value on v1..v27 — the field
+            // did not exist.
+            sqlx::query(
+                "INSERT INTO ref_certificates
+                 (id, repo_id, ref_name, old_sha, new_sha,
+                  pusher_did, node_did, signature, issued_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 ON CONFLICT (repo_id, ref_name) DO NOTHING",
+            )
+            .bind("legacy-cert-1")
+            .bind("legacy-repo")
+            .bind("refs/heads/main")
+            .bind("0000")
+            .bind("1111")
+            .bind("did:key:zLEGACYPUSHER")
+            .bind("did:key:zLEGACYNODE")
+            .bind("legacy-sig")
+            .bind("2026-07-01T10:00:00+00:00")
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        async fn legacy_row_reads_as_v1(pool: &PgPool) -> i32 {
+            // After v37 the legacy row (inserted without an explicit
+            // version) reads back as 1 via the DEFAULT, not as 0 or
+            // NULL — the latter would be a hard insert error under
+            // NOT NULL DEFAULT, but the read-back is the actual
+            // forward-compat property the v1 verify path relies on.
+            sqlx::query_scalar::<_, i32>(
+                "SELECT version FROM ref_certificates WHERE id = 'legacy-cert-1'",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+
+        // 1. Fresh chain: v37 has run, the column exists with DEFAULT 1.
+        let db = Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+        assert_eq!(
+            version_column_default(&pool).await.as_deref(),
+            Some("1"),
+            "v37 must declare the version column with DEFAULT 1"
+        );
+
+        // 2. Roll back to pre-v37: drop the column AND the v37 record.
+        //    The rollback is split into two statements because ALTER
+        //    TABLE ... DROP COLUMN and DELETE run in the same DDL
+        //    surface but the column drop must complete before the
+        //    next step reads schema_migrations.
+        sqlx::query("ALTER TABLE ref_certificates DROP COLUMN version")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 37")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            version_column_default(&pool).await.is_none(),
+            "precondition: column removed and its migration record removed"
+        );
+
+        // 3. Seed a legacy cert on the pre-v37 schema (no version
+        //    column ⇒ the INSERT must omit it).
+        seed_pre_v37_cert(&pool).await;
+
+        // 4. Re-run migrations: v37 must re-add the column with
+        //    DEFAULT 1, and the legacy row must read back as 1.
+        db.run_migrations().await.unwrap();
+        assert_eq!(
+            version_column_default(&pool).await.as_deref(),
+            Some("1"),
+            "v37 must recreate the version column with DEFAULT 1 on an upgrading node"
+        );
+        assert_eq!(
+            legacy_row_reads_as_v1(&pool).await,
+            1,
+            "a pre-v37 cert row reads as version 1 after v37 runs, so the \
+             v1 verify path on a new client still works against an upgraded database"
+        );
+    }
+
+    /// INV-7: upgrade-path test — seed a database at v9 with duplicate
+    /// ref_certificates, then let the real v10 migration fire via
+    /// run_migrations().  This exercises the migration code path rather than
+    /// hand-copying its SQL, so the test stays in sync with MIGRATIONS[v10].
+    #[sqlx::test]
+    async fn v10_upgrade_dedup_via_migration(pool: PgPool) {
+        // 1. Bootstrap schema via the full migration chain.
+        let db = Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+
+        // 2. Roll back to v9: remove the v10-unique index and the
+        //    schema_migrations record so that run_migrations() re-applies v10.
+        sqlx::query("DROP INDEX IF EXISTS idx_ref_certs_repo_ref")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 10")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // 3. Seed repos and duplicate certs (raw INSERT — no ON CONFLICT
+        //    since the index is gone).
+        let r1 = uuid::Uuid::new_v4().to_string();
+        let r2 = uuid::Uuid::new_v4().to_string();
+        for (id, name) in [(&r1, "upgrade-repo-a"), (&r2, "upgrade-repo-b")] {
+            db.create_repo(&RepoRecord {
+                id: id.clone(),
+                name: name.into(),
+                owner_did: "did:key:zOWNER".into(),
+                description: None,
+                is_public: true,
+                default_branch: "main".into(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                disk_path: format!("/tmp/{name}"),
+                forked_from: None,
+                machine_id: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        // Helper macro for raw INSERT.
+        macro_rules! insert_cert {
+            ($id:expr, $repo_id:expr, $ref_name:expr, $old_sha:expr, $new_sha:expr, $issued_at:expr) => {
+                sqlx::query(
+                    "INSERT INTO ref_certificates
+                     (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                )
+                .bind($id)
+                .bind($repo_id)
+                .bind($ref_name)
+                .bind($old_sha)
+                .bind($new_sha)
+                .bind("did:key:zPUSHER")
+                .bind("did:key:zNODE")
+                .bind("sig")
+                .bind($issued_at)
+                .execute(&pool)
+                .await
+                .unwrap();
+            };
+        }
+
+        // Repo A, ref "main": two rows with distinct timestamps.
+        insert_cert!(
+            "dup-a-old",
+            &r1,
+            "refs/heads/main",
+            "0000",
+            "1111",
+            "2026-07-01T10:00:00Z"
+        );
+        insert_cert!(
+            "dup-a-new",
+            &r1,
+            "refs/heads/main",
+            "aaaa",
+            "bbbb",
+            "2026-07-02T10:00:00Z"
+        );
+
+        // Repo A, ref "feature": two rows with IDENTICAL timestamps — the
+        // id-DESC tiebreaker must choose the higher id (alphabetical: "z" > "a").
+        insert_cert!(
+            "dup-feat-a",
+            &r1,
+            "refs/heads/feature",
+            "0000",
+            "1111",
+            "2026-07-01T10:00:00Z"
+        );
+        insert_cert!(
+            "dup-feat-z",
+            &r1,
+            "refs/heads/feature",
+            "cccc",
+            "dddd",
+            "2026-07-01T10:00:00Z"
+        );
+
+        // Repo B, ref "main": two rows with distinct timestamps.
+        insert_cert!(
+            "dup-b-old",
+            &r2,
+            "refs/heads/main",
+            "0000",
+            "1111",
+            "2026-07-01T10:00:00Z"
+        );
+        insert_cert!(
+            "dup-b-new",
+            &r2,
+            "refs/heads/main",
+            "eeee",
+            "ffff",
+            "2026-07-02T10:00:00Z"
+        );
+
+        // A non-duplicate singleton row (single row per ref) — must survive
+        // untouched.
+        insert_cert!(
+            "singleton",
+            &r2,
+            "refs/heads/singleton",
+            "0000",
+            "1111",
+            "2026-07-01T10:00:00Z"
+        );
+
+        // 4. Run migrations — the v10 dedup fires inside run_pending_migrations.
+        db.run_migrations().await.unwrap();
+
+        // 5. Assert each ref has exactly one survivor.
+        let all_r1 = db.list_ref_certificates(&r1, 10).await.unwrap();
+        assert_eq!(all_r1.len(), 2, "repo A: 2 refs, 1 survivor each");
+
+        let r1_main: Vec<_> = all_r1
+            .iter()
+            .filter(|c| c.ref_name == "refs/heads/main")
+            .collect();
+        assert_eq!(r1_main.len(), 1, "repo A main deduped to one row");
+        assert_eq!(r1_main[0].id, "dup-a-new", "newer timestamp survives");
+        assert_eq!(r1_main[0].old_sha, "aaaa");
+        assert_eq!(r1_main[0].new_sha, "bbbb");
+
+        let r1_feat: Vec<_> = all_r1
+            .iter()
+            .filter(|c| c.ref_name == "refs/heads/feature")
+            .collect();
+        assert_eq!(r1_feat.len(), 1, "repo A feature deduped to one row");
+        assert_eq!(
+            r1_feat[0].id, "dup-feat-z",
+            "same-timestamp tiebreaker: higher id wins (id DESC)"
+        );
+
+        let all_r2 = db.list_ref_certificates(&r2, 10).await.unwrap();
+        assert_eq!(all_r2.len(), 2, "repo B: 2 refs, 1 survivor each");
+
+        let r2_main: Vec<_> = all_r2
+            .iter()
+            .filter(|c| c.ref_name == "refs/heads/main")
+            .collect();
+        assert_eq!(r2_main.len(), 1, "repo B main deduped to one row");
+        assert_eq!(r2_main[0].id, "dup-b-new", "newer timestamp survives");
+
+        let all_r2 = db.list_ref_certificates(&r2, 10).await.unwrap();
+        assert_eq!(
+            all_r2.iter().filter(|c| c.id == "singleton").count(),
+            1,
+            "non-duplicate singleton untouched"
+        );
+
+        // 6. Verify the unique index exists: the upsert helper must succeed
+        //    (exercises ON CONFLICT) and a direct duplicate INSERT must fail.
+        db.insert_ref_certificate(&make_cert(
+            "post-migration-upsert",
+            &r1,
+            "refs/heads/main",
+            "1111",
+            "2222",
+            "2026-07-03T10:00:00Z",
+        ))
+        .await
+        .unwrap();
+        let after_upsert = db.list_ref_certificates(&r1, 10).await.unwrap();
+        let r1_main_after: Vec<_> = after_upsert
+            .iter()
+            .filter(|c| c.ref_name == "refs/heads/main")
+            .collect();
+        assert_eq!(
+            r1_main_after.len(),
+            1,
+            "upsert keeps exactly one row for main"
+        );
+        assert_eq!(
+            r1_main_after[0].id, "dup-a-new",
+            "upsert preserves original id"
+        );
+        assert_eq!(r1_main_after[0].old_sha, "1111", "upsert updated old_sha");
+
+        // A raw INSERT for the same (repo_id, ref_name) must now fail.
+        let err = sqlx::query(
+            "INSERT INTO ref_certificates
+             (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind("should-fail")
+        .bind(&r1)
+        .bind("refs/heads/main")
+        .bind("xxxx")
+        .bind("yyyy")
+        .bind("did:key:zPUSHER")
+        .bind("did:key:zNODE")
+        .bind("sig")
+        .bind("2026-07-04T10:00:00Z")
+        .execute(&pool)
+        .await;
+        assert!(
+            err.is_err(),
+            "raw duplicate INSERT must be rejected by the unique index"
+        );
+    }
+}
+#[cfg(test)]
+mod ref_update_db_tests {
+    use super::{Db, ReceivedRefUpdate};
+    use sqlx::PgPool;
+
+    async fn db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    fn update(
+        id: &str,
+        repo: &str,
+        owner_did: Option<&str>,
+        ref_name: &str,
+        sha: &str,
+    ) -> ReceivedRefUpdate {
+        ReceivedRefUpdate {
+            id: id.to_string(),
+            node_did: "did:key:zNode".into(),
+            pusher_did: "did:key:zPusher".into(),
+            repo: repo.to_string(),
+            owner_did: owner_did.map(|s| s.to_string()),
+            ref_name: ref_name.to_string(),
+            old_sha: "0000000000000000000000000000000000000000".into(),
+            new_sha: sha.to_string(),
+            timestamp: "2026-07-02T12:00:00Z".into(),
+            cert_id: None,
+            received_at: "2026-07-02T12:00:01Z".into(),
+            from_peer: "12D3KooWTest".into(),
+        }
+    }
+
+    #[sqlx::test]
+    async fn insert_and_list_with_owner_did(pool: PgPool) {
+        let db = db(pool).await;
+        db.insert_ref_update(&update(
+            "u1",
+            "zOwner/myrepo",
+            Some("did:key:zOwner"),
+            "refs/heads/main",
+            "aaaa",
+        ))
+        .await
+        .unwrap();
+
+        let all = db.list_ref_updates_keyset(None, 100, None).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].owner_did.as_deref(), Some("did:key:zOwner"));
+        assert_eq!(all[0].repo, "zOwner/myrepo");
+    }
+
+    #[sqlx::test]
+    async fn insert_and_list_without_owner_did(pool: PgPool) {
+        let db = db(pool).await;
+        db.insert_ref_update(&update(
+            "u2",
+            "zOwner/myrepo",
+            None,
+            "refs/heads/main",
+            "bbbb",
+        ))
+        .await
+        .unwrap();
+
+        let all = db.list_ref_updates_keyset(None, 100, None).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].owner_did, None);
+    }
+
+    #[sqlx::test]
+    async fn list_repo_ref_updates_filters_by_repo(pool: PgPool) {
+        let db = db(pool).await;
+        db.insert_ref_update(&update(
+            "u3",
+            "alice/repo1",
+            Some("did:key:zAlice"),
+            "refs/heads/main",
+            "cccc",
+        ))
+        .await
+        .unwrap();
+        db.insert_ref_update(&update(
+            "u4",
+            "bob/repo2",
+            Some("did:key:zBob"),
+            "refs/heads/feat",
+            "dddd",
+        ))
+        .await
+        .unwrap();
+
+        let alice_events = db
+            .list_ref_updates_keyset(Some("alice/repo1"), 100, None)
+            .await
+            .unwrap();
+        assert_eq!(alice_events.len(), 1);
+        assert_eq!(alice_events[0].id, "u3");
+        assert_eq!(alice_events[0].owner_did.as_deref(), Some("did:key:zAlice"));
+
+        let bob_events = db
+            .list_ref_updates_keyset(Some("bob/repo2"), 100, None)
+            .await
+            .unwrap();
+        assert_eq!(bob_events.len(), 1);
+        assert_eq!(bob_events[0].id, "u4");
+        assert_eq!(bob_events[0].owner_did.as_deref(), Some("did:key:zBob"));
+
+        let empty = db
+            .list_ref_updates_keyset(Some("other/repo"), 100, None)
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn list_ref_updates_filtered_by_repo(pool: PgPool) {
+        let db = db(pool).await;
+        db.insert_ref_update(&update(
+            "u5",
+            "ownerA/proj",
+            Some("did:key:zA"),
+            "refs/heads/main",
+            "eeee",
+        ))
+        .await
+        .unwrap();
+        db.insert_ref_update(&update(
+            "u6",
+            "ownerB/proj",
+            Some("did:web:host:zB"),
+            "refs/heads/main",
+            "ffff",
+        ))
+        .await
+        .unwrap();
+
+        let filtered = db
+            .list_ref_updates_keyset(Some("ownerA/proj"), 100, None)
+            .await
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "u5");
+
+        let all = db.list_ref_updates_keyset(None, 100, None).await.unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[sqlx::test]
+    async fn insert_update_idempotent_on_conflict(pool: PgPool) {
+        let db = db(pool).await;
+        let u = update(
+            "u7",
+            "repo/x",
+            Some("did:key:zX"),
+            "refs/heads/main",
+            "gggg",
+        );
+        db.insert_ref_update(&u).await.unwrap();
+        db.insert_ref_update(&u).await.unwrap();
+
+        let all = db.list_ref_updates_keyset(None, 100, None).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].new_sha, "gggg");
+    }
+}
+
+#[cfg(test)]
+mod peer_reachability_tests {
+    use super::{Db, PeerWriteAuthority};
+    use sqlx::PgPool;
+
+    // Real derivable did:key fixtures. The unproven arm resolves the verifying
+    // key, so a made-up method-id is refused before any SQL runs.
+    const VICTIM_DID: &str = "did:key:z6Mkrmsd28nDTPBjk55EJCSjtJLVJDZffyczjBEHvywhutM4";
+    const HONEST_URL: &str = "https://honest-peer.example.com";
+    const ATTACKER_URL: &str = "https://attacker.example.com";
+
+    async fn db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    /// Read the row back through `list_peers`, the same surface the federated
+    /// fan-out filters on, rather than issuing raw SQL from the test.
+    async fn peer(db: &Db, did: &str) -> (String, bool) {
+        let row = db
+            .list_peers()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.did == did)
+            .expect("seeded peer row is missing");
+        (row.http_url, row.last_ping_ok)
+    }
+
+    /// Parsed rather than string-compared, so the ordering assertion does not
+    /// depend on the stored timestamp's textual precision.
+    async fn last_seen(db: &Db, did: &str) -> chrono::DateTime<chrono::Utc> {
+        let row = db
+            .list_peers()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.did == did)
+            .expect("seeded peer row is missing");
+        chrono::DateTime::parse_from_rfc3339(&row.last_seen.expect("last_seen is set by upsert"))
+            .expect("last_seen is rfc3339")
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// Seed a peer that has earned reachability, asserting the seed took so a
+    /// later case cannot pass vacuously on a row that was never written.
+    async fn seed_reachable(db: &Db) {
+        db.upsert_peer(VICTIM_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .unwrap();
+        db.mark_peer_ping(VICTIM_DID, true).await.unwrap();
+        assert_eq!(
+            peer(db, VICTIM_DID).await,
+            (HONEST_URL.to_string(), true),
+            "seed did not take"
+        );
+    }
+
+    /// Repointing an existing peer's URL must drop the reachability gate: the
+    /// new host has not been probed, so it cannot inherit the old host's
+    /// earned `last_ping_ok`.
+    #[sqlx::test]
+    async fn url_change_clears_reachability(pool: PgPool) {
+        let db = db(pool).await;
+        seed_reachable(&db).await;
+
+        // Proven: the repoint is the row's own key announcing a new host, which
+        // is the case #270's reset is about. An unproven repoint is refused
+        // outright now, so it cannot express this property.
+        db.upsert_peer(
+            VICTIM_DID,
+            ATTACKER_URL,
+            PeerWriteAuthority::Proven(VICTIM_DID),
+        )
+        .await
+        .unwrap();
+
+        let (url, reachable) = peer(&db, VICTIM_DID).await;
+        assert_eq!(url, ATTACKER_URL, "the URL should still be rewritten");
+        assert!(
+            !reachable,
+            "a repointed peer must re-earn reachability, not inherit it"
+        );
+    }
+
+    /// A plain liveness re-announce carries the same URL and must not cost an
+    /// honest peer its place in the federated fan-out. Guards against a fix
+    /// that clears the flag on every conflict instead of only on a change.
+    #[sqlx::test]
+    async fn same_url_reannounce_keeps_reachability(pool: PgPool) {
+        let db = db(pool).await;
+        seed_reachable(&db).await;
+
+        db.upsert_peer(VICTIM_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .unwrap();
+
+        let (url, reachable) = peer(&db, VICTIM_DID).await;
+        assert_eq!(url, HONEST_URL);
+        assert!(
+            reachable,
+            "an unchanged-URL re-announce must not drop the gate"
+        );
+    }
+
+    /// The must-not-grant direction. An unchanged URL preserves the flag as it
+    /// stands, which means FALSE stays FALSE: reachability is earned by a probe,
+    /// never by announcing. This is the only case that fails if the conditional
+    /// is flattened to `last_ping_ok = (peers.http_url IS NOT DISTINCT FROM $2)`,
+    /// which would let any unsigned same-URL re-announce set the flag TRUE.
+    #[sqlx::test]
+    async fn same_url_reannounce_does_not_grant_reachability(pool: PgPool) {
+        let db = db(pool).await;
+        db.upsert_peer(VICTIM_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .unwrap();
+        assert_eq!(peer(&db, VICTIM_DID).await, (HONEST_URL.to_string(), false));
+
+        db.upsert_peer(VICTIM_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .unwrap();
+
+        let (_, reachable) = peer(&db, VICTIM_DID).await;
+        assert!(
+            !reachable,
+            "announcing must never grant reachability without a probe"
+        );
+    }
+
+    /// A first insert stays out of the fan-out until a probe confirms it. Guards
+    /// against the conditional leaking into the INSERT branch.
+    #[sqlx::test]
+    async fn fresh_peer_inserts_unreachable(pool: PgPool) {
+        let db = db(pool).await;
+
+        db.upsert_peer(
+            "did:key:z6MkfGVENKztfeXa631WYVqyAGaXeP8AnN6nTkfogHn9vaaQ",
+            HONEST_URL,
+            PeerWriteAuthority::Unproven,
+        )
+        .await
+        .unwrap();
+
+        let (_, reachable) = peer(
+            &db,
+            "did:key:z6MkfGVENKztfeXa631WYVqyAGaXeP8AnN6nTkfogHn9vaaQ",
+        )
+        .await;
+        assert!(!reachable, "a never-probed peer must insert unreachable");
+    }
+
+    /// Comparison is exact, by decision: http_url is stored as announced and
+    /// nothing normalizes it, so a trailing slash is a different remote as far
+    /// as this row is concerned and clears the gate. Pins that decision against
+    /// a future normalizing comparison, which every other case here would pass
+    /// because they only ever compare identical or wholly different hosts.
+    #[sqlx::test]
+    async fn cosmetic_url_difference_counts_as_a_change(pool: PgPool) {
+        let db = db(pool).await;
+        seed_reachable(&db).await;
+
+        let with_slash = format!("{HONEST_URL}/");
+        db.upsert_peer(
+            VICTIM_DID,
+            &with_slash,
+            PeerWriteAuthority::Proven(VICTIM_DID),
+        )
+        .await
+        .unwrap();
+
+        let (url, reachable) = peer(&db, VICTIM_DID).await;
+        assert_eq!(url, with_slash);
+        assert!(
+            !reachable,
+            "comparison is exact, so a cosmetic difference clears the gate too"
+        );
+    }
+
+    /// The reset must ride the existing UPDATE, not gate it. Hoisting the
+    /// condition to a statement-level WHERE would leave every case above green
+    /// while silently skipping the whole update on a same-URL re-announce, so
+    /// liveness would stop advancing and the peer would age out on last_seen.
+    #[sqlx::test]
+    async fn same_url_reannounce_still_advances_last_seen(pool: PgPool) {
+        let db = db(pool).await;
+        db.upsert_peer(VICTIM_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .unwrap();
+        let first = last_seen(&db, VICTIM_DID).await;
+
+        db.upsert_peer(VICTIM_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .unwrap();
+
+        let second = last_seen(&db, VICTIM_DID).await;
+        assert!(
+            second > first,
+            "a same-URL re-announce is a liveness signal and must still \
+             advance last_seen: {first} then {second}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod peer_authority_tests {
+    use super::{Db, PeerWriteAuthority, PeerWriteDenied};
+    use sqlx::PgPool;
+
+    // Real derivable did:key fixtures. The unproven arm resolves the verifying
+    // key, so a made-up method-id is refused before any SQL runs.
+    const VICTIM_DID: &str = "did:key:z6MkuMqUm4i228K9qXidJ57zqSWAcQLgrcbMxB8RKVLuqitj";
+    const OTHER_DID: &str = "did:key:z6MkuzEVwHSWSCLq6xAkgTAJxHMa24KuBtgozce77TEihnWD";
+    const WEB_DID: &str = "did:web:squatter.example.com";
+    const HONEST_URL: &str = "https://honest-peer.example.com";
+    const ATTACKER_URL: &str = "https://attacker.example.com";
+
+    async fn db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    /// `peer_exists` answers the membership question the gossip ingest gate
+    /// asks on every event, so both answers are pinned here: a registered DID
+    /// is true, and an unregistered one is false rather than an error or a
+    /// prefix match on a registered DID.
+    #[sqlx::test]
+    async fn peer_exists_answers_both_ways(pool: sqlx::PgPool) {
+        let db = db(pool).await;
+        let did = VICTIM_DID;
+
+        assert!(
+            !db.peer_exists(did).await.unwrap(),
+            "an empty peers table must answer false, not error"
+        );
+
+        db.upsert_peer(
+            did,
+            "https://peer.example.com",
+            PeerWriteAuthority::Proven(did),
+        )
+        .await
+        .unwrap();
+
+        assert!(db.peer_exists(did).await.unwrap());
+        assert!(
+            !db.peer_exists(OTHER_DID).await.unwrap(),
+            "a different DID must not match"
+        );
+        assert!(
+            !db.peer_exists(&VICTIM_DID[..VICTIM_DID.len() - 1])
+                .await
+                .unwrap(),
+            "the lookup is an equality test, not a prefix test"
+        );
+    }
+
+    /// The whole row, read back through `list_peers` rather than raw SQL, so a
+    /// case that claims "unchanged" is comparing every column a consumer sees.
+    async fn row(db: &Db, did: &str) -> Option<(String, String, Option<String>, bool, String)> {
+        db.list_peers()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.did == did)
+            .map(|p| {
+                (
+                    p.did,
+                    p.http_url,
+                    p.last_seen,
+                    p.last_ping_ok,
+                    p.announced_at,
+                )
+            })
+    }
+
+    /// Seed a row and assert the seed took, so no case below can pass
+    /// vacuously against a row that was never written.
+    async fn seed(db: &Db) -> (String, String, Option<String>, bool, String) {
+        db.upsert_peer(VICTIM_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .unwrap();
+        db.mark_peer_ping(VICTIM_DID, true).await.unwrap();
+        let seeded = row(db, VICTIM_DID).await.expect("seed did not take");
+        assert_eq!(seeded.1, HONEST_URL, "seed did not take");
+        assert!(seeded.3, "seed did not earn reachability");
+        seeded
+    }
+
+    fn denial(err: anyhow::Error) -> PeerWriteDenied {
+        err.downcast::<PeerWriteDenied>()
+            .expect("rejection must be the typed denial, or the handler renders it as a 500")
+    }
+
+    /// A row a deployed database ALREADY holds must keep refreshing its
+    /// liveness. Before this gate existed `upsert_peer` did no DID validation
+    /// at all and the handler accepted any parseable DID, so live peer tables
+    /// carry did:web rows and did:key rows whose key never resolved. Judging
+    /// the DID before looking at whether the row exists freezes those forever:
+    /// the unsigned refresh is refused, and a signed one is impossible because
+    /// no key resolves. Nothing is protected by that, since the row is already
+    /// there and an identical-URL refresh changes no authority. Kills a gate
+    /// scoped to the DID instead of to the INSERT.
+    #[sqlx::test]
+    async fn a_legacy_row_can_still_refresh_its_liveness(pool: PgPool) {
+        let db = db(pool).await;
+
+        for legacy in [WEB_DID, "did:key:znotarealkeymaterial"] {
+            sqlx::query(
+                "INSERT INTO peers (did, http_url, last_seen, announced_at) \
+                 VALUES ($1, $2, $3, $3)",
+            )
+            .bind(legacy)
+            .bind(HONEST_URL)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&db.pool)
+            .await
+            .expect("seeding a pre-gate row must succeed");
+
+            db.upsert_peer(legacy, HONEST_URL, PeerWriteAuthority::Unproven)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("a legacy row must keep refreshing its liveness: {legacy} -> {e}")
+                });
+        }
+    }
+
+    /// The other half: the gate still refuses to CREATE such a row. Without
+    /// this, scoping the check to the insert path could be satisfied by
+    /// dropping the check altogether.
+    #[sqlx::test]
+    async fn a_legacy_did_still_cannot_be_created_fresh(pool: PgPool) {
+        let db = db(pool).await;
+
+        let err = db
+            .upsert_peer(WEB_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .expect_err("an unseen non-did:key must still be refused at insert");
+        assert!(
+            matches!(denial(err), PeerWriteDenied::UnsupportedDidMethod { .. }),
+            "the insert refusal must survive the insert-scoping"
+        );
+    }
+
+    /// Discovery stays open: an unproven caller may still seed an unseen
+    /// did:key row. Kills a gate widened until it rejects inserts too.
+    #[sqlx::test]
+    async fn unproven_insert_of_an_unseen_did_key_is_allowed(pool: PgPool) {
+        let db = db(pool).await;
+
+        db.upsert_peer(VICTIM_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .unwrap();
+
+        let (_, url, last_seen, reachable, _) = row(&db, VICTIM_DID).await.expect("row missing");
+        assert_eq!(url, HONEST_URL);
+        assert!(last_seen.is_some());
+        assert!(!reachable, "a never-probed peer must insert unreachable");
+    }
+
+    /// The defect this change exists to close. Kills the unconditional
+    /// `ON CONFLICT(did) DO UPDATE SET http_url = $2`.
+    #[sqlx::test]
+    async fn unproven_repoint_of_an_existing_row_is_rejected(pool: PgPool) {
+        let db = db(pool).await;
+        let before = seed(&db).await;
+
+        let err = db
+            .upsert_peer(VICTIM_DID, ATTACKER_URL, PeerWriteAuthority::Unproven)
+            .await
+            .expect_err("an unproven repoint must be an error, never a silent no-op");
+
+        assert!(
+            matches!(denial(err), PeerWriteDenied::UnprovenRepoint { .. }),
+            "the denial must be the typed repoint refusal"
+        );
+        assert_eq!(
+            row(&db, VICTIM_DID).await.expect("row vanished"),
+            before,
+            "the stored row must be byte-identical after a refused repoint"
+        );
+    }
+
+    /// Honest peers re-announce, so the identical-URL case is a liveness
+    /// refresh, not a denial. The URL string is reused byte for byte: the
+    /// comparison inherited from #270 is exact, so a trailing slash would make
+    /// this pass as a repoint rejection instead. Kills a too-wide gate.
+    #[sqlx::test]
+    async fn unproven_reannounce_of_the_identical_url_refreshes_last_seen(pool: PgPool) {
+        let db = db(pool).await;
+        let before = seed(&db).await;
+
+        db.upsert_peer(VICTIM_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .expect("an identical-URL re-announce cannot change the URL, so it is allowed");
+
+        let after = row(&db, VICTIM_DID).await.expect("row vanished");
+        assert_eq!(after.1, HONEST_URL, "URL untouched");
+        assert_eq!(after.3, before.3, "reachability untouched");
+        assert_eq!(after.4, before.4, "announced_at untouched");
+        let parse = |s: &Option<String>| {
+            chrono::DateTime::parse_from_rfc3339(s.as_deref().expect("last_seen is set")).unwrap()
+        };
+        assert!(
+            parse(&after.2) > parse(&before.2),
+            "a same-URL re-announce is a liveness signal and must advance last_seen"
+        );
+    }
+
+    /// A signed repoint from the row's own key is the allowed case, and it must
+    /// still clear reachability per #270: a proven repoint is still an unprobed
+    /// URL. Kills a gate that rejects proven writes, and kills dropping the
+    /// #270 CASE.
+    #[sqlx::test]
+    async fn proven_repoint_by_the_rows_own_did_updates_and_clears_reachability(pool: PgPool) {
+        let db = db(pool).await;
+        seed(&db).await;
+
+        db.upsert_peer(
+            VICTIM_DID,
+            ATTACKER_URL,
+            PeerWriteAuthority::Proven(VICTIM_DID),
+        )
+        .await
+        .unwrap();
+
+        let (_, url, _, reachable, _) = row(&db, VICTIM_DID).await.expect("row missing");
+        assert_eq!(url, ATTACKER_URL, "a proven repoint must land");
+        assert!(
+            !reachable,
+            "a repointed peer must re-earn reachability, even when the repoint is signed"
+        );
+    }
+
+    /// The RUSTSEC-2022-0009 shape at the boundary: a valid proof of control
+    /// over one DID must not authorize a write to a different DID's row. Kills
+    /// a bare proven/unproven flag that never checks WHICH DID was proven, and
+    /// kills neutralizing the boundary's comparison.
+    #[sqlx::test]
+    async fn proof_of_another_did_cannot_write_this_row(pool: PgPool) {
+        let db = db(pool).await;
+        let before = seed(&db).await;
+
+        let err = db
+            .upsert_peer(
+                VICTIM_DID,
+                ATTACKER_URL,
+                PeerWriteAuthority::Proven(OTHER_DID),
+            )
+            .await
+            .expect_err("a proof naming another DID must not authorize this row");
+
+        assert!(
+            matches!(denial(err), PeerWriteDenied::ProofDidMismatch { .. }),
+            "the denial must name the proof/target mismatch"
+        );
+        assert_eq!(
+            row(&db, VICTIM_DID).await.expect("row vanished"),
+            before,
+            "the stored row must be byte-identical after a mismatched proof"
+        );
+    }
+
+    /// Signed first contact must not regress: a proven write for an unseen DID
+    /// still inserts.
+    #[sqlx::test]
+    async fn proven_insert_of_an_unseen_did_is_allowed(pool: PgPool) {
+        let db = db(pool).await;
+
+        db.upsert_peer(
+            VICTIM_DID,
+            HONEST_URL,
+            PeerWriteAuthority::Proven(VICTIM_DID),
+        )
+        .await
+        .unwrap();
+
+        let (_, url, _, reachable, _) = row(&db, VICTIM_DID).await.expect("row missing");
+        assert_eq!(url, HONEST_URL);
+        assert!(!reachable, "a never-probed peer must insert unreachable");
+    }
+
+    /// R8. A DID whose method can never authenticate is refused in the
+    /// validation class, with nothing written. Kills a method gate applied only
+    /// to the update path. This case is about the METHOD LABEL alone, which is
+    /// the one thing methodNotSupported can truthfully say; a did:key whose key
+    /// material does not resolve is a different refusal and is covered by the
+    /// unresolvable tests below, so it is deliberately not in this loop.
+    #[sqlx::test]
+    async fn unproven_insert_of_a_non_did_key_is_rejected(pool: PgPool) {
+        let db = db(pool).await;
+
+        for did in [WEB_DID, "did:gitlawb:z6MkSomeKey"] {
+            let err = db
+                .upsert_peer(did, HONEST_URL, PeerWriteAuthority::Unproven)
+                .await
+                .expect_err("a DID method that can never authenticate must not be insertable");
+
+            let denied = denial(err);
+            assert!(
+                matches!(denied, PeerWriteDenied::UnsupportedDidMethod { .. }),
+                "the denial must be the typed method refusal: {did}"
+            );
+            assert!(
+                denied
+                    .to_string()
+                    .contains("methodNotSupported: only did:key peers"),
+                "the denial must name the unsupported method"
+            );
+            assert!(
+                row(&db, did).await.is_none(),
+                "a rejected announce must leave no row behind: {did}"
+            );
+        }
+    }
+
+    /// The oversized method-id is refused ahead of the quadratic base58 decode,
+    /// and the caller is told THAT, not that did:key is unsupported. Kills
+    /// folding the key-resolution failure back into the method class.
+    #[sqlx::test]
+    async fn unproven_insert_of_an_oversized_did_key_reports_the_cause(pool: PgPool) {
+        let db = db(pool).await;
+        let did = format!("did:key:z{}", "a".repeat(70));
+
+        let err = db
+            .upsert_peer(&did, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .expect_err("a did:key whose key cannot be resolved must not be insertable");
+
+        let denied = denial(err);
+        assert!(
+            matches!(denied, PeerWriteDenied::UnresolvableDid { .. }),
+            "the denial must be the typed resolution refusal"
+        );
+        let denied = denied.to_string();
+        assert!(
+            denied.contains("cannot resolve DID"),
+            "an unresolvable did:key must report resolution, not method support, got {denied:?}"
+        );
+        assert!(
+            denied.contains("method-specific id too long"),
+            "the denial must carry the underlying cause, got {denied:?}"
+        );
+        assert!(
+            row(&db, &did).await.is_none(),
+            "a rejected announce must leave no row behind: {did}"
+        );
+    }
+
+    /// The remaining resolution failures, one input class per entry, each
+    /// pinned to its own cause. The multibase entry asserts only the class
+    /// message: its sub-reason is multibase's own Display and a dependency bump
+    /// can reword it.
+    #[sqlx::test]
+    async fn unproven_insert_of_an_unresolvable_did_key_reports_the_cause(pool: PgPool) {
+        let db = db(pool).await;
+
+        // "0" is not in the base58btc alphabet, so the decode itself fails.
+        // "notarealkey" carries the right method label and no decodable key,
+        // which is the permanently uncorrectable row this gate prevents.
+        // The secp256k1 vector is the W3C did:key test vector: it decodes
+        // cleanly and is simply not an ed25519 key.
+        // The wrong-length vector is base58btc(0xed 0x01 || sixteen bytes
+        // 0x00..0x0f) with the multibase 'z' prefix: the right multicodec, half
+        // the key.
+        for (did, cause) in [
+            ("did:key:z0", None),
+            ("did:key:notarealkey", None),
+            (
+                "did:key:zQ3shokFTS3brHcDQrn82RUDfCZESWL1ZdCEJwekUDPQiYBme",
+                Some("not an ed25519 multicodec key"),
+            ),
+            (
+                "did:key:zAq9r99PUfP1Xyitb5n8V9sxht",
+                Some("ed25519 key must be 32 bytes"),
+            ),
+        ] {
+            let err = db
+                .upsert_peer(did, HONEST_URL, PeerWriteAuthority::Unproven)
+                .await
+                .expect_err("a did:key whose key cannot be resolved must not be insertable");
+
+            let denied = denial(err);
+            assert!(
+                matches!(denied, PeerWriteDenied::UnresolvableDid { .. }),
+                "the denial must be the typed resolution refusal: {did}"
+            );
+            let denied = denied.to_string();
+            assert!(
+                denied.contains("cannot resolve DID"),
+                "an unresolvable did:key must report resolution, not method support: \
+                 {did} got {denied:?}"
+            );
+            if let Some(cause) = cause {
+                assert!(
+                    denied.contains(cause),
+                    "the denial must carry the underlying cause {cause:?}: {did} got {denied:?}"
+                );
+            }
+            assert!(
+                row(&db, did).await.is_none(),
+                "a rejected announce must leave no row behind: {did}"
+            );
+        }
+    }
+
+    /// The bootstrap announce-back in main.rs hands this boundary the contacted
+    /// peer's raw JSON string, so a value that never parses as a DID reaches
+    /// here; the announce handler cannot produce it, since it parses req.did
+    /// first. The parse error is what an operator reading that loop's warning
+    /// needs, and methodNotSupported would be a false claim about a string that
+    /// names no method at all.
+    #[sqlx::test]
+    async fn unproven_insert_of_an_unparseable_string_reports_the_parse_failure(pool: PgPool) {
+        let db = db(pool).await;
+
+        for (did, cause) in [
+            ("not-a-did", "does not start with 'did:'"),
+            ("did:foo:x", "unsupported DID method: foo"),
+        ] {
+            let err = db
+                .upsert_peer(did, HONEST_URL, PeerWriteAuthority::Unproven)
+                .await
+                .expect_err("a string that is not a DID must not be insertable");
+
+            let denied = denial(err);
+            assert!(
+                matches!(denied, PeerWriteDenied::UnresolvableDid { .. }),
+                "the denial must be the typed resolution refusal: {did}"
+            );
+            let denied = denied.to_string();
+            assert!(
+                denied.contains("cannot resolve DID"),
+                "an unparseable DID must report resolution, not method support: \
+                 {did} got {denied:?}"
+            );
+            assert!(
+                denied.contains(cause),
+                "the denial must carry the parse failure {cause:?}: {did} got {denied:?}"
+            );
+            assert!(
+                row(&db, did).await.is_none(),
+                "a rejected announce must leave no row behind: {did}"
+            );
+        }
+    }
+}
+
+/// #273 completeness ledger: every writer of the `peers` table.
+///
+/// The required set is derived from the authority that DEFINES membership, the
+/// write statements themselves, not from the set of `upsert_peer` callers. A
+/// caller scan is structurally blind to a future writer that issues its own SQL
+/// and bypasses `upsert_peer`, which is precisely the case the type system
+/// cannot see.
+///
+/// The type system carries the real weight: `upsert_peer`'s authority parameter
+/// has no default, so a new caller cannot omit its declaration, compile-enforced
+/// and exhaustive by construction. This scan is the backstop for the bypass case
+/// alone, which is why it is one equality assertion rather than a framework.
+///
+/// The ledger, one row per function that writes the table:
+///
+/// | Writer | Disposition |
+/// | --- | --- |
+/// | `upsert_peer` (db/mod.rs) | guarded by the authority parameter |
+/// | `mark_peer_ping` (db/mod.rs) | benign for `http_url`: it writes only `last_seen` and `last_ping_ok`. It IS the table's other production writer, and its unauthenticated reachability is tracked separately as issue #269 |
+/// | `prune_self_peers` (db/mod.rs) | a delete keyed on `http_url`; cannot repoint; boot-only caller in main.rs |
+/// | `prune_non_public_peers` (db/mod.rs) | a delete keyed on a computed bad-DID array; cannot repoint; boot-only caller in main.rs |
+/// | `seed_local_peer` (sync.rs) | excluded by test-module location: a deliberate `upsert_peer` bypass for `file://` fixtures, which the public-URL gate rejects |
+/// | `a_legacy_row_can_still_refresh_its_liveness` (db/mod.rs) | test-only. Seeds a PRE-GATE row by raw SQL on purpose: `upsert_peer` cannot create one, since the gate it is testing refuses exactly that DID. The fixture models what a deployed table already holds |
+/// | `gossip_ping_round_requires_two_failures_before_persisting_unreachable` (main.rs) | test-only fixture seed. Raw SQL because the test drives the readiness HYSTERESIS, which needs a row already at `last_ping_ok = TRUE` before the round runs; it never exercises the announce gate |
+/// | `manual_ping_uses_readiness_without_mutating_federation_gate` (api/peers.rs) | test-only fixture seed, same shape and same reason: the row under test must pre-exist so the assertion is about what the ping does NOT rewrite |
+/// | `seed_peer` (p2p/mod.rs) | test-only fixture seed. Raw SQL so the gossip ingest tests can drive the known-peer gate directly, including the did:web case `upsert_peer` would refuse |
+/// | `federated_peer_query_is_bounded` (api/repos.rs) | test-only fixture seed for the bounded federation query; inserts reachable rows without exercising peer admission |
+/// | `federated_route_annotates_peer_repos_on_real_200_body` (api/repos.rs) | test-only fixture seed; inserts the mock peer row the bounded federation query reads, so the response-envelope assertions run against a real HTTP 200 body |
+/// | `federated_route_reports_truncated_when_peer_fetch_fails` (api/repos.rs) | test-only fixture seed; seeds one unreachable peer so the fetch-failure path is the witness under test |
+/// | `federated_route_reports_truncated_when_peer_table_overflows` (api/repos.rs) | test-only fixture seed; overflows the peer table past `MAX_FEDERATED_PEERS` so the count bound is the only witness for `truncated` |
+///
+/// And the `upsert_peer` CALL-SITE authority table, which the ledger above
+/// structurally cannot hold, because the bootstrap site issues no SQL of its own
+/// and therefore can never appear in a scan of write statements:
+///
+/// | Call site | Authority declared |
+/// | --- | --- |
+/// | api/peers.rs (announce) | proven if and only if the `AuthenticatedDid` extension is present, carrying that extension's DID |
+/// | main.rs (bootstrap announce-back) | unproven, unconditionally. Reasoned-not-run: no runtime test reaches that site in this change |
+#[cfg(test)]
+mod peers_table_writer_guard {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    /// The per-file scan, split out so the multi-line-SQL property can be
+    /// asserted against a synthetic source rather than only against the real
+    /// tree, which happens to contain no multi-line peers write today. A guard
+    /// whose blind spot is invisible because the tree does not currently
+    /// exercise it is one that fails the moment somebody writes normal code.
+    fn scan_source(src: &str) -> BTreeMap<String, usize> {
+        let needles: Vec<String> = needles().iter().map(|n| n.to_lowercase()).collect();
+        let mut found: BTreeMap<String, usize> = BTreeMap::new();
+        // Normalize the WHOLE file before matching, not each line on its
+        // own. Per-line `contains` is whitespace- and case-sensitive, so
+        // `sqlx::query(r#"UPDATE\n  peers SET ..."#)` walked straight past
+        // it, and that multi-line form is how the longer queries in this
+        // file are already written. Verified both ways: the single-line
+        // bypass went RED, the identical statement split across lines
+        // stayed GREEN. Offsets are mapped back to line numbers so each
+        // statement is still attributed to the function that issues it.
+        let mut flat = String::with_capacity(src.len());
+        let mut starts: Vec<(usize, usize)> = Vec::new(); // (offset, line index)
+        for (idx, line) in src.lines().enumerate() {
+            starts.push((flat.len(), idx));
+            flat.push_str(&line.trim().to_lowercase());
+            flat.push(' ');
+        }
+        let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        // Re-derive offsets against the collapsed text by walking it once.
+        let mut collapsed = String::with_capacity(flat.len());
+        let mut owners: Vec<usize> = Vec::new(); // line index per byte
+        for (idx, line) in src.lines().enumerate() {
+            for tok in line.trim().to_lowercase().split_whitespace() {
+                if !collapsed.is_empty() {
+                    collapsed.push(' ');
+                    owners.push(idx);
+                }
+                for _ in 0..tok.len() {
+                    owners.push(idx);
+                }
+                collapsed.push_str(tok);
+            }
+        }
+
+        let fn_at: Vec<&str> = {
+            let mut current = "<module level>";
+            src.lines()
+                .map(|line| {
+                    if let Some(name) = declared_fn(line) {
+                        current = name;
+                    }
+                    current
+                })
+                .collect()
+        };
+
+        for needle in &needles {
+            let mut from = 0usize;
+            while let Some(rel) = collapsed[from..].find(needle.as_str()) {
+                let at = from + rel;
+                let line_idx = owners.get(at).copied().unwrap_or(0);
+                let owner = fn_at.get(line_idx).copied().unwrap_or("<module level>");
+                *found.entry(owner.to_string()).or_default() += 1;
+                from = at + needle.len();
+            }
+        }
+        found
+    }
+
+    /// Each dispositioned writer and the number of statements it issues against
+    /// the table. Bidirectional: an undispositioned hit fails, and so does a
+    /// listed function that no longer has one.
+    const LEDGER: &[(&str, usize)] = &[
+        ("a_legacy_row_can_still_refresh_its_liveness", 1),
+        ("federated_peer_query_is_bounded", 1),
+        ("federated_route_annotates_peer_repos_on_real_200_body", 1),
+        ("federated_route_reports_truncated_when_peer_fetch_fails", 1),
+        (
+            "federated_route_reports_truncated_when_peer_table_overflows",
+            1,
+        ),
+        (
+            "gossip_ping_round_requires_two_failures_before_persisting_unreachable",
+            1,
+        ),
+        (
+            "manual_ping_uses_readiness_without_mutating_federation_gate",
+            1,
+        ),
+        ("mark_peer_ping", 1),
+        ("prune_non_public_peers", 1),
+        ("prune_self_peers", 1),
+        ("seed_local_peer", 1),
+        ("seed_peer", 1),
+        ("upsert_peer", 2),
+    ];
+
+    /// Assembled at runtime rather than written as literals, so this module's
+    /// own source does not match the scan it performs.
+    fn needles() -> Vec<String> {
+        ["INSERT INTO ", "UPDATE ", "DELETE FROM "]
+            .iter()
+            .map(|verb| format!("{verb}peers"))
+            .collect()
+    }
+
+    fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("the crate source tree must be readable") {
+            let path = entry.expect("directory entry").path();
+            if path.is_dir() {
+                rust_sources(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// The function a line declares, if it declares one.
+    fn declared_fn(line: &str) -> Option<&str> {
+        let trimmed = line.trim_start();
+        let rest = [
+            "pub(crate) async fn ",
+            "pub(crate) fn ",
+            "pub async fn ",
+            "pub fn ",
+            "async fn ",
+            "fn ",
+        ]
+        .iter()
+        .find_map(|p| trimmed.strip_prefix(p))?;
+        rest.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .next()
+            .filter(|name| !name.is_empty())
+    }
+
+    /// The backstop the authority parameter cannot provide: a new raw write
+    /// against the table from outside `upsert_peer` is invisible to the type
+    /// system, so it is caught here or not at all.
+    /// The blind spot this guard shipped with: matching a verb-plus-table needle
+    /// per line is whitespace- and case-sensitive, so the identical statement split
+    /// across lines walked past it. That form is how the longer queries in this
+    /// file are already written, so it is the shape a future writer most likely
+    /// takes. Both directions asserted, plus lowercase.
+    ///
+    /// The fixtures are DERIVED from `needles()` at runtime for the same reason
+    /// the needles themselves are: a literal here would be found by the scan of
+    /// this very file and counted against this test function. Deriving them
+    /// also means the test follows if the needle set ever changes.
+    #[test]
+    fn the_scan_sees_a_write_whose_verb_and_table_are_on_different_lines() {
+        for needle in needles() {
+            let (verb, table) = needle.rsplit_once(' ').expect("a needle is '<VERB> peers'");
+            let cases = [
+                ("single-line", format!("{verb} {table} SET x = $1")),
+                (
+                    "split across lines",
+                    format!("{verb}\n             {table}\n             SET x = $1"),
+                ),
+                (
+                    "lowercase, double-spaced",
+                    format!("{}  {} set x = $1", verb.to_lowercase(), table),
+                ),
+            ];
+            for (label, sql) in cases {
+                let src = format!("fn sneaky() {{\n    sqlx::query(\"{sql}\");\n}}\n");
+                let found = scan_source(&src);
+                assert_eq!(
+                    found.get("sneaky").copied(),
+                    Some(1),
+                    "the scan missed a peers write written {label} with needle {needle:?}: {found:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_peers_table_write_is_dispositioned() {
+        let mut files = Vec::new();
+        rust_sources(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        // Anti-vacuity: a scrape that walked nothing would report a clean tree.
+        assert!(
+            files.len() > 10,
+            "the scan found only {} source files, so a clean result proves nothing",
+            files.len()
+        );
+
+        let mut found: BTreeMap<String, usize> = BTreeMap::new();
+        for file in &files {
+            let src = std::fs::read_to_string(file).expect("source file must be readable");
+
+            for (owner, n) in scan_source(&src) {
+                *found.entry(owner).or_default() += n;
+            }
+        }
+
+        let expected: BTreeMap<String, usize> =
+            LEDGER.iter().map(|(f, n)| ((*f).to_string(), *n)).collect();
+        assert_eq!(
+            found, expected,
+            "the peers-table writers no longer match the ledger. A new writer must \
+             be dispositioned in the table above (and gated), and a removed one \
+             dropped from LEDGER"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cid_candidate_order_tests {
+    use super::Db;
+    use sqlx::PgPool;
+
+    /// The candidate order `oids_for_cid` returns must not depend on the physical
+    /// row order in `pinned_cids`.
+    ///
+    /// `get_by_cid` walks the candidates under ONE shared probe budget, visit budget
+    /// and pager, so whichever candidate comes back first is the one that spends the
+    /// request's budget. Without an `ORDER BY` the query is a bare sequential scan and
+    /// Postgres is free to return heap order, which any UPDATE to any row rewrites: two
+    /// nodes holding identical data, or one node before and after an unrelated write,
+    /// resolve the same CID by trying candidates in a different order, so one serves the
+    /// object and the other sheds a 503.
+    ///
+    /// The sibling `pin_sources_for_oid` already orders its union for exactly this
+    /// reason, and the handler's own comment leans on that determinism.
+    ///
+    /// MUTATION (RED): drop the `ORDER BY` and the post-UPDATE read comes back rotated.
+    #[sqlx::test]
+    async fn oids_for_cid_is_ordered_independently_of_physical_row_order(pool: PgPool) {
+        let db = Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+
+        let cid = "bafkreiorderingfixtureaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let oids = ["aa".repeat(32), "bb".repeat(32), "cc".repeat(32)];
+        for oid in &oids {
+            db.record_pinned_cid(oid, cid, None).await.unwrap();
+        }
+
+        let before = db.oids_for_cid(cid).await.unwrap();
+        assert_eq!(before.len(), 3, "fixture must seed three candidates");
+
+        // Move the first candidate to the end of the heap the way production does it:
+        // an unpin followed by a re-pin of the same object. An in-place UPDATE is not
+        // enough, since a HOT update leaves the row reachable from its original item
+        // pointer and a sequential scan still returns it in its old position.
+        sqlx::query("DELETE FROM pinned_cids WHERE sha256_hex = $1")
+            .bind(&oids[0])
+            .execute(&pool)
+            .await
+            .expect("unpin one candidate");
+        db.record_pinned_cid(&oids[0], cid, None).await.unwrap();
+
+        let after = db.oids_for_cid(cid).await.unwrap();
+        assert_eq!(
+            before, after,
+            "an unrelated write to one candidate must not reorder the candidate list; \
+             the order decides which oid spends the request's shared budget"
+        );
+
+        let mut sorted = after.clone();
+        sorted.sort();
+        assert_eq!(
+            after, sorted,
+            "the order must be a stated one (ascending oid), not whatever the heap holds"
+        );
     }
 }

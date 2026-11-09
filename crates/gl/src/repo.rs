@@ -5,7 +5,7 @@ use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-use crate::http::NodeClient;
+use crate::http::{sanitize_node_msg, NodeClient};
 use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
@@ -25,14 +25,22 @@ pub enum RepoCmd {
         private: bool,
         #[arg(long, default_value = "main")]
         branch: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
     },
     /// List repositories on a node
     List {
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -40,7 +48,11 @@ pub enum RepoCmd {
     /// Print the gitlawb:// clone command for a repo
     Clone {
         name: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -48,7 +60,11 @@ pub enum RepoCmd {
     /// Show repository metadata
     Info {
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -63,7 +79,11 @@ pub enum RepoCmd {
         /// Max number of commits to show
         #[arg(long, short, default_value = "20")]
         limit: u32,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -75,7 +95,11 @@ pub enum RepoCmd {
         /// New name for the fork (defaults to source repo name)
         #[arg(long, short)]
         name: Option<String>,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -84,7 +108,11 @@ pub enum RepoCmd {
     LabelAdd {
         repo: String,
         label: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -93,7 +121,11 @@ pub enum RepoCmd {
     LabelRemove {
         repo: String,
         label: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -101,7 +133,11 @@ pub enum RepoCmd {
     /// List labels on a repository
     LabelList {
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -110,7 +146,11 @@ pub enum RepoCmd {
     Owner {
         /// Repository name or owner/repo
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -126,7 +166,11 @@ pub enum RepoCmd {
         #[arg(long)]
         url: String,
         /// URL of the origin node (where the repo lives)
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -135,7 +179,11 @@ pub enum RepoCmd {
     ReplicaUnregister {
         /// Repository in owner/repo format
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -144,8 +192,14 @@ pub enum RepoCmd {
     Replicas {
         /// Repository in owner/repo format
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
 }
 
@@ -203,25 +257,141 @@ pub async fn run(args: RepoArgs) -> Result<()> {
         RepoCmd::ReplicaUnregister { repo, node, dir } => {
             cmd_replica_unregister(repo, node, dir).await
         }
-        RepoCmd::Replicas { repo, node } => cmd_replicas(repo, node).await,
+        RepoCmd::Replicas { repo, node, dir } => cmd_replicas(repo, node, dir).await,
     }
 }
 
 /// Derive the short DID key segment from a keypair, or fall back to the node's DID.
-async fn resolve_owner_did(node: &str, dir: Option<&std::path::Path>) -> Result<String> {
-    if let Ok(kp) = load_keypair_from_dir(dir) {
-        let did = kp.did().to_string();
-        return Ok(did.split(':').next_back().unwrap_or(&did).to_string());
+/// Resolve the owner short-DID for a bare repo name from the LOCAL identity.
+/// Never falls back to the node's own DID (that produced bogus "owned by the
+/// node" results for repos that don't exist) — if there's no local identity the
+/// caller must pass an explicit `owner/name`.
+async fn resolve_owner_did(_node: &str, dir: Option<&std::path::Path>) -> Result<String> {
+    let kp = load_keypair_from_dir(dir).context(
+        "no local identity to resolve the repo owner — pass `owner/name`, or run `gl identity new`",
+    )?;
+    let did = kp.did().to_string();
+    Ok(did.split(':').next_back().unwrap_or(&did).to_string())
+}
+
+/// Fetch `GET /` from the node and return the `web_url` if the node advertises one.
+///
+/// The View: link is a nice-to-have, so every failure mode degrades to `None`
+/// rather than failing the enclosing command — but failures are surfaced as
+/// stderr warnings (request error, non-success HTTP status with the status,
+/// malformed advertised value), since they all mean the node itself is
+/// misbehaving or misconfigured, which the user would otherwise never learn.
+/// A successful response that lacks a usable `web_url` (field missing or
+/// blank) omits the link silently: self-hosted nodes without a web front-end
+/// are expected to not advertise one (#370).
+///
+/// The body is treated like every other caller-chosen node reply (INV-6): the
+/// read is capped and an accepted `web_url` must be free of control/bidi bytes
+/// — it reaches the terminal verbatim through the View: line.
+pub(crate) async fn fetch_node_web_url(node: &str) -> Option<String> {
+    let info_client = NodeClient::new(node, None);
+    let info_resp = match info_client.get("/").await {
+        Ok(resp) => resp,
+        Err(err) => {
+            eprintln!("warning: node info request failed ({err}); skipping View link");
+            return None;
+        }
+    };
+    let status = info_resp.status();
+    if !status.is_success() {
+        eprintln!("warning: node info request returned {status}; skipping View link");
+        return None;
     }
-    let client = NodeClient::new(node, None);
-    let info: Value = client
-        .get("/")
-        .await?
-        .json()
-        .await
-        .context("failed to fetch node info")?;
-    let did = info["did"].as_str().context("node missing DID")?;
-    Ok(did.split(':').next_back().unwrap_or(did).to_string())
+    // An info reply is a DID, a few URLs and counts — 8 KiB is well past what
+    // the shape needs; anything longer is hostile or broken (peer.rs precedent).
+    let raw_body = crate::http::read_body_capped(info_resp, 8 * 1024).await;
+    match web_url_from_info_body(&raw_body) {
+        Ok(url) => url,
+        Err(reason) => {
+            eprintln!("warning: {reason}; skipping View link");
+            None
+        }
+    }
+}
+
+/// Classify a capped `GET /` body for the `View:` advertisement. Split out of
+/// `fetch_node_web_url` so tests can pin the classification contract directly:
+/// a truncated or half-read body is indistinguishable from a node that
+/// advertised nothing, so it must warn rather than silently omit the link.
+fn web_url_from_info_body(
+    raw_body: &crate::http::CappedBody,
+) -> std::result::Result<Option<String>, String> {
+    if raw_body.truncated || raw_body.read_failed {
+        return Err("node info body was oversized or could not be read in full".to_string());
+    }
+    let info: Value = match serde_json::from_str(&raw_body.text) {
+        Ok(json) => json,
+        Err(_) => return Err("node info body was not valid JSON".to_string()),
+    };
+    // Missing field / non-string degrade to None without warning — same contract
+    // as before; only transport- and advertisement-level failures warn there.
+    let raw = match info["web_url"].as_str() {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    // A present-but-malformed value means the node is misconfigured; say so
+    // instead of quietly dropping the link. Mirrors the node-side boot
+    // validation: must be an absolute http(s) URL with no query or fragment —
+    // the link is built by string-appending `/{owner}/{repo}` to it. Control
+    // and bidi-format bytes are rejected outright (not stripped): they have no
+    // legitimate place in a base URL and would reach the terminal through the
+    // View: line — including when they arrive percent-encoded (INV-6).
+    let malformed_reason: Option<String> = if trimmed
+        .chars()
+        .any(|c| c.is_control() || gitlawb_core::sanitize::is_bidi_format(c))
+    {
+        Some("contains control or bidi characters".to_string())
+    } else {
+        match trimmed.parse::<url::Url>() {
+            Err(_) => Some("not an absolute URL".to_string()),
+            Ok(parsed) if !matches!(parsed.scheme(), "http" | "https") => {
+                Some("not http(s)".to_string())
+            }
+            Ok(parsed) if parsed.query().is_some() || parsed.fragment().is_some() => {
+                Some("contains a query or fragment".to_string())
+            }
+            // userinfo is rejected because the `View:` line prints the
+            // value verbatim; a remote advertisement carrying
+            // `user:pass@host` would land that credential in terminal
+            // scrollback and CI logs.
+            Ok(parsed) if !parsed.username().is_empty() || parsed.password().is_some() => {
+                Some("contains a username or password".to_string())
+            }
+            Ok(parsed)
+                if parsed
+                    .host_str()
+                    .unwrap_or("")
+                    .chars()
+                    .chain(
+                        percent_encoding::percent_decode_str(parsed.path())
+                            .decode_utf8_lossy()
+                            .chars(),
+                    )
+                    .any(|c| c.is_control() || gitlawb_core::sanitize::is_bidi_format(c)) =>
+            {
+                Some("contains control or bidi characters, even percent-encoded".to_string())
+            }
+            Ok(_) => None,
+        }
+    };
+    match malformed_reason {
+        // The reason string is ours; the advertised value is not — defang it
+        // exactly as it would have been defanged had it been accepted.
+        Some(reason) => Err(format!(
+            "node advertised a malformed web_url ({:?}, {reason})",
+            sanitize_node_msg(trimmed)
+        )),
+        None => Ok(Some(trimmed.to_string())),
+    }
 }
 
 async fn cmd_create(
@@ -253,13 +423,7 @@ async fn cmd_create(
         .post("/api/v1/repos", &body)
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let payload: Value = resp.json().await.context("invalid JSON response")?;
-
-    if !status.is_success() {
-        let msg = payload["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("create failed ({status}): {msg}");
-    }
+    let payload = crate::http::read_json(resp, "create").await?;
 
     let clone_url = payload["clone_url"].as_str().unwrap_or("");
     let gitlawb_url = format!("gitlawb://{owner_did}/{name}");
@@ -267,7 +431,11 @@ async fn cmd_create(
     println!("✓ Created repository: {name}");
     println!("  Clone: git clone {gitlawb_url}");
     println!("  HTTP:  {clone_url}");
-    println!("  View:  https://gitlawb.com/{owner_short}/{name}");
+    // Only print View: when the node advertises a web_url — self-hosted nodes
+    // without a web front-end would otherwise produce a 404 link (#370).
+    if let Some(web_url) = fetch_node_web_url(&node).await {
+        println!("  View:  {web_url}/{owner_short}/{name}");
+    }
     if let Some(desc) = payload["description"].as_str().filter(|s| !s.is_empty()) {
         println!("  Desc:  {desc}");
     }
@@ -279,12 +447,7 @@ async fn cmd_list(node: String, dir: Option<PathBuf>) -> Result<()> {
     let client = NodeClient::new(&node, None);
 
     let url = format!("/api/v1/repos?owner={owner}");
-    let repos: Value = client
-        .get(&url)
-        .await?
-        .json()
-        .await
-        .context("failed to list repos")?;
+    let repos = crate::http::read_json(client.get(&url).await?, "list repos").await?;
     let repos = repos.as_array().context("expected array")?;
 
     if repos.is_empty() {
@@ -298,7 +461,10 @@ async fn cmd_list(node: String, dir: Option<PathBuf>) -> Result<()> {
         let name = r["name"].as_str().unwrap_or("?");
         let desc = r["description"].as_str().unwrap_or("");
         let public = r["is_public"].as_bool().unwrap_or(true);
-        let updated = r["updated_at"].as_str().map(|s| &s[..10]).unwrap_or("?");
+        let updated = r["updated_at"]
+            .as_str()
+            .map(|s| crate::text::truncate(s, 10))
+            .unwrap_or("?");
         let vis = if public { "public" } else { "private" };
         println!("  {name:<24}  {vis:<8}  {updated}  {desc}");
     }
@@ -306,31 +472,37 @@ async fn cmd_list(node: String, dir: Option<PathBuf>) -> Result<()> {
 }
 
 async fn cmd_clone(name: String, node: String, dir: Option<PathBuf>) -> Result<()> {
-    let did = if let Ok(kp) = load_keypair_from_dir(dir.as_deref()) {
-        kp.did().to_string()
+    // Owner is taken from an explicit `owner/name`, else the LOCAL identity —
+    // never the node's own DID. A missing repo then surfaces as the helper's
+    // clear 404 rather than a clone under an invented owner.
+    let (did, repo_name) = if let Some((owner, rest)) = name.split_once('/') {
+        (owner.to_string(), rest.to_string())
     } else {
-        let client = NodeClient::new(&node, None);
-        let info: Value = client.get("/").await?.json().await?;
-        info["did"]
-            .as_str()
-            .context("node missing DID")?
-            .to_string()
+        // Bare name: derive the SHORT owner key via the same helper the other
+        // commands use, so the URL is `gitlawb://z6Mk.../name` — not the full
+        // `did:key:z6Mk...` form, whose colons in the authority break the helper.
+        (resolve_owner_did(&node, dir.as_deref()).await?, name)
     };
-    let url = format!("gitlawb://{did}/{name}");
+    let url = format!("gitlawb://{did}/{repo_name}");
     println!("  cloning {url}");
     let status = std::process::Command::new("git")
         .arg("clone")
         .arg(&url)
+        // Point the remote helper at the same node the user selected.
+        .env("GITLAWB_NODE", &node)
         .status()
         .context("failed to run git clone — is git installed?")?;
     if !status.success() {
-        anyhow::bail!("git clone failed");
+        anyhow::bail!("git clone failed — does the repo exist on this node?");
     }
     Ok(())
 }
 
 async fn cmd_info(repo: String, node: String, dir: Option<PathBuf>) -> Result<()> {
-    let client = NodeClient::new(&node, None);
+    // Sign when an identity is available so the read-visibility-gated replica
+    // sub-fetch below resolves for a private repo's owner (public repos still
+    // work anonymously).
+    let client = NodeClient::new(&node, load_keypair_from_dir(dir.as_deref()).ok());
 
     let (owner, name) = if repo.contains('/') {
         let (o, n) = repo.split_once('/').unwrap();
@@ -340,12 +512,20 @@ async fn cmd_info(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
         (short, repo)
     };
 
-    let r: Value = client
-        .get(&format!("/api/v1/repos/{owner}/{name}"))
-        .await?
-        .json()
+    let resp = client
+        .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}"))
         .await
-        .context("repo not found")?;
+        .context("failed to connect to node")?;
+    // A non-existent (or unreadable/quarantined) repo is a real 404 from the
+    // node — surface it plainly instead of printing a stub card with `?` fields
+    // and a placeholder owner DID.
+    if resp.status().as_u16() == 404 {
+        anyhow::bail!("repository '{owner}/{name}' not found");
+    }
+    // Every other status routes through read_json: a 2xx yields the parsed body,
+    // any other non-2xx yields the node's capped + sanitized message, and
+    // the error read is bounded rather than buffering the whole hostile body.
+    let r = crate::http::read_json(resp, "repo info").await?;
 
     let owner_did = r["owner_did"].as_str().unwrap_or(&owner);
     let gitlawb_url = format!("gitlawb://{owner_did}/{name}");
@@ -368,7 +548,7 @@ async fn cmd_info(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
 
     // Replica count — failure to fetch is non-fatal (older nodes don't expose this).
     if let Ok(resp) = client
-        .get(&format!("/api/v1/repos/{owner}/{name}/replicas"))
+        .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}/replicas"))
         .await
     {
         if resp.status().is_success() {
@@ -404,12 +584,7 @@ async fn cmd_replica_register(
         .await
         .context("failed to connect to origin node")?;
 
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or_default();
-    if !status.is_success() {
-        let msg = body["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("replica register failed ({status}): {msg}");
-    }
+    let body = crate::http::read_json(resp, "replica register").await?;
 
     let count = body["replica_count"].as_i64().unwrap_or(0);
     println!("Registered as replica of {owner}/{name}");
@@ -436,35 +611,27 @@ async fn cmd_replica_unregister(repo: String, node: String, dir: Option<PathBuf>
         .await
         .context("failed to connect to origin node")?;
 
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or_default();
-    if !status.is_success() {
-        let msg = body["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("replica unregister failed ({status}): {msg}");
-    }
+    let body = crate::http::read_json(resp, "replica unregister").await?;
 
     let count = body["replica_count"].as_i64().unwrap_or(0);
     println!("Unregistered as replica of {owner}/{name}  ({count} replicas remaining)");
     Ok(())
 }
 
-async fn cmd_replicas(repo: String, node: String) -> Result<()> {
+async fn cmd_replicas(repo: String, node: String, dir: Option<PathBuf>) -> Result<()> {
     let (owner, name) = repo
         .split_once('/')
         .map(|(o, n)| (o.to_string(), n.to_string()))
         .context("use owner/repo format")?;
 
-    let client = NodeClient::new(&node, None);
+    // Read-visibility-gated: public repos list anonymously, private repos need
+    // the owner's signature. Sign when an identity is available.
+    let client = NodeClient::new(&node, load_keypair_from_dir(dir.as_deref()).ok());
     let resp = client
-        .get(&format!("/api/v1/repos/{owner}/{name}/replicas"))
+        .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}/replicas"))
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or_default();
-    if !status.is_success() {
-        let msg = body["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("replicas list failed ({status}): {msg}");
-    }
+    let body = crate::http::read_json(resp, "replicas list").await?;
 
     let count = body["replica_count"].as_i64().unwrap_or(0);
     println!("{owner}/{name}: {count} replicas");
@@ -474,7 +641,7 @@ async fn cmd_replicas(repo: String, node: String) -> Result<()> {
             let url = r["replica_url"].as_str().unwrap_or("?");
             let registered = r["registered_at"]
                 .as_str()
-                .map(|s| &s[..10.min(s.len())])
+                .map(|s| crate::text::truncate(s, 10))
                 .unwrap_or("?");
             println!("  {registered}  {did}  →  {url}");
         }
@@ -500,12 +667,7 @@ pub(crate) async fn cmd_commits(
     };
 
     let url = format!("/api/v1/repos/{owner}/{name}/commits?branch={branch}&limit={limit}");
-    let resp: Value = client
-        .get(&url)
-        .await?
-        .json()
-        .await
-        .context("failed to fetch commits")?;
+    let resp = crate::http::read_json(client.get(&url).await?, "commits").await?;
 
     let commits = resp["commits"].as_array().cloned().unwrap_or_default();
     if commits.is_empty() {
@@ -521,7 +683,7 @@ pub(crate) async fn cmd_commits(
             .or_else(|| c["sha"].as_str())
             .or_else(|| c["oid"].as_str())
             .unwrap_or("?");
-        let short_sha = &sha[..sha.len().min(10)];
+        let short_sha = crate::text::truncate(sha, 10);
         let msg = c["message"].as_str().unwrap_or("(no message)");
         let first_line = msg.lines().next().unwrap_or(msg);
         let author = c["author_name"]
@@ -531,7 +693,7 @@ pub(crate) async fn cmd_commits(
         let date = c["date"]
             .as_str()
             .or_else(|| c["committer_date"].as_str())
-            .map(|s| &s[..10.min(s.len())])
+            .map(|s| crate::text::truncate(s, 10))
             .unwrap_or("?");
         println!("  {short_sha}  {date}  {first_line}  ({author})");
     }
@@ -558,13 +720,7 @@ async fn cmd_fork(
         .post(&format!("/api/v1/repos/{owner}/{repo_name}/fork"), &body)
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let result: Value = resp.json().await.context("invalid JSON response")?;
-
-    if !status.is_success() {
-        let msg = result["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("fork failed ({status}): {msg}");
-    }
+    let result = crate::http::read_json(resp, "fork").await?;
 
     let fork_name = result["name"].as_str().unwrap_or(&repo_name);
     let owner_did = result["owner_did"].as_str().unwrap_or("?");
@@ -574,7 +730,7 @@ async fn cmd_fork(
 }
 
 /// Returns (owner, repo_name) — if repo contains '/', splits on it; otherwise uses caller's DID.
-async fn resolve_owner_repo_pair(
+pub(crate) async fn resolve_owner_repo_pair(
     repo: &str,
     node: &str,
     dir: Option<&std::path::Path>,
@@ -602,13 +758,7 @@ async fn cmd_label_add(
         .post(&format!("/api/v1/repos/{owner}/{name}/labels"), &body)
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let result: Value = resp.json().await.context("invalid JSON")?;
-
-    if !status.is_success() {
-        let msg = result["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("add label failed ({status}): {msg}");
-    }
+    let result = crate::http::read_json(resp, "add label").await?;
 
     let added = result["added"].as_bool().unwrap_or(true);
     if added {
@@ -633,13 +783,7 @@ async fn cmd_label_remove(
         .delete(&format!("/api/v1/repos/{owner}/{name}/labels/{label}"), &[])
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let result: Value = resp.json().await.context("invalid JSON")?;
-
-    if !status.is_success() {
-        let msg = result["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("remove label failed ({status}): {msg}");
-    }
+    let _ = crate::http::read_json(resp, "remove label").await?;
 
     println!("- Label removed: {label} from {owner}/{name}");
     Ok(())
@@ -647,14 +791,24 @@ async fn cmd_label_remove(
 
 async fn cmd_label_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()> {
     let (owner, name) = resolve_owner_repo_pair(&repo, &node, dir.as_deref()).await?;
-    let client = NodeClient::new(&node, None);
+    // Read-visibility-gated like the sibling read surfaces (replicas, protected
+    // branches): sign when an identity is available so a private-repo owner can
+    // read their own labels, while public repos stay anonymously listable.
+    let client = NodeClient::new(&node, load_keypair_from_dir(dir.as_deref()).ok());
 
-    let resp: Value = client
-        .get(&format!("/api/v1/repos/{owner}/{name}/labels"))
-        .await?
-        .json()
-        .await
-        .context("invalid JSON")?;
+    // Marry both refactors: main's get_maybe_signed (read-visibility gating —
+    // public repos stay anon-listable, private-repo owner signs) carrying the
+    // PR's read_json status-check-before-parse (#186: bounded error read, no
+    // parse-before-status). get_authed from the PR is dropped in favor of
+    // get_maybe_signed so the visibility gate is preserved.
+    let resp = crate::http::read_json(
+        client
+            .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}/labels"))
+            .await
+            .context("failed to connect to node")?,
+        "list labels",
+    )
+    .await?;
 
     let labels = resp["labels"].as_array().cloned().unwrap_or_default();
     if labels.is_empty() {
@@ -668,17 +822,39 @@ async fn cmd_label_list(repo: String, node: String, dir: Option<PathBuf>) -> Res
     Ok(())
 }
 
+/// Parse the protected-branch list from the node's `GET /branches/protected`
+/// response. The endpoint returns `{"protected_branches": [...], "count": N}`
+/// (see `crates/gitlawb-node/src/api/protect.rs`); each entry may be a plain
+/// branch-name string or an object carrying a `name` field.
+fn parse_protected_branches(val: &Value) -> Vec<String> {
+    val["protected_branches"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|b| {
+                    b.as_str()
+                        .map(String::from)
+                        .or_else(|| b["name"].as_str().map(String::from))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 async fn cmd_owner(repo: String, node: String, dir: Option<PathBuf>, json_out: bool) -> Result<()> {
     let keypair = load_keypair_from_dir(dir.as_deref())?;
     let my_did = keypair.did().to_string();
     let my_short = my_did.split(':').next_back().unwrap_or(&my_did).to_string();
 
     let (owner, name) = resolve_owner_repo_pair(&repo, &node, dir.as_deref()).await?;
-    let client = NodeClient::new(&node, None);
+    // Sign with the loaded identity so the read-visibility-gated protected-branch
+    // fetch below works on the owner's own private repos.
+    let client = NodeClient::new(&node, Some(keypair));
 
-    // Fetch repo info
+    // Fetch repo info (get_repo is read-visibility-gated; sign so the owner can
+    // inspect their own private repo).
     let resp = client
-        .get(&format!("/api/v1/repos/{owner}/{name}"))
+        .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}"))
         .await
         .context("failed to connect to node")?;
     if !resp.status().is_success() {
@@ -693,25 +869,14 @@ async fn cmd_owner(repo: String, node: String, dir: Option<PathBuf>, json_out: b
         .to_string();
     let is_owner = my_did == owner_did || my_short == owner_short;
 
-    // Fetch protected branches
+    // Fetch protected branches (read-visibility-gated; signed via the client).
     let protected: Vec<String> = match client
-        .get(&format!("/api/v1/repos/{owner}/{name}/branches/protected"))
+        .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}/branches/protected"))
         .await
     {
         Ok(resp) if resp.status().is_success() => {
             let val: Value = resp.json().await.unwrap_or_default();
-            val.as_array()
-                .or_else(|| val["branches"].as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|b| {
-                            b.as_str()
-                                .map(String::from)
-                                .or_else(|| b["name"].as_str().map(String::from))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
+            parse_protected_branches(&val)
         }
         _ => Vec::new(),
     };
@@ -748,6 +913,20 @@ async fn cmd_owner(repo: String, node: String, dir: Option<PathBuf>, json_out: b
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn parse_protected_branches_reads_node_shape() {
+        use serde_json::json;
+        assert_eq!(
+            parse_protected_branches(&json!({"protected_branches":["main","release"],"count":2})),
+            vec!["main".to_string(), "release".to_string()]
+        );
+        assert!(parse_protected_branches(&json!({"count":0})).is_empty());
+        assert_eq!(
+            parse_protected_branches(&json!({"protected_branches":[{"name":"main"}]})),
+            vec!["main".to_string()]
+        );
+    }
 
     fn write_identity(dir: &TempDir) {
         let kp = gitlawb_core::identity::Keypair::generate();
@@ -794,6 +973,285 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_fetch_node_web_url_with_web_url() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"web_url":"https://example.com","did":"did:key:z6Mk"}"#)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url.as_deref(), Some("https://example.com"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_node_web_url_trims_trailing_slash() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"web_url":"https://example.com/"}"#)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url.as_deref(), Some("https://example.com"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_node_web_url_without_web_url() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"did":"did:key:z6Mk"}"#)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url, None);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_node_web_url_empty_string() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"web_url":""}"#)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url, None);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_node_web_url_whitespace_only() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"web_url":"   "}"#)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url, None);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_node_web_url_server_error() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(500)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url, None);
+    }
+
+    /// A node advertising a present-but-malformed web_url (not an absolute
+    /// http(s) URL) must not yield a View link — and must warn, since a
+    /// malformed advertisement means the node is misconfigured (#370).
+    #[tokio::test]
+    async fn test_fetch_node_web_url_malformed_value_is_rejected() {
+        for bad in [
+            "gitlawb.com",
+            "not a url",
+            "ftp://files.example.com",
+            // Query/fragment corrupt the appended /{owner}/{repo} path.
+            "https://example.com?a=1",
+            "https://example.com/#faq",
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let _m = server
+                .mock("GET", "/")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!(r#"{{"web_url":"{bad}"}}"#))
+                .create_async()
+                .await;
+
+            let web_url = fetch_node_web_url(&server.url()).await;
+            assert_eq!(
+                web_url, None,
+                "malformed web_url {bad:?} must not render a View link"
+            );
+        }
+    }
+
+    /// A transport-level failure (connection refused) degrades to None but is
+    /// no longer silent: the request error is surfaced on stderr so an
+    /// unreachable node isn't indistinguishable from one without a web_url.
+    #[tokio::test]
+    async fn test_fetch_node_web_url_connection_refused_warns() {
+        // Port 1 on localhost is reserved (tcpmux) and refuses connections.
+        let web_url = fetch_node_web_url("http://127.0.0.1:1").await;
+        assert_eq!(web_url, None);
+    }
+
+    /// A hostile node can smuggle ANSI/bell/bidi controls inside a web_url that
+    /// still passes http(s) URL parsing — those bytes would reach the terminal
+    /// verbatim through the View: line. The advertised value must be rejected
+    /// outright: no control byte may survive into the returned string.
+    #[tokio::test]
+    async fn test_fetch_node_web_url_rejects_control_bytes() {
+        for bad in [
+            "https://example.com/\x1b[31mred",      // ANSI CSI escape in path
+            "https://example.com\x07",              // bell
+            "https://ex\u{202e}ample.com",          // bidi override (RLO)
+            "https://example.com/\u{200f}",         // RLM format char
+            "\x1b]0;title\x07https://evil.example", // OSC title-set prefix
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let _m = server
+                .mock("GET", "/")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                // serde_json escapes the control bytes so the body is VALID
+                // JSON — a raw literal would make parse fail and the test
+                // would pass without reaching the control check at all.
+                .with_body(serde_json::json!({"web_url": bad}).to_string())
+                .create_async()
+                .await;
+
+            let web_url = fetch_node_web_url(&server.url()).await;
+            assert_eq!(
+                web_url, None,
+                "web_url with control bytes {bad:?} must be rejected"
+            );
+        }
+    }
+
+    /// An oversized or half-read `GET /` body must warn, not silently
+    /// classify as "no web front-end": a cut body fails JSON parse, which is
+    /// indistinguishable from a node that advertised nothing without the
+    /// truncated flag. Removing the flag check makes this test pass
+    /// vacuously through the parse-fail arm.
+    #[test]
+    fn web_url_from_info_body_warns_on_truncated_reads() {
+        for (body, label) in [
+            (
+                crate::http::CappedBody {
+                    text: r#"{"web_url":"https://x"#.repeat(2000),
+                    truncated: true,
+                    read_failed: false,
+                },
+                "truncated",
+            ),
+            (
+                crate::http::CappedBody {
+                    text: r#"{"web_url":"https://x"#.to_string(),
+                    truncated: false,
+                    read_failed: true,
+                },
+                "read_failed",
+            ),
+        ] {
+            let err = web_url_from_info_body(&body)
+                .expect_err(&format!("{label} body must warn, not silently classify"));
+            assert!(
+                err.contains("oversized or could not be read"),
+                "{label}: got {err}"
+            );
+        }
+        // A clean body missing web_url still classifies as a silent None.
+        let clean = crate::http::CappedBody {
+            text: r#"{"did":"did:key:x"}"#.to_string(),
+            truncated: false,
+            read_failed: false,
+        };
+        assert_eq!(web_url_from_info_body(&clean).unwrap(), None);
+    }
+
+    /// Percent-encoded bidi must not slip past the literal scan: a node
+    /// advertising `https://example.com/%E2%80%AE` serves wire bytes with no
+    /// Cf code point, but a browser decodes it into a reordering character
+    /// on the rendered View: link (INV-6).
+    #[test]
+    fn web_url_from_info_body_rejects_percent_encoded_bidi() {
+        let body = crate::http::CappedBody {
+            text: r#"{"web_url":"https://example.com/%E2%80%AE"}"#.to_string(),
+            truncated: false,
+            read_failed: false,
+        };
+        let err = web_url_from_info_body(&body).expect_err("percent-encoded bidi must be rejected");
+        assert!(err.contains("bidi"), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_node_web_url_validates_after_trimming() {
+        // Trailing slash is trimmed before validation; result stays usable.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"web_url":"http://localhost:8080/ui/"}"#)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url.as_deref(), Some("http://localhost:8080/ui"));
+    }
+
+    /// A remote node that advertises `web_url` with userinfo (`user@`,
+    /// `user:pass@`) must be dropped: the value is reprinted on the `View:`
+    /// line, and a credential embedded in the URL would land in terminal
+    /// scrollback and CI logs. Mirrors the node-side boot validation.
+    #[tokio::test]
+    async fn test_fetch_node_web_url_rejects_userinfo() {
+        for bad in [
+            "https://user@example.com",
+            "https://user:secret@example.com",
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let _m = server
+                .mock("GET", "/")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!(r#"{{"web_url":"{}"}}"#, bad))
+                .create_async()
+                .await;
+
+            let web_url = fetch_node_web_url(&server.url()).await;
+            assert_eq!(
+                web_url, None,
+                "web_url with userinfo {bad:?} must be rejected"
+            );
+        }
+    }
+
+    /// A non-success status must still return None (View link is cosmetic) but
+    /// the status surfaces as a user-visible stderr warning instead of being
+    /// swallowed silently (#370 review).
+    #[tokio::test]
+    async fn test_fetch_node_web_url_non_success_warns_with_status() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(503)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url, None);
+        // The warning itself goes to stderr; mockito can't capture it here, so
+        // this asserts only the None contract. Manual check: run against a
+        // 503-ing node and observe "node info request returned 503" on stderr.
+    }
+
+    #[tokio::test]
     async fn test_cmd_create_server_error() {
         let dir = TempDir::new().unwrap();
         write_identity(&dir);
@@ -804,6 +1262,7 @@ mod tests {
             .with_status(409)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"repository already exists"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -819,6 +1278,8 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("already exists"));
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -884,6 +1345,33 @@ mod tests {
         cmd_list(server.url(), Some(dir.path().to_path_buf()))
             .await
             .unwrap();
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cmd_list_repos_surfaces_denial() {
+        // A node error must Err with the status, not trip the vague "expected
+        // array" fallback that hides the node's actual response.
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos\?owner=".to_string()),
+            )
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"boom"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let err = cmd_list(server.url(), Some(dir.path().to_path_buf()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("500"), "got: {err}");
         _m.assert_async().await;
     }
 
@@ -986,6 +1474,7 @@ mod tests {
             .with_status(400)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"you already have a repo named myrepo"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -1001,6 +1490,8 @@ mod tests {
             err.to_string().contains("already have a repo"),
             "got: {err}"
         );
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -1086,6 +1577,10 @@ mod tests {
                 "GET",
                 mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/labels$".to_string()),
             )
+            // Identity is loaded, so get_maybe_signed must sign — requiring the
+            // header guards against a regression back to bare get().
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"labels":[]}"#)
@@ -1112,6 +1607,10 @@ mod tests {
                 "GET",
                 mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/labels$".to_string()),
             )
+            // Identity is loaded, so get_maybe_signed must sign — requiring the
+            // header guards against a regression back to bare get().
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"labels":["language:rust","topic:defi"]}"#)
@@ -1128,6 +1627,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cmd_label_list_anonymous_when_no_identity() {
+        // Empty dir → no identity → get_maybe_signed must fall back to an
+        // anonymous GET (the public-repo path). Assert NO signature header.
+        let dir = TempDir::new().unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", mockito::Matcher::Regex(r"/labels$".to_string()))
+            .match_header("signature", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"labels":[]}"#)
+            .create_async()
+            .await;
+
+        cmd_label_list(
+            "owner/pubrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cmd_label_list_404_errors() {
+        // A non-reader of a private repo gets 404 from the now-gated endpoint.
+        // The client must surface that as an error, not print "No labels" and
+        // exit 0 (the error body has no `labels` key).
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/labels$".to_string()),
+            )
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repo not found"}"#)
+            .create_async()
+            .await;
+
+        let err = cmd_label_list(
+            "myrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("list labels failed (404")
+                && err.to_string().contains("repo not found"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cmd_label_list_non_json_error_surfaces_status() {
+        // A non-2xx response with a non-JSON body (e.g. a proxy 502) must still
+        // surface the HTTP status, not collapse to a bare JSON-parse error.
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/labels$".to_string()),
+            )
+            .with_status(502)
+            .with_header("content-type", "text/html")
+            .with_body("<html>502 Bad Gateway</html>")
+            .create_async()
+            .await;
+
+        let err = cmd_label_list(
+            "myrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("list labels failed (502"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_cmd_owner_is_owner() {
         let dir = TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
@@ -1137,11 +1727,15 @@ mod tests {
         let short = did.split(':').next_back().unwrap().to_string();
 
         let mut server = mockito::Server::new_async().await;
+        // Both fetches are read-visibility-gated; with an identity loaded they
+        // must be signed. Requiring the header guards a regression to get().
         let _repo = server
             .mock(
                 "GET",
                 mockito::Matcher::Regex(format!(r"^/api/v1/repos/{short}/myrepo$")),
             )
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(format!(
@@ -1156,9 +1750,11 @@ mod tests {
                     r"^/api/v1/repos/{short}/myrepo/branches/protected$"
                 )),
             )
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"["main"]"#)
+            .with_body(r#"{"protected_branches":["main"],"count":1}"#)
             .create_async()
             .await;
 
@@ -1199,7 +1795,7 @@ mod tests {
             )
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"["main","release"]"#)
+            .with_body(r#"{"protected_branches":["main","release"],"count":2}"#)
             .create_async()
             .await;
 
@@ -1240,7 +1836,7 @@ mod tests {
             )
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"["main"]"#)
+            .with_body(r#"{"protected_branches":["main"],"count":1}"#)
             .create_async()
             .await;
 
@@ -1268,6 +1864,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"not found"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -1280,5 +1877,355 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("not found"), "got: {err}");
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _repo.assert_async().await;
+    }
+
+    // ── Gated CLI reads surface node denials, not empty renders (#123) ──
+
+    #[tokio::test]
+    async fn cmd_commits_surfaces_denial_not_empty() {
+        // A gated 404 must Err, not print "No commits" as if the repo were empty.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/alice/secret/commits".to_string()),
+            )
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = cmd_commits(
+            "alice/secret".to_string(),
+            "main".to_string(),
+            20,
+            server.url(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "cmd_commits must Err on 404");
+        assert!(result.unwrap_err().to_string().contains("not found"));
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cmd_label_list_surfaces_denial_not_empty() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/alice/secret/labels".to_string()),
+            )
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = cmd_label_list("alice/secret".to_string(), server.url(), None).await;
+        assert!(result.is_err(), "cmd_label_list must Err on 404");
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
+    }
+
+    // cmd_info keeps its bespoke 404 message ahead of read_json...
+    #[tokio::test]
+    async fn cmd_info_404_keeps_bespoke_message() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/secret")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"gone"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let err = cmd_info("alice/secret".to_string(), server.url(), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("repository 'alice/secret' not found"),
+            "bespoke 404 text lost: {err}"
+        );
+        _m.assert_async().await;
+    }
+
+    // ...and every other non-2xx routes through read_json (capped + sanitized).
+    #[tokio::test]
+    async fn cmd_info_500_routes_through_read_json() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/secret")
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"boom"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let err = cmd_info("alice/secret".to_string(), server.url(), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("repo info failed"),
+            "read_json label lost: {err}"
+        );
+        assert!(err.contains("500"), "status not surfaced: {err}");
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_cmd_replicas_signs_when_identity_present() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+
+        let mut server = mockito::Server::new_async().await;
+        // Read-visibility-gated: with an identity the request must be signed.
+        let _m = server
+            .mock("GET", mockito::Matcher::Regex(r"/replicas$".to_string()))
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"repo":"owner/myrepo","replica_count":0,"replicas":[]}"#)
+            .create_async()
+            .await;
+
+        cmd_replicas(
+            "owner/myrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cmd_replicas_anonymous_when_no_identity() {
+        // Empty dir → no identity → get_maybe_signed must fall back to an
+        // anonymous GET (the public-repo path). Assert NO signature header.
+        let dir = TempDir::new().unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", mockito::Matcher::Regex(r"/replicas$".to_string()))
+            .match_header("signature", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"repo":"owner/pubrepo","replica_count":0,"replicas":[]}"#)
+            .create_async()
+            .await;
+
+        cmd_replicas(
+            "owner/pubrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cmd_info_signs_repo_and_replica_fetches() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+
+        let mut server = mockito::Server::new_async().await;
+        // Both the primary repo fetch and the replica sub-fetch are
+        // read-visibility-gated; with an identity loaded both must be signed.
+        let _repo = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/owner/myrepo$".to_string()),
+            )
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"id":"r1","name":"myrepo","owner_did":"did:key:zOwner","is_public":false,"default_branch":"main"}"#,
+            )
+            .create_async()
+            .await;
+        let _replicas = server
+            .mock("GET", mockito::Matcher::Regex(r"/replicas$".to_string()))
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"replica_count":0,"replicas":[]}"#)
+            .create_async()
+            .await;
+
+        cmd_info(
+            "owner/myrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cmd_info_404_surfaces_error_not_fake_repo() {
+        // A non-reader of a private repo gets a JSON 404 from the now-gated
+        // GET /api/v1/repos/{owner}/{name}. The command must surface that as an
+        // error, not parse the error body and print a fabricated repo summary
+        // (owner / "?" / public=true / main) before exiting 0.
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+
+        let mut server = mockito::Server::new_async().await;
+        let _repo = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/owner/myrepo$".to_string()),
+            )
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repo not found"}"#)
+            .create_async()
+            .await;
+
+        let err = cmd_info(
+            "owner/myrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap_err();
+        // The merged cmd_info maps a 404 to a generic "not found" (it does not
+        // echo the server's message body on 404), which still surfaces the error
+        // rather than fabricating a repo card, and avoids leaking any
+        // server-provided detail on a private-repo denial.
+        assert!(
+            err.to_string()
+                .contains("repository 'owner/myrepo' not found"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cmd_info_non_json_error_surfaces_status() {
+        // A non-2xx response with a non-JSON body (e.g. a proxy 502) must still
+        // surface the HTTP status, not collapse to a bare JSON-parse error.
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+
+        let mut server = mockito::Server::new_async().await;
+        let _repo = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/owner/myrepo$".to_string()),
+            )
+            .with_status(502)
+            .with_header("content-type", "text/html")
+            .with_body("<html>502 Bad Gateway</html>")
+            .create_async()
+            .await;
+
+        let err = cmd_info(
+            "owner/myrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("repo info failed (502"),
+            "got: {err}"
+        );
+    }
+}
+
+// Drives the three deny/negative arms that the merge reconciliation changed but
+// that no existing test executed (they were only reasoned): resolve_owner_did
+// with no identity, cmd_info on an authenticated-but-denied 403, and
+// get_maybe_signed with no keypair. Each asserts the must-not case.
+#[cfg(test)]
+mod vet_merge_deny_arms {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write_identity(dir: &TempDir) {
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let pem = kp.to_pem().unwrap();
+        std::fs::write(dir.path().join("identity.pem"), pem.as_bytes()).unwrap();
+    }
+
+    // No local identity must hard-error, never fall back to the node's own DID.
+    // (Load-bearing: #113's pre-merge resolve_owner_did returned Ok via a node
+    // fetch here; a reintroduced fallback makes this go red.)
+    #[tokio::test]
+    async fn resolve_owner_did_no_identity_errors_not_fallback() {
+        let empty = TempDir::new().unwrap(); // no identity.pem written
+        let err = resolve_owner_did("http://unused.invalid", Some(empty.path()))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no local identity to resolve the repo owner"),
+            "got: {err}"
+        );
+    }
+
+    // An authenticated caller DENIED with a 403 must surface an error, never
+    // render a repo card (deny-as-success is the client-contract break).
+    #[tokio::test]
+    async fn cmd_info_403_denied_surfaces_error_not_card() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/owner/myrepo$".to_string()),
+            )
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"forbidden"}"#)
+            .create_async()
+            .await;
+        let err = cmd_info(
+            "owner/myrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("repo info failed (403"),
+            "got: {err}"
+        );
+    }
+
+    // No keypair must send an unsigned GET; the mock only matches when the
+    // Signature header is absent, so a wrongly-signed request fails to match.
+    #[tokio::test]
+    async fn get_maybe_signed_no_keypair_sends_unsigned() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/owner/pub")
+            .match_header("signature", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("{}")
+            .create_async()
+            .await;
+        let client = NodeClient::new(server.url(), None);
+        let resp = client
+            .get_maybe_signed("/api/v1/repos/owner/pub")
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "unsigned GET should match the Missing-signature mock; got {}",
+            resp.status()
+        );
     }
 }
