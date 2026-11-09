@@ -5,6 +5,28 @@
 //!
 //! The schema is frozen at v1. All fields are mandatory for forward compatibility.
 //! Nodes that receive a certificate with an unknown version MUST reject it.
+//!
+//! ## Replay
+//!
+//! A certificate proves *who* asserted a ref update and *what* they asserted.
+//! It does not prove the assertion is fresh. [`RefUpdateBody::seq`] and
+//! [`RefUpdateBody::nonce`] are inside the signed bytes (see
+//! [`RefUpdateBody::to_signing_bytes`]), so a verifier can trust the values,
+//! but deciding whether a nonce is being reused or a `seq` is going backwards
+//! needs state.
+//!
+//! This crate is deliberately stateless — it is embedded in both nodes and
+//! clients — so replay is **not** enforced here and cannot be. Ownership of
+//! the check sits with the verifier that accepts and persists certificates,
+//! which must:
+//!
+//! - reject a `nonce` it has already accepted for the same `(repo, ref_name)`;
+//! - reject a `seq` that does not advance past the last accepted `seq` for
+//!   that `(repo, ref_name)`.
+//!
+//! Until such a verifier exists, replay of ref-update certificates is not
+//! enforced anywhere in this workspace. This contract exists so the first one
+//! inherits the requirement instead of re-deriving it.
 
 use std::collections::HashSet;
 
@@ -41,11 +63,19 @@ pub struct RefUpdateBody {
     pub from: String,
     /// The new commit hash (SHA-256 hex).
     pub to: String,
-    /// Monotonically increasing sequence number. Prevents replay.
+    /// Monotonically increasing sequence number, scoped to `(repo, ref_name)`.
+    ///
+    /// Signed, but not enforced by this crate: core holds no state. The
+    /// verifier that persists certificates must reject a `seq` that does not
+    /// advance for the same repo and ref. See the module docs on replay.
     pub seq: u64,
     /// RFC 3339 timestamp of this update.
     pub timestamp: DateTime<Utc>,
-    /// Random nonce for deduplication.
+    /// Random nonce, unique per certificate.
+    ///
+    /// Signed, but not enforced by this crate: core holds no state. The
+    /// verifier that persists certificates must reject a nonce it has already
+    /// accepted for the same repo and ref. See the module docs on replay.
     pub nonce: String,
 }
 
@@ -140,7 +170,16 @@ impl RefUpdateCert {
     ///
     /// Counts distinct signer DIDs, not signature entries: a repeated
     /// signature from the same maintainer counts once.
+    ///
+    /// `threshold` must be at least 1. Zero is rejected instead of being
+    /// treated as "no signatures required": a caller that derives the
+    /// threshold from configuration and gets 0 would otherwise accept any
+    /// certificate, whether its signatures verify or not.
     pub fn satisfies_threshold(&self, maintainers: &[Did], threshold: usize) -> Result<bool> {
+        if threshold == 0 {
+            return Err(Error::RefCert("threshold must be at least 1".to_string()));
+        }
+
         let valid = self.verify_all()?;
         let distinct_signers: HashSet<&Did> =
             valid.iter().filter(|d| maintainers.contains(d)).collect();
@@ -378,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn threshold_zero_is_always_satisfied() {
+    fn threshold_zero_is_rejected() {
         let kp = Keypair::generate();
         let cert = RefUpdateCert::new(
             kp.did(),
@@ -389,6 +428,120 @@ mod tests {
             &kp,
         )
         .unwrap();
-        assert!(cert.satisfies_threshold(&[], 0).unwrap());
+
+        // Zero must never read as "no signatures required", even with an empty
+        // maintainer set.
+        let err = cert.satisfies_threshold(&[], 0).unwrap_err();
+        assert!(
+            err.to_string().contains("threshold must be at least 1"),
+            "zero must be refused as an invalid threshold"
+        );
+    }
+
+    /// The threshold is checked before any signature work, so a zero is
+    /// reported as a threshold error even when the certificate's signatures
+    /// are also invalid. Otherwise a broken certificate would let a caller
+    /// mistake the failure for a legitimate verification result.
+    #[test]
+    fn threshold_zero_is_rejected_before_signature_verification() {
+        let kp = Keypair::generate();
+        let other = Keypair::generate();
+        let mut cert = RefUpdateCert::new(
+            kp.did(),
+            "refs/heads/main".to_string(),
+            dummy_hash('0'),
+            dummy_hash('a'),
+            1,
+            &kp,
+        )
+        .unwrap();
+        cert.signatures[0].sig = other.sign_b64(b"unrelated bytes");
+
+        let err = cert.satisfies_threshold(&[kp.did()], 0).unwrap_err();
+        assert!(
+            err.to_string().contains("threshold must be at least 1"),
+            "the invalid threshold must win over the invalid signature"
+        );
+    }
+
+    /// `seq` and `nonce` are the verifier's replay inputs, so they have to be
+    /// inside the signed body; tapping either one must invalidate the
+    /// certificate rather than leave it verifying with different values.
+    #[test]
+    fn replay_fields_are_covered_by_the_signature() {
+        let kp = Keypair::generate();
+        let cert = RefUpdateCert::new(
+            kp.did(),
+            "refs/heads/main".to_string(),
+            dummy_hash('0'),
+            dummy_hash('a'),
+            7,
+            &kp,
+        )
+        .unwrap();
+        cert.verify_all().expect("baseline must verify");
+
+        let mut bumped = cert.clone();
+        bumped.body.seq = 8;
+        assert!(
+            matches!(bumped.verify_all(), Err(Error::SignatureInvalid)),
+            "changing seq must invalidate the signature"
+        );
+
+        let mut renamed = cert.clone();
+        renamed.body.nonce = "different-nonce".to_string();
+        assert!(
+            matches!(renamed.verify_all(), Err(Error::SignatureInvalid)),
+            "changing nonce must invalidate the signature"
+        );
+    }
+
+    /// A signature minted by a real key must not verify when the signer is
+    /// spelled in another multibase alphabet. Otherwise the same identity
+    /// would satisfy a maintainer allowlist under several DID strings.
+    ///
+    /// Base64url is deliberate: its 47-character method-id fits under the
+    /// pre-existing length bound, so this test reaches the canonical-prefix
+    /// rule and fails on the pre-fix code instead of being refused for length.
+    #[test]
+    fn verify_all_rejects_a_non_canonical_did_spelling() {
+        let kp = Keypair::generate();
+        let mut cert = RefUpdateCert::new(
+            kp.did(),
+            "refs/heads/main".to_string(),
+            dummy_hash('0'),
+            dummy_hash('a'),
+            1,
+            &kp,
+        )
+        .unwrap();
+
+        let mut prefixed = vec![0xed, 0x01];
+        prefixed.extend_from_slice(&kp.verifying_key().to_bytes());
+        cert.signatures[0].signer = format!(
+            "did:key:{}",
+            multibase::encode(multibase::Base::Base64Url, &prefixed)
+        )
+        .parse()
+        .expect("method is still `key`");
+
+        let err = cert
+            .verify_all()
+            .expect_err("a non-canonical did:key spelling must not resolve");
+        assert!(
+            err.to_string().contains("base58btc"),
+            "rejection must come from the canonical-prefix rule, not the length guard"
+        );
+        assert!(
+            !matches!(
+                cert.satisfies_threshold(&[cert.signatures[0].signer.clone()], 1),
+                Ok(true)
+            ),
+            "the alternate spelling must not satisfy a threshold"
+        );
+
+        // The canonical spelling of the same key is unaffected.
+        cert.signatures[0].signer = kp.did();
+        assert!(cert.satisfies_threshold(&[kp.did()], 1).unwrap());
     }
 }

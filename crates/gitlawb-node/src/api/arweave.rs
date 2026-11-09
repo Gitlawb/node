@@ -1,12 +1,13 @@
 //! GET /api/v1/arweave/anchors — list Arweave ref-update anchors.
 
 use axum::{
-    extract::{Query, State},
+    extract::{Extension, Query, State},
     Json,
 };
 use serde::Deserialize;
 
-use crate::error::Result;
+use crate::db::normalize_owner_key;
+use crate::error::{AppError, Result};
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -21,17 +22,62 @@ fn default_limit() -> i64 {
 }
 
 /// GET /api/v1/arweave/anchors
+///
+/// `?repo=<owner>/<name>` returns anchors for one repository and binds the
+/// request to the canonical read-authorization path used by every other
+/// repo-scoped read: the same `authorize_repo_read` helper, with the caller
+/// identity attached. Missing repositories, quarantined mirrors, and signed
+/// non-readers all collapse to the standard `404` (no existence oracle). The
+/// unscoped listing is auth-only — the #121 contract — and does not admit
+/// visibility filtering, which is the #136 stale-index class and explicitly
+/// out of scope for this auth slice.
 pub async fn list_anchors(
     State(state): State<AppState>,
     Query(q): Query<ListAnchorsQuery>,
+    auth: Option<Extension<crate::auth::AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
-    let limit = q.limit.min(200);
-    // Bare `?` so connection-class sqlx failures downcast to `AppError::Db` and
-    // map to 503 `db_unavailable` (not 500 via `.map_err(AppError::Internal)`) (#251).
-    let anchors = state
-        .db
-        .list_arweave_anchors(q.repo.as_deref(), limit)
-        .await?;
+    // The route's `optional_signature` layer is permissive (it admits unsigned
+    // legacy callers) so this in-handler check is the actual gate. A signed
+    // non-reader still passes this check and proceeds to the authz step below.
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    if caller.is_none() {
+        return Err(AppError::Unauthorized(
+            "authentication required for anchor listing".into(),
+        ));
+    }
+
+    // Clamp before the SQL query. A negative or non-numeric limit must not
+    // reach Postgres as `LIMIT -1` (which it rejects as a db error / 500) — the
+    // contract is the same default ceiling as the listing page itself.
+    let limit = q.limit.clamp(0, 200);
+
+    let anchors = if let Some(repo_slug) = q.repo.as_deref() {
+        // Parse the user-supplied "owner/name" through the same slug validator
+        // the sync path uses, so a malformed query is a 400, not a 500.
+        let (owner, name) = match crate::git::repo_store::validate_repo_slug(repo_slug) {
+            Ok(parts) => parts,
+            Err(e) => return Err(AppError::BadRequest(format!("invalid ?repo: {e}"))),
+        };
+        // Read gate. Returns `RepoNotFound` (→ 404) indistinguishably for
+        // missing repos, quarantined mirrors, and signed non-readers.
+        let (record, _rules) =
+            crate::api::authorize_repo_read(&state, owner, name, caller, "/").await?;
+        // Build the SQL filter from the canonical stored slug, NOT from the
+        // user-supplied `?repo=` string. Anchor rows are written as
+        // `{normalize_owner_key(owner_did)}/{name}` (the short form), so a
+        // request that passes authz with the full `did:key:…/name` form would
+        // match zero rows and return a false empty page. The gate already
+        // verified the repo is readable; `record.owner_did` is the canonical
+        // identity and `record.name` is the stored name.
+        let stored_slug = format!("{}/{}", normalize_owner_key(&record.owner_did), record.name);
+        state
+            .db
+            .list_arweave_anchors(Some(&stored_slug), limit)
+            .await?
+    } else {
+        // No scope → no repo-read decision. Auth-only.
+        state.db.list_arweave_anchors(None, limit).await?
+    };
 
     Ok(Json(serde_json::json!({
         "anchors": anchors,
@@ -60,6 +106,7 @@ mod closed_pool_tests {
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/arweave/anchors")
+                    .extension(crate::auth::AuthenticatedDid("did:key:test".into()))
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )

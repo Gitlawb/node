@@ -1,5 +1,5 @@
 <!--
-  Thanks for contributing to Gitlawb. Keep PRs focused on one change.
+  Thanks for contributing to Twigpine. Keep PRs focused on one change.
   Protocol-level changes (identity, signatures, wire format) should start
   as an issue before code — see CONTRIBUTING.md.
 -->

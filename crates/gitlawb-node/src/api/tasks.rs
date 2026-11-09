@@ -30,6 +30,33 @@ fn forbidden(msg: &str) -> (StatusCode, Json<Value>) {
     )
 }
 
+/// This module's error shape with an opaque body: the real error is logged
+/// server-side and never serialized (#250), matching the envelope
+/// `AppError::Db` renders. Also mirrors its status split: pool-class failures
+/// are a retryable 503 `db_unavailable`, everything else the opaque 500
+/// `db_error`, so a transient outage is not reported as permanent.
+fn db_error(e: anyhow::Error) -> (StatusCode, Json<Value>) {
+    tracing::error!(error = %format!("{e:#}"), "task database error");
+    if let Some(sql) = e.chain().find_map(|c| c.downcast_ref::<sqlx::Error>()) {
+        if crate::error::db_unavailable(sql) {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": crate::error::DB_UNAVAILABLE_CODE,
+                    "message": crate::error::DB_UNAVAILABLE_MESSAGE,
+                })),
+            );
+        }
+    }
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "error": "db_error",
+            "message": crate::error::DB_ERROR_MESSAGE,
+        })),
+    )
+}
+
 // ── Request / response types ──────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -101,6 +128,37 @@ pub async fn create_task(
     if !crate::api::did_matches(&auth.0, &body.delegator_did) {
         return Err(forbidden("delegator_did must be the authenticated signer"));
     }
+    // #496: a caller-supplied repo_id must name a repo the caller owns. Without
+    // this, any signed caller can plant a task — payload and UCAN included —
+    // under a foreign repo id, where the named assignee can claim it. Resolve
+    // the id against hosted repos: a hosted, non-quarantined repo admits tasks
+    // only from its owner (403 otherwise). An id naming no hosted repo
+    // (unknown, or quarantined — which is hidden as if it did not exist, so
+    // 403ing it would confirm a real id) is stored verbatim as an opaque
+    // label: this is a write gate and does not bind an unresolved id to a
+    // repo. Task reads are caller-independent on this base (the list endpoints
+    // are not repo-scoped), before and after this change. The 403-vs-201 split
+    // between a hosted repo id and an unknown one is itself a one-bit oracle —
+    // a stranger holding a private repo's id learns it is hosted here — but
+    // denying foreign repos requires drawing exactly that line, and repo ids
+    // already surface via the task list on this base. Repo-less tasks are
+    // unaffected.
+    if let Some(repo_id) = body.repo_id.as_deref() {
+        let record = state.db.get_repo_by_id(repo_id).await.map_err(db_error)?;
+        if let Some(record) = record {
+            let quarantined = state
+                .db
+                .is_repo_quarantined(&record.id)
+                .await
+                .map_err(db_error)?;
+            if !quarantined && crate::api::require_repo_owner(&record, &auth.0).is_err() {
+                // Same denial text the GraphQL copy relays from
+                // `require_repo_owner`, so the two copies of this gate do not
+                // disagree in observable output.
+                return Err(forbidden(crate::api::REPO_OWNER_ONLY_MESSAGE));
+            }
+        }
+    }
     let now = Utc::now().to_rfc3339();
     let task = AgentTask {
         id: Uuid::new_v4().to_string(),
@@ -117,12 +175,7 @@ pub async fn create_task(
         updated_at: now,
         deadline: body.deadline,
     };
-    state.db.create_task(&task).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-    })?;
+    let task = state.db.create_task(&task).await.map_err(db_error)?;
     Ok((StatusCode::CREATED, Json(task_to_json(&task))))
 }
 
@@ -175,16 +228,28 @@ pub async fn claim_task(
         return Err(forbidden("assignee_did must be the authenticated signer"));
     }
     let task = state.db.claim_task(&id, &auth.0).await.map_err(|e| {
+        if e.downcast_ref::<crate::db::TaskReservedForOtherAssignee>()
+            .is_some()
+        {
+            return forbidden("task not claimable: reserved for another assignee");
+        }
         (
             StatusCode::CONFLICT,
             Json(json!({ "error": e.to_string() })),
         )
     })?;
+    let by_did = task
+        .assignee_did
+        .as_deref()
+        .map(crate::db::trim_assignee_did)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| auth.0.clone());
     let _ = state.task_event_tx.send(TaskEventBroadcast {
         task_id: id,
         old_status: "pending".to_string(),
         new_status: "claimed".to_string(),
-        by_did: auth.0,
+        by_did,
         at: Utc::now().to_rfc3339(),
     });
     Ok(Json(task_to_json(&task)))
@@ -219,14 +284,14 @@ pub async fn complete_task(
         })?;
     if !crate::api::did_matches(
         &auth.0,
-        existing.assignee_did.as_deref().unwrap_or_default(),
+        crate::db::trim_assignee_did(existing.assignee_did.as_deref().unwrap_or_default()),
     ) {
         return Err(forbidden("only the task assignee can complete it"));
     }
     let by_did = auth.0;
     let task = state
         .db
-        .finish_task(&id, "completed", body.result.as_deref())
+        .finish_task(&id, "completed", body.result.as_deref(), &by_did)
         .await
         .map_err(|e| {
             (
@@ -234,6 +299,13 @@ pub async fn complete_task(
                 Json(json!({ "error": e.to_string() })),
             )
         })?;
+    let by_did = task
+        .assignee_did
+        .as_deref()
+        .map(crate::db::trim_assignee_did)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or(by_did);
     let _ = state.task_event_tx.send(TaskEventBroadcast {
         task_id: id,
         old_status: "claimed".to_string(),
@@ -272,7 +344,7 @@ pub async fn fail_task(
         })?;
     if !crate::api::did_matches(
         &auth.0,
-        existing.assignee_did.as_deref().unwrap_or_default(),
+        crate::db::trim_assignee_did(existing.assignee_did.as_deref().unwrap_or_default()),
     ) {
         return Err(forbidden("only the task assignee can fail it"));
     }
@@ -280,7 +352,7 @@ pub async fn fail_task(
     let reason = body.reason.unwrap_or_default();
     let task = state
         .db
-        .finish_task(&id, "failed", Some(&reason))
+        .finish_task(&id, "failed", Some(&reason), &by_did)
         .await
         .map_err(|e| {
             (
@@ -288,6 +360,13 @@ pub async fn fail_task(
                 Json(json!({ "error": e.to_string() })),
             )
         })?;
+    let by_did = task
+        .assignee_did
+        .as_deref()
+        .map(crate::db::trim_assignee_did)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or(by_did);
     let _ = state.task_event_tx.send(TaskEventBroadcast {
         task_id: id,
         old_status: "claimed".to_string(),
@@ -296,4 +375,37 @@ pub async fn fail_task(
         at: Utc::now().to_rfc3339(),
     });
     Ok(Json(task_to_json(&task)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The gate's DB helper must mirror `AppError::Db`: a pool-level failure is
+    /// the retryable 503 `db_unavailable`, a query fault the opaque 500.
+    #[test]
+    fn db_error_matches_app_error_status_split() {
+        let unavailable = db_error(anyhow::Error::from(sqlx::Error::PoolTimedOut));
+        assert_eq!(unavailable.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable.1 .0["error"], crate::error::DB_UNAVAILABLE_CODE);
+        assert_eq!(
+            unavailable.1 .0["message"],
+            crate::error::DB_UNAVAILABLE_MESSAGE
+        );
+
+        let query = db_error(anyhow::Error::from(sqlx::Error::Protocol(
+            "column \"machine_id\" does not exist".into(),
+        )));
+        assert_eq!(query.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(query.1 .0["error"], "db_error");
+        assert_eq!(query.1 .0["message"], crate::error::DB_ERROR_MESSAGE);
+        assert!(!query.1 .0.to_string().contains("machine_id"));
+    }
+
+    /// `.context()` layers must not hide the sqlx error from the status split.
+    #[test]
+    fn db_error_sees_sqlx_through_context() {
+        let wrapped = anyhow::Error::from(sqlx::Error::PoolClosed).context("repo lookup failed");
+        assert_eq!(db_error(wrapped).0, StatusCode::SERVICE_UNAVAILABLE);
+    }
 }
