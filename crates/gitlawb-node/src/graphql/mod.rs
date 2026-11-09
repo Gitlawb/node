@@ -424,7 +424,7 @@ mod tests {
         // documented maximums instead of going stale as literals.
         for (field, selection, max) in [
             ("refUpdates", "repo", MAX_VISIBLE_REF_UPDATES),
-            ("tasks", "id", MAX_VISIBLE_TASK_PAGE_SIZE),
+            ("tasks", "items { id }", MAX_VISIBLE_TASK_PAGE_SIZE),
             (
                 "reposPage",
                 "nodes { name }",
@@ -726,12 +726,12 @@ mod tests {
         );
 
         // tasks(limit: MAX_VISIBLE_TASK_PAGE_SIZE):
-        // Single-field selection has child_complexity 1, so the cost is
-        // 50 + MAX_VISIBLE_TASK_PAGE_SIZE + 1 <= 400.
+        // Selection items { id } has child_complexity 2, so the cost is
+        // 50 + MAX_VISIBLE_TASK_PAGE_SIZE + 2 <= 400.
         // It passes validation and reaches the resolver.
         let single_task = schema
             .execute(format!(
-                "{{ tasks(limit: {MAX_VISIBLE_TASK_PAGE_SIZE}) {{ id }} }}"
+                "{{ tasks(limit: {MAX_VISIBLE_TASK_PAGE_SIZE}) {{ items {{ id }} }} }}"
             ))
             .await;
         assert!(
@@ -751,14 +751,14 @@ mod tests {
             single_task.errors
         );
 
-        // Two-field selection has child_complexity 2, so the cost is
-        // 50 + MAX_VISIBLE_TASK_PAGE_SIZE + 2 <= 400.
+        // Selection items { id status } has child_complexity 3, so the cost is
+        // 50 + MAX_VISIBLE_TASK_PAGE_SIZE + 3 <= 400.
         // A request at the documented maximum stays reachable with multiple
         // fields (the old multiplicative price rejected it at 450); it passes
         // validation and reaches the resolver like the single-field case.
         let multi_task = schema
             .execute(format!(
-                "{{ tasks(limit: {MAX_VISIBLE_TASK_PAGE_SIZE}) {{ id status }} }}"
+                "{{ tasks(limit: {MAX_VISIBLE_TASK_PAGE_SIZE}) {{ items {{ id status }} }} }}"
             ))
             .await;
         assert!(

@@ -897,8 +897,10 @@ mod tests {
 
         let mut stream = connect_ws(addr).await;
 
-        // Query with 6 aliased task fields (exceeding MAX_GRAPHQL_TASK_READS_PER_REQUEST = 5)
-        let query = r#"{"id":"1","type":"subscribe","payload":{"query":"query { f1: tasks { items { id } } f2: tasks { items { id } } f3: tasks { items { id } } f4: tasks { items { id } } f5: tasks { items { id } } f6: tasks { items { id } } }"}}"#;
+        // Query with 6 aliased task fields (exceeding MAX_GRAPHQL_TASK_READS_PER_REQUEST = 5).
+        // limit: 1 keeps the document under GRAPHQL_MAX_COMPLEXITY so the 6th
+        // field reaches the brake instead of failing complexity first.
+        let query = r#"{"id":"1","type":"subscribe","payload":{"query":"query { f1: tasks(limit: 1) { items { id } } f2: tasks(limit: 1) { items { id } } f3: tasks(limit: 1) { items { id } } f4: tasks(limit: 1) { items { id } } f5: tasks(limit: 1) { items { id } } f6: tasks(limit: 1) { items { id } } }"}}"#;
         ws_send_text(&mut stream, query).await;
         let frames = ws_recv_op_frames(&mut stream, "1").await;
         let resp = frames.join("\n");

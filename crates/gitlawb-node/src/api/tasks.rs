@@ -1754,13 +1754,16 @@ mod visible_tasks_tests {
             req
         };
 
+        // Six default-size aliases would exceed GRAPHQL_MAX_COMPLEXITY before
+        // the brake can debit; limit: 1 keeps all six under the budget so the
+        // 6th field reaches and trips TaskReadBrake.
         let aliased_query = "{ \
-            a1: tasks { items { id } } \
-            a2: tasks { items { id } } \
-            a3: tasks { items { id } } \
-            a4: tasks { items { id } } \
-            a5: tasks { items { id } } \
-            a6: tasks { items { id } } \
+            a1: tasks(limit: 1) { items { id } } \
+            a2: tasks(limit: 1) { items { id } } \
+            a3: tasks(limit: 1) { items { id } } \
+            a4: tasks(limit: 1) { items { id } } \
+            a5: tasks(limit: 1) { items { id } } \
+            a6: tasks(limit: 1) { items { id } } \
         }";
         let resp = router.oneshot(query(peer, aliased_query)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
