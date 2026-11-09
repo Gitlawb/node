@@ -7,6 +7,7 @@ mod bootstrap;
 mod cert;
 mod config;
 mod db;
+mod durable_outbox;
 mod encrypted_pin;
 mod error;
 mod git;
@@ -630,6 +631,13 @@ async fn main() -> Result<()> {
     }
 
     let _legacy_cid_sweep = spawn_legacy_cid_sweep(&state, &config);
+    let _queue_lifecycle_sweep = spawn_queue_lifecycle_sweep(&state, &config);
+    // NOTE: the due-request worker is spawned AFTER the one-shot startup
+    // reconcile/drain below, not here: its 5s interval would otherwise tick
+    // during operator/PoS setup and interleave with boot recovery on backlog
+    // rows (state gates prevent data loss, but the interleave costs recovery
+    // latency and widens the reconcile/drain race window).
+    let _marker_cleanup_worker = spawn_marker_cleanup_worker(&state);
 
     let router = server::build_router(state.clone());
     // Re-register the socket bound at startup — same fd, so there was never a
@@ -761,6 +769,63 @@ async fn main() -> Result<()> {
     let grace = std::time::Duration::from_secs(config.shutdown_grace_secs);
     info!(grace_secs = config.shutdown_grace_secs, "axum server ready");
 
+    // #26 Split PR 1: drain any `applied` rows left by a previous
+    // process that crashed after Git applied a ref but before the
+    // bookkeeping landed. Runs once, BEFORE the server accepts new
+    // pushes, so a recovery re-derivation does not race a fresh push.
+    // Non-fatal: a transient drain failure is logged and the rows
+    // remain `applied` for the next startup to pick up.
+    //
+    // P1-A: the reconcile step runs FIRST and promotes any `prepared`
+    // or `uncertain` row whose target SHA actually landed on disk.
+    // This is the path that recovers a ref when the post-receive
+    // `mark_pending_ref_transitions_applied` call errored or was
+    // interrupted after `receive_pack` returned Ok, or when
+    // receive-pack returned Err but some refs may have landed
+    // (the `uncertain` state). Without this step, the drain (gated
+    // on `state = 'applied'`) would never see those rows.
+    //
+    // P2 (reviewer-1/2 round 3): use the multi-pass reconcile so
+    // prepared/uncertain rows beyond the first 1000-row page are
+    // processed in the same startup, rather than waiting for the
+    // next restart (where they might age out of MAX_RECONCILE_AGE).
+    match durable_outbox::reconcile_prepared_from_disk_all(
+        state.clone(),
+        durable_outbox::DRAIN_PER_PASS_LIMIT,
+        durable_outbox::DRAIN_MAX_PASSES,
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(n) => info!(
+            n,
+            "reconciled prepared/uncertain -> applied via on-disk ref match"
+        ),
+        Err(e) => warn!(
+            err = %e,
+            "pending ref transition reconcile failed at startup (non-fatal; will retry on next start)"
+        ),
+    }
+    match durable_outbox::drain_receive_pack_requests_all(
+        state.clone(),
+        durable_outbox::DRAIN_PER_PASS_LIMIT,
+        durable_outbox::DRAIN_MAX_PASSES,
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(n) => info!(n, "drained pending ref transitions from prior run"),
+        Err(e) => warn!(
+            err = %e,
+            "pending ref transition drain failed at startup (non-fatal; will retry on next start)"
+        ),
+    }
+
+    // Start the due-request worker only now that boot recovery is done (see
+    // the note at the other spawns above): its first tick must not interleave
+    // with the one-shot reconcile/drain on backlog rows.
+    let _due_request_worker = spawn_due_request_worker(&state);
+
     // `into_make_service_with_connect_info` exposes the socket peer address as
     // `ConnectInfo<SocketAddr>` so the push limiter can key on the real client
     // when no trusted proxy header applies (see `rate_limit::client_key`).
@@ -791,6 +856,158 @@ async fn main() -> Result<()> {
     serve_result?;
     info!("clean exit");
     Ok(())
+}
+
+/// U4 (#173): spawn the periodic legacy provider-CID repair sweep. Releases before this
+/// version stored the PROVIDER CID (Kubo dag-pb / Pinata CIDv0) in `pinned_cids.cid`,
+/// and this version's `/ipfs/{cid}` resolver withholds any row whose stored key is not
+/// the raw-content CID. The opportunistic repair on the pin path only fires when a push
+/// re-carries the object, which normal git negotiation makes it not do, so those rows
+/// need a walk. DETACHED, never on the boot path: the caller keeps serving while this
+/// runs, and the sweep's own batch bound plus inter-batch delay keep it off the DB's
+/// critical path. Its cursor is durable, so a restart mid-walk resumes instead of
+/// rewinding. It re-arms after every run, including a failed one, so it never returns
+/// and there is no awaited value to log here; the shutdown watcher below is what ends
+/// it.
+///
+/// A named function rather than an inline block in `main` so the WIRING has a seam a
+/// test can call: that the task is spawned at all, that it reads its batch and delay
+/// from the config knobs rather than some other field, that the caller is not blocked
+/// on it, and that the shutdown watcher actually ends it mid-walk. The sweep's own
+/// behavior is covered elsewhere; this is the boot-path half.
+fn spawn_legacy_cid_sweep(state: &AppState, config: &Config) -> tokio::task::JoinHandle<()> {
+    let db = state.db.clone();
+    let repos_dir = config.repos_dir.clone();
+    let git_bin = state.git_bin.clone();
+    let git_timeout = std::time::Duration::from_secs(config.git_service_timeout_secs);
+    let batch = config.pin_repair_sweep_batch;
+    let delay = std::time::Duration::from_secs(config.pin_repair_sweep_delay_secs);
+    let mut shutdown_rx = state.subscribe_shutdown();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = ipfs_pin::run_sweep_rearmed(
+                &repos_dir, &git_bin, git_timeout, batch, delay,
+                ipfs_pin::SWEEP_REARM_DELAY, &db,
+            ) => {}
+            // Shutdown mid-walk simply drops the run; the persisted cursor means the
+            // next boot picks up where this one stopped.
+            _ = shutdown_rx.changed() => {}
+        }
+    })
+}
+
+/// #26 Split PR 1 step 4 — periodic queue-lifecycle purge. Runs on
+/// the same detached task pattern as `spawn_legacy_cid_sweep`:
+/// tokio::spawn with a shutdown watcher, never on the boot path. The
+/// interval is fixed at 24 hours (the spec calls for "one per
+/// cluster per day"); the inter-batch delay is implicit in the
+/// batch size plus the wall-clock cost of each pass. The drain
+/// (`drain_receive_pack_requests_all`) and the purge
+/// (`purge_request_queue`) share the same `DRAIN_PER_PASS_LIMIT`
+/// budget so a 1000-row purge pass takes roughly the same time as
+/// a 1000-row drain pass.
+fn spawn_queue_lifecycle_sweep(state: &AppState, config: &Config) -> tokio::task::JoinHandle<()> {
+    let app_state = state.clone();
+    let retention_days = config.queue_retention_days;
+    let batch = config.queue_purge_batch;
+    let git_timeout = std::time::Duration::from_secs(config.git_service_timeout_secs.min(30));
+    let mut shutdown_rx = state.subscribe_shutdown();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Consume the immediate first tick: Tokio intervals fire
+        // immediately on creation, which would run the purge
+        // concurrently with startup reconcile/drain. The child purge
+        // is terminal-parent-gated in SQL, but delaying the first
+        // sweep a full period removes the race entirely.
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(e) = durable_outbox::purge_request_queue(
+                        &app_state.db,
+                        retention_days,
+                        batch,
+                    ).await {
+                        tracing::warn!(err = %e, "queue lifecycle purge failed; will retry on next tick");
+                    }
+                    // Drain marker tombstones with the bounded deleter;
+                    // failures retain the tombstone for the next tick.
+                    if let Err(e) = durable_outbox::drain_marker_cleanup_queue(
+                        &app_state,
+                        batch,
+                        git_timeout,
+                    ).await {
+                        tracing::warn!(err = %e, "marker cleanup drain failed");
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    break;
+                }
+            }
+        }
+    })
+}
+
+/// Shutdown-aware background due-request loop. The startup drain runs
+/// once; without this, `effects_pending` rows with a future
+/// `next_attempt_at` would wait until the next process restart.
+/// Polls the indexed due query with bounded batches and failure
+/// isolation (one request's error never aborts the batch).
+fn spawn_due_request_worker(state: &AppState) -> tokio::task::JoinHandle<()> {
+    let app_state = state.clone();
+    let mut shutdown_rx = state.subscribe_shutdown();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    match durable_outbox::drain_receive_pack_requests(
+                        app_state.clone(),
+                        durable_outbox::DRAIN_PER_PASS_LIMIT,
+                    )
+                    .await
+                    {
+                        Ok((0, _)) => {}
+                        Ok((n, _)) => tracing::info!(n, "due request worker drained"),
+                        Err(e) => tracing::warn!(err = %e, "due request worker drain failed"),
+                    }
+                }
+                _ = shutdown_rx.changed() => break,
+            }
+        }
+    })
+}
+
+/// Dedicated marker-tombstone worker at a shorter cadence than the
+/// daily purge, so external Git refs do not linger a full period
+/// after their SQL owner is gone.
+fn spawn_marker_cleanup_worker(state: &AppState) -> tokio::task::JoinHandle<()> {
+    let app_state = state.clone();
+    let git_timeout =
+        std::time::Duration::from_secs(app_state.config.git_service_timeout_secs.min(30));
+    let mut shutdown_rx = state.subscribe_shutdown();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(e) = durable_outbox::drain_marker_cleanup_queue(
+                        &app_state,
+                        durable_outbox::DRAIN_PER_PASS_LIMIT,
+                        git_timeout,
+                    )
+                    .await
+                    {
+                        tracing::warn!(err = %e, "marker cleanup worker failed");
+                    }
+                }
+                _ = shutdown_rx.changed() => break,
+            }
+        }
+    })
 }
 
 fn spawn_shutdown_signal(tx: watch::Sender<bool>) {
@@ -1280,55 +1497,6 @@ mod rate_limiter_sweep_tests {
 }
 
 /// it.
-fn spawn_legacy_cid_sweep(state: &AppState, config: &Config) -> tokio::task::JoinHandle<()> {
-    let db = state.db.clone();
-    let repos_dir = config.repos_dir.clone();
-    let git_bin = state.git_bin.clone();
-    let git_timeout = std::time::Duration::from_secs(config.git_service_timeout_secs);
-    let batch = config.pin_repair_sweep_batch;
-    let delay = std::time::Duration::from_secs(config.pin_repair_sweep_delay_secs);
-    let mut shutdown_rx = state.subscribe_shutdown();
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = ipfs_pin::run_sweep_rearmed(
-                &repos_dir, &git_bin, git_timeout, batch, delay,
-                ipfs_pin::SWEEP_REARM_DELAY, &db,
-            ) => {}
-            _ = shutdown_rx.changed() => {}
-        }
-    })
-}
-
-async fn gossip_ping_round(
-    db: &Db,
-    client: &reqwest::Client,
-    failed_once: &mut HashSet<String>,
-    peers: Vec<db::PeerRecord>,
-) {
-    {
-        let current_dids: HashSet<&str> = peers.iter().map(|peer| peer.did.as_str()).collect();
-        failed_once.retain(|did| current_dids.contains(did.as_str()));
-    }
-    for peer in peers {
-        let ok = ping_peer_readiness(client, &peer.http_url).await;
-        match peer_ping_db_update(failed_once, &peer.did, ok) {
-            Some(reachable) => {
-                if let Err(error) = db.mark_peer_ping(&peer.did, reachable).await {
-                    warn!(did = %peer.did, err = %error, "failed to persist peer readiness");
-                }
-            }
-            None => warn!(
-                did = %peer.did,
-                "peer readiness probe failed once; preserving previous federation status"
-            ),
-        }
-    }
-}
-
-/// Decide whether one readiness sample should update the persisted federation
-/// gate. A success is authoritative immediately. A failure must repeat on the
-/// next gossip tick before it can mark a peer unreachable, so one transient
-/// database hiccup does not hide the peer's repositories for five minutes.
 fn peer_ping_db_update(failed_once: &mut HashSet<String>, did: &str, ready: bool) -> Option<bool> {
     if ready {
         failed_once.remove(did);
@@ -1503,6 +1671,32 @@ fn load_or_create_keypair_at(key_path: &std::path::Path) -> Result<Keypair> {
 
     info!(path = %key_path.display(), did = %kp.did(), "generated new node identity");
     Ok(kp)
+}
+
+async fn gossip_ping_round(
+    db: &Db,
+    client: &reqwest::Client,
+    failed_once: &mut HashSet<String>,
+    peers: Vec<db::PeerRecord>,
+) {
+    {
+        let current_dids: HashSet<&str> = peers.iter().map(|peer| peer.did.as_str()).collect();
+        failed_once.retain(|did| current_dids.contains(did.as_str()));
+    }
+    for peer in peers {
+        let ok = ping_peer_readiness(client, &peer.http_url).await;
+        match peer_ping_db_update(failed_once, &peer.did, ok) {
+            Some(reachable) => {
+                if let Err(error) = db.mark_peer_ping(&peer.did, reachable).await {
+                    warn!(did = %peer.did, err = %error, "failed to persist peer readiness");
+                }
+            }
+            None => warn!(
+                did = %peer.did,
+                "peer readiness probe failed once; preserving previous federation status"
+            ),
+        }
+    }
 }
 
 #[cfg(test)]

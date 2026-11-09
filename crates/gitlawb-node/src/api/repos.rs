@@ -4,6 +4,7 @@ use axum::response::Response;
 use axum::Json;
 use bytes::Bytes;
 use futures::{stream, StreamExt};
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,12 +15,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::cert;
 use crate::error::{AppError, Result};
 use crate::git::{smart_http, store, visibility_pack};
 use crate::state::AppState;
 use crate::visibility::{visibility_check, withheld_globs, Decision};
-use crate::webhooks;
 
 /// The git all-zeros object id — the create/delete sentinel in a ref update.
 const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
@@ -1067,6 +1066,8 @@ pub(crate) mod drain_faults {
         pub(crate) repo_read_attempts: usize,
         pub(crate) rules_read_attempts: usize,
         pub(crate) reread_exhausted: bool,
+        pub(crate) outcome_commit_failures_left: usize,
+        pub(crate) outcome_commit_attempts: usize,
     }
 
     fn table() -> &'static Mutex<HashMap<String, Counters>> {
@@ -1139,6 +1140,30 @@ pub(crate) mod drain_faults {
         }
         false
     }
+
+    /// Test path: arm `n` injected failures for the request-level outcome
+    /// commit (`commit_request_outcomes_atomically`) on `repo_id`.
+    pub(crate) fn arm_outcome_commit(repo_id: &str, n: usize) {
+        table()
+            .lock()
+            .unwrap()
+            .entry(repo_id.to_string())
+            .or_default()
+            .outcome_commit_failures_left = n;
+    }
+
+    /// Production-path hook: count one outcome-commit attempt, return whether
+    /// it must fail.
+    pub(crate) fn take_outcome_commit(repo_id: &str) -> bool {
+        let mut map = table().lock().unwrap();
+        let c = map.entry(repo_id.to_string()).or_default();
+        c.outcome_commit_attempts += 1;
+        if c.outcome_commit_failures_left > 0 {
+            c.outcome_commit_failures_left -= 1;
+            return true;
+        }
+        false
+    }
 }
 
 /// The drain's repo re-read, behind the test-only fault seam above.
@@ -1160,6 +1185,45 @@ async fn drain_list_rules(
         return Err(anyhow::anyhow!("injected visibility-rule re-read failure"));
     }
     ctx.db.list_visibility_rules(record_id).await
+}
+
+/// The request-level outcome commit, behind the test-only fault seam above.
+/// A forced failure exercises the carve-out where `outcome_commit_ok=false`
+/// still returns 200 and defers effects to startup reconcile.
+#[allow(clippy::too_many_arguments)]
+async fn commit_request_outcomes_seamed(
+    state: &AppState,
+    _record_id: &str,
+    request_id: &str,
+    ok_names: &[&str],
+    ng_names: &[&str],
+    uncertain_names: &[&str],
+    unpack_failed: bool,
+    exit_ok: bool,
+    parsed_json_opt: Option<&serde_json::Value>,
+    accepted_ordinal: Option<i32>,
+    rejected_reason: Option<&str>,
+    terminal_no_effects: bool,
+) -> anyhow::Result<()> {
+    #[cfg(test)]
+    if drain_faults::take_outcome_commit(_record_id) {
+        return Err(anyhow::anyhow!("injected outcome-commit failure"));
+    }
+    state
+        .db
+        .commit_request_outcomes_atomically(
+            request_id,
+            ok_names,
+            ng_names,
+            uncertain_names,
+            unpack_failed,
+            exit_ok,
+            parsed_json_opt,
+            accepted_ordinal,
+            rejected_reason,
+            terminal_no_effects,
+        )
+        .await
 }
 
 /// Attempts allowed for the drain re-read before the lap gives up. The coalesced
@@ -2058,6 +2122,49 @@ fn fork_withheld_blocks(
 /// and as the signing path, so they can never drift apart.
 const SYNC_NOTIFY_PATH: &str = "/api/v1/sync/notify";
 
+/// Post-git disposition: one tested gate deciding replication/Tigris,
+/// metrics/inline effects, and HTTP 200 after `git receive-pack` returns.
+///
+/// Policy 2 carve-out (documented in the PR body): `spawn_tail` and
+/// `release_ok` follow in-memory report knowledge (`exit_ok &&
+/// any_ref_ok`) even when the outcome commit failed, because F2
+/// disconnect safety requires the tail before `release`, the tail is
+/// read-only on disk, and announces carry `cert_id: None`. Durable
+/// accounting (`run_effects`: push events, certs, webhooks) instead
+/// waits for the outcome commit, else startup reconcile (Option B
+/// attended-restart contract).
+///
+/// Storage/replication split for capability-free pushes: a zero
+/// `report-status` with git exit ok may still have landed refs, and the
+/// shared Tigris copy must stay fresh — otherwise the next write's
+/// `acquire_write` download replaces the local repo with the stale
+/// archive, erasing the acknowledged landing (and its marker) before
+/// startup reconcile can prove it. So `release_ok` also covers exit-ok
+/// pushes with no report (`report_absent`), while `spawn_tail` stays
+/// proven-refs-only: uploading the post-push disk state is always safe,
+/// announcing unproven refs is not. The deferred tail for late-proved
+/// refs runs from the drain (see `tail_owed_after_proof`).
+#[derive(Debug, PartialEq, Eq)]
+struct PostGitDisposition {
+    spawn_tail: bool,
+    release_ok: bool,
+    run_effects: bool,
+}
+
+fn post_git_disposition(
+    exit_ok: bool,
+    any_ref_ok: bool,
+    outcome_commit_ok: bool,
+    report_absent: bool,
+) -> PostGitDisposition {
+    let landed = exit_ok && any_ref_ok;
+    PostGitDisposition {
+        spawn_tail: landed,
+        release_ok: exit_ok && (any_ref_ok || report_absent),
+        run_effects: landed && outcome_commit_ok,
+    }
+}
+
 /// Send one signed `/sync/notify` request for a single ref update.
 ///
 /// The receiver is single-ref, so a multi-ref push fans out one request per
@@ -2187,8 +2294,10 @@ pub async fn git_receive_pack(
         return Err(AppError::RepoNotFound(format!("{owner}/{name}")));
     }
 
-    // Parse ref updates from pkt-line body before handing to git
-    let ref_updates = parse_ref_updates(&body);
+    // Parse ref updates from pkt-line body before handing to git. The count
+    // cap and duplicate-refusal live inside `parse_ref_updates`, so both fire
+    // before any per-request materialization, gate, or durable write below.
+    let ref_updates = parse_ref_updates(&body)?;
     tracing::debug!(
         ref_count = ref_updates.len(),
         "parsed ref updates from pack"
@@ -2243,6 +2352,147 @@ pub async fn git_receive_pack(
         }
     }
 
+    // ── Internal-namespace push gate ────────────────────────────────
+    // `refs/gitlawb/*` carries node-managed metadata (request markers as
+    // blobs under `requests/`, issue JSON blobs under `issues/`). A pusher
+    // must never write there: an attacker-controlled ref pointing at a blob
+    // or tree is skipped by `rev-list --all` yet still served, bypassing
+    // the fail-closed under-withhold check. Refuse before intent is
+    // written so a denied push leaves no rows behind.
+    if let Some(bad) = ref_updates
+        .iter()
+        .map(|u| u.ref_name.as_str())
+        .find(|r| ref_is_internal_namespace(r))
+    {
+        tracing::warn!(
+            repo = %name,
+            ref_name = %bad,
+            "refusing push into internal refs/gitlawb/ namespace"
+        );
+        return Err(AppError::Forbidden(
+            "pushing to refs/gitlawb/* is not allowed".into(),
+        ));
+    }
+
+    // #26 Split PR 1: durable intent for this push, written BEFORE the
+    // per-repo lease, admission permits, and the receive_pack call. Holding
+    // no lease and no admission permit across the DB transaction means a
+    // stalled statement cannot exhaust the push admission pool while the git
+    // resource the permit meters is idle. Bounded by a 30s timeout that
+    // refuses the push without running Git on incomplete intent; atomic
+    // parent+children so a refused pre-Git request cannot strand a
+    // payload-only parent.
+    let signature_header = headers
+        .get("signature")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let signature_input = headers
+        .get("signature-input")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let content_digest = headers
+        .get("content-digest")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    let request_bytes_hash = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&body);
+        h.finalize().to_vec()
+    };
+    let req_row = crate::db::ReceivePackRequest {
+        id: request_id.clone(),
+        repo_id: record.id.clone(),
+        pusher_did: auth.0.to_string(),
+        node_did: state.node_did.to_string(),
+        request_bytes: Vec::new(),
+        request_bytes_hash,
+        state: crate::db::request_state::RECEIVED.to_string(),
+        git_exit_ok: None,
+        parsed_report: None,
+        accepted_ordinal: None,
+        attempt_count: 0,
+        last_error: None,
+        next_attempt_at: None,
+        created_at: now.clone(),
+        completed_at: None,
+        signature_header: Some(signature_header.clone()),
+        signature_input: Some(signature_input.clone()),
+        content_digest: Some(content_digest.clone()),
+    };
+    let db_timeout = std::time::Duration::from_secs(30);
+    // Arm the drop-guard BEFORE the insert resolves: on timeout the
+    // cancellation may land after the commit did, stranding a `received`
+    // aggregate the early return below would otherwise leave behind. The
+    // refuse is a no-op on an id that never committed.
+    let _intent_guard = IntentDropGuard::new(state.db.clone(), request_id.clone());
+    let db_result = tokio::time::timeout(
+        db_timeout,
+        state.db.insert_receive_pack_request_with_children(
+            &req_row,
+            &record.id,
+            &state.node_did.to_string(),
+            auth.0.as_str(),
+            &ref_updates,
+            &signature_header,
+            &signature_input,
+            &content_digest,
+        ),
+    )
+    .await;
+    // Both timeout expiry and DB error refuse the push before any lease or
+    // permit is held, so admission capacity is never pinned by this write.
+    // The insert is one transaction: timeout cancellation rolls back rather
+    // than leaving a partially committed intent. `db_result` is
+    // `Result<Result<..>, Elapsed>`: the outer `Err` is the timeout, the
+    // inner `Err` is a real insert failure — both must refuse without
+    // running git, or refs land with no request rows and nothing to
+    // reconcile them.
+    match db_result {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            tracing::error!(
+                err = %e,
+                repo = %name,
+                "failed to persist durable post-receive intent; refusing push"
+            );
+            return Err(AppError::Overloaded(
+                "durable intent write failed, retry shortly".into(),
+            ));
+        }
+        Err(_) => {
+            tracing::error!(
+                repo = %name,
+                "durable intent write timed out; refusing push"
+            );
+            return Err(AppError::Overloaded(
+                "durable intent write failed, retry shortly".into(),
+            ));
+        }
+    }
+    // Empty command stream (`0000` flush, no ref updates): no child can ever
+    // consume the proof, and the no-report outcome below terminalizes the
+    // parent without an accepted child that could ack it — leaving a
+    // terminal aggregate the retention gate holds forever. Ack up front:
+    // with zero children there are no effects to complete, so the proof is
+    // vacuously durable. (The ACK gate itself is untouched: any request
+    // that may have landed refs still waits for the drain's ack.)
+    if ref_updates.is_empty() {
+        if let Err(e) = state.db.ack_request_proof(&request_id).await {
+            tracing::warn!(
+                err = %e,
+                request_id = %request_id,
+                repo = %name,
+                "empty push: proof ack failed; retention will hold the aggregate"
+            );
+        }
+    }
+
     // Per-repo in-process write lease (#174 U2/F3): SUPPLEMENTS the cluster-wide pg
     // advisory lock. Acquire it BEFORE acquire_write (one consistent order everywhere,
     // so the two serializers can never invert into a self-hang) so a second SAME-NODE
@@ -2292,17 +2542,33 @@ pub async fn git_receive_pack(
     // delete+recreate under the same slug while the bare repo on disk is reused,
     // and an id-keyed lease stops serializing exactly across that rotation.
     let repo_key = crate::state::repo_identity_key(&record.owner_did, &record.name);
-    let lease = state
+    // Drop-guard: armed above (before the insert resolved) so the
+    // insert-timeout cancellation window is covered too. Explicit refusals
+    // below still call `refuse_receive_pack_before_git` inline for a
+    // synchronous terminal state; the guard is the backstop for drops.
+    let lease = match state
         .repo_write_leases
         .acquire(&repo_key, lease_steal_after)
         .await
-        .ok_or_else(|| {
+    {
+        Some(l) => l,
+        None => {
             tracing::warn!(
                 repo = %name,
                 "repo write-lease waiter cap reached; shedding with 503"
             );
-            AppError::Overloaded("repo is busy with another push, retry shortly".into())
-        })?;
+            if let Err(e) = state
+                .db
+                .refuse_receive_pack_before_git(&request_id, "repo write-lease waiter cap reached")
+                .await
+            {
+                tracing::warn!(err = %e, request_id = %request_id, "pre-git refusal cleanup failed");
+            }
+            return Err(AppError::Overloaded(
+                "repo is busy with another push, retry shortly".into(),
+            ));
+        }
+    };
 
     // Admission permits are taken HERE, AFTER the per-repo lease and BEFORE acquire_write.
     // Ordering is the fix (#174 P2 DoS): the lease is a block-and-wait serializer, so a
@@ -2327,14 +2593,42 @@ pub async fn git_receive_pack(
     // pushes draw from the dedicated WRITE pool, separate from reads, and it is held for the
     // whole op (moved into the AdmissionGuard below).
     let caller_key = read_caller_key(&headers, peer, state.push_limiter_trust);
-    let _caller_permit = acquire_read_caller_permit(
+    let _caller_permit = match acquire_read_caller_permit(
         &state.git_write_per_caller,
         caller_key.as_deref(),
         name,
         "receive-pack",
-    )?;
-    let _permit = git_permit(&state.git_write_semaphore)?;
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            if let Err(ce) = state
+                .db
+                .refuse_receive_pack_before_git(&request_id, "admission per-source cap reached")
+                .await
+            {
+                tracing::warn!(err = %ce, request_id = %request_id, "pre-git refusal cleanup failed");
+            }
+            return Err(e);
+        }
+    };
+    let _permit = match git_permit(&state.git_write_semaphore) {
+        Ok(p) => p,
+        Err(e) => {
+            if let Err(ce) = state
+                .db
+                .refuse_receive_pack_before_git(&request_id, "git write pool saturated")
+                .await
+            {
+                tracing::warn!(err = %ce, request_id = %request_id, "pre-git refusal cleanup failed");
+            }
+            return Err(e);
+        }
+    };
 
+    // Intent row and its digest comment live above (pre-lease): durable intent
+    // is minimal — only the digest is consumed by recovery (marker
+    // correlation). The raw pack is never replayed by this split, so it is
+    // not copied into the shared database.
     tracing::debug!(repo = %name, "acquiring write lock");
     // Bound the write acquire under `git_acquire_timeout_secs`. acquire_write's
     // advisory-lock loop already caps at ~60s, but its per-iteration
@@ -2349,22 +2643,64 @@ pub async fn git_receive_pack(
     // permit is a handler local here (moved into the AdmissionGuard only after this),
     // so the early return on timeout drops it and frees the slot; shed a bounded 503.
     let acquire_deadline = std::time::Duration::from_secs(state.config.git_acquire_timeout_secs);
-    let mut guard = tokio::time::timeout(
+    let acquire_raw = tokio::time::timeout(
         acquire_deadline,
         state
             .repo_store
             .acquire_write(&record.owner_did, &record.name),
     )
-    .await
-    .map_err(|_elapsed| {
-        tracing::warn!(repo = %name, "acquire_write timed out; shedding with 503");
-        AppError::Overloaded("git service acquisition timed out, retry shortly".into())
-    })?
-    .map_err(|e| acquire_write_app_error(&e, name))?;
+    .await;
+    let mut guard = match acquire_raw {
+        Err(_) => {
+            tracing::warn!(repo = %name, "acquire_write timed out; shedding with 503");
+            if let Err(e) = state
+                .db
+                .refuse_receive_pack_before_git(&request_id, "acquire_write timed out")
+                .await
+            {
+                tracing::warn!(err = %e, request_id = %request_id, "pre-git refusal cleanup failed");
+            }
+            return Err(AppError::Overloaded(
+                "git service acquisition timed out, retry shortly".into(),
+            ));
+        }
+        Ok(Err(e)) => {
+            if let Err(ce) = state
+                .db
+                .refuse_receive_pack_before_git(&request_id, "acquire_write failed")
+                .await
+            {
+                tracing::warn!(err = %ce, request_id = %request_id, "pre-git refusal cleanup failed");
+            }
+            return Err(acquire_write_app_error(&e, name));
+        }
+        Ok(Ok(g)) => g,
+    };
     let disk_path = guard.path().to_path_buf();
     tracing::debug!(repo = %name, path = %disk_path.display(), "running git receive-pack");
     let body_len = body.len();
     let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+    // Recovery upgrade invariant (best-effort): before the first
+    // durable intent or marker relies on reflogs/hidden refs,
+    // idempotently enable them for new and upgraded repos. Failures
+    // are non-fatal here — refusing the push would break fake-git
+    // harnesses and non-repo disk paths in tests, and production
+    // reconcile already fails closed (leaves rows prepared for
+    // attended recovery) when a reflog is missing. A failed upgrade
+    // only degrades automatic recovery to attended recovery.
+    // Bounded through the configured git binary: the unbounded
+    // synchronous variant would run several `git config` children with
+    // no timeout while holding both admission permits, the lease, and
+    // the repo write lock.
+    if let Err(e) = crate::git::store::verify_recovery_prereqs_bounded(
+        &state.git_bin,
+        &disk_path,
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    {
+        tracing::warn!(err = %e, repo = %name, "recovery prereqs unavailable; proceeding with degraded automatic recovery");
+    }
     // Move both admission permits into the guard so they release only after the spawned
     // receive-pack process group is reaped, on complete/timeout/disconnect — not the
     // instant a disconnect drops this future while the detached reaper runs (#174 P1-a).
@@ -2405,14 +2741,432 @@ pub async fn git_receive_pack(
     let admission = smart_http::AdmissionGuard::new(_permit, _caller_permit)
         .with_hold(std::sync::Arc::clone(&guard))
         .with_lease(lease.clone());
-    let receive_result = smart_http::receive_pack(
+
+    // Marker hiding was verified above by `verify_recovery_prereqs`,
+    // which is warn-and-proceed (not a push refusal): on failure the
+    // marker is still written and reconcile quarantines on a missing
+    // or mismatched marker. Compute the value and write the per-request
+    // marker through the bounded runners using the configured git binary:
+    // both hold admission permits, the lease, and the write lock, so an
+    // unbounded `hash-object` could pin them all on a hung child.
+    match crate::git::store::marker_value_for_bounded(
+        &state.git_bin,
+        &disk_path,
+        &req_row.request_bytes_hash,
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    {
+        Ok(marker_value) => {
+            if let Err(e) = crate::git::store::write_marker_bounded(
+                &state.git_bin,
+                &disk_path,
+                &request_id,
+                &marker_value,
+                std::time::Duration::from_secs(10),
+            )
+            .await
+            {
+                tracing::warn!(
+                    err = %e,
+                    request_id = %request_id,
+                    repo = %name,
+                    "bounded marker write failed; reconcile will quarantine this request"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                err = %e,
+                request_id = %request_id,
+                repo = %name,
+                "marker value computation failed; reconcile will quarantine this request"
+            );
+        }
+    }
+
+    // P1 (reviewer-1/2 round 3): use receive_pack_raw to get the raw
+    // stdout (which contains the report-status with per-ref ok/ng
+    // results) and the process exit status. This allows us to:
+    // 1. Parse per-ref results to distinguish proven rejections from
+    //    uncertain outcomes on error.
+    // 2. On success, write effects and then DELETE outbox rows so they
+    //    don't replay on restart.
+    //
+    // The reflog action is best-effort binding (receive-pack writes a
+    // fixed `push` message and ignores GIT_REFLOG_ACTION); causality
+    // still relies on marker + tuple/timestamp + history guards. Marker
+    // namespace hiding was verified above by `verify_recovery_prereqs`.
+    let reflog_action = format!("gitlawb-request:{request_id}");
+    // Phase-flip the drop-guard: git is about to start, so a dropped future
+    // from here forward is a mid-git disconnect (not a pre-git shed). The
+    // guard then marks children uncertain and terminalizes the parent, which
+    // the mark_uncertain path below cannot do on a drop — it never runs, and
+    // the detached reaper does process teardown only, no DB writes.
+    _intent_guard.notify_git_started();
+    let (receive_raw, exit_ok) = match smart_http::receive_pack_raw_with_reflog(
         &state.git_bin,
         &disk_path,
         body,
         git_timeout,
         Some(admission),
+        Some(&reflog_action),
     )
-    .await;
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            // Timeout or spawn failure — the git process group was
+            // torn down. Mark all prepared rows as uncertain so the
+            // reconcile step can check them against disk at startup.
+            if let Err(ce) = state
+                .db
+                .mark_pending_ref_transitions_uncertain(&request_id)
+                .await
+            {
+                tracing::warn!(
+                    err = %ce,
+                    request_id = %request_id,
+                    repo = %name,
+                    "failed to mark pending ref transitions uncertain after receive-pack error"
+                );
+            }
+            let app = git_service_app_error(&e);
+            match &app {
+                AppError::Timeout(_) => tracing::warn!(repo = %name, "git receive-pack timed out"),
+                AppError::BadRequest(msg) => {
+                    tracing::warn!(repo = %name, err = %msg, "git receive-pack: bad client request")
+                }
+                _ => tracing::error!(repo = %name, err = %e, "git receive-pack failed"),
+            }
+            return Err(app);
+        }
+    };
+
+    // P1 (reviewer-1/2 round 4): complete the per-ref outcome
+    // model. The previous `all_refs_ok` ignored `unpack_ok` and
+    // treated an absent report as success, then ran the durable
+    // effects loop unconditionally. A mixed push where one ref is
+    // rejected still issued a signed certificate, an anchor job, a
+    // push event, a trust-score bump, and a webhook for the rejected
+    // ref. Git can report `unpack ok / ng refs/heads/main` on a
+    // zero exit (a non-fast-forward, a hook denial), and that path
+    // is exactly the one the previous logic missed.
+    //
+    // Build the set of ref names that the report-status proves
+    // landed. Every ref update the handler intended to land gets a
+    // fate:
+    //   - in `ok_set`           → row goes to `applied`, effects fire
+    //   - in `report` but ng    → row goes to `cancelled`, no effects
+    //   - not in `report` at all → row goes to `uncertain` for reconcile
+    //
+    // If `unpack_ok == false`, no ref could have landed — all rows
+    // become `cancelled` and no effects fire for any ref.
+    //
+    // If the report is unparseable (client did not request
+    // report-status, or framing was malformed), every row becomes
+    // `uncertain` so the on-disk reflog proof can sort out which
+    // ones actually landed at the next startup.
+    let report = smart_http::parse_report_status(&receive_raw);
+
+    // (unpack_ok, all_in_report_ok, ok_set, request_failed).
+    //
+    // Outcome authority: only a complete Git report or request-bound
+    // disk evidence may move a child to `applied`; process exit alone
+    // never does. An absent report is indeterminate regardless of exit
+    // status — a capability-free client can omit `report-status` and
+    // Git then returns no per-ref results even for rejected commands.
+    // The branches below synthesize nothing as success; unreported
+    // refs become `uncertain` for reconcile, which must prove landing
+    // before any push event, certificate, anchor, or webhook.
+    let (unpack_ok, all_in_report_ok, ok_set, request_failed) = match &report {
+        Some((unpack_ok, ref_results)) => {
+            let ok_set: std::collections::HashSet<&str> = ref_results
+                .iter()
+                .filter(|(_, ok)| *ok)
+                .map(|(name, _)| name.as_str())
+                .collect();
+            let all_in_report_ok = ref_results.iter().all(|(_, ok)| *ok);
+            (*unpack_ok, all_in_report_ok, ok_set, !exit_ok)
+        }
+        None => {
+            // No report: indeterminate regardless of exit status. Every
+            // declared ref is `uncertain` for reconcile.
+            let ok_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            (false, true, ok_set, !exit_ok)
+        }
+    };
+
+    // Per-ref outcome, committed atomically with the parent request
+    // row in one transaction (see
+    // `commit_request_outcomes_atomically`). The previous code flipped
+    // children and stamped the parent in separate writes, so a crash
+    // between them left applied children attached to a `received`
+    // parent the drain never schedules. The normalized `parsed_report`
+    // is the accepted-ref authority when present; the no-report path
+    // stores no report and moves the parent to `rejected_at_git` for
+    // fail-closed reconcile, and the executor's null-report fallback
+    // covers reconciled/legacy rows (not just backward compatibility).
+    let pending_ref_names: Vec<&str> = ref_updates.iter().map(|u| u.ref_name.as_str()).collect();
+
+    // #26 Split PR 1: the push event id is keyed on
+    // `(request_id, accepted_ordinal)`. The `accepted_ordinal` is
+    // the ordinal (in `ref_updates`) of the FIRST ref the report
+    // proves landed; the v30 migration's `ordinal` column carries
+    // the position. No `first_ref_name` rewrite is needed because
+    // the identity is on the request, not on a mutable per-ref
+    // column. Compute it once here so the per-ref effects loop can
+    // stamp the request row at the right moment. Unpack failure
+    // clears it below: no ref landed, so no ordinal is accepted.
+    let mut accepted_ordinal: Option<i32> = ref_updates
+        .iter()
+        .position(|u| ok_set.contains(u.ref_name.as_str()))
+        .map(|i| i as i32);
+    if !unpack_ok {
+        accepted_ordinal = None;
+    }
+
+    // Build the atomic outcome inputs.
+    #[allow(clippy::type_complexity)]
+    let (
+        unpack_failed,
+        ok_names,
+        ng_names,
+        uncertain_names,
+        parsed_json_opt,
+        rejected_reason,
+        terminal_no_effects,
+    ): (
+        bool,
+        Vec<&str>,
+        Vec<&str>,
+        Vec<&str>,
+        Option<serde_json::Value>,
+        Option<String>,
+        bool,
+    ) = match &report {
+        None => {
+            // No report-status: indeterminate regardless of exit status.
+            // Process success is not per-ref success — a capability-free
+            // client can omit `report-status` and Git then emits zero
+            // result bytes even for rejected commands. Every declared ref
+            // stays `uncertain`; reconcile must prove landing on disk
+            // before any push event, certificate, anchor, or webhook.
+            // The client still receives the Git response; only durable
+            // effects are deferred. This arm runs FIRST: with no report the
+            // `unpack_ok` flag below is meaningless, and routing here through
+            // the unpack-failure arm would mislabel the aggregate and persist
+            // a false `git_exit_ok`.
+            (
+                false,
+                Vec::new(),
+                Vec::new(),
+                pending_ref_names.clone(),
+                None,
+                Some(crate::durable_outbox::NO_REPORT_AWAITING_EVIDENCE.to_string()),
+                false,
+            )
+        }
+        Some(parsed) if !unpack_ok => {
+            // Unpack failure proves no ref landed, regardless of per-ref
+            // `ok` bits or process exit. The report is present here (absence
+            // is handled above), so its ref list is authoritative: cancel
+            // every child, clear any accepted ordinal, and terminalize with
+            // no effects so the executor can never outrun the cancelled rows.
+            let parsed_json = serde_json::json!({
+                "unpack_ok": false,
+                "ref_results": parsed.1.iter().map(|(n, _)| serde_json::json!({
+                    "ref_name": n,
+                    "ok": false,
+                })).collect::<Vec<_>>(),
+            });
+            (
+                true,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Some(parsed_json),
+                None,
+                true,
+            )
+        }
+        Some(parsed) => {
+            // Report present with unpack ok (absence is handled in the first
+            // arm): per-ref fates from the authoritative report.
+            let mut ok_names: Vec<&str> = Vec::new();
+            let mut ng_names: Vec<&str> = Vec::new();
+            let mut unmentioned: Vec<&str> = Vec::new();
+            let reported: std::collections::HashSet<&str> =
+                parsed.1.iter().map(|(n, _)| n.as_str()).collect();
+            for name in &pending_ref_names {
+                if !reported.contains(name) {
+                    unmentioned.push(*name);
+                } else if ok_set.contains(name) {
+                    ok_names.push(*name);
+                } else {
+                    ng_names.push(*name);
+                }
+            }
+            // Syntactic completeness (flush) is enforced in
+            // `strip_sideband`; command-set completeness is enforced here:
+            // a parsed report that omits declared refs is not
+            // authoritative. Persist the whole request as indeterminate so
+            // reconciliation produces a fresh normalized outcome before
+            // anything is retired. Otherwise a partial prefix would commit
+            // one ok child as applied, leave siblings uncertain, and the
+            // executor would delete the unresolved evidence on completion.
+            if !unmentioned.is_empty() {
+                tracing::warn!(
+                    request_id = %request_id,
+                    repo = %name,
+                    unmentioned = ?unmentioned,
+                    "report-status omits declared refs; persisting as indeterminate"
+                );
+                (
+                    false,
+                    Vec::new(),
+                    Vec::new(),
+                    pending_ref_names.clone(),
+                    None,
+                    Some("incomplete report-status: omitted declared refs".to_string()),
+                    false,
+                )
+            } else {
+                if !ng_names.is_empty() {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        repo = %name,
+                        rejected_refs = ?ng_names,
+                        "git report-status: some refs rejected; durable effects will skip them"
+                    );
+                }
+                let parsed_json = serde_json::json!({
+                    "unpack_ok": parsed.0,
+                    "ref_results": parsed.1.iter().map(|(n, ok)| serde_json::json!({
+                        "ref_name": n,
+                        "ok": ok,
+                    })).collect::<Vec<_>>(),
+                });
+                // All refs rejected with exit zero: terminal with no
+                // effects. The startup drain must have nothing executable
+                // to revisit and retention must be able to purge.
+                let terminal = ok_names.is_empty() && !pending_ref_names.is_empty();
+                (
+                    false,
+                    ok_names,
+                    ng_names,
+                    unmentioned,
+                    Some(parsed_json),
+                    None,
+                    terminal,
+                )
+            }
+        }
+    };
+
+    // Bounded synchronous retry for post-git outcome commit. After git has landed
+    // refs we cannot 503 (refs are already durable), but leaving the parent in
+    // `received` hides it from the claim-gated due worker, which only matches
+    // `outcomes_committed` / `effects_pending`. Retry up to 3x with short
+    // backoff; on persistent failure the push still returns 200 (git did
+    // land), metrics/effects are skipped inline, and durable effects wait for
+    // the next process restart, when startup reconcile promotes disk-proved
+    // children and the aggregate. This attended-restart window is by design:
+    // refs are safe on disk, never silently dropped, just not yet accounted.
+    //
+    // Stash the computed fates on the drop-guard first: a drop during the
+    // retries (or anywhere later while the guard is armed) then commits these
+    // fates via the guard's bounded retry instead of a context-free blanket
+    // `uncertain` — git-proven rejections land `cancelled`, not `uncertain`.
+    _intent_guard.set_fates(ComputedFates {
+        ok_names: ok_names.iter().map(|s| s.to_string()).collect(),
+        ng_names: ng_names.iter().map(|s| s.to_string()).collect(),
+        uncertain_names: uncertain_names.iter().map(|s| s.to_string()).collect(),
+        unpack_failed,
+        git_exit_ok: exit_ok,
+        parsed_json: parsed_json_opt.clone(),
+        accepted_ordinal,
+        rejected_reason: rejected_reason.clone(),
+        terminal_no_effects,
+    });
+    let mut delay_ms = 20;
+    let outcome_commit_ok = loop {
+        match commit_request_outcomes_seamed(
+            &state,
+            &record.id,
+            &request_id,
+            &ok_names,
+            &ng_names,
+            &uncertain_names,
+            unpack_failed,
+            exit_ok,
+            parsed_json_opt.as_ref(),
+            accepted_ordinal,
+            rejected_reason.as_deref(),
+            terminal_no_effects,
+        )
+        .await
+        {
+            Ok(()) => break true,
+            Err(e) if delay_ms < 500 => {
+                tracing::warn!(
+                    err = %e,
+                    request_id = %request_id,
+                    repo = %name,
+                    delay_ms,
+                    "commit_request_outcomes_atomically failed; retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                delay_ms = delay_ms.saturating_mul(5).min(500);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    err = %e,
+                    request_id = %request_id,
+                    repo = %name,
+                    "commit_request_outcomes_atomically failed after retries; \
+                     effects deferred to startup reconcile (parent stays received \
+                     unless the still-armed guard terminalizes it on scope exit, \
+                     which startup reconcile recovers the same way)"
+                );
+                break false;
+            }
+        }
+    };
+
+    // A resolved outcome commit leaves no `received` parent behind, so drops
+    // from here on need no guard cleanup — disarm to avoid a wasteful spawned
+    // txn per push. On persistent commit failure the guard stays in its
+    // git-started phase: a later drop still terminalizes the aggregate for
+    // startup reconcile instead of stranding it.
+    if outcome_commit_ok {
+        _intent_guard.disarm();
+    }
+
+    // On non-zero exit, return an error to the caller. The outbox
+    // rows have already been handled above (per-ref fates applied).
+    // The client-visible body does NOT include wire-supplied ref
+    // names — ref names can carry control bytes and the previous
+    // `format!("refs rejected: {rejected:?}")` embedded them in a
+    // 500 response. Server-side the names are logged above.
+    if request_failed {
+        let reclaimed = guard
+            .lock()
+            .expect("repo write-lock mutex poisoned")
+            .take()
+            .expect("the write lock is only taken here, and only once");
+        let _ = reclaimed.release(false).await;
+        drop(lease);
+
+        let body_msg = if !unpack_ok {
+            "git-receive-pack failed: unpack failed"
+        } else if !all_in_report_ok {
+            "git-receive-pack failed: refs rejected"
+        } else {
+            "git-receive-pack failed"
+        };
+        return Err(AppError::Git(body_msg.to_string()));
+    }
 
     // #174 F2/U5: the post-receive replication tail runs in an independently owned
     // task. It parks on `git_encrypt_semaphore` (withheld / candidate / full-scan
@@ -2456,8 +3210,65 @@ pub async fn git_receive_pack(
     // The alternative, detaching `release` and the tail together to keep the ordering,
     // would return 200 to the pusher before the durable copy lands, which is a larger
     // change to the client contract than the window it closes.
-    let push_succeeded = receive_result.is_ok();
+    let push_succeeded = exit_ok;
     let publish_durability = PublishDurabilitySlot::new();
+    // P1 (reviewer-1/2 round 4): the durable effects only fire for
+    // refs the report-status proves landed. The previous code ran
+    // them unconditionally once past the `!exit_ok` return, so a
+    // `unpack ok / ng refs/heads/main` zero-exit push still signed
+    // a cert and queued an anchor for the rejected ref.
+    //
+    // `push_succeeded` is the request-level signal for the
+    // replication tail and the lock release. `any_ref_ok` is the
+    // request-scoped effects gate (push event, trust score,
+    // metrics): at least one ref must have landed for those to be
+    // meaningful. Both derive from the committed child state
+    // (`ok_names`, already unpack-gated to empty on unpack failure),
+    // never from the raw `ok_set`, so an `unpack_ok: false` report
+    // listing `ok: true` bits cannot reach effects or the tail.
+    let any_ref_ok = unpack_ok && !ok_names.is_empty();
+    // Single post-git disposition gate: replication/Tigris, metrics, and
+    // inline effects all derive from one struct so Option B
+    // attended-restart cannot disagree with itself across blocks.
+    // Policy 2 carve-out (see PR body): replication/Tigris runs on
+    // in-memory report knowledge even when the outcome commit failed,
+    // because F2 disconnect safety requires the tail before `release`,
+    // the tail is read-only on disk, and announces carry `cert_id: None`.
+    // Durable accounting instead waits for startup reconcile.
+    //
+    // MUTATION (RED): gating `spawn_tail`/`release_ok` on
+    // `outcome_commit_ok` breaks `post_git_disposition_replication_carve_out`.
+    let disposition =
+        post_git_disposition(exit_ok, any_ref_ok, outcome_commit_ok, report.is_none());
+
+    // One replication tail per push, on the proven-landed ref set the
+    // disposition selected. When a release ordering is armed below, the
+    // tail spawns there carrying the durability slot; otherwise it fires
+    // here for the carve-out path (replication on in-memory knowledge).
+    let landed_refs: Vec<RefUpdate> = if disposition.spawn_tail {
+        let landed_names: std::collections::HashSet<&str> = ok_names.iter().copied().collect();
+        ref_updates
+            .iter()
+            .filter(|u| landed_names.contains(u.ref_name.as_str()))
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if disposition.spawn_tail && !push_succeeded && !landed_refs.is_empty() {
+        tokio::spawn(post_receive_replication_tail(
+            state.clone(),
+            record.clone(),
+            landed_refs.clone(),
+            disk_path.clone(),
+            auth.0.to_string(),
+            None,
+        ));
+    }
+
+    // Always release the advisory lock — even on error — to prevent stale locks
+    // from blocking subsequent pushes. Only upload to Tigris when the push
+    // succeeded; uploading a half-applied repo would propagate corruption.
     // Reclaim the write lock from the shared cell (#173 F2). This is only reachable
     // once `receive_pack` has returned, so the admission guard's copy can only ever
     // DELAY release, never perform it early; on the disconnect path this line is not
@@ -2472,21 +3283,23 @@ pub async fn git_receive_pack(
         // `release` is classified by how far the publish actually got rather
         // than by the mere fact that release was entered.
         publish_durability.arm_for_release(reclaimed.publish_stage());
-        tokio::spawn(post_receive_replication_tail(
-            state.clone(),
-            record.clone(),
-            ref_updates.clone(),
-            disk_path.clone(),
-            auth.0.to_string(),
-            Some(publish_durability.arc()),
-        ));
+        if disposition.spawn_tail && !landed_refs.is_empty() {
+            tokio::spawn(post_receive_replication_tail(
+                state.clone(),
+                record.clone(),
+                landed_refs,
+                disk_path.clone(),
+                auth.0.to_string(),
+                Some(publish_durability.arc()),
+            ));
+        }
     }
     // Short-circuit on a refused publish BEFORE anything downstream observes
     // the push. The pack is on local disk but not in object storage, so
     // touching the repo, recording the push, bumping trust, issuing ref
     // certificates or answering 200 would all be reporting a write no other
     // node can read.
-    let outcome = reclaimed.release(push_succeeded).await;
+    let outcome = reclaimed.release(disposition.release_ok).await;
     // `release` classified the tree on whatever outcome it reached, so this
     // future's copy of the settlement must not classify it a second time: a
     // definite refusal has already deleted the tree and cleared its marker.
@@ -2504,115 +3317,159 @@ pub async fn git_receive_pack(
     // the disconnect path this line is never reached: clone (a) rides the reaper (F3).
     drop(lease);
 
-    let result = receive_result.map_err(|e| {
-        let app = git_service_app_error(&e);
-        match &app {
-            AppError::Timeout(_) => tracing::warn!(repo = %name, "git receive-pack timed out"),
-            AppError::BadRequest(msg) => {
-                tracing::warn!(repo = %name, err = %msg, "git receive-pack: bad client request")
-            }
-            _ => tracing::error!(repo = %name, err = %e, "git receive-pack failed"),
-        }
-        app
-    })?;
+    // Unless refs landed AND the outcome was durably committed, return 200
+    // with the receive-pack body and run no durable effects (no push event,
+    // no trust score, no metrics, no webhooks, no certs, no anchor jobs).
+    // Refs the commit resolved were flipped to `cancelled` / `uncertain`
+    // above and reconcile will not promote them; on commit failure children
+    // stay `prepared` until the guard's scope-exit drop commits the stashed
+    // fates or marks them `uncertain`, and reconcile resolves either outcome.
+    if !disposition.run_effects {
+        return axum::response::Response::builder()
+            .status(axum::http::StatusCode::OK)
+            .header("Content-Type", "application/x-git-receive-pack-result")
+            .header("Cache-Control", "no-cache")
+            .body(axum::body::Body::from(receive_raw))
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("failed to build response: {e}")));
+    }
 
-    // Update the repo's updated_at timestamp after a successful push
+    // #26 Split PR 1 step 3 — the per-ref effects fan-out moved into
+    // `apply_request_effects`. The live handler and the recovery
+    // drain call the same function, so the live and recovery paths
+    // produce identical artifact ids and the request row's
+    // `accepted_ordinal` is the single source of truth for the push
+    // event identity. A `Retry` outcome here means one or more
+    // per-ref effects failed transiently; the request is left in
+    // `effects_pending` for the drain to pick up on the next
+    // startup. A `Nothing` outcome means the request had no
+    // accepted ref (the disposition gate above would have caught
+    // that case via `run_effects`, so this is defensive).
     let _ = state.db.touch_repo(&record.id).await;
-
-    // Record the successful push for metrics. The body has already been
-    // consumed by smart_http::receive_pack so we observe size up front.
     crate::metrics::record_push(&record.id);
     crate::metrics::observe_pack_size(body_len as f64);
 
-    // Record push event for trust score and issue a signed ref certificate.
-    // The route is behind `require_signature`, so the verified pusher identity is
-    // always present; use it directly rather than re-parsing the headers.
-    let did = auth.0.as_str();
+    // Claim ownership before inline effects: a background worker may
+    // concurrently list this just-committed row as due. Loser skips;
+    // the owner executes. Lease is recoverable on crash.
+    match state
+        .db
+        .try_claim_due_request(&request_id, 300, &Utc::now().to_rfc3339())
+        .await
     {
-        // Use the first new commit hash we parsed, fall back to timestamp
-        let commit_hash = ref_updates
-            .first()
-            .map(|u| u.new_sha.clone())
-            .unwrap_or_else(|| Utc::now().timestamp().to_string());
-
-        let _ = state.db.record_push(did, &record.id, &commit_hash, 0).await;
-        if let Ok(push_count) = state.db.get_push_count(did).await {
-            // 0.05 base (from registration) + 0.05 per push, capped at 1.0
-            // 1 push → 0.10, 5 pushes → 0.30, 19 pushes → 1.0
-            let new_score = (push_count as f64 * 0.05 + 0.05).min(1.0);
-            let _ = state.db.update_trust_score(did, new_score).await;
+        Ok(true) => {}
+        _ => {
+            return axum::response::Response::builder()
+                .status(axum::http::StatusCode::OK)
+                .header("Content-Type", "application/x-git-receive-pack-result")
+                .header("Cache-Control", "no-cache")
+                .body(axum::body::Body::from(receive_raw))
+                .map_err(|e| AppError::Internal(anyhow::anyhow!("failed to build response: {e}")));
         }
+    }
 
-        // Issue a signed certificate for every ref this push advanced, each
-        // carrying that ref's real old→new transition. A multi-ref push must
-        // not collapse to a single cert covering only the first ref.
-        for update in &ref_updates {
-            match cert::issue_ref_certificate(
+    match crate::durable_outbox::apply_request_effects(&state, &request_id).await {
+        Ok(crate::durable_outbox::EffectsOutcome::Done) => {
+            if let Err(e) = state.db.mark_request_complete(&request_id).await {
+                tracing::warn!(
+                    err = %e,
+                    request_id = %request_id,
+                    repo = %name,
+                    "live path: mark_request_complete failed; drain will pick up"
+                );
+            }
+        }
+        Ok(crate::durable_outbox::EffectsOutcome::Nothing) => {
+            // No accepted ref (defensive — `any_ref_ok` gates the
+            // call site, so this branch is unreachable in practice).
+            // Mark complete so the drain skips the request.
+            if let Err(e) = state.db.mark_request_complete(&request_id).await {
+                tracing::warn!(
+                    err = %e,
+                    request_id = %request_id,
+                    repo = %name,
+                    "live path: mark_request_complete (Nothing) failed"
+                );
+            }
+        }
+        Ok(crate::durable_outbox::EffectsOutcome::Retry { last_error }) => {
+            // Centralized policy: exponential backoff, attempt_count increment,
+            // and quarantine all live in one place — routing through the same helper
+            // as the drain so both executors advance retry state identically.
+            if let Err(e) = crate::durable_outbox::schedule_request_retry_or_quarantine(
                 &state,
-                &record.id,
-                &update.ref_name,
-                &update.old_sha,
-                &update.new_sha,
-                did,
+                &request_id,
+                &last_error,
             )
             .await
             {
-                Ok(c) => {
-                    tracing::info!(cert_id = %c.id, repo = %record.name, ref_name = %update.ref_name, pusher = %did, "issued ref certificate")
-                }
-                Err(e) => {
-                    tracing::warn!(err = %e, ref_name = %update.ref_name, "failed to issue ref certificate")
-                }
+                tracing::warn!(
+                    err = %e,
+                    request_id = %request_id,
+                    repo = %name,
+                    "live path: schedule retry failed; drain will pick up"
+                );
+            }
+        }
+        Ok(crate::durable_outbox::EffectsOutcome::AwaitingSiblings) => {
+            // Siblings unresolved: completion waits for startup reconcile,
+            // not for a failed effect. Route nowhere near retry accounting
+            // — incrementing attempts here would quarantine a request that
+            // is only waiting. The aggregate stays `outcomes_committed`,
+            // re-checkable once the claim lease lapses, so the drain
+            // re-checks it and reconcile resolves it.
+            //
+            // Accepted residual, stated honestly: this arm is unreachable
+            // through the current outcome builder — `run_effects` requires a
+            // non-empty committed ok-set, and a successful commit leaves no
+            // `prepared`/`uncertain` sibling behind (every prepared child is
+            // flipped; unmentioned refs force the indeterminate path, which
+            // does not run effects). The arm exists for symmetry with the
+            // drain consumer, so a future builder change that CAN produce
+            // live siblings waits instead of misrouting to quarantine. Its
+            // presence (not behavior) is pinned in inv22_gates; deleting it
+            // must be a conscious edit, not drift.
+            tracing::debug!(
+                request_id = %request_id,
+                repo = %name,
+                "live path: siblings unresolved, waiting for reconcile (no retry accounting)"
+            );
+        }
+        Err(e) => {
+            // Execution errors must advance retry accounting so the request
+            // is not frozen behind the 300s claim lease with attempt_count
+            // stuck. Route through the same helper as the drain.
+            tracing::error!(
+                err = %e,
+                request_id = %request_id,
+                repo = %name,
+                "live path: apply_request_effects returned Err; scheduling retry"
+            );
+            let msg = format!("executor error: {e}");
+            if let Err(sched_err) = crate::durable_outbox::schedule_request_retry_or_quarantine(
+                &state,
+                &request_id,
+                &msg,
+            )
+            .await
+            {
+                tracing::warn!(
+                    err = %sched_err,
+                    request_id = %request_id,
+                    repo = %name,
+                    "live path: schedule retry (Err arm) failed"
+                );
             }
         }
     }
 
-    // Fire push webhooks — one per ref update
-    if !ref_updates.is_empty() {
-        let base_url = state
-            .config
-            .public_url
-            .as_deref()
-            .unwrap_or("http://127.0.0.1:7545")
-            .trim_end_matches('/');
-        let owner_short = crate::db::normalize_owner_key(&record.owner_did);
-        let clone_url = format!("{}/{}/{}.git", base_url, owner_short, record.name);
-
-        for update in &ref_updates {
-            let payload = serde_json::json!({
-                "ref": update.ref_name,
-                "before": update.old_sha,
-                "after": update.new_sha,
-                "created": update.old_sha == ZERO_SHA,
-                "forced": false,
-                "pusher": {
-                    "did": did,
-                },
-                "repository": {
-                    "id": record.id,
-                    "name": record.name,
-                    "owner_did": record.owner_did,
-                    "clone_url": clone_url,
-                },
-            });
-            webhooks::fire_event(
-                state.db.clone(),
-                state.http_client.clone(),
-                &record.id,
-                "push",
-                payload,
-            );
-        }
-    }
-
-    Ok(result)
+    axum::response::Response::builder()
+        .status(axum::http::StatusCode::OK)
+        .header("Content-Type", "application/x-git-receive-pack-result")
+        .header("Cache-Control", "no-cache")
+        .body(axum::body::Body::from(receive_raw))
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("failed to build response: {e}")))
 }
 
-/// The detached post-receive replication tail (#174 F2): everything a landed push
-/// still owes after its git response has been returned: the replication decision,
-/// the per-repo-coalesced pin/encrypt task, and this push's own Pinata + announce
-/// task. Split out of `git_receive_pack` so the ordering the coalescing gate depends
-/// on is directly testable; the handler spawns it and returns.
 /// Records the release-side publish outcome for the detached post-receive tail.
 ///
 /// The subtle case is the one this type exists for: the handler future is
@@ -2755,7 +3612,16 @@ async fn publish_durability_confirmed(
     }
 }
 
-async fn post_receive_replication_tail(
+/// The detached post-receive replication tail (#174 F2): everything a landed push
+/// still owes after its git response has been returned: the replication decision,
+/// the per-repo-coalesced pin/encrypt task, and this push's own Pinata + announce
+/// task. Split out of `git_receive_pack` so the ordering the coalescing gate depends
+/// on is directly testable; the handler spawns it and returns.
+/// Deferred-replication entry: the drain spawns this for aggregates that
+/// complete without ever having a live tail (capability-free pushes whose
+/// landing reconcile proved). `pub(crate)` so the drain can call it; the
+/// live handler is the other caller.
+pub(crate) async fn post_receive_replication_tail(
     state: AppState,
     record: RepoRecord,
     ref_updates: Vec<RefUpdate>,
@@ -2780,10 +3646,10 @@ async fn post_receive_replication_tail(
     }
 
     // Replication enforcement (Phase 2): decide once per push whether the public
-    // may read this repo at all and, if so, which blob and withheld-subtree tree
-    // OIDs must not leave the node. `withheld == None` means this push pins nothing
-    // (private / mode A / undetermined, or a walk that failed): skip every pin so
-    // even commit and tag objects (which the withheld walk never lists) stay local. Fail closed: a
+    // may read this repo at all and, if so, which blob OIDs must not leave the
+    // node. `withheld == None` means this push pins nothing (private / mode A /
+    // undetermined, or a walk that failed): skip every pin so even commit and tree
+    // objects (which withheld_blob_oids never lists) stay local. Fail closed: a
     // private or undetermined repo never leaks. The announce decision that gates
     // the network-facing sends is taken separately, below.
     let rules_opt = state.db.list_visibility_rules(&record.id).await.ok();
@@ -3109,10 +3975,6 @@ async fn post_receive_replication_tail(
                 if announce {
                     if let Some(p2p) = &p2p_handle {
                         p2p.publish_ref_update(crate::p2p::RefUpdateEvent {
-                            // Named, not literal: the ingest gate compares `v`
-                            // against this same constant, so a bump has to move
-                            // both ends together rather than leaving the emitter
-                            // on a version the gate no longer accepts.
                             v: crate::p2p::CURRENT_REF_UPDATE_VERSION,
                             node_did: node_did_str.clone(),
                             pusher_did: pusher_did_clone.clone(),
@@ -3124,14 +3986,6 @@ async fn post_receive_replication_tail(
                             timestamp: chrono::Utc::now().to_rfc3339(),
                             cert_id: None,
                             cid: cid.map(|s| s.to_string()),
-                            // Left unsigned here on purpose. The swarm loop
-                            // signs the event with the node keypair via
-                            // `p2p::signed_publish_bytes` immediately before it
-                            // publishes, and skips the publish outright if
-                            // signing fails, so the wire always carries a
-                            // signature even though this construction site does
-                            // not. Setting one here would be signed over a
-                            // payload the publisher has not finished building.
                             sig: None,
                         })
                         .await;
@@ -4136,16 +4990,319 @@ pub async fn get_icaptcha_proof(
     })))
 }
 
+// ── Drop guard for stranded intents ──────────────────────────────────────
+
+/// Phase-aware drop-guard that terminalizes a durable intent when the handler
+/// future is dropped. Two uncovered spans need two cleanups:
+/// - Dropped before git starts (lease park, `acquire_write`, prereq checks,
+///   marker write, or a commit landing inside the insert-timeout cancellation
+///   window): no git evidence can exist, so refuse the aggregate outright —
+///   parent to `rejected_at_git`, `prepared` children to `cancelled`.
+/// - Dropped after git starts (the whole `receive_pack` await and the outcome
+///   commit): git may have landed refs, so commit the stashed fates when the
+///   report was already parsed (proven rejections go `cancelled`, unknowns
+///   `uncertain`); with no fates, mark `prepared` children `uncertain` and
+///   terminalize the parent, mirroring the `receive_pack` Err arm for a
+///   drop that can never reach it. Startup reconcile still promotes proved
+///   children of a `rejected_at_git` parent.
+///
+/// Arm before the intent insert resolves (the refuse is a no-op on an
+/// uncommitted id), move to git-started immediately before awaiting
+/// `receive_pack`, stash computed fates once the report is parsed, and disarm
+/// once the outcome commit resolves. A sync Drop cannot await, so cleanup is
+/// spawned like `KillGroupOnDrop` and `RepoWriteGuard` do: prefer the current
+/// runtime handle, and with no runtime (off-runtime drop, process teardown)
+/// log loudly instead of panicking on a bare `tokio::spawn`. The spawned
+/// cleanup retries with backoff until the aggregate leaves `received`
+/// (see `retry_guard_cleanup`): a single shot can lose the race the early
+/// arming was meant to close.
+struct IntentDropGuard {
+    db: std::sync::Arc<crate::db::Db>,
+    request_id: String,
+    phase: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    fates: std::sync::Arc<std::sync::Mutex<Option<ComputedFates>>>,
+}
+
+const INTENT_PHASE_PRE_GIT: u8 = 0;
+const INTENT_PHASE_GIT_STARTED: u8 = 1;
+const INTENT_PHASE_DONE: u8 = 2;
+
+impl IntentDropGuard {
+    fn new(db: std::sync::Arc<crate::db::Db>, request_id: String) -> Self {
+        Self {
+            db,
+            request_id,
+            phase: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(INTENT_PHASE_PRE_GIT)),
+            fates: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Stash the computed outcome fates once git's report is parsed, so a
+    /// later drop commits fates instead of a blanket `uncertain`.
+    fn set_fates(&self, fates: ComputedFates) {
+        if let Ok(mut slot) = self.fates.lock() {
+            *slot = Some(fates);
+        }
+    }
+
+    /// Call immediately before awaiting `receive_pack`: from here a drop is a
+    /// mid-git disconnect, not a pre-git shed.
+    fn notify_git_started(&self) {
+        self.phase.store(
+            INTENT_PHASE_GIT_STARTED,
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
+    fn disarm(&self) {
+        self.phase
+            .store(INTENT_PHASE_DONE, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Owned per-ref outcome fates computed from git's report-status, stashed on
+/// the drop-guard so a post-git drop commits them instead of a context-free
+/// blanket `uncertain`. A guard that only knows "git started" would flip even
+/// git-proven rejections to `uncertain`, which reconcile can never resolve
+/// (a rejected ref never lands, so no proof can exist) — they would linger
+/// until an operator path. With fates, rejections go straight to `cancelled`
+/// (terminal, purgeable) and only genuinely unknown refs stay `uncertain`.
+#[derive(Clone)]
+struct ComputedFates {
+    ok_names: Vec<String>,
+    ng_names: Vec<String>,
+    uncertain_names: Vec<String>,
+    unpack_failed: bool,
+    git_exit_ok: bool,
+    parsed_json: Option<serde_json::Value>,
+    accepted_ordinal: Option<i32>,
+    rejected_reason: Option<String>,
+    terminal_no_effects: bool,
+}
+
+/// Spawned drop-guard cleanup with bounded retry. A single shot can evaluate
+/// the `state = 'received'` gate before a racing commit lands (the
+/// insert-timeout cancellation window) or hit a transient DB error — either
+/// strands permanently since nothing re-drives it. Retry with short backoff
+/// until a live aggregate leaves `received`; a missing row retries until the
+/// budget expires instead, since it may be an insert whose commit has not
+/// landed yet. The budget covers the 30s intent-insert lifetime, so a commit
+/// landing inside the cancellation window is always observed.
+///
+/// Each attempt is bounded 10s like the sibling cleanups: a lock-blocked
+/// `commit_request_outcomes_atomically` (awaited bare, unbounded inside) must
+/// not park the spawned task and its pool connection past the budget — the
+/// case the bound exists for. The existing warn arm retries inside the budget.
+async fn retry_guard_cleanup(
+    db: &std::sync::Arc<crate::db::Db>,
+    request_id: &str,
+    post_git: bool,
+    fates: Option<ComputedFates>,
+) {
+    retry_guard_cleanup_with_budget(
+        db,
+        request_id,
+        post_git,
+        fates,
+        std::time::Duration::from_secs(30),
+    )
+    .await
+}
+
+/// Budget-parameterized core of [`retry_guard_cleanup`]; the wrapper above
+/// supplies the production 30s, tests supply milliseconds.
+async fn retry_guard_cleanup_with_budget(
+    db: &std::sync::Arc<crate::db::Db>,
+    request_id: &str,
+    post_git: bool,
+    fates: Option<ComputedFates>,
+    budget: std::time::Duration,
+) {
+    const ATTEMPT_CAP: std::time::Duration = std::time::Duration::from_secs(10);
+    let start = std::time::Instant::now();
+    let mut delay = std::time::Duration::from_millis(100);
+    loop {
+        if start.elapsed() >= budget {
+            tracing::warn!(
+                request_id = %request_id,
+                "drop-guard cleanup budget exhausted with aggregate still uncommitted/received"
+            );
+            return;
+        }
+        // Every DB round is bounded, and each bound is clamped to the
+        // remaining budget: a fixed 10s attempt (or an unbounded state
+        // read) could otherwise overshoot the budget by a whole window,
+        // parking the spawned task and its pool connection past it.
+        let slice = std::cmp::min(ATTEMPT_CAP, budget - start.elapsed());
+        enum Check {
+            Missing,
+            Terminal,
+            Received,
+            Unknown,
+        }
+        let check = match tokio::time::timeout(slice, db.get_receive_pack_request(request_id)).await
+        {
+            Err(_) => {
+                tracing::warn!(
+                    request_id = %request_id,
+                    "drop-guard state check timed out; retrying within budget"
+                );
+                Check::Unknown
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    err = %e,
+                    request_id = %request_id,
+                    "drop-guard state check failed; retrying within budget"
+                );
+                Check::Unknown
+            }
+            Ok(Ok(None)) => Check::Missing,
+            Ok(Ok(Some(req))) if req.state != crate::db::request_state::RECEIVED => Check::Terminal,
+            Ok(Ok(Some(_))) => Check::Received,
+        };
+        match check {
+            Check::Terminal => return,
+            // Missing (uncommitted or purged) and Unknown (failed read):
+            // only the budget decides; a missing row may be an insert
+            // whose commit has not landed yet.
+            Check::Missing | Check::Unknown => {}
+            Check::Received => {
+                let remaining = budget.saturating_sub(start.elapsed());
+                if remaining.is_zero() {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        "drop-guard cleanup budget exhausted with aggregate still received"
+                    );
+                    return;
+                }
+                let run = async {
+                    if post_git {
+                        match &fates {
+                            Some(f) if !(f.terminal_no_effects && f.parsed_json.is_none()) => {
+                                let ok: Vec<&str> = f.ok_names.iter().map(String::as_str).collect();
+                                let ng: Vec<&str> = f.ng_names.iter().map(String::as_str).collect();
+                                let un: Vec<&str> =
+                                    f.uncertain_names.iter().map(String::as_str).collect();
+                                db.commit_request_outcomes_atomically(
+                                    request_id,
+                                    &ok,
+                                    &ng,
+                                    &un,
+                                    f.unpack_failed,
+                                    f.git_exit_ok,
+                                    f.parsed_json.as_ref(),
+                                    f.accepted_ordinal,
+                                    f.rejected_reason.as_deref(),
+                                    f.terminal_no_effects,
+                                )
+                                .await
+                            }
+                            _ => db.mark_receive_pack_interrupted(request_id).await,
+                        }
+                    } else {
+                        db.refuse_receive_pack_before_git(
+                            request_id,
+                            "handler dropped before git started",
+                        )
+                        .await
+                    }
+                };
+                match tokio::time::timeout(std::cmp::min(ATTEMPT_CAP, remaining), run).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            err = %e,
+                            request_id = %request_id,
+                            "drop-guard cleanup attempt failed; retrying within budget"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            request_id = %request_id,
+                            "drop-guard cleanup attempt timed out; retrying within budget"
+                        );
+                    }
+                }
+            }
+        }
+        if start.elapsed() + delay > budget {
+            tracing::warn!(
+                request_id = %request_id,
+                "drop-guard cleanup budget exhausted with aggregate still uncommitted/received"
+            );
+            return;
+        }
+        tokio::time::sleep(delay).await;
+        delay = std::cmp::min(delay * 2, std::time::Duration::from_secs(5));
+    }
+}
+
+impl Drop for IntentDropGuard {
+    fn drop(&mut self) {
+        let phase = self.phase.load(std::sync::atomic::Ordering::Acquire);
+        if phase == INTENT_PHASE_DONE {
+            return;
+        }
+        let db = self.db.clone();
+        let request_id = self.request_id.clone();
+        let post_git = phase == INTENT_PHASE_GIT_STARTED;
+        let fates = self.fates.lock().ok().and_then(|mut slot| slot.take());
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    retry_guard_cleanup(&db, &request_id, post_git, fates).await;
+                });
+            }
+            Err(_) => {
+                tracing::warn!(
+                    request_id = %request_id,
+                    phase,
+                    "intent drop-guard fired off-runtime; cannot spawn cleanup, intent may strand"
+                );
+            }
+        }
+    }
+}
+
 // ── Pkt-line parsing ──────────────────────────────────────────────────────
+
+/// True for refnames inside the node-managed namespace: the `refs/gitlawb/`
+/// subtree plus the bare `refs/gitlawb` name (no trailing slash), which
+/// `starts_with("refs/gitlawb/")` alone misses and which lands on repos with
+/// no internal refs yet. Extracted so the gate predicate is unit-testable;
+/// the handler denies any push naming such a ref before intent is written.
+fn ref_is_internal_namespace(ref_name: &str) -> bool {
+    ref_name == "refs/gitlawb" || ref_name.starts_with("refs/gitlawb/")
+}
+
+/// Maximum ref commands accepted in one receive-pack body.
+///
+/// Every accepted entry costs a per-ref branch-protection SELECT plus a
+/// durable child row that rides the aggregate into reconcile/quarantine scans
+/// until retention. One body (`max_pack_bytes` allows gigabytes, ~24M command
+/// lines) could otherwise turn a single request into tens of thousands of
+/// pre-lease DB operations, an unbounded durable row set for one signer, and
+/// an equally unbounded `Vec<RefUpdate>` of three-String entries — so the cap
+/// fires inside the parse loop, bounding the allocation too, not just the
+/// downstream work. Sized well above a legitimate mirror push (branches + tags
+/// of any realistic repo) while keeping the worst-case pre-intent work at ~8k
+/// indexed SELECTs and ~8k child rows — comfortably inside the 30s
+/// intent-write guard. A repo needing to move more than this in one push
+/// pushes in batches. Pinned from both sides by
+/// `receive_pack_refuses_a_ref_update_count_over_the_cap` (over the cap is
+/// refused) and `receive_pack_admits_a_ref_update_count_at_the_cap` (exactly
+/// at the cap is not).
+const MAX_REF_UPDATES: usize = 8192;
 
 /// `Clone` so `git_receive_pack` can hand the parsed updates to the detached
 /// replication tail at the durability boundary while the certificate and webhook
 /// loops below still iterate their own copy (#174 U5).
-#[derive(Clone)]
-struct RefUpdate {
-    old_sha: String,
-    new_sha: String,
-    ref_name: String,
+#[derive(Clone, Debug)]
+pub(crate) struct RefUpdate {
+    pub(crate) old_sha: String,
+    pub(crate) new_sha: String,
+    pub(crate) ref_name: String,
 }
 
 /// A git object id is 40 hex chars; length alone is not enough, since a peer
@@ -4156,8 +5313,32 @@ fn is_hex_sha(s: &str) -> bool {
 
 /// Parse git receive-pack pkt-line ref updates from the request body.
 /// Format per line: `<40-hex-old> <40-hex-new> <refname>[NUL capabilities]\n`
-fn parse_ref_updates(body: &[u8]) -> Vec<RefUpdate> {
+///
+/// Returns `Err` if any command line in the ref-update section is not valid
+/// UTF-8. Silently skipping non-UTF-8 lines would allow a pusher to plant
+/// refs/gitlawb/* refs (bytes ≥ 0x80 are accepted by git but invisible to
+/// the namespace gate and visibility_pack exemption), so the whole push must
+/// be refused instead.
+///
+/// Two more refusals/adjustments happen here so a hostile body is bounded
+/// before it is materialized, not after:
+/// - Past [`MAX_REF_UPDATES`] command lines the push is refused
+///   (`BadRequest`), counting every valid line — a body up to `max_pack_bytes`
+///   holds ~24M lines, and building three Strings per entry for all of them
+///   before checking would make the cap a post-parse bound only.
+/// - Identical commands in one push are dropped: they would derive the same
+///   deterministic intent child id, and `pending_ref_transitions` has no
+///   `ON CONFLICT`, so the duplicate would fail the whole intent transaction
+///   and answer a permanent shape as a retryable `Overloaded`. Git processes
+///   the second occurrence of a command as the same no-op anyway.
+///
+/// Pinned by `receive_pack_refuses_a_ref_update_count_over_the_cap`,
+/// `receive_pack_admits_a_ref_update_count_at_the_cap`, and
+/// `receive_pack_dedupes_identical_ref_commands_before_intent`.
+fn parse_ref_updates(body: &[u8]) -> Result<Vec<RefUpdate>> {
     let mut updates = Vec::new();
+    let mut commands = 0usize;
+    let mut seen: HashSet<(String, String, String)> = HashSet::new();
     let mut pos = 0;
 
     while pos + 4 <= body.len() {
@@ -4182,9 +5363,18 @@ fn parse_ref_updates(body: &[u8]) -> Vec<RefUpdate> {
         let data = &body[pos + 4..pos + len];
         pos += len;
 
+        // Non-UTF-8 ref-update lines must be refused, not skipped. Git accepts
+        // refnames with bytes ≥ 0x80 (e.g. \xff-prefixed), so a skipped line
+        // bypasses the refs/gitlawb namespace gate below and lands a blob ref
+        // that is invisible to parse_ref_updates yet still served by
+        // visibility_pack. Reject the entire push so no such ref reaches git.
         let line = match std::str::from_utf8(data) {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(_) => {
+                return Err(AppError::BadRequest(
+                    "ref-update line is not valid UTF-8; push refused".into(),
+                ))
+            }
         };
 
         // Strip capabilities (after NUL) and trailing newline
@@ -4196,15 +5386,28 @@ fn parse_ref_updates(body: &[u8]) -> Vec<RefUpdate> {
 
         let parts: Vec<&str> = line.splitn(3, ' ').collect();
         if parts.len() == 3 && is_hex_sha(parts[0]) && is_hex_sha(parts[1]) {
-            updates.push(RefUpdate {
+            commands += 1;
+            if commands > MAX_REF_UPDATES {
+                return Err(AppError::BadRequest(format!(
+                    "too many ref updates in one push: more than {MAX_REF_UPDATES}"
+                )));
+            }
+            let candidate = RefUpdate {
                 old_sha: parts[0].to_string(),
                 new_sha: parts[1].to_string(),
                 ref_name: parts[2].to_string(),
-            });
+            };
+            if seen.insert((
+                candidate.ref_name.clone(),
+                candidate.old_sha.clone(),
+                candidate.new_sha.clone(),
+            )) {
+                updates.push(candidate);
+            }
         }
     }
 
-    updates
+    Ok(updates)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -5294,7 +6497,7 @@ mod tests {
         };
 
         // Valid 40-hex old + new -> accepted.
-        let updates = parse_ref_updates(&pkt(&sha_a, &sha_b, "refs/heads/main"));
+        let updates = parse_ref_updates(&pkt(&sha_a, &sha_b, "refs/heads/main")).unwrap();
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].old_sha, sha_a);
         assert_eq!(updates[0].new_sha, sha_b);
@@ -5302,12 +6505,24 @@ mod tests {
 
         // 40-byte non-hex fields -> dropped.
         let junk = "Z".repeat(40);
-        assert!(parse_ref_updates(&pkt(&junk, &sha_b, "refs/heads/main")).is_empty());
-        assert!(parse_ref_updates(&pkt(&sha_a, &junk, "refs/heads/main")).is_empty());
+        assert!(parse_ref_updates(&pkt(&junk, &sha_b, "refs/heads/main"))
+            .unwrap()
+            .is_empty());
+        assert!(parse_ref_updates(&pkt(&sha_a, &junk, "refs/heads/main"))
+            .unwrap()
+            .is_empty());
 
         // Wrong lengths -> dropped.
-        assert!(parse_ref_updates(&pkt(&"a".repeat(39), &sha_b, "refs/heads/main")).is_empty());
-        assert!(parse_ref_updates(&pkt(&sha_a, &"b".repeat(41), "refs/heads/main")).is_empty());
+        assert!(
+            parse_ref_updates(&pkt(&"a".repeat(39), &sha_b, "refs/heads/main"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            parse_ref_updates(&pkt(&sha_a, &"b".repeat(41), "refs/heads/main"))
+                .unwrap()
+                .is_empty()
+        );
 
         // A bad line among good ones drops only the bad line.
         let sha_c = "c".repeat(40);
@@ -5315,7 +6530,7 @@ mod tests {
         let good = pkt(&sha_a, &sha_c, "refs/heads/good");
         let mut mixed = bad[..bad.len() - 4].to_vec(); // strip trailing flush
         mixed.extend_from_slice(&good);
-        let updates = parse_ref_updates(&mixed);
+        let updates = parse_ref_updates(&mixed).unwrap();
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].ref_name, "refs/heads/good");
     }
@@ -5534,6 +6749,71 @@ mod tests {
         let repo = repo_owned_by(OWNER_DID);
         assert!(owner_push_rejection(false, &repo, Some(STRANGER_DID)).is_none());
         assert!(owner_push_rejection(false, &repo, None).is_none());
+    }
+
+    /// Policy 2 carve-out: replication/Tigris follows landed report
+    /// knowledge even when the outcome commit failed, while durable
+    /// accounting waits. MUTATION (RED): gating `spawn_tail` or
+    /// `release_ok` on `outcome_commit_ok` breaks the carve-out row.
+    #[test]
+    fn post_git_disposition_replication_carve_out() {
+        // Happy path: everything runs.
+        assert_eq!(
+            post_git_disposition(true, true, true, false),
+            PostGitDisposition {
+                spawn_tail: true,
+                release_ok: true,
+                run_effects: true
+            },
+        );
+        // Commit failure defers accounting but NOT replication/Tigris.
+        assert_eq!(
+            post_git_disposition(true, true, false, false),
+            PostGitDisposition {
+                spawn_tail: true,
+                release_ok: true,
+                run_effects: false
+            },
+        );
+        // No landed refs with a report: nothing runs anywhere.
+        assert_eq!(
+            post_git_disposition(true, false, true, false),
+            PostGitDisposition {
+                spawn_tail: false,
+                release_ok: false,
+                run_effects: false
+            },
+        );
+        // Failed git: nothing runs anywhere, report or not.
+        assert_eq!(
+            post_git_disposition(false, false, false, false),
+            PostGitDisposition {
+                spawn_tail: false,
+                release_ok: false,
+                run_effects: false
+            },
+        );
+        assert_eq!(
+            post_git_disposition(false, false, true, true),
+            PostGitDisposition {
+                spawn_tail: false,
+                release_ok: false,
+                run_effects: false
+            },
+        );
+        // No report with exit ok: refs may have landed, so the shared
+        // copy is refreshed (no stale-download erasure) but nothing is
+        // announced and no effects run until reconcile proves the landing.
+        // MUTATION (RED): dropping `report_absent` from `release_ok`
+        // reintroduces the stale-Tigris erasure of acknowledged pushes.
+        assert_eq!(
+            post_git_disposition(true, false, true, true),
+            PostGitDisposition {
+                spawn_tail: false,
+                release_ok: true,
+                run_effects: false
+            },
+        );
     }
 
     #[test]
@@ -8285,6 +9565,114 @@ mod tests {
         );
     }
 
+    /// A handler refusal after intent insert leaves a terminal aggregate, not
+    /// a strand. Same stall as the deadline test above, but the push carries
+    /// a real ref command, so intent has children: after the 503 the parent
+    /// must be `rejected_at_git` with `completed_at` (purge-eligible), every
+    /// child `cancelled` (never promotable, no tuple poisoning), and the
+    /// proof acked (no purge block). Deleting any inline refuse call strands
+    /// `received` + `prepared` and turns these red. The inline refuse is
+    /// synchronous, so no sleep/poll is needed — unlike the drop-guard path.
+    #[sqlx::test]
+    async fn receive_pack_refusal_terminalizes_intent_aggregate(pool: sqlx::PgPool) {
+        use crate::git::repo_store::advisory_lock_key;
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+
+        let owner = "z6refuseagg";
+        let name = "ra1";
+        let owner_slug = owner.replace([':', '/'], "_");
+        let lock_key = advisory_lock_key(&owner_slug, name);
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let mut cfg = (*state.config).clone();
+        cfg.git_acquire_timeout_secs = 2;
+        cfg.git_service_timeout_secs = 600;
+        state.config = std::sync::Arc::new(cfg);
+        state
+            .db
+            .upsert_mirror_repo(owner, name, "/tmp/z6refuseagg-ra1", None, false)
+            .await
+            .unwrap();
+        let repo_id = state
+            .db
+            .get_repo(owner, name)
+            .await
+            .unwrap()
+            .expect("mirror row exists")
+            .id;
+
+        // Stall acquire_write on a second pooled connection.
+        let mut lock_conn = pool.acquire().await.expect("second connection");
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(lock_key)
+            .execute(&mut *lock_conn)
+            .await
+            .expect("hold the advisory lock");
+
+        let did = "did:key:z6refuseagg";
+        let peer: SocketAddr = "203.0.113.91:5000".parse().unwrap();
+        let result = git_receive_pack(
+            State(state.clone()),
+            Path((owner.to_string(), name.to_string())),
+            Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            crate::rate_limit::PeerAddr(Some(peer)),
+            axum::http::HeaderMap::new(),
+            ref_update_body("1111111111111111111111111111111111111111"),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(AppError::Overloaded(_))),
+            "stalled acquire_write must shed with Overloaded/503; got {result:?}"
+        );
+
+        // Exactly one aggregate for this push, terminal on both levels.
+        let (req_id, req_state, completed_at): (String, String, Option<String>) = sqlx::query_as(
+            "SELECT id, state, completed_at FROM receive_pack_requests WHERE repo_id = $1",
+        )
+        .bind(&repo_id)
+        .fetch_one(state.db.pool())
+        .await
+        .expect("one intent aggregate per refused push");
+        assert_eq!(
+            req_state,
+            crate::db::request_state::REJECTED_AT_GIT,
+            "refused parent is terminal"
+        );
+        assert!(
+            completed_at.is_some(),
+            "refused parent carries completed_at so retention can purge it"
+        );
+        let children = state
+            .db
+            .list_pending_ref_transitions_for_request(&req_id)
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1, "the ref command produced one child");
+        assert_eq!(
+            children[0].state,
+            crate::db::pending_state::CANCELLED,
+            "refused child is cancelled, never prepared"
+        );
+        let proof = state
+            .db
+            .get_request_proof(&req_id)
+            .await
+            .unwrap()
+            .expect("proof row exists");
+        assert!(
+            proof.acked_at.is_some(),
+            "refused proof is acked so purge is not blocked"
+        );
+
+        sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(lock_key)
+            .execute(&mut *lock_conn)
+            .await
+            .expect("release the advisory lock");
+    }
+
     #[cfg(unix)]
     fn pid_alive(pid: i32) -> bool {
         // SAFETY: kill(2) with signal 0 only probes; it takes integers and borrows no
@@ -8545,7 +9933,12 @@ mod tests {
         // is still writing the request body would EPIPE that write, which
         // `drive_git_child` surfaces as an error after a successful exit status, making
         // the push fail for a reason that has nothing to do with the lock under test.
-        let git_bin = write_fake_git(tmp.path(), "#!/bin/sh\ncat >/dev/null\nexit 0\n");
+        // It emits a single-framed report-status (unpack ok + ok main) so the
+        // outcome authority (report, not process exit) marks the ref applied.
+        let git_bin = write_fake_git(
+            tmp.path(),
+            "#!/bin/sh\ncat >/dev/null\nprintf '0022\\001unpack ok\\nok refs/heads/main\\n0000'\nexit 0\n",
+        );
 
         let mut state = crate::test_support::test_state(pool.clone()).await;
         state.git_bin = git_bin;
@@ -8586,7 +9979,13 @@ mod tests {
                         "203.0.113.83:5000".parse::<SocketAddr>().unwrap(),
                     )),
                     axum::http::HeaderMap::new(),
-                    axum::body::Bytes::from_static(b"0000"),
+                    // Request-level gate defines success as
+                    // `exit_ok && any_ref_ok`: a bare `0000` flush
+                    // carries no ref command, so `ok_set` is empty
+                    // and the push correctly skips the Tigris upload.
+                    // Send one accepted ref so this positive control
+                    // exercises the upload path.
+                    ref_update_body("1111111111111111111111111111111111111111"),
                 ),
             )
             .await
@@ -8624,6 +10023,98 @@ mod tests {
             1,
             "a completed push must reach the Tigris upload site once"
         );
+    }
+
+    /// Durable intent is wired at the handler boundary: a successful
+    /// receive-pack leaves a request row, exactly one child carrying the
+    /// pusher DID, and a versioned proof record.
+    /// MUTATION (RED): wrapping the
+    /// `insert_receive_pack_request_with_children` call in `if false`
+    /// leaves zero rows and this test fails.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn receive_pack_success_persists_durable_intent_rows(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+
+        let owner = "z6intent";
+        let name = "in1";
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let git_bin = write_fake_git(
+            tmp.path(),
+            "#!/bin/sh\ncat >/dev/null\nprintf '0022\\001unpack ok\\nok refs/heads/main\\n0000'\nexit 0\n",
+        );
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.git_bin = git_bin;
+        state.repo_store = crate::git::repo_store::RepoStore::new(
+            repos_dir.path().to_path_buf(),
+            None,
+            crate::git::repo_store::build_lock_pool(&pool, 4, std::time::Duration::from_secs(5)),
+            std::time::Duration::from_secs(5),
+        );
+        let mut cfg = (*state.config).clone();
+        cfg.enforce_owner_push = false;
+        state.config = std::sync::Arc::new(cfg);
+        state
+            .db
+            .upsert_mirror_repo(owner, name, "/tmp/z6intent-in1", None, false)
+            .await
+            .unwrap();
+
+        let pusher = "did:key:z6MkIntentProofDidAAAAAAAAAAAAAAAAAA";
+        let resp = git_receive_pack(
+            State(state.clone()),
+            Path((owner.to_string(), name.to_string())),
+            Extension(crate::auth::AuthenticatedDid(pusher.to_string())),
+            crate::rate_limit::PeerAddr(Some("203.0.113.84:5000".parse::<SocketAddr>().unwrap())),
+            axum::http::HeaderMap::new(),
+            ref_update_body("5555555555555555555555555555555555555555"),
+        )
+        .await
+        .expect("push must succeed");
+        assert_eq!(resp.status(), 200, "push must succeed");
+
+        let repo_id = state.db.get_repo(owner, name).await.unwrap().unwrap().id;
+        let (reqs,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)::BIGINT FROM receive_pack_requests WHERE repo_id = $1 AND pusher_did = $2",
+        )
+        .bind(&repo_id)
+        .bind(pusher)
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            reqs, 1,
+            "exactly one durable request row per successful push"
+        );
+        let (kids,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)::BIGINT FROM pending_ref_transitions WHERE repo_id = $1 AND pusher_did = $2",
+        )
+        .bind(&repo_id)
+        .bind(pusher)
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
+        // Live success applies inline and deletes accepted children after
+        // effects, so zero-or-one (deleted after Done) is accepted; the
+        // request + proof rows are the load-bearing evidence the insert
+        // creates. A disabled insert leaves all three at zero.
+        assert!(
+            kids <= 1,
+            "at most one child row survives live completion; got {kids}"
+        );
+        let (proofs,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)::BIGINT FROM request_proofs WHERE repo_id = $1 AND pusher_did = $2",
+        )
+        .bind(&repo_id)
+        .bind(pusher)
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(proofs, 1, "exactly one versioned proof record per intent");
     }
 
     /// #173 F1 (RED-before/GREEN-after): an exhausted repo write-lock POOL is a capacity
@@ -9293,6 +10784,536 @@ mod tests {
         axum::body::Bytes::from(format!("{:04x}{}0000", line.len() + 4, line))
     }
 
+    /// Build a receive-pack body carrying `count` distinct ref-update commands,
+    /// framed like [`ref_update_body`] (one pkt-line each, then the flush).
+    fn ref_update_body_many(count: usize) -> axum::body::Bytes {
+        let mut s = String::new();
+        for i in 0..count {
+            let line = format!("{ZERO_SHA} {:040x} refs/heads/branch-{i}", i + 1);
+            s.push_str(&format!("{:04x}{}", line.len() + 4, line));
+        }
+        s.push_str("0000");
+        axum::body::Bytes::from(s)
+    }
+
+    /// Build a receive-pack body from explicit `(new_sha, refname)` commands
+    /// in the given order — duplicates allowed — one pkt-line each, then flush.
+    fn ref_update_body_cmds(cmds: &[(&str, &str)]) -> axum::body::Bytes {
+        let mut s = String::new();
+        for (new_sha, refname) in cmds {
+            let line = format!("{ZERO_SHA} {new_sha} {refname}");
+            s.push_str(&format!("{:04x}{}", line.len() + 4, line));
+        }
+        s.push_str("0000");
+        axum::body::Bytes::from(s)
+    }
+
+    // The ref-count cap refuses inside `parse_ref_updates`, so the refusal
+    // fires BEFORE the owner-push and branch-protection gates, BEFORE any
+    // entry beyond the cap is materialized, and BEFORE the durable intent
+    // insert: one oversized body cannot become thousands of per-ref
+    // `is_branch_protected` SELECTs or a durable row set that rides
+    // reconcile/quarantine scans until retention. The signer here is NOT the
+    // owner, so if the cap were removed — or moved below the owner gate — the
+    // answer would become Forbidden instead: pinning both the refusal and its
+    // placement. Goes RED without `MAX_REF_UPDATES`.
+    #[sqlx::test]
+    async fn receive_pack_refuses_a_ref_update_count_over_the_cap(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+
+        let owner = "z6refcapowner";
+        let name = "rc1";
+        let state =
+            crate::test_support::test_state_with(pool.clone(), |cfg| cfg.enforce_owner_push = true)
+                .await;
+        state
+            .db
+            .upsert_mirror_repo(owner, name, "/tmp/z6refcapowner-rc1", None, false)
+            .await
+            .unwrap();
+        let repo_id = state
+            .db
+            .get_repo(owner, name)
+            .await
+            .unwrap()
+            .expect("mirror row exists")
+            .id;
+
+        let pusher = "did:key:z6refcapother";
+        let peer: SocketAddr = "203.0.113.92:5000".parse().unwrap();
+        let result = git_receive_pack(
+            State(state.clone()),
+            Path((owner.to_string(), name.to_string())),
+            Extension(crate::auth::AuthenticatedDid(pusher.to_string())),
+            crate::rate_limit::PeerAddr(Some(peer)),
+            axum::http::HeaderMap::new(),
+            ref_update_body_many(MAX_REF_UPDATES + 1),
+        )
+        .await;
+        match result {
+            Err(AppError::BadRequest(msg)) => assert!(
+                msg.contains("too many ref updates"),
+                "the refusal names the cap; got: {msg}"
+            ),
+            Err(other) => panic!("over-cap push must refuse with BadRequest/400; got {other:?}"),
+            Ok(_) => panic!("over-cap push must refuse, not serve"),
+        }
+
+        // No rows at all: the refusal precedes the durable intent insert, so
+        // nothing rides retention, reconcile, or quarantine scans.
+        let (req_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM receive_pack_requests WHERE repo_id = $1")
+                .bind(&repo_id)
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(req_count, 0, "no intent aggregate for a refused push");
+        let (child_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM pending_ref_transitions WHERE repo_id = $1")
+                .bind(&repo_id)
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(child_count, 0, "no child rows for a refused push");
+    }
+
+    // Boundary pin for the in-loop cap: EXACTLY MAX_REF_UPDATES commands is a
+    // legal push that must pass the cap and fall through to the next gate —
+    // here the owner gate (non-owner signer, enforcement on), which answers
+    // Forbidden. The over-cap test alone cannot catch an off-by-one: both `>`
+    // and `>=` refuse MAX+1, but only `>` lets MAX through, so this test goes
+    // RED the moment the boundary starts rejecting a legal at-cap push
+    // (e.g. a `>=` slip or counting the flush line as a command).
+    #[sqlx::test]
+    async fn receive_pack_admits_a_ref_update_count_at_the_cap(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+
+        let owner = "z6refcapowner";
+        let name = "rc-boundary";
+        let state =
+            crate::test_support::test_state_with(pool.clone(), |cfg| cfg.enforce_owner_push = true)
+                .await;
+        state
+            .db
+            .upsert_mirror_repo(owner, name, "/tmp/z6refcapowner-boundary", None, false)
+            .await
+            .unwrap();
+        let repo_id = state
+            .db
+            .get_repo(owner, name)
+            .await
+            .unwrap()
+            .expect("mirror row exists")
+            .id;
+
+        let pusher = "did:key:z6refcapother";
+        let peer: SocketAddr = "203.0.113.93:5000".parse().unwrap();
+        let result = git_receive_pack(
+            State(state.clone()),
+            Path((owner.to_string(), name.to_string())),
+            Extension(crate::auth::AuthenticatedDid(pusher.to_string())),
+            crate::rate_limit::PeerAddr(Some(peer)),
+            axum::http::HeaderMap::new(),
+            ref_update_body_many(MAX_REF_UPDATES),
+        )
+        .await;
+        match result {
+            Err(AppError::Forbidden(msg)) => assert!(
+                !msg.contains("too many ref updates"),
+                "an at-cap push must reach the owner gate, not the cap; got: {msg}"
+            ),
+            Err(other) => panic!(
+                "an at-cap push must pass the cap and refuse at the owner gate; got {other:?}"
+            ),
+            Ok(_) => panic!("a non-owner at-cap push must still refuse at the owner gate"),
+        }
+        let (req_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM receive_pack_requests WHERE repo_id = $1")
+                .bind(&repo_id)
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(req_count, 0, "the owner gate precedes the intent insert");
+    }
+
+    // Two identical command lines in one push derive the same deterministic
+    // intent child id (`pending_ref_transition` + request id + ref + old + new)
+    // and the `pending_ref_transitions` INSERT has no `ON CONFLICT`, so without
+    // dedupe the whole intent transaction dies on the duplicate: the handler
+    // answers `Overloaded` — a retryable status for a shape that can never
+    // succeed — and ZERO rows survive (nothing for reconcile). With the
+    // parse-level dedupe this A,B,A body inserts two children, stalls at the
+    // lease like the refusal harness, and terminalizes normally. Goes RED
+    // (`fetch_one` finds no aggregate) without the dedupe.
+    #[sqlx::test]
+    async fn receive_pack_dedupes_identical_ref_commands_before_intent(pool: sqlx::PgPool) {
+        use crate::git::repo_store::advisory_lock_key;
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+
+        let owner = "z6dupintent";
+        let name = "di1";
+        let owner_slug = owner.replace([':', '/'], "_");
+        let lock_key = advisory_lock_key(&owner_slug, name);
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let mut cfg = (*state.config).clone();
+        cfg.git_acquire_timeout_secs = 2;
+        cfg.git_service_timeout_secs = 600;
+        state.config = std::sync::Arc::new(cfg);
+        state
+            .db
+            .upsert_mirror_repo(owner, name, "/tmp/z6dupintent-di1", None, false)
+            .await
+            .unwrap();
+        let repo_id = state
+            .db
+            .get_repo(owner, name)
+            .await
+            .unwrap()
+            .expect("mirror row exists")
+            .id;
+
+        // Stall acquire_write on a second pooled connection so the push stops
+        // after the intent insert; the rows below are what the insert wrote.
+        let mut lock_conn = pool.acquire().await.expect("second connection");
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(lock_key)
+            .execute(&mut *lock_conn)
+            .await
+            .expect("hold the advisory lock");
+
+        let did = "did:key:z6dupintent";
+        let peer: SocketAddr = "203.0.113.94:5000".parse().unwrap();
+        let sha_a = "1111111111111111111111111111111111111111";
+        let sha_b = "2222222222222222222222222222222222222222";
+        let result = git_receive_pack(
+            State(state.clone()),
+            Path((owner.to_string(), name.to_string())),
+            Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            crate::rate_limit::PeerAddr(Some(peer)),
+            axum::http::HeaderMap::new(),
+            ref_update_body_cmds(&[
+                (sha_a, "refs/heads/main"),
+                (sha_b, "refs/heads/other"),
+                (sha_a, "refs/heads/main"), // identical to line 1, non-adjacent
+            ]),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(AppError::Overloaded(_))),
+            "stalled acquire_write must shed with Overloaded/503; got {result:?}"
+        );
+
+        let (req_id,): (String,) =
+            sqlx::query_as("SELECT id FROM receive_pack_requests WHERE repo_id = $1")
+                .bind(&repo_id)
+                .fetch_one(state.db.pool())
+                .await
+                .expect("the intent aggregate exists: the duplicate must not kill the insert txn");
+        let children = state
+            .db
+            .list_pending_ref_transitions_for_request(&req_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            children.len(),
+            2,
+            "three command lines dedupe to two children — the repeated main command \
+             is one child, not a PK collision"
+        );
+
+        sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(lock_key)
+            .execute(&mut *lock_conn)
+            .await
+            .expect("release the advisory lock");
+    }
+
+    /// Absent report-status with exit zero is indeterminate, not proof.
+    /// A capability-free client omits `report-status`; Git then emits zero
+    /// result bytes even for rejected commands. The handler must leave every
+    /// child `uncertain`, keep the parent out of `outcomes_committed`, and
+    /// emit no push event, certificate, anchor, or webhook.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn absent_report_with_exit_zero_defers_effects_until_evidence(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Fake emits zero result bytes with exit zero: the exact
+        // capability-free boundary.
+        let git_bin = write_fake_git(tmp.path(), "#!/bin/sh\ncat >/dev/null\nexit 0\n");
+        let mut state = f4_state_with_repo(
+            pool.clone(),
+            tmp.path(),
+            &git_bin,
+            "z6noreport",
+            "n1",
+            false,
+        )
+        .await;
+        let mut cfg = (*state.config).clone();
+        cfg.enforce_owner_push = false;
+        state.config = std::sync::Arc::new(cfg);
+
+        let peer: SocketAddr = "203.0.113.99:5000".parse().unwrap();
+        let resp = git_receive_pack(
+            State(state.clone()),
+            Path(("z6noreport".to_string(), "n1".to_string())),
+            Extension(crate::auth::AuthenticatedDid(
+                "did:key:z6noreport".to_string(),
+            )),
+            crate::rate_limit::PeerAddr(Some(peer)),
+            axum::http::HeaderMap::new(),
+            ref_update_body("3333333333333333333333333333333333333333"),
+        )
+        .await
+        .expect("capability-free push still receives the Git response");
+        assert_eq!(
+            resp.status(),
+            200,
+            "client is not rejected; effects are deferred"
+        );
+
+        // No child may be applied on exit-status alone.
+        let applied = state
+            .db
+            .list_pending_ref_transitions_applied(100)
+            .await
+            .unwrap();
+        assert!(
+            applied.is_empty(),
+            "absent report must not mark any child applied"
+        );
+        // No executable parent: nothing for the drain to effect.
+        let due = state.db.list_receive_pack_requests_due(100).await.unwrap();
+        assert!(
+            due.is_empty(),
+            "indeterminate request must not become executable without disk evidence"
+        );
+        // The aggregate must read as indeterminate, not unpack-failed: the
+        // documented no-report reason and the TRUE git exit (0 here), so
+        // operators see "await disk evidence" instead of a false unpack
+        // failure flag. Routing the absent report through the unpack arm
+        // persists "unpack failed without parseable report" + FALSE.
+        let repo_id = state
+            .db
+            .get_repo("z6noreport", "n1")
+            .await
+            .unwrap()
+            .expect("repo exists")
+            .id;
+        let (req_state, last_error, git_exit_ok): (String, Option<String>, Option<bool>) =
+            sqlx::query_as(
+                "SELECT state, last_error, git_exit_ok FROM receive_pack_requests WHERE repo_id = $1",
+            )
+            .bind(&repo_id)
+            .fetch_one(state.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            req_state,
+            crate::db::request_state::REJECTED_AT_GIT,
+            "indeterminate parent waits in rejected_at_git for reconcile"
+        );
+        assert_eq!(
+            last_error.as_deref(),
+            Some(crate::durable_outbox::NO_REPORT_AWAITING_EVIDENCE),
+            "parent carries the indeterminate reason, not an unpack-failure label"
+        );
+        assert_eq!(
+            git_exit_ok,
+            Some(true),
+            "parent records the true git exit (0), not a false unpack failure"
+        );
+        // Storage durability: git exited ok, so the shared copy is refreshed
+        // even with no proven refs — otherwise the next Tigris-backed write
+        // restores a stale archive over the landed refs (and their marker)
+        // before reconcile can prove the landing. The upload-site counter
+        // records reaching the upload decision (tests run tigris: None).
+        assert_eq!(
+            state.repo_store.tigris_upload_site_reached(),
+            1,
+            "exit-ok push must reach the Tigris upload site with or without a report"
+        );
+    }
+
+    /// A valid empty (`0000`, no commands) push terminalizes with its proof
+    /// acked, so retention can purge it: no child can ever consume the
+    /// proof, and the no-report outcome has no accepted child to ack it.
+    /// Without the up-front ack the terminal parent fails the ACK gate
+    /// forever. Backdates `completed_at` past retention and proves the
+    /// purge deletes the aggregate.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn empty_receive_pack_acks_proof_for_retention(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let git_bin = write_fake_git(tmp.path(), "#!/bin/sh\ncat >/dev/null\nexit 0\n");
+        let mut state =
+            f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6empty", "e1", false).await;
+        let mut cfg = (*state.config).clone();
+        cfg.enforce_owner_push = false;
+        state.config = std::sync::Arc::new(cfg);
+
+        let peer: SocketAddr = "203.0.113.97:5000".parse().unwrap();
+        let resp = git_receive_pack(
+            State(state.clone()),
+            Path(("z6empty".to_string(), "e1".to_string())),
+            Extension(crate::auth::AuthenticatedDid("did:key:z6empty".to_string())),
+            crate::rate_limit::PeerAddr(Some(peer)),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from_static(b"0000"),
+        )
+        .await
+        .expect("empty push receives the Git response");
+        assert_eq!(resp.status(), 200);
+
+        let repo_id = state
+            .db
+            .get_repo("z6empty", "e1")
+            .await
+            .unwrap()
+            .expect("repo exists")
+            .id;
+        let (req_id, req_state): (String, String) =
+            sqlx::query_as("SELECT id, state FROM receive_pack_requests WHERE repo_id = $1")
+                .bind(&repo_id)
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            req_state,
+            crate::db::request_state::REJECTED_AT_GIT,
+            "empty push terminalizes without effects"
+        );
+        let proof = state
+            .db
+            .get_request_proof(&req_id)
+            .await
+            .unwrap()
+            .expect("proof row exists");
+        assert!(
+            proof.acked_at.is_some(),
+            "empty push acks its proof up front (no child ever could)"
+        );
+
+        // Age past retention: the aggregate must purge.
+        let old = (chrono::Utc::now() - chrono::Duration::days(8)).to_rfc3339();
+        sqlx::query("UPDATE receive_pack_requests SET completed_at = $1 WHERE id = $2")
+            .bind(&old)
+            .bind(&req_id)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(7)).to_rfc3339();
+        let purged = state
+            .db
+            .purge_completed_receive_pack_requests_returning(&cutoff, 100)
+            .await
+            .unwrap();
+        assert!(
+            purged.iter().any(|(id, _)| id == &req_id),
+            "empty terminal aggregate is purge-eligible, got {purged:?}"
+        );
+    }
+
+    /// `unpack_ok: false` with a per-ref `ok: true` bit and exit zero must
+    /// emit zero effects. The unpack gate clears the accepted set and
+    /// terminalizes; children are cancelled, never applied.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn unpack_failure_with_ok_bit_emits_no_effects(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Single-framed report claiming unpack failure yet ok:true.
+        let payload = "\x01unpack fail\nok refs/heads/main\n";
+        let report = format!("{:04x}{payload}0000", payload.len() + 4);
+        let git_bin = write_fake_git(
+            tmp.path(),
+            &format!("#!/bin/sh\ncat >/dev/null\nprintf '{report}'\nexit 0\n"),
+        );
+        let mut state =
+            f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6unpack", "u1", false).await;
+        let mut cfg = (*state.config).clone();
+        cfg.enforce_owner_push = false;
+        state.config = std::sync::Arc::new(cfg);
+
+        let peer: SocketAddr = "203.0.113.98:5000".parse().unwrap();
+        let before_certs = state
+            .db
+            .list_ref_certificates(
+                &state
+                    .db
+                    .get_repo("z6unpack", "u1")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                100,
+            )
+            .await
+            .unwrap()
+            .len();
+        let resp = git_receive_pack(
+            State(state.clone()),
+            Path(("z6unpack".to_string(), "u1".to_string())),
+            Extension(crate::auth::AuthenticatedDid(
+                "did:key:z6unpack".to_string(),
+            )),
+            crate::rate_limit::PeerAddr(Some(peer)),
+            axum::http::HeaderMap::new(),
+            ref_update_body("4444444444444444444444444444444444444444"),
+        )
+        .await
+        .expect("unpack-failed push still receives the Git response");
+        assert_eq!(resp.status(), 200);
+        let applied = state
+            .db
+            .list_pending_ref_transitions_applied(100)
+            .await
+            .unwrap();
+        assert!(applied.is_empty(), "unpack failure applies no child");
+        let after_certs = state
+            .db
+            .list_ref_certificates(
+                &state
+                    .db
+                    .get_repo("z6unpack", "u1")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                100,
+            )
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(
+            before_certs, after_certs,
+            "unpack failure issues no certificate"
+        );
+        let due = state.db.list_receive_pack_requests_due(100).await.unwrap();
+        assert!(
+            due.is_empty(),
+            "unpack failure terminalizes with nothing executable"
+        );
+    }
+
     /// F4 scenario 2 — push-burst bound at the handler layer: with a scan pool of
     /// ONE, two concurrent pushes to two path-scoped repos never have more than one
     /// scan's git alive at a time (an atomic mkdir lock in the fake git detects any
@@ -9312,13 +11333,15 @@ mod tests {
         let lockdir = tmp.path().join("scan.lock");
         let ranfile = tmp.path().join("scan.ran");
         let overlap = tmp.path().join("scan.overlap");
-        // receive-pack succeeds instantly; every candidate-scan git op (cat-file /
-        // rev-list / ls-tree) holds an atomic mkdir lock for 150ms — a second scan
-        // process alive at the same instant records an overlap.
+        // receive-pack succeeds instantly with a report-status (unpack ok
+        // + ok main) so the report authority marks refs applied; every
+        // candidate-scan git op (cat-file / rev-list / ls-tree) holds an
+        // atomic mkdir lock for 150ms — a second scan process alive at
+        // the same instant records an overlap.
         let body = format!(
             "#!/bin/sh\n\
              case \"$1\" in\n\
-               receive-pack) cat > /dev/null 2>/dev/null ;;\n\
+               receive-pack) cat > /dev/null 2>/dev/null; printf '0022\\001unpack ok\\nok refs/heads/main\\n0000' ;;\n\
                rev-parse) echo deadbeef ;;\n\
                cat-file|rev-list|ls-tree)\n\
                  if mkdir \"{lock}\" 2>/dev/null; then\n\
@@ -12216,7 +14239,18 @@ mod tests {
         let log = tmp.join("git.log");
         let git_bin = match git_body {
             Some(body) => write_fake_git(tmp, body),
-            None => f2a_logging_git(tmp, &log),
+            // Default shim: fake `receive-pack` success with a report-status
+            // (unpack ok + ok main) while logging every invocation and
+            // delegating all other git commands to real git.
+            None => {
+                let body = format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\n\
+                     case \"$1\" in receive-pack) cat >/dev/null 2>/dev/null; printf '0022\\001unpack ok\\nok refs/heads/main\\n0000'; exit 0 ;; esac\n\
+                     exec git \"$@\"\n",
+                    log.display()
+                );
+                write_fake_git(tmp, &body)
+            }
         };
         let repos_dir = tmp.join("repos");
         std::fs::create_dir_all(&repos_dir).unwrap();
@@ -12267,19 +14301,126 @@ mod tests {
         use axum::extract::{Path, State};
         use axum::Extension;
         use std::net::SocketAddr;
+        // One accepted ref: the request-level gate (`exit_ok &&
+        // any_ref_ok`) needs a landed ref to spawn the replication
+        // tail and reach the Tigris upload; a bare `0000` flush is
+        // correctly a no-op.
+        let line = format!("{ZERO_SHA} 1111111111111111111111111111111111111111 refs/heads/main");
+        let body = axum::body::Bytes::from(format!("{:04x}{}0000", line.len() + 4, line));
         git_receive_pack(
             State(state.clone()),
             Path((owner.to_string(), name.to_string())),
             Extension(crate::auth::AuthenticatedDid(format!("did:key:{owner}"))),
             crate::rate_limit::PeerAddr(Some("203.0.113.90:5000".parse::<SocketAddr>().unwrap())),
             axum::http::HeaderMap::new(),
-            axum::body::Bytes::from_static(b"0000"),
+            body,
         )
     }
 
     #[cfg(unix)]
     fn p2_logged(log: &std::path::Path, prefix: &str) -> bool {
         f2a_log(log).lines().any(|l| l.starts_with(prefix))
+    }
+
+    /// A persistent `commit_request_outcomes_atomically` failure must not fail
+    /// the push: the request-level gate (`outcome_commit_ok=false`) defers all
+    /// durable effects to startup reconcile while the handler still answers
+    /// 200, releases the write lock, and leaves the parent in `received` for
+    /// the due worker. Asserted at the handler boundary, not the pure fn:
+    /// removing the `run_effects` gate would land a push event, cert, and
+    /// webhook row and turn this red.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn outcome_commit_failure_returns_200_and_defers_effects(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let log = tmp.path().join("git.log");
+        let git_bin = write_fake_git(
+            tmp.path(),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\n\
+                 case \"$1\" in receive-pack) cat >/dev/null 2>/dev/null; printf '0022\\001unpack ok\\nok refs/heads/main\\n0000'; exit 0 ;; esac\n\
+                 exec git \"$@\"\n",
+                log.display()
+            ),
+        );
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.git_bin = git_bin;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        // Real (non-parked) store: release resolves and the tail gets its
+        // publish-durability confirmation, so nothing parks.
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool.clone());
+        let owner = "z6ocommit";
+        let name = "t1";
+        state
+            .db
+            .upsert_mirror_repo(owner, name, &format!("/unused-{owner}-{name}"), None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo(owner, name).await.unwrap().unwrap();
+        state
+            .repo_store
+            .init(&rec.owner_did, &rec.name)
+            .await
+            .unwrap();
+
+        // Enough injected failures to exhaust the retry budget (delay_ms
+        // 20 -> 100 -> 500, then break false).
+        drain_faults::arm_outcome_commit(&rec.id, 4);
+
+        let resp = p2_push(&state, owner, name)
+            .await
+            .expect("the push must return, not park");
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "a persistent outcome-commit failure defers effects; it does not fail the push"
+        );
+
+        // The tail still spawns on a landed push: its `for-each-ref` walk
+        // appears in the git log after the handler returns.
+        let mut walked = false;
+        for _ in 0..100 {
+            if p2_logged(&log, "for-each-ref") {
+                walked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            walked,
+            "the replication tail must still run on a landed push"
+        );
+
+        // No durable effects were written: the gate deferred them all.
+        let push_events: i64 = sqlx::query_scalar("SELECT count(*) FROM push_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let certs: i64 = sqlx::query_scalar("SELECT count(*) FROM ref_certificates")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let hooks: i64 = sqlx::query_scalar("SELECT count(*) FROM webhook_deliveries")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!((push_events, certs, hooks), (0, 0, 0));
+
+        // The parent never reaches a terminal state: it stays in a
+        // reconcile-recoverable phase (`received` while the commit is
+        // still armed, or `outcomes_committed`/`effects_pending` once the
+        // still-armed intent guard terminalizes it on scope exit).
+        let parent_state: String = sqlx::query_scalar("SELECT state FROM receive_pack_requests")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(
+            ["received", "outcomes_committed", "effects_pending"].contains(&parent_state.as_str()),
+            "a failed outcome commit must leave the parent recoverable, got: {parent_state}"
+        );
     }
 
     /// #174 (jatmn P2, RED-before/GREEN-after): a client disconnect DURING
@@ -12486,6 +14627,7 @@ mod tests {
         owner: &str,
         name: &str,
         gate: Arc<crate::git::tigris::BlockingGate>,
+        report_ok: bool,
     ) -> (
         AppState,
         std::path::PathBuf,
@@ -12493,7 +14635,23 @@ mod tests {
         tokio::task::JoinHandle<()>,
     ) {
         let log = tmp.join("git.log");
-        let git_bin = f2a_logging_git(tmp, &log);
+        // `report_ok` fakes a report-status `ok refs/heads/main` so the push
+        // proves a landing and `disposition.spawn_tail` admits the live tail;
+        // the plain logging shim leaves the push report-absent, which under
+        // the proven-refs gate spawns no tail at all.
+        let git_bin = if report_ok {
+            write_fake_git(
+                tmp,
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\n\
+                     case \"$1\" in receive-pack) cat >/dev/null 2>/dev/null; printf '0022\\001unpack ok\\nok refs/heads/main\\n0000'; exit 0 ;; esac\n\
+                     exec git \"$@\"\n",
+                    log.display()
+                ),
+            )
+        } else {
+            f2a_logging_git(tmp, &log)
+        };
         let repos_dir = tmp.join("repos");
         std::fs::create_dir_all(&repos_dir).unwrap();
         let (endpoint, puts, server) = p3_put_counting_store().await;
@@ -12567,7 +14725,8 @@ mod tests {
         // Shut: every compression from this store parks until the gate opens.
         let gate = Arc::new(crate::git::tigris::BlockingGate::shut());
         let (state, log, puts, server) =
-            p3_compression_gated_state(pool, tmp.path(), "z6p3comp", "c1", Arc::clone(&gate)).await;
+            p3_compression_gated_state(pool, tmp.path(), "z6p3comp", "c1", Arc::clone(&gate), true)
+                .await;
 
         let mut fut = Box::pin(p2_push(&state, "z6p3comp", "c1"));
         let mut ran = false;
@@ -12635,7 +14794,7 @@ mod tests {
         let gate = Arc::new(crate::git::tigris::BlockingGate::shut());
         gate.open();
         let (state, log, puts, server) =
-            p3_compression_gated_state(pool, tmp.path(), "z6p3ctrl", "c1", gate).await;
+            p3_compression_gated_state(pool, tmp.path(), "z6p3ctrl", "c1", gate, true).await;
 
         p2_push(&state, "z6p3ctrl", "c1")
             .await
@@ -12700,8 +14859,15 @@ mod tests {
     async fn receive_pack_cancelled_during_compression_leaves_no_servable_refs(pool: sqlx::PgPool) {
         let tmp = tempfile::TempDir::new().unwrap();
         let gate = Arc::new(crate::git::tigris::BlockingGate::shut());
-        let (state, log, puts, server) =
-            p3_compression_gated_state(pool, tmp.path(), "z6p3quar", "c1", Arc::clone(&gate)).await;
+        let (state, log, puts, server) = p3_compression_gated_state(
+            pool,
+            tmp.path(),
+            "z6p3quar",
+            "c1",
+            Arc::clone(&gate),
+            false,
+        )
+        .await;
         let rec = state.db.get_repo("z6p3quar", "c1").await.unwrap().unwrap();
         let repos_dir = tmp.path().join("repos");
         let live =
@@ -12776,8 +14942,15 @@ mod tests {
     ) {
         let tmp = tempfile::TempDir::new().unwrap();
         let gate = Arc::new(crate::git::tigris::BlockingGate::shut());
-        let (mut state, _log, _puts, server) =
-            p3_compression_gated_state(pool, tmp.path(), "z6p3disc", "c1", Arc::clone(&gate)).await;
+        let (mut state, _log, _puts, server) = p3_compression_gated_state(
+            pool,
+            tmp.path(),
+            "z6p3disc",
+            "c1",
+            Arc::clone(&gate),
+            false,
+        )
+        .await;
         // Its own directory: `write_fake_git` always writes `fakegit`, and the
         // state builder has already put the logging shim at that name.
         let gitdir = tmp.path().join("hanging-git");
@@ -12868,6 +15041,7 @@ exit 0
             "z6p3rwin",
             "c1",
             Arc::clone(&gate),
+            false,
         )
         .await;
         let gitdir = tmp.path().join("hanging-git");
@@ -12991,7 +15165,7 @@ exit 0
         let gate = Arc::new(crate::git::tigris::BlockingGate::shut());
         gate.open();
         let (state, _log, puts, server) =
-            p3_compression_gated_state(pool, tmp.path(), "z6p3serv", "c1", gate).await;
+            p3_compression_gated_state(pool, tmp.path(), "z6p3serv", "c1", gate, false).await;
         let rec = state.db.get_repo("z6p3serv", "c1").await.unwrap().unwrap();
         let repos_dir = tmp.path().join("repos");
         let marker = p3_quarantine_marker(&repos_dir, &rec.owner_did, "c1");
@@ -13404,5 +15578,366 @@ exit 0
                 .is_empty(),
             "and the unvetted push still maps no CID"
         );
+    }
+
+    /// A ref-update command line that is not valid UTF-8 refuses the whole
+    /// push. Git accepts refnames with bytes >= 0x80, so silently skipping
+    /// such a line would plant a ref the namespace gate never sees and no
+    /// durable child row covers. Removing the Err arm (skip-and-continue)
+    /// turns the expect_err red.
+    #[test]
+    fn parse_ref_updates_refuses_non_utf8_command_line() {
+        // Well-formed section first: one command + flush parses fine.
+        let good_payload = format!("{} {} refs/heads/main\n", "0".repeat(40), "1".repeat(40));
+        let good_body = format!("{:04x}{}0000", good_payload.len() + 4, good_payload);
+        let updates = parse_ref_updates(good_body.as_bytes()).expect("well-formed section parses");
+        assert_eq!(updates.len(), 1, "one command line yields one update");
+        assert_eq!(updates[0].ref_name, "refs/heads/main");
+
+        // Same framing, but the refname carries a raw 0xFF byte (note: `b"\xff"`
+        // is one raw byte; `"\xff"` in a str literal would be U+00FF instead).
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"0000000000000000000000000000000000000000 ");
+        payload.extend_from_slice(b"1111111111111111111111111111111111111111 ");
+        payload.extend_from_slice(b"refs/gitlawb/issues/\xffx\n");
+        let mut body = format!("{:04x}", payload.len() + 4).into_bytes();
+        body.extend_from_slice(&payload);
+        body.extend_from_slice(b"0000");
+        let err =
+            parse_ref_updates(&body).expect_err("a non-UTF-8 command line must refuse the push");
+        assert!(
+            matches!(err, AppError::BadRequest(_)),
+            "undecodable ref-update line is a client error (400), got {err:?}"
+        );
+    }
+
+    /// The spawned guard cleanup commits stashed fates instead of a blanket
+    /// `uncertain`: an `ok` child lands `applied`, an `ng` child lands
+    /// `cancelled` (terminal, purgeable — reconcile could never resolve a
+    /// proven rejection left `uncertain`), and the parent carries the parsed
+    /// report. Reverting the fates arm to `mark_receive_pack_interrupted`
+    /// flips the ng child to `uncertain` and turns this red.
+    #[sqlx::test]
+    async fn guard_retry_with_fates_commits_them_not_blanket_uncertain(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let now = chrono::Utc::now().to_rfc3339();
+        let req = crate::db::ReceivePackRequest {
+            id: "req-guard-fates".to_string(),
+            repo_id: "repo-guard-fates".to_string(),
+            pusher_did: "did:key:z6pusher".to_string(),
+            node_did: state.node_did.to_string(),
+            request_bytes: Vec::new(),
+            request_bytes_hash: vec![7u8; 32],
+            state: crate::db::request_state::RECEIVED.to_string(),
+            git_exit_ok: None,
+            parsed_report: None,
+            accepted_ordinal: None,
+            attempt_count: 0,
+            last_error: None,
+            next_attempt_at: None,
+            created_at: now.clone(),
+            completed_at: None,
+            signature_header: Some("sig".to_string()),
+            signature_input: Some("sig-input".to_string()),
+            content_digest: Some("digest".to_string()),
+        };
+        let updates = vec![
+            RefUpdate {
+                old_sha: "0".repeat(40),
+                new_sha: "1".repeat(40),
+                ref_name: "refs/heads/main".to_string(),
+            },
+            RefUpdate {
+                old_sha: "0".repeat(40),
+                new_sha: "2".repeat(40),
+                ref_name: "refs/heads/feat".to_string(),
+            },
+        ];
+        state
+            .db
+            .insert_receive_pack_request_with_children(
+                &req,
+                "repo-guard-fates",
+                &state.node_did.to_string(),
+                "did:key:z6pusher",
+                &updates,
+                "sig",
+                "sig-input",
+                "digest",
+            )
+            .await
+            .unwrap();
+        let fates = ComputedFates {
+            ok_names: vec!["refs/heads/main".to_string()],
+            ng_names: vec!["refs/heads/feat".to_string()],
+            uncertain_names: Vec::new(),
+            unpack_failed: false,
+            git_exit_ok: true,
+            parsed_json: Some(serde_json::json!({
+                "unpack_ok": true,
+                "ref_results": [
+                    {"ref_name": "refs/heads/main", "ok": true},
+                    {"ref_name": "refs/heads/feat", "ok": false},
+                ],
+            })),
+            accepted_ordinal: Some(0),
+            rejected_reason: None,
+            terminal_no_effects: false,
+        };
+        retry_guard_cleanup(&state.db, "req-guard-fates", true, Some(fates)).await;
+
+        let parent = state
+            .db
+            .get_receive_pack_request("req-guard-fates")
+            .await
+            .unwrap()
+            .expect("parent exists");
+        assert_eq!(
+            parent.state,
+            crate::db::request_state::OUTCOMES_COMMITTED,
+            "fates commit advances the parent"
+        );
+        assert!(
+            parent.parsed_report.is_some(),
+            "committed fates carry the parsed report"
+        );
+        let children = state
+            .db
+            .list_pending_ref_transitions_for_request("req-guard-fates")
+            .await
+            .unwrap();
+        let by_name: std::collections::HashMap<&str, &str> = children
+            .iter()
+            .map(|c| (c.ref_name.as_str(), c.state.as_str()))
+            .collect();
+        assert_eq!(
+            by_name.get("refs/heads/main"),
+            Some(&crate::db::pending_state::APPLIED),
+            "ok child applies"
+        );
+        assert_eq!(
+            by_name.get("refs/heads/feat"),
+            Some(&crate::db::pending_state::CANCELLED),
+            "git-proven rejection cancels (never blanket uncertain)"
+        );
+    }
+
+    /// Without stashed fates the post-git cleanup falls back to
+    /// `mark_receive_pack_interrupted`, and a non-`received` aggregate stops
+    /// the loop immediately. A missing id exhausts only the (short test)
+    /// budget and returns — proving the budget exit without a 30s test.
+    #[sqlx::test]
+    async fn guard_retry_without_fates_marks_interrupted_and_stops_when_terminal(
+        pool: sqlx::PgPool,
+    ) {
+        let state = crate::test_support::test_state(pool).await;
+        let now = chrono::Utc::now().to_rfc3339();
+        let req = crate::db::ReceivePackRequest {
+            id: "req-guard-nofates".to_string(),
+            repo_id: "repo-guard-nofates".to_string(),
+            pusher_did: "did:key:z6pusher".to_string(),
+            node_did: state.node_did.to_string(),
+            request_bytes: Vec::new(),
+            request_bytes_hash: vec![7u8; 32],
+            state: crate::db::request_state::RECEIVED.to_string(),
+            git_exit_ok: None,
+            parsed_report: None,
+            accepted_ordinal: None,
+            attempt_count: 0,
+            last_error: None,
+            next_attempt_at: None,
+            created_at: now.clone(),
+            completed_at: None,
+            signature_header: Some("sig".to_string()),
+            signature_input: Some("sig-input".to_string()),
+            content_digest: Some("digest".to_string()),
+        };
+        let updates = vec![RefUpdate {
+            old_sha: "0".repeat(40),
+            new_sha: "1".repeat(40),
+            ref_name: "refs/heads/main".to_string(),
+        }];
+        state
+            .db
+            .insert_receive_pack_request_with_children(
+                &req,
+                "repo-guard-nofates",
+                &state.node_did.to_string(),
+                "did:key:z6pusher",
+                &updates,
+                "sig",
+                "sig-input",
+                "digest",
+            )
+            .await
+            .unwrap();
+
+        retry_guard_cleanup(&state.db, "req-guard-nofates", true, None).await;
+        let parent = state
+            .db
+            .get_receive_pack_request("req-guard-nofates")
+            .await
+            .unwrap()
+            .expect("parent exists");
+        assert_eq!(
+            parent.state,
+            crate::db::request_state::REJECTED_AT_GIT,
+            "no-fates fallback terminalizes the parent"
+        );
+        let children = state
+            .db
+            .list_pending_ref_transitions_for_request("req-guard-nofates")
+            .await
+            .unwrap();
+        assert_eq!(
+            children[0].state,
+            crate::db::pending_state::UNCERTAIN,
+            "no-fates fallback leaves the child uncertain for reconcile"
+        );
+
+        // Terminal aggregate: returns without touching anything.
+        retry_guard_cleanup(&state.db, "req-guard-nofates", true, None).await;
+        let again = state
+            .db
+            .get_receive_pack_request("req-guard-nofates")
+            .await
+            .unwrap()
+            .expect("parent exists");
+        assert_eq!(
+            again.state,
+            crate::db::request_state::REJECTED_AT_GIT,
+            "cleanup on a terminal aggregate is a no-op"
+        );
+
+        // Missing id: only the budget decides; a millisecond budget proves
+        // the exit without waiting out production 30s.
+        retry_guard_cleanup_with_budget(
+            &state.db,
+            "req-never-existed",
+            false,
+            None,
+            std::time::Duration::from_millis(150),
+        )
+        .await;
+    }
+
+    /// Each cleanup attempt is bounded, not just the loop: with the parent
+    /// row locked by an open transaction, the refuse UPDATE blocks until the
+    /// per-attempt timeout fires, and the loop exits at the (short test)
+    /// budget instead of parking the task past it. Unwrapping the attempt
+    /// timeout parks the UPDATE forever and this hangs (caught by the outer
+    /// guard timeout, slow-red rather than green).
+    #[sqlx::test]
+    async fn guard_retry_attempt_bounded_under_row_lock(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let now = chrono::Utc::now().to_rfc3339();
+        let req = crate::db::ReceivePackRequest {
+            id: "req-row-locked".to_string(),
+            repo_id: "repo-row-locked".to_string(),
+            pusher_did: "did:key:z6pusher".to_string(),
+            node_did: state.node_did.to_string(),
+            request_bytes: Vec::new(),
+            request_bytes_hash: vec![7u8; 32],
+            state: crate::db::request_state::RECEIVED.to_string(),
+            git_exit_ok: None,
+            parsed_report: None,
+            accepted_ordinal: None,
+            attempt_count: 0,
+            last_error: None,
+            next_attempt_at: None,
+            created_at: now.clone(),
+            completed_at: None,
+            signature_header: Some("sig".to_string()),
+            signature_input: Some("sig-input".to_string()),
+            content_digest: Some("digest".to_string()),
+        };
+        state
+            .db
+            .insert_receive_pack_request_with_children(
+                &req,
+                "repo-row-locked",
+                &state.node_did.to_string(),
+                "did:key:z6pusher",
+                &[],
+                "sig",
+                "sig-input",
+                "digest",
+            )
+            .await
+            .unwrap();
+
+        // Hold the parent row locked inside an EXPLICIT transaction for the
+        // whole call: a pooled `SELECT ... FOR UPDATE` outside a transaction
+        // releases at statement end (autocommit) and holds nothing. Every
+        // cleanup UPDATE below blocks on this lock until the per-attempt
+        // timeout fires.
+        let mut locker = pool.begin().await.expect("locker transaction");
+        sqlx::query("SELECT 1 FROM receive_pack_requests WHERE id = $1 FOR UPDATE")
+            .bind("req-row-locked")
+            .fetch_one(&mut *locker)
+            .await
+            .unwrap();
+
+        // GREEN returns at the test budget with elapsed below the 10s
+        // per-attempt cap, proving the clamp (not just the loop budget):
+        // without the per-attempt bound the UPDATE parks until the lock
+        // releases — never, in this test — and trips the outer guard.
+        // The outer guard sits above the 10s cap but far below infinity so
+        // a regression slow-fails instead of wedging the suite.
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            retry_guard_cleanup_with_budget(
+                &state.db,
+                "req-row-locked",
+                false,
+                None,
+                std::time::Duration::from_secs(2),
+            ),
+        )
+        .await
+        .expect("bounded attempts must return, not park past the outer guard");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "cleanup under a held row lock must return inside the per-attempt \
+             bound, not park the UPDATE; took {elapsed:?}"
+        );
+        // Releasing the lock lets the stranded aggregate terminalize.
+        locker.rollback().await.unwrap();
+    }
+
+    /// The internal-namespace predicate covers the bare `refs/gitlawb` name
+    /// and the whole subtree, and nothing else. The handler denies any push
+    /// naming such a ref before intent is written; narrowing the predicate
+    /// (e.g. dropping the bare-name arm) turns these red.
+    #[test]
+    fn internal_namespace_gate_covers_bare_name_and_subtree() {
+        // Denied: bare name, subtree root, exempt namespaces, attacker refs.
+        for denied in [
+            "refs/gitlawb",
+            "refs/gitlawb/",
+            "refs/gitlawb/requests/550e8400-e29b-41d4-a716-446655440000",
+            "refs/gitlawb/issues/abc123",
+            "refs/gitlawb/evil",
+        ] {
+            assert!(
+                ref_is_internal_namespace(denied),
+                "push gate must deny {denied}"
+            );
+        }
+        // Allowed: content refs, lookalike prefixes, empty.
+        for allowed in [
+            "refs/heads/main",
+            "refs/tags/v1",
+            "refs/gitlawbfoo",
+            "refs/heads/gitlawb/x",
+            "",
+        ] {
+            assert!(
+                !ref_is_internal_namespace(allowed),
+                "push gate must allow {allowed}"
+            );
+        }
     }
 }
