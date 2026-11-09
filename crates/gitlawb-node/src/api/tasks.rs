@@ -203,7 +203,7 @@ pub(crate) fn task_visible(
         let assignee_match = task
             .assignee_did
             .as_deref()
-            .map(|a| crate::api::did_matches(c, a))
+            .map(|a| crate::api::did_matches(c, crate::db::trim_assignee_did(a)))
             .unwrap_or(false);
         if assignee_match {
             return true;
@@ -490,7 +490,7 @@ pub(crate) fn task_claimable(
     rules_by_repo: &HashMap<String, Vec<VisibilityRule>>,
 ) -> bool {
     if let Some(assignee) = task.assignee_did.as_deref() {
-        return crate::api::did_matches(caller, assignee);
+        return crate::api::did_matches(caller, crate::db::trim_assignee_did(assignee));
     }
     // Unassigned task: check repo visibility if repo is specified and locally hosted
     let Some(repo_id) = task.repo_id.as_deref() else {
@@ -1155,6 +1155,66 @@ mod visible_tasks_tests {
             StatusCode::OK,
             "the repo owner must see the task via the repo's read gate"
         );
+    }
+
+    /// A stored assignee with whitespace padding must match a caller
+    /// presenting the same DID in trimmed form on every gate, matching the
+    /// trim-assignee contract Db::claim_task and REST finish already apply.
+    #[sqlx::test]
+    async fn padded_stored_assignee_matches_trimmed_caller_on_read_and_claim(pool: PgPool) {
+        let state = test_state(pool).await;
+        let mut t = task("t-pad", None, DELEGATOR);
+        t.assignee_did = Some(format!("\t{ASSIGNEE} \n"));
+        state.db.create_task(&t).await.unwrap();
+
+        // Read gate: the trimmed caller sees the padded task.
+        let visible = super::get_visible_task(&state.db, "t-pad", Some(ASSIGNEE))
+            .await
+            .unwrap();
+        assert!(
+            visible.is_some(),
+            "padded assignee must be readable by the trimmed caller"
+        );
+
+        // Claim gate: same contract; a padded reservation is claimable by its assignee.
+        let claimable = super::get_claimable_task(&state.db, "t-pad", ASSIGNEE)
+            .await
+            .unwrap();
+        assert!(
+            claimable.is_some(),
+            "padded assignee must be claimable by the trimmed caller"
+        );
+
+        // And strangers still get the opaque denial.
+        let denied = super::get_visible_task(&state.db, "t-pad", Some(STRANGER))
+            .await
+            .unwrap();
+        assert!(
+            denied.is_none(),
+            "stranger must not see a task reserved for another"
+        );
+
+        // REST surface: 200 for the assignee, 404 for the stranger.
+        let resp = list_router(state.clone())
+            .oneshot(signed_request_as(
+                ASSIGNEE,
+                Method::GET,
+                "/api/v1/tasks/t-pad",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = list_router(state)
+            .oneshot(signed_request_as(
+                STRANGER,
+                Method::GET,
+                "/api/v1/tasks/t-pad",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[sqlx::test]

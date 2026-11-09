@@ -160,7 +160,10 @@ impl MutationRoot {
             .await
             .map_err(crate::graphql::graphql_app_err)?
             .ok_or_else(|| async_graphql::Error::new("task not found"))?;
-        if !crate::api::did_matches(caller, existing.assignee_did.as_deref().unwrap_or_default()) {
+        if !crate::api::did_matches(
+            caller,
+            crate::db::trim_assignee_did(existing.assignee_did.as_deref().unwrap_or_default()),
+        ) {
             return Err(async_graphql::Error::new(
                 "only the task assignee can complete it",
             ));
@@ -213,7 +216,10 @@ impl MutationRoot {
             .await
             .map_err(crate::graphql::graphql_app_err)?
             .ok_or_else(|| async_graphql::Error::new("task not found"))?;
-        if !crate::api::did_matches(caller, existing.assignee_did.as_deref().unwrap_or_default()) {
+        if !crate::api::did_matches(
+            caller,
+            crate::db::trim_assignee_did(existing.assignee_did.as_deref().unwrap_or_default()),
+        ) {
             return Err(async_graphql::Error::new(
                 "only the task assignee can fail it",
             ));

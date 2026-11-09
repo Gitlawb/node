@@ -26,7 +26,7 @@ We will acknowledge receipt within 48 hours and aim to release a fix within 14 d
 
 **Content addressing**
 - Every git object is content-addressed via CIDv1 (SHA-256)
-- Tamper-evident by construction — a modified object changes its CID
+- Tamper-evident by construction: a modified object changes its CID
 
 **UCAN token validation**
 - Bootstrap UCAN tokens are issued at registration.
@@ -35,8 +35,8 @@ We will acknowledge receipt within 48 hours and aim to release a fix within 14 d
 - Capability grants are not yet consulted by repository write authorization; see the limitations below.
 
 **Smart contracts (Base Sepolia testnet)**
-- `GitlawbDIDRegistry` — on-chain DID → document registry
-- `GitlawbNameRegistry` — human name → DID registry
+- `GitlawbDIDRegistry`: on-chain DID → document registry
+- `GitlawbNameRegistry`: human name → DID registry
 - Both auditable on-chain, no admin keys
 
 ---
@@ -55,7 +55,7 @@ These are documented limitations of the current live release. They should be pri
 
 ### Repository write authorization defaults
 - `git-receive-pack` verifies HTTP Signatures and, with the default configuration, also requires the pusher DID to be the repository owner: `GITLAWB_ENFORCE_OWNER_PUSH` defaults to `true`.
-- **Impact:** With the default setting, a valid signature authenticates the pusher *and* the pusher must be the repository owner. Authentication is not authorization on its own — anyone can mint a `did:key` and sign — so owner enforcement is the only thing that prevents every signed caller from pushing to every repository, including private ones.
+- **Impact:** With the default setting, a valid signature authenticates the pusher, and the pusher must be the repository owner. Authentication is not authorization on its own, since anyone can mint a `did:key` and sign, so owner enforcement is the only thing that prevents every signed caller from pushing to every repository, including private ones.
 - **Mitigation:** `GITLAWB_ENFORCE_OWNER_PUSH=false` is the explicit rolling-upgrade compatibility override. Disable it only for the duration of an upgrade whose pushers are not yet the repo owner, then turn it back on. Delegated and CI keys count as non-owners: a UCAN `git/push` capability is verified but not yet honored for authorization, so they cannot push while this is on.
 
 ### UCAN delegation and revocation
@@ -73,7 +73,7 @@ These are documented limitations of the current live release. They should be pri
 ### Private repository reads
 - Repository and path-scoped visibility checks are enforced for repository API and Git content reads. A denied whole-repository or root read returns the same 404 shape as a missing repository, so the denial does not reveal private-repository existence.
 - Sparse-clone support exposes withheld path globs to callers who may read the repository root. Do not put sensitive information in withheld path names.
-- Task list/get reads (`GET /api/v1/tasks`, `GET /api/v1/tasks/{id}`, and GraphQL `tasks` / `task`) are repository/task-gated through shared visibility collectors and omit `ucan_token`. `/api/v1/ipfs/pins` and `/api/v1/arweave/anchors` are not repository-gated; pin and anchor listings expose object and ref metadata.
+- Task list/get reads (`GET /api/v1/tasks`, `GET /api/v1/tasks/{id}`, and GraphQL `tasks` / `task` over HTTP and WebSocket) are repository/task-gated through shared visibility collectors and omit `ucan_token`. All of those transports share the same per-IP `GITLAWB_TASK_READ_RATE_LIMIT` budget. `/api/v1/ipfs/pins` and `/api/v1/arweave/anchors` are not repository-gated; pin and anchor listings expose object and ref metadata.
 - Changing a repository's visibility controls future serving, but cannot retract ref metadata or configured external pins and anchors already announced while the repository was public. Do not push secrets to an announceable repository.
 - **Impact:** Visibility policies protect the repository and Git content routes they gate, not every metadata endpoint or previously published content.
 - **Remaining boundary:** This read control does not address the independent write-authorization and UCAN-delegation limitations described above.
@@ -119,10 +119,10 @@ These are documented limitations of the current live release. They should be pri
 ## Threat Model
 
 Twigpine is designed to be secure against:
-- **Unauthenticated writes** — HTTP Signature auth on protected write endpoints; see Known Limitations for owner and capability authorization gaps
-- **Tampered git objects** — CIDv1 content addressing detects modification
-- **Identity spoofing** — DIDs derived from public keys, unforgeable without the private key
-- **Centralized takedown** — no single point of control; data on IPFS + Arweave
+- **Unauthenticated writes:** HTTP Signature auth on protected write endpoints; see Known Limitations for owner and capability authorization gaps
+- **Tampered git objects:** CIDv1 content addressing detects modification
+- **Identity spoofing:** DIDs derived from public keys, unforgeable without the private key
+- **Centralized takedown:** no single point of control; data on IPFS + Arweave
 
 Twigpine is **not yet** designed to defend against:
 - A compromised node operator (node operators are trusted for their own node)
