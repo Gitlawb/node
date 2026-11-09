@@ -58,4 +58,16 @@ ignore = [
     # (verified 2026-11-03). REMOVE only when Cargo.lock has no crypto-bigint
     # below 0.7.6: `grep -A1 'name = "crypto-bigint"' Cargo.lock`.
     "RUSTSEC-2026-0387", # crypto-bigint timing variability (no compatible fix)
+
+    # libsqlite3-sys 0.30.1 (bundled SQLite WAL uninitialized-memory disclosure,
+    # CVE-2026-119375). Present in Cargo.lock because sqlx resolves sqlx-sqlite
+    # unconditionally; sqlx is built postgres-only
+    # (crates/gitlawb-node/Cargo.toml), so sqlx-sqlite and its bundled SQLite C
+    # source are never compiled or linked (`cargo tree -i sqlx-sqlite` prints
+    # nothing) and there is no reachable WAL open to attack. The fix requires
+    # libsqlite3-sys >= 0.39, but sqlx-sqlite 0.8.6 pins ^0.30.1; a compatible
+    # bump needs a sqlx upgrade, not a lockfile refresh. REMOVE this ignore if
+    # sqlx is ever built with the `sqlite` feature or any other libsqlite3-sys
+    # consumer enters the build.
+    "RUSTSEC-2026-0459", # libsqlite3-sys bundled SQLite CVE (not linked in our build)
 ]
