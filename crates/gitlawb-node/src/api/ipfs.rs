@@ -2133,7 +2133,15 @@ async fn gate_and_serve(
 /// Returns all CIDs that have been pinned to the local IPFS node from git
 /// objects received via push. Each entry includes the git SHA-256 hex, the
 /// CIDv1 string, and the timestamp when it was pinned.
-pub async fn list_pins(State(state): State<AppState>) -> Result<Json<serde_json::Value>> {
+pub async fn list_pins(
+    State(state): State<AppState>,
+    auth: Option<Extension<crate::auth::AuthenticatedDid>>,
+) -> Result<Json<serde_json::Value>> {
+    if auth.is_none() {
+        return Err(crate::error::AppError::Unauthorized(
+            "authentication required for pin listing".into(),
+        ));
+    }
     // Bare `?` so connection-class sqlx failures downcast to `AppError::Db` and
     // map to 503 `db_unavailable` (not 500 via `.map_err(AppError::Internal)`) (#251).
     let pins = state.db.list_pinned_cids().await?;
@@ -2426,6 +2434,7 @@ mod closed_pool_tests {
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/ipfs/pins")
+                    .extension(crate::auth::AuthenticatedDid("did:key:test".into()))
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -2520,7 +2529,10 @@ mod tests {
                 "/ipfs/{cid}",
                 axum::routing::get(crate::api::ipfs::get_by_cid),
             )
-            .layer(axum::middleware::from_fn(crate::auth::optional_signature))
+            .layer(axum::middleware::from_fn_with_state(
+                crate::auth::SignatureBodyLimit(crate::server::SIGNED_BODY_LIMIT),
+                crate::auth::optional_signature,
+            ))
             .with_state(state)
     }
 
@@ -3758,9 +3770,13 @@ mod tests {
         // deterministically.
         let endpoint = crate::test_support::silent_http_endpoint().await;
         let tigris =
-            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint)
-                .await;
-        state.repo_store = crate::git::repo_store::RepoStore::new(repos_dir, Some(tigris), pool);
+            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint);
+        state.repo_store = crate::git::repo_store::RepoStore::new(
+            repos_dir,
+            Some(tigris),
+            pool,
+            std::time::Duration::from_secs(300),
+        );
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
         let mut cfg = (*state.config).clone();
         cfg.git_acquire_timeout_secs = 1;
@@ -3831,9 +3847,13 @@ mod tests {
         // (endpoint-pinned test client, no AWS_* env reads).
         let endpoint = crate::test_support::silent_http_endpoint().await;
         let tigris =
-            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint)
-                .await;
-        state.repo_store = crate::git::repo_store::RepoStore::new(repos_dir, Some(tigris), pool);
+            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint);
+        state.repo_store = crate::git::repo_store::RepoStore::new(
+            repos_dir,
+            Some(tigris),
+            pool,
+            std::time::Duration::from_secs(300),
+        );
         let mut cfg = (*state.config).clone();
         cfg.git_acquire_timeout_secs = 1;
         state.config = Arc::new(cfg);
@@ -7956,9 +7976,18 @@ mod tests {
         // (endpoint-pinned test client, no AWS_* env reads).
         let endpoint = crate::test_support::silent_http_endpoint().await;
         let tigris =
-            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint)
-                .await;
-        state.repo_store = crate::git::repo_store::RepoStore::new(repos_dir, Some(tigris), pool);
+            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint);
+        state.repo_store = crate::git::repo_store::RepoStore::new(
+            repos_dir,
+            Some(tigris),
+            pool,
+            std::time::Duration::from_secs(300),
+        );
+        state
+            .db
+            .upsert_mirror_repo("z6f3budget", "ghost", "/unused-ghost", None, false)
+            .await
+            .unwrap();
         let mut cfg = (*state.config).clone();
         cfg.ipfs_request_budget_secs = 1;
         cfg.git_acquire_timeout_secs = 2;
@@ -8338,6 +8367,7 @@ mod tests {
     #[tokio::test]
     async fn get_by_cid_per_source_cap_sheds_same_source_admits_other() {
         let mut state = crate::test_support::test_state_lazy();
+        state.db.pool().close().await;
         // Global pool has room; the per-source cap is 1.
         state.git_ipfs_walk_semaphore = Arc::new(Semaphore::new(8));
         state.git_ipfs_walk_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
@@ -8364,16 +8394,23 @@ mod tests {
             "a source at its per-source /ipfs walk cap must shed 503 with global capacity free"
         );
 
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "overloaded");
+
         // A DIFFERENT source is NOT shed by the per-source cap: it clears admission and
-        // proceeds (then errors on the lazy DB, which is not a 503).
+        // proceeds to the closed DB, which has a distinct db_unavailable error code.
         let resp = ipfs_router(state)
             .oneshot(get_cid(&cid, Some(other)))
             .await
             .unwrap();
-        assert_ne!(
-            resp.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "a different source must not be shed by the per-source cap"
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["error"],
+            crate::error::DB_UNAVAILABLE_CODE,
+            "a different source must clear admission and reach the closed database"
         );
     }
 

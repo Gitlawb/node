@@ -1,11 +1,11 @@
-//! Decentralized Identifier (DID) types for the gitlawb network.
+//! Decentralized Identifier (DID) types for the Twigpine network.
 //!
 //! Supported methods:
 //!   - `did:key`      — ephemeral, derived directly from an Ed25519 public key
 //!   - `did:web`      — anchored to a domain
 //!   - `did:gitlawb`  — native, anchored to the libp2p DHT
 //!
-//! The canonical DID for a gitlawb actor is `did:key` during bootstrap
+//! The canonical DID for a Twigpine actor is `did:key` during bootstrap
 //! and migrates to `did:gitlawb` once DHT anchoring is live.
 
 use ed25519_dalek::VerifyingKey;
@@ -19,6 +19,19 @@ use crate::{Error, Result};
 /// Multicodec prefix for Ed25519 public keys.
 /// Value: 0xed01 encoded as a varint.
 const ED25519_MULTICODEC: &[u8] = &[0xed, 0x01];
+
+/// The only multibase prefix a `did:key` method-specific id may carry.
+///
+/// The DID:key spec encodes Ed25519 keys as base58btc, which is multibase
+/// `z`. `multibase::decode` happily accepts every other alphabet, and each
+/// spelling of the same key bytes would produce a distinct DID string while
+/// gates, allowlists, and database rows compare DIDs as strings — one
+/// identity would read as several. Rejecting the alternatives here keeps the
+/// mapping from `did:key` to key single-valued for every caller of
+/// [`Did::to_verifying_key`] (HTTP signatures, UCAN, ref certs, peer
+/// announces). `gitlawb-attest` enforces the same rule for attestation
+/// signers.
+const DID_KEY_MULTIBASE_PREFIX: char = 'z';
 
 /// A Decentralized Identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -71,7 +84,14 @@ impl Did {
 
     /// Resolve the Ed25519 verifying key from a `did:key`.
     ///
-    /// Returns `Err` if the DID is not a `did:key` or the key bytes are invalid.
+    /// Only the canonical base58btc (`z`) spelling is accepted. Other
+    /// multibase encodings decode to the same key but spell a different DID
+    /// string, so accepting them would let one identity appear under several
+    /// identifiers to string-comparing gates and allowlists.
+    ///
+    /// Returns `Err` if the DID is not a `did:key`, uses a non-canonical
+    /// multibase prefix, the key bytes are invalid, or the key is a
+    /// small-order (weak) point.
     pub fn to_verifying_key(&self) -> Result<VerifyingKey> {
         if !self.is_did_key() {
             return Err(Error::InvalidDid(format!(
@@ -93,8 +113,26 @@ impl Did {
             ));
         }
 
-        let (_, bytes) =
+        // Cheap prefix gate before the decode, then the base check on what
+        // multibase actually parsed. The first keeps a clearly non-canonical id
+        // off the decoder. The second is belt-and-braces — multibase maps a
+        // leading `z` only to `Base58Btc` — but it states the requirement
+        // directly instead of relying on that mapping, and `gitlawb-attest`
+        // makes the same pair of checks.
+        if !self.method_id().starts_with(DID_KEY_MULTIBASE_PREFIX) {
+            return Err(Error::InvalidDid(
+                "did:key must use base58btc (z-prefix)".to_string(),
+            ));
+        }
+
+        let (base, bytes) =
             multibase::decode(self.method_id()).map_err(|e| Error::InvalidDid(e.to_string()))?;
+
+        if base != Base::Base58Btc {
+            return Err(Error::InvalidDid(
+                "did:key must use base58btc (z-prefix)".to_string(),
+            ));
+        }
 
         if !bytes.starts_with(ED25519_MULTICODEC) {
             return Err(Error::InvalidDid(
@@ -106,7 +144,25 @@ impl Did {
             .try_into()
             .map_err(|_| Error::InvalidDid("ed25519 key must be 32 bytes".to_string()))?;
 
-        VerifyingKey::from_bytes(&key_bytes).map_err(|e| Error::InvalidDid(e.to_string()))
+        let key =
+            VerifyingKey::from_bytes(&key_bytes).map_err(|e| Error::InvalidDid(e.to_string()))?;
+
+        // `from_bytes` only decompresses, so it accepts a small-order point.
+        // Such a key satisfies the verification equation for any message, and
+        // every X25519 shared secret derived from it is the all-zero key: the
+        // order-1 and order-2 points convert to the all-zero Montgomery u
+        // directly, and the order-4 and order-8 points are annihilated by the
+        // scalar clamping instead. `is_weak` covers the whole torsion set.
+        // Mixed-order points are correctly NOT rejected, since clamping clears
+        // the cofactor component. Rejecting
+        // at resolution is what makes this the choke point: every consumer that
+        // resolves a DID through here inherits the rejection, and a recipient
+        // that cannot resolve already fails closed downstream.
+        if key.is_weak() {
+            return Err(Error::InvalidDid("small-order ed25519 key".to_string()));
+        }
+
+        Ok(key)
     }
 
     /// Return the full DID string as a `&str`.
@@ -152,7 +208,7 @@ impl From<Did> for String {
     }
 }
 
-/// A DID Document for a gitlawb actor.
+/// A DID Document for a Twigpine actor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DidDocument {
     #[serde(rename = "@context")]
@@ -368,5 +424,155 @@ mod tests {
             "did:key method-id is fixed-width"
         );
         did.to_verifying_key().expect("a real did:key must resolve");
+    }
+
+    /// `multibase::decode` accepts every alphabet, so the same Ed25519 key can
+    /// be spelled as several `did:key` strings. Only base58btc is canonical;
+    /// the rest must be refused so one identity cannot appear as several to
+    /// gates and allowlists that compare DID strings.
+    #[test]
+    fn to_verifying_key_rejects_non_base58btc_multibase() {
+        use ed25519_dalek::SigningKey;
+        let signing = SigningKey::from_bytes(&[9u8; 32]);
+        let mut prefixed = ED25519_MULTICODEC.to_vec();
+        prefixed.extend_from_slice(&signing.verifying_key().to_bytes());
+
+        let canonical = Did::from_verifying_key(&signing.verifying_key());
+        assert_eq!(
+            canonical.to_verifying_key().unwrap().to_bytes(),
+            signing.verifying_key().to_bytes(),
+            "base58btc is the accepted spelling"
+        );
+
+        // These spellings fit inside the method-id bound, so they reach the
+        // canonical-prefix check and must be refused there.
+        for base in [Base::Base64Url, Base::Base32Lower] {
+            let alternative = format!("did:key:{}", multibase::encode(base, &prefixed));
+            let did: Did = alternative.parse().expect("method is still `key`");
+            assert_ne!(
+                did.as_str(),
+                canonical.as_str(),
+                "the same key must not compare equal under another spelling"
+            );
+
+            let err = did
+                .to_verifying_key()
+                .expect_err("non-canonical multibase must be refused");
+            assert!(
+                matches!(err, Error::InvalidDid(_)),
+                "must be an InvalidDid, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("base58btc"),
+                "the error must name the canonical encoding: {err}"
+            );
+        }
+
+        // A base16 spelling of the same key is longer than the method-id
+        // bound, so it is refused by the length guard before the prefix check.
+        // Either way it must not resolve.
+        for base in [Base::Base16Lower, Base::Base16Upper] {
+            let alternative = format!("did:key:{}", multibase::encode(base, &prefixed));
+            let did: Did = alternative.parse().expect("method is still `key`");
+            assert!(
+                matches!(did.to_verifying_key(), Err(Error::InvalidDid(_))),
+                "a base16 spelling of a real key must not resolve"
+            );
+        }
+    }
+
+    /// base58flickr (`Z`) is the non-bitcoin sibling alphabet. Its spelling of
+    /// a real key fits under the length bound, so it must be refused for the
+    /// prefix, not merely for its size.
+    #[test]
+    fn to_verifying_key_rejects_a_base58flickr_spelling() {
+        use ed25519_dalek::SigningKey;
+        let signing = SigningKey::from_bytes(&[11u8; 32]);
+        let mut prefixed = ED25519_MULTICODEC.to_vec();
+        prefixed.extend_from_slice(&signing.verifying_key().to_bytes());
+
+        let did: Did = format!(
+            "did:key:{}",
+            multibase::encode(Base::Base58Flickr, &prefixed)
+        )
+        .parse()
+        .expect("method is still `key`");
+
+        let err = did
+            .to_verifying_key()
+            .expect_err("base58flickr must be refused");
+        assert!(
+            err.to_string().contains("base58btc"),
+            "the error must name the canonical encoding: {err}"
+        );
+    }
+
+    /// An empty method-specific id must be refused by the prefix rule without
+    /// panicking on a missing first character.
+    #[test]
+    fn to_verifying_key_rejects_an_empty_method_id() {
+        let did: Did = "did:key:".parse().expect("method is still `key`");
+        let err = did
+            .to_verifying_key()
+            .expect_err("an empty method id must be refused");
+        assert!(
+            err.to_string().contains("base58btc"),
+            "the error must name the canonical encoding: {err}"
+        );
+    }
+
+    /// A canonical base58btc spelling is not enough on its own: the bytes must
+    /// also carry the ed25519-pub multicodec. This pins the check that stops a
+    /// key of another type from resolving as an Ed25519 key.
+    #[test]
+    fn to_verifying_key_rejects_base58btc_with_a_wrong_multicodec() {
+        use ed25519_dalek::SigningKey;
+        let signing = SigningKey::from_bytes(&[12u8; 32]);
+        let mut buf = vec![0x12, 0x00]; // sha2-256, not ed25519-pub
+        buf.extend_from_slice(&signing.verifying_key().to_bytes());
+
+        let did: Did = format!("did:key:{}", multibase::encode(Base::Base58Btc, &buf))
+            .parse()
+            .expect("method is still `key`");
+
+        let err = did
+            .to_verifying_key()
+            .expect_err("a non-ed25519 multicodec must be refused");
+        assert!(
+            err.to_string().contains("ed25519"),
+            "the error must name the expected multicodec: {err}"
+        );
+    }
+
+    /// A `did:key` can encode a small-order (weak) Ed25519 point. Such a key
+    /// satisfies the verification equation for any message and, converted to
+    /// Montgomery form for X25519, yields the all-zero shared secret, so an
+    /// envelope sealed to it is decryptable by anyone. Resolution is the choke
+    /// point every `Did`-based consumer shares, so it fails closed here.
+    #[test]
+    fn to_verifying_key_rejects_a_small_order_key() {
+        // The compressed identity point, the canonical small-order key.
+        let mut weak = [0u8; 32];
+        weak[0] = 1;
+        let mut prefixed = Vec::with_capacity(ED25519_MULTICODEC.len() + 32);
+        prefixed.extend_from_slice(ED25519_MULTICODEC);
+        prefixed.extend_from_slice(&weak);
+        let did: Did = format!(
+            "did:key:{}",
+            multibase::encode(multibase::Base::Base58Btc, &prefixed)
+        )
+        .parse()
+        .expect("a small-order did:key is still well-formed");
+
+        let err = did
+            .to_verifying_key()
+            .expect_err("a small-order did:key must not resolve");
+        match err {
+            Error::InvalidDid(msg) => assert!(
+                msg.contains("small-order"),
+                "rejection must name the small-order key, got: {msg}"
+            ),
+            other => panic!("expected Error::InvalidDid, got {other:?}"),
+        }
     }
 }
