@@ -166,9 +166,12 @@ pub(crate) fn is_public_ip(ip: std::net::IpAddr) -> bool {
 /// Mirror-upstream variant of [`is_public_ip`]: in addition to the shared
 /// peer classification, rejects IANA special-purpose ranges that are
 /// non-global, locally meaningful, or unsafe as owner-controlled outbound
-/// fetch endpoints. Configure-time mirror URL validation and the fetch-time
-/// egress policy share this so a stored URL can never fail the worker it is
-/// scheduled for.
+/// fetch endpoints. For IP-literal upstreams, configure-time URL validation
+/// and the fetch-time egress policy share this classifier, so a stored
+/// literal can never fail the worker it is scheduled for. Hostname upstreams
+/// are only shape-checked at configure time: each fetch resolves DNS and
+/// applies this classifier to the answers, so a hostname whose answers turn
+/// non-public still fails at fetch time.
 pub(crate) fn mirror_upstream_ip_permitted(ip: std::net::IpAddr) -> bool {
     if !is_public_ip(ip) {
         return false;

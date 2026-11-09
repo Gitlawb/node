@@ -283,6 +283,13 @@ fn reject_sensitive_local_config(git_bin: &str, repo_path: &Path, deadline: Inst
     }
 }
 
+/// Budget for each preflight probe inside [`run_fetch`] (the URL-rewrite
+/// check and the sensitive-local-config scan). Both run local git children
+/// against the on-disk repo, so a short bound is generous; keeping them on
+/// their own deadlines means `upstream_mirror_fetch_timeout_secs` covers
+/// only the external pack transfer it documents.
+const PREFLIGHT_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn run_fetch(
     git_bin: &str,
     repo_path: &Path,
@@ -296,11 +303,17 @@ fn run_fetch(
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect();
+    let rewrite_deadline = Instant::now()
+        .checked_add(PREFLIGHT_PROBE_TIMEOUT)
+        .context("mirror URL-rewrite probe timeout is not representable")?;
+    reject_local_url_rewrite(git_bin, repo_path, &upstream.url, rewrite_deadline)?;
+    let config_deadline = Instant::now()
+        .checked_add(PREFLIGHT_PROBE_TIMEOUT)
+        .context("mirror local-config probe timeout is not representable")?;
+    reject_sensitive_local_config(git_bin, repo_path, config_deadline)?;
     let deadline = Instant::now()
         .checked_add(timeout)
         .context("upstream mirror fetch timeout is not representable")?;
-    reject_local_url_rewrite(git_bin, repo_path, &upstream.url, deadline)?;
-    reject_sensitive_local_config(git_bin, repo_path, deadline)?;
     let (status, _stdout, stderr) =
         crate::git::visibility_pack::run_bounded_git_raw_isolated_https_with_config(
             git_bin, &args, repo_path, b"", deadline, &config,

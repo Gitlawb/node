@@ -171,7 +171,9 @@ pub struct Config {
     pub upstream_mirror_interval_secs: u64,
 
     /// Maximum wall-clock time for one external `git fetch`. The child runs in
-    /// its own process group and is fully reaped on timeout.
+    /// its own process group and is fully reaped on timeout. The preflight
+    /// URL-rewrite and local-config probes run on their own short bounds and
+    /// do not consume this budget.
     #[arg(
         long,
         env = "GITLAWB_UPSTREAM_MIRROR_FETCH_TIMEOUT_SECS",
