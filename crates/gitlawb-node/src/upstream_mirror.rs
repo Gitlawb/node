@@ -116,47 +116,7 @@ fn reject_always_local_hostname(host: &str) -> Result<()> {
 }
 
 fn address_is_permitted(ip: IpAddr) -> bool {
-    if !crate::api::peers::is_public_ip(ip) {
-        return false;
-    }
-    let classified = match ip {
-        IpAddr::V6(v6) => crate::api::peers::embedded_ipv4(v6)
-            .map(IpAddr::V4)
-            .unwrap_or(ip),
-        _ => ip,
-    };
-    match classified {
-        IpAddr::V4(v4) => {
-            let [a, b, c, _] = v4.octets();
-            // IANA special-purpose ranges that are not globally reachable but
-            // may be routed inside labs, clouds, or operator networks. They are
-            // unsuitable for an owner-controlled outbound fetch even though
-            // `Ipv4Addr::is_private` does not classify them as RFC1918.
-            !(a >= 224
-                || (a == 192 && b == 0 && c == 0)
-                || (a == 192 && b == 0 && c == 2)
-                || (a == 192 && b == 88 && c == 99)
-                || (a == 198 && matches!(b, 18 | 19))
-                || (a == 198 && b == 51 && c == 100)
-                || (a == 203 && b == 0 && c == 113))
-        }
-        IpAddr::V6(v6) => {
-            let s = v6.segments();
-            // IANA special-purpose ranges that are non-global, locally
-            // meaningful, or unsafe to treat as ordinary forge endpoints.
-            // Reject the complete IETF protocol-assignment /23 rather than
-            // trying to maintain its narrow globally reachable exceptions;
-            // a public forge has no reason to depend on those anycast ranges.
-            !(v6.is_multicast()
-                || (s[0] & 0xffc0) == 0xfec0
-                || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
-                || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 1)
-                || (s[0] == 0x2001 && (s[1] & 0xfe00) == 0)
-                || (s[0] == 0x2001 && s[1] == 0x0db8)
-                || (s[0] == 0x3fff && (s[1] & 0xf000) == 0)
-                || s[0] == 0x5f00)
-        }
-    }
+    crate::api::peers::mirror_upstream_ip_permitted(ip)
 }
 
 fn parse_git_version(output: &str) -> Option<(u64, u64)> {

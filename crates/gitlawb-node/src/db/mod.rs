@@ -163,6 +163,16 @@ pub(crate) fn validate_mirror_upstream_url(raw: &str) -> Result<reqwest::Url> {
     if !crate::api::peers::is_public_http_url(raw) {
         anyhow::bail!("mirror upstream URL must use a public host");
     }
+    // An IP-literal host must also pass the fetch worker's stricter permit;
+    // otherwise the row stores fine but every scheduled fetch hard-fails.
+    if let Some(host) = url.host_str() {
+        let literal = host.trim_start_matches('[').trim_end_matches(']');
+        if let Ok(ip) = literal.parse::<std::net::IpAddr>() {
+            if !crate::api::peers::mirror_upstream_ip_permitted(ip) {
+                anyhow::bail!("mirror upstream URL uses an unsuitable literal host");
+            }
+        }
+    }
     if url.host_str().is_none() || url.path().trim_matches('/').is_empty() {
         anyhow::bail!("mirror upstream URL must include a host and repository path");
     }
@@ -5407,6 +5417,12 @@ mod mirror_state_tests {
             "https://forge.internal/Gitlawb/node.git",
             "https://[::ffff:127.0.0.1]/Gitlawb/node.git",
             "https://[64:ff9b::7f00:1]/Gitlawb/node.git",
+            // Special-use literals the peer classifier accepts but the fetch
+            // worker's stricter permit denies; configure and fetch must agree.
+            "https://192.0.2.1/org/repo.git",
+            "https://198.18.0.1/org/repo.git",
+            "https://203.0.113.5/org/repo.git",
+            "https://[2001:db8::1]/org/repo.git",
         ] {
             assert!(
                 validate_mirror_upstream_url(invalid).is_err(),

@@ -163,6 +163,54 @@ pub(crate) fn is_public_ip(ip: std::net::IpAddr) -> bool {
     true
 }
 
+/// Mirror-upstream variant of [`is_public_ip`]: in addition to the shared
+/// peer classification, rejects IANA special-purpose ranges that are
+/// non-global, locally meaningful, or unsafe as owner-controlled outbound
+/// fetch endpoints. Configure-time mirror URL validation and the fetch-time
+/// egress policy share this so a stored URL can never fail the worker it is
+/// scheduled for.
+pub(crate) fn mirror_upstream_ip_permitted(ip: std::net::IpAddr) -> bool {
+    if !is_public_ip(ip) {
+        return false;
+    }
+    let classified = match ip {
+        std::net::IpAddr::V6(v6) => embedded_ipv4(v6).map(std::net::IpAddr::V4).unwrap_or(ip),
+        _ => ip,
+    };
+    match classified {
+        std::net::IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            // IANA special-purpose ranges that are not globally reachable but
+            // may be routed inside labs, clouds, or operator networks. They are
+            // unsuitable for an owner-controlled outbound fetch even though
+            // `Ipv4Addr::is_private` does not classify them as RFC1918.
+            !(a >= 224
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 192 && b == 0 && c == 2)
+                || (a == 192 && b == 88 && c == 99)
+                || (a == 198 && matches!(b, 18 | 19))
+                || (a == 198 && b == 51 && c == 100)
+                || (a == 203 && b == 0 && c == 113))
+        }
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments();
+            // IANA special-purpose ranges that are non-global, locally
+            // meaningful, or unsafe to treat as ordinary forge endpoints.
+            // Reject the complete IETF protocol-assignment /23 rather than
+            // trying to maintain its narrow globally reachable exceptions;
+            // a public forge has no reason to depend on those anycast ranges.
+            !(v6.is_multicast()
+                || (s[0] & 0xffc0) == 0xfec0
+                || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
+                || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 1)
+                || (s[0] == 0x2001 && (s[1] & 0xfe00) == 0)
+                || (s[0] == 0x2001 && s[1] == 0x0db8)
+                || (s[0] == 0x3fff && (s[1] & 0xf000) == 0)
+                || s[0] == 0x5f00)
+        }
+    }
+}
+
 /// Whether a peer `http_url` is a public http(s) endpoint safe to register.
 /// Rejects non-http(s) schemes, loopback/unspecified/private/link-local IPs,
 /// and `localhost` / `.localhost` / `.local` / `.internal` hostnames. Used at
