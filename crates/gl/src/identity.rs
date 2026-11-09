@@ -99,6 +99,27 @@ pub fn load_keypair_from_dir(dir: Option<&std::path::Path>) -> Result<Keypair> {
     Keypair::from_pem(&pem).context("failed to load keypair from PEM")
 }
 
+/// Load keypair from an optional directory override, distinguishing missing default
+/// identity (clean anonymous) from an explicit directory error or corrupt PEM.
+pub fn load_optional_keypair(dir: Option<&std::path::Path>) -> Result<Option<Keypair>> {
+    if let Some(d) = dir {
+        return load_keypair_from_dir(Some(d)).map(Some);
+    }
+    let base = match dirs::home_dir() {
+        Some(h) => h.join(".gitlawb"),
+        None => return Ok(None),
+    };
+    let path = key_path(&base);
+    match fs::read_to_string(&path) {
+        Ok(pem) => Keypair::from_pem(&pem)
+            .context("failed to load keypair from PEM")
+            .map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::Error::from(e)
+            .context(format!("failed to read identity from {}", path.display()))),
+    }
+}
+
 async fn cmd_new(dir: Option<PathBuf>, force: bool) -> Result<()> {
     cmd_new_with_reader(dir, force, &mut std::io::stdin().lock()).await
 }
