@@ -42,10 +42,12 @@ use crate::{Error, Result};
 pub const CERT_TYPE: &str = "gitlawb/ref-update/v1";
 
 /// Exact url-safe unpadded base64 length of a 64-byte Ed25519 signature.
-/// Anything longer cannot decode to a valid signature, so the tolerant
-/// threshold scan refuses to base64-decode it at all — the length gate is what
-/// keeps an attacker-sized sig string from costing allocation before the
-/// signature is rejected.
+/// The tolerant threshold scan requires this canonical unpadded length before
+/// attempting decode: the length gate is a DoS bound that keeps an
+/// attacker-sized sig string from costing allocation before the signature is
+/// rejected. A longer string is not meaningless (the same 64 bytes can appear
+/// in padded or non-url-safe encodings) but no in-tree signer produces one,
+/// so the scan skips non-canonical entries rather than decoding them.
 const ENCODED_SIG_LEN: usize = 86;
 
 /// Hard ceiling on signature entries a certificate may carry into the
