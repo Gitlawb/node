@@ -1593,7 +1593,7 @@ async fn run_pass(
                         .save_reconciliation_offset(&repo.id, "PINATA", next.as_deref())
                         .await
                     {
-                        tracing::warn!(repo = %repo_slug, err = %e, "save_reconciliation_offset(PINATA) failed, next pass will start from head");
+                        tracing::warn!(repo = %repo_slug, err = %e, "save_reconciliation_offset(PINATA) failed, continuation offset unchanged; next pass resumes from the previously persisted offset");
                     }
                 } else {
                     tracing::debug!(repo = %repo_slug, "Pinata dispatched nothing this pass, continuation offset left unchanged");

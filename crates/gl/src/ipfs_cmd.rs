@@ -157,9 +157,10 @@ async fn cmd_list(node: String, dir: Option<PathBuf>) -> Result<()> {
 fn render_pin(pin: &Value) -> Vec<String> {
     let sha = pin["sha256_hex"].as_str().unwrap_or("?");
     let pinned_at = pin["pinned_at"].as_str().unwrap_or("?");
-    // Trim pinned_at to date+time without subseconds
+    // Trim pinned_at to date+time without subseconds; truncate() is
+    // boundary-safe (a raw &s[..19] panics on a split code point).
     let ts = if pinned_at.len() >= 19 {
-        &pinned_at[..19]
+        crate::text::truncate(pinned_at, 19)
     } else {
         pinned_at
     };
@@ -782,6 +783,24 @@ mod tests {
             "the timestamp is still trimmed to seconds; got:\n{out}"
         );
         assert!(out.contains("backends: local ipfs"), "got:\n{out}");
+    }
+
+    /// A node-supplied timestamp whose 19th byte splits a multi-byte code
+    /// point must not panic the CLI — `&s[..19]` panics there; `truncate`
+    /// returns the boundary-safe prefix.
+    #[test]
+    fn render_pin_does_not_panic_on_a_non_boundary_timestamp() {
+        let mut ts = "2026-07-02T12:00:0".to_string();
+        ts.push('é'); // 2-byte char starting at byte 18: byte 19 is its tail
+        assert_eq!(ts.len(), 20);
+        assert!(std::panic::catch_unwind(|| &ts[..19]).is_err());
+        let pin: Value = serde_json::json!({
+            "sha256_hex":"abc123","cid":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4",
+            "local_cid":null,"pinata_cid":null,"local_pinned":true,
+            "pinata_pinned":false,"pinned_at":ts,
+        });
+        let out = render_pin(&pin).join("\n");
+        assert!(out.contains("pinned: 2026-07-02T12:00:0"), "got:\n{out}");
     }
 
     #[tokio::test]
