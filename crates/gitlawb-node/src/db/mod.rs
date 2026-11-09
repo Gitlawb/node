@@ -9367,7 +9367,7 @@ mod list_tasks_keyset_plan_tests {
             q = q.bind(status);
         }
         if let Some(assignee) = assignee {
-            q = q.bind(normalize_owner_key(assignee));
+            q = q.bind(crate::db::normalize_owner_key(assignee));
         }
         if let Some((created_at, id)) = after {
             q = q.bind(created_at).bind(id);

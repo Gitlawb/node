@@ -444,6 +444,10 @@ pub(crate) async fn get_visible_task(
             // Slash-form ids are mirror rows: is_public is hardcoded and rules
             // are never replicated, so their own pair is vacuous. Match
             // get_claimable_task and fail closed on the same opaque None.
+            // Deliberate asymmetry with the list path: task_visible honors
+            // party-read on the row itself (a delegator sees their own task
+            // listed), while get denies every caller because a mirror row has
+            // no local repo backing to serve a read from.
             if repo_id.contains('/') {
                 return Ok(None);
             }
@@ -1241,6 +1245,52 @@ mod visible_tasks_tests {
 
         let resp = list_router(state)
             .oneshot(anon_get("/api/v1/tasks/t1"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Pin the deliberate list-vs-get asymmetry for mirror-hosted (slash-form)
+    /// repo_ids: the delegator sees the row in a list (the row itself is DB
+    /// metadata they may read), while get fails closed for every caller
+    /// because a mirror row has no local repo backing to serve from.
+    #[sqlx::test]
+    async fn mirror_repo_task_lists_for_delegator_but_get_denies_all(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .upsert_mirror_repo(DELEGATOR, "mirror", "/tmp/mirror", None, false)
+            .await
+            .unwrap();
+        let mirror_id = format!("{DELEGATOR}/mirror");
+        state
+            .db
+            .create_task(&task("t1", Some(&mirror_id), DELEGATOR))
+            .await
+            .unwrap();
+
+        let resp = list_router(state.clone())
+            .oneshot(signed_request_as(
+                DELEGATOR,
+                Method::GET,
+                "/api/v1/tasks",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(
+            body["count"], 1,
+            "delegator must see its mirror-hosted task in a list"
+        );
+
+        let resp = list_router(state)
+            .oneshot(signed_request_as(
+                DELEGATOR,
+                Method::GET,
+                "/api/v1/tasks/t1",
+                Body::empty(),
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);

@@ -259,6 +259,7 @@ mod tests {
             db,
             tokio::sync::broadcast::channel(1).0,
             tokio::sync::broadcast::channel(1).0,
+            crate::api::task_cursor::TaskCursorKey::derive(&[42u8; 32]),
         )
     }
 
@@ -284,6 +285,7 @@ mod tests {
             Arc::new(Db::for_testing(pool)),
             ref_tx.clone(),
             task_tx.clone(),
+            crate::api::task_cursor::TaskCursorKey::derive(&[42u8; 32]),
         );
         for count in [7, 8] {
             let fields = (0..count)
@@ -380,7 +382,10 @@ mod tests {
                 assert_eq!(response.errors.len(), 1);
                 assert_eq!(response.errors[0].message, "Query is too complex.");
                 assert_eq!(
-                    db.list_tasks(Some("pending"), None, 8).await.unwrap().len(),
+                    db.list_tasks_keyset(Some("pending"), None, 8, None)
+                        .await
+                        .unwrap()
+                        .len(),
                     8
                 );
                 continue;
@@ -397,7 +402,7 @@ mod tests {
                 7
             );
             assert_eq!(
-                db.list_tasks(Some("claimed"), Some(caller), 8)
+                db.list_tasks_keyset(Some("claimed"), Some(caller), 8, None)
                     .await
                     .unwrap()
                     .len(),
@@ -662,7 +667,12 @@ mod tests {
         pool.close().await;
         let (ref_tx, _) = tokio::sync::broadcast::channel(16);
         let (task_tx, _) = tokio::sync::broadcast::channel(16);
-        let schema = build_schema(Arc::new(Db::for_testing(pool)), ref_tx, task_tx);
+        let schema = build_schema(
+            Arc::new(Db::for_testing(pool)),
+            ref_tx,
+            task_tx,
+            crate::api::task_cursor::TaskCursorKey::derive(&[42u8; 32]),
+        );
 
         // refUpdates(limit: MAX_VISIBLE_REF_UPDATES):
         // Single-field selection has child_complexity 1 -> cost 100 + 200 + 1 = 301 <= 400.
