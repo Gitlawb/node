@@ -1,0 +1,782 @@
+//! Opaque, integrity-protected continuation tokens for the task read surfaces.
+//!
+//! The task list pages by keyset over `(created_at, id)`, but the rows a
+//! caller may *see* are a filtered subset of the rows the query has to
+//! *examine*. Handing the caller a raw `(created_at, id)` cursor therefore
+//! forced a choice between two broken options (#327 review): anchor the cursor
+//! on the last visible row, and a window of denied tasks longer than the scan
+//! budget stalls paging forever; or anchor it on the last examined row, and a
+//! denied read leaks the id and timestamp of a task `GET /tasks/{id}` other-
+//! wise 404s.
+//!
+//! A server-issued token removes the choice. The position it carries is the
+//! last *examined* candidate, so paging always advances, and the payload is
+//! opaque and MAC'd, so the caller learns nothing from it and cannot forge one
+//! naming a row of their choosing.
+//!
+//! The position must be *confidential*, not merely unforgeable: a token that
+//! merely signed a base64 payload would still let its holder read the id and
+//! timestamp of the denied row it names, which is the disclosure the token
+//! exists to prevent. The payload is therefore encrypted under a
+//! synthetic-IV construction (SIV): the tag is an HMAC over the filter and the
+//! plaintext, and it doubles as the IV seeding the keystream the plaintext is
+//! XORed with. That needs no randomness source and no dependency beyond the
+//! `hmac`/`sha2` pair already used for webhook signatures and blob recipient
+//! tags, and it is decrypt-last: nothing is parsed until the tag verifies.
+//!
+//! Making the token the *only* accepted cursor also fixes the ordering-domain
+//! bug the same review found. `agent_tasks.created_at` is TEXT and compared as
+//! TEXT, so `...Z` and `...+00:00` denote one instant but sort differently. A
+//! caller-typed timestamp could silently skip or repeat same-time rows. The
+//! token instead carries the stored string verbatim, so the value compared is
+//! always a value the server wrote.
+//!
+//! A token is bound to the *caller* as well as the filter. The position it
+//! names is the last examined candidate, not the last visible one, so it
+//! encodes how far a scan got under one caller's visibility. Resuming it as a
+//! different caller would start the scan past rows that caller is entitled to
+//! read, silently dropping them from the answer (#327 review). The presenting
+//! caller's normalized DID (empty and flagged absent when anonymous) is
+//! therefore part of the MAC input, so a token presented by anyone else fails
+//! to verify rather than under-reporting.
+//!
+//! Wire form: `v1.<iv>.<body>`, both parts base64url unpadded: the 16-byte
+//! synthetic IV (the truncated MAC, which also seeds the keystream) and the
+//! padded, encrypted JSON payload.
+
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+
+use crate::error::AppError;
+
+type HmacSha256 = Hmac<Sha256>;
+
+const CURSOR_PREFIX: &str = "v1";
+const KEY_DERIVATION_LABEL: &[u8] = b"gitlawb/tasks-cursor-key/v1";
+const TAG_DOMAIN: &[u8] = b"gitlawb/tasks-cursor-tag/v1";
+const STREAM_DOMAIN: &[u8] = b"gitlawb/tasks-cursor-stream/v1";
+/// Truncated MAC length, and the synthetic IV width. 128 bits is far beyond
+/// forgery reach for a token that carries no authority of its own (every page
+/// re-runs the visibility gate against the presenting caller), and keeps the
+/// token short enough to sit in a query string.
+const TAG_LEN: usize = 16;
+
+/// Padding bucket for the serialized cursor payload, in bytes. The keystream
+/// XORs the plaintext byte for byte, so token length would otherwise track
+/// payload length and leak the named row's field widths to a holder who
+/// cannot decrypt anything. 128 comfortably covers the widest realistic
+/// payload: a 35-char RFC3339 timestamp (`to_rfc3339()` renders 29 chars at
+/// millisecond precision and 32 at microsecond, 35 only with all nine
+/// fractional digits), a 36-char server-minted UUID, and the fixed JSON
+/// envelope plus a 10-digit expiry, which together total 101 bytes. Should a future payload ever exceed the bucket, the length
+/// rounds up to the next multiple instead of failing, so `encode` never
+/// breaks — it just mints a longer token.
+const PAYLOAD_BUCKET: usize = 128;
+
+/// How long an issued cursor stays acceptable. Keyset positions never go stale
+/// on their own — `created_at`/`id` are immutable — so this is not a
+/// correctness bound. It bounds how long a token stays valid across a node
+/// restart-and-rotate and keeps an abandoned page from being resumed
+/// indefinitely.
+const CURSOR_TTL_SECS: i64 = 24 * 60 * 60;
+
+/// Node-keyed MAC key for continuation tokens, derived from the node keypair
+/// seed so it needs no configuration and survives restarts of the same node.
+/// Derived rather than used directly so a token forgery oracle could not
+/// bear on the signing key itself.
+#[derive(Clone)]
+pub struct TaskCursorKey([u8; 32]);
+
+impl std::fmt::Debug for TaskCursorKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TaskCursorKey(<redacted>)")
+    }
+}
+
+impl TaskCursorKey {
+    pub fn derive(node_seed: &[u8; 32]) -> Self {
+        let mut mac = HmacSha256::new_from_slice(node_seed).expect("HMAC accepts any key length");
+        mac.update(KEY_DERIVATION_LABEL);
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&mac.finalize().into_bytes());
+        Self(key)
+    }
+}
+
+/// The keyset position a token carries: the last candidate row the previous
+/// request examined, whether or not the caller was allowed to see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskPosition {
+    pub created_at: String,
+    pub id: String,
+}
+
+impl TaskPosition {
+    pub fn new(created_at: impl Into<String>, id: impl Into<String>) -> Self {
+        Self {
+            created_at: created_at.into(),
+            id: id.into(),
+        }
+    }
+
+    pub fn as_pair(&self) -> (&str, &str) {
+        (self.created_at.as_str(), self.id.as_str())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct CursorPayload<'a> {
+    /// `created_at` of the last examined candidate, verbatim as stored.
+    t: &'a str,
+    /// `id` of the last examined candidate.
+    i: &'a str,
+    /// Unix expiry.
+    e: i64,
+}
+
+/// The filter a page was issued under. A cursor is only meaningful against the
+/// same `status`/`assignee_did` filter that produced it: resuming a filtered
+/// scan from an unfiltered position (or the reverse) silently skips rows.
+/// Bound into the MAC rather than stored in the payload, so it costs no token
+/// length and cannot be edited without invalidating the tag.
+#[derive(Debug, Clone, Copy)]
+pub struct TaskFilter<'a> {
+    pub status: Option<&'a str>,
+    pub assignee_did: Option<&'a str>,
+}
+
+/// The visibility identity a token was issued to. Normalized through
+/// `normalize_owner_key` so the two spellings of one `did:key` identity
+/// (`did:key:X` and bare `X`) bind identically, matching `did_matches` on the
+/// read path: a caller who authenticates with the other spelling of their own
+/// DID must be able to resume their own page.
+fn caller_binding(caller: Option<&str>) -> &str {
+    caller.map(crate::db::normalize_owner_key).unwrap_or("")
+}
+
+/// The assignee filter a token was issued under. Normalized through
+/// `normalize_owner_key` so the two spellings of one `did:key` identity
+/// (`did:key:X` and bare `X`) bind identically, matching `list_tasks_keyset`
+/// in SQL: minting under `did:key:X` and resuming with bare `X` (or the reverse)
+/// hits the same rows and must verify under the MAC.
+fn assignee_binding(assignee: Option<&str>) -> &str {
+    assignee.map(crate::db::normalize_owner_key).unwrap_or("")
+}
+
+fn cursor_mac(
+    key: &TaskCursorKey,
+    filter: TaskFilter<'_>,
+    caller: Option<&str>,
+    plaintext: &[u8],
+) -> HmacSha256 {
+    let mut mac = HmacSha256::new_from_slice(&key.0).expect("HMAC accepts any key length");
+    mac.update(TAG_DOMAIN);
+    // Length-prefix every field so no two distinct filter/caller/plaintext
+    // tuples can produce the same MAC input.
+    for field in [
+        filter.status.unwrap_or("").as_bytes(),
+        assignee_binding(filter.assignee_did).as_bytes(),
+        caller_binding(caller).as_bytes(),
+        plaintext,
+    ] {
+        mac.update(&(field.len() as u64).to_be_bytes());
+        mac.update(field);
+    }
+    // Presence is distinct from emptiness for all three optional fields, so an
+    // anonymous token cannot collide with one issued to a caller whose
+    // normalized DID is the empty string.
+    mac.update(&[
+        u8::from(filter.status.is_some()),
+        u8::from(filter.assignee_did.is_some()),
+        u8::from(caller.is_some()),
+    ]);
+    mac
+}
+
+/// Synthetic IV: the authentication tag over the filter and plaintext, which
+/// also seeds the keystream. Deterministic by construction, so no randomness
+/// source is needed and two tokens for the same page are byte-identical.
+fn siv(
+    key: &TaskCursorKey,
+    filter: TaskFilter<'_>,
+    caller: Option<&str>,
+    plaintext: &[u8],
+) -> [u8; TAG_LEN] {
+    let mut out = [0u8; TAG_LEN];
+    out.copy_from_slice(
+        &cursor_mac(key, filter, caller, plaintext)
+            .finalize()
+            .into_bytes()[..TAG_LEN],
+    );
+    out
+}
+
+/// XOR `buf` with the keystream for `iv`. Its own inverse, so encrypt and
+/// decrypt are the same call.
+fn apply_keystream(key: &TaskCursorKey, iv: &[u8; TAG_LEN], buf: &mut [u8]) {
+    for (block_index, chunk) in buf.chunks_mut(32).enumerate() {
+        let mut mac = HmacSha256::new_from_slice(&key.0).expect("HMAC accepts any key length");
+        mac.update(STREAM_DOMAIN);
+        mac.update(iv);
+        mac.update(&(block_index as u64).to_be_bytes());
+        let block = mac.finalize().into_bytes();
+        for (byte, k) in chunk.iter_mut().zip(block.iter()) {
+            *byte ^= k;
+        }
+    }
+}
+
+/// Mint a token resuming at `position` for `filter`, usable only by `caller`.
+///
+/// The serialized payload is padded with trailing whitespace to a fixed
+/// bucket before the SIV tag is computed: the keystream preserves plaintext
+/// length, so an unpadded payload would let the token's length leak the
+/// named row's field widths (a 25-char `to_rfc3339()` rendering mints a
+/// shorter token than a 35-char one). `decode` tolerates the padding because
+/// `serde_json` ignores trailing whitespace, and the tag covers the padded
+/// bytes, so a token minted before padding landed still verifies.
+pub fn encode(
+    key: &TaskCursorKey,
+    filter: TaskFilter<'_>,
+    caller: Option<&str>,
+    position: &TaskPosition,
+) -> String {
+    let mut payload = serde_json::to_vec(&CursorPayload {
+        t: &position.created_at,
+        i: &position.id,
+        e: chrono::Utc::now().timestamp() + CURSOR_TTL_SECS,
+    })
+    .expect("cursor payload is plain strings and an integer");
+    let padded_len = payload.len().next_multiple_of(PAYLOAD_BUCKET);
+    payload.resize(padded_len, b' ');
+    let iv = siv(key, filter, caller, &payload);
+    apply_keystream(key, &iv, &mut payload);
+    format!(
+        "{CURSOR_PREFIX}.{}.{}",
+        URL_SAFE_NO_PAD.encode(iv),
+        URL_SAFE_NO_PAD.encode(&payload)
+    )
+}
+
+/// One rejection message for every way a token can fail to verify. A caller
+/// who mangled a token, replayed an expired one, or tried to move one to a
+/// different filter or a different presenting identity learns only that the
+/// cursor is not usable — never which of those it was, and never anything
+/// about the row it named.
+const INVALID_CURSOR: &str = "invalid or expired cursor";
+
+fn reject() -> AppError {
+    AppError::BadRequest(INVALID_CURSOR.into())
+}
+
+/// Verify a token against `filter` and the presenting `caller`, and return the
+/// position it carries.
+pub fn decode(
+    key: &TaskCursorKey,
+    filter: TaskFilter<'_>,
+    caller: Option<&str>,
+    token: &str,
+) -> crate::error::Result<TaskPosition> {
+    let mut parts = token.split('.');
+    let (Some(version), Some(iv_b64), Some(body_b64), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(reject());
+    };
+    if version != CURSOR_PREFIX {
+        return Err(reject());
+    }
+    let iv_bytes = URL_SAFE_NO_PAD.decode(iv_b64).map_err(|_| reject())?;
+    let mut plaintext = URL_SAFE_NO_PAD.decode(body_b64).map_err(|_| reject())?;
+    let iv: [u8; TAG_LEN] = iv_bytes.try_into().map_err(|_| reject())?;
+
+    apply_keystream(key, &iv, &mut plaintext);
+    // Authenticate before parsing: until the tag matches, `plaintext` is just
+    // attacker-chosen bytes run through a keystream. `verify_truncated_left`
+    // is the constant-time compare, so a forgery attempt cannot be steered by
+    // timing the first differing byte.
+    cursor_mac(key, filter, caller, &plaintext)
+        .verify_truncated_left(&iv)
+        .map_err(|_| reject())?;
+
+    let decoded: CursorPayload<'_> = serde_json::from_slice(&plaintext).map_err(|_| reject())?;
+    if decoded.e < chrono::Utc::now().timestamp() {
+        return Err(reject());
+    }
+    Ok(TaskPosition::new(decoded.t, decoded.i))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key() -> TaskCursorKey {
+        TaskCursorKey::derive(&[7u8; 32])
+    }
+
+    fn unfiltered() -> TaskFilter<'static> {
+        TaskFilter {
+            status: None,
+            assignee_did: None,
+        }
+    }
+
+    #[test]
+    fn round_trips_position_verbatim() {
+        let k = key();
+        // A stored timestamp the server wrote, fractional digits and all.
+        let pos = TaskPosition::new("2026-01-03T00:00:00.123456789+00:00", "task-a");
+        let token = encode(&k, unfiltered(), None, &pos);
+        assert_eq!(decode(&k, unfiltered(), None, &token).unwrap(), pos);
+        // A sub-bucket payload pads to exactly one bucket: the padding
+        // claim is an exact width, and every other width assertion here is
+        // bucket-relative, so only an absolute check catches a pad that
+        // skips "next multiple" or a drifted bucket constant.
+        let body = token.split('.').nth(2).expect("token has a body part");
+        let raw = URL_SAFE_NO_PAD.decode(body).unwrap();
+        assert_eq!(
+            raw.len(),
+            PAYLOAD_BUCKET,
+            "normal token must pad to exactly one bucket"
+        );
+    }
+
+    /// The whole point of the token is that the caller may hold it without
+    /// learning the denied row it names. A signed-but-plaintext payload would
+    /// pass every other test here and still fail this one.
+    #[test]
+    fn token_does_not_expose_the_row_it_names() {
+        let k = key();
+        let token = encode(
+            &k,
+            unfiltered(),
+            None,
+            &TaskPosition::new("2026-01-03T00:00:00+00:00", "denied-task-id"),
+        );
+        let body = token.split('.').nth(2).expect("token has a body part");
+        let raw = URL_SAFE_NO_PAD.decode(body).unwrap();
+        let as_text = String::from_utf8_lossy(&raw);
+        for secret in ["denied-task-id", "2026-01-03", "\"t\"", "\"i\""] {
+            assert!(
+                !as_text.contains(secret),
+                "token body must not carry {secret:?} in the clear: {as_text:?}"
+            );
+        }
+        // Also assert it is not merely reordered or whitespace-mangled JSON.
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&raw).is_err(),
+            "token body must not be parseable as JSON"
+        );
+    }
+
+    /// The keystream preserves plaintext length, so without the fixed-width
+    /// padding a token naming a 35-char timestamp would be measurably longer
+    /// than one naming a 32-char one: the holder would learn the withheld
+    /// row's field widths without decrypting anything. Mint the same shape
+    /// both ways and require identical token length.
+    #[test]
+    fn token_length_does_not_vary_with_position_width() {
+        let k = key();
+        // Ids are server-minted fixed-length UUIDs; the timestamp is the
+        // width that varies in production (`to_rfc3339()` renders 35 chars
+        // with nanoseconds, 25 without fractional seconds).
+        let id = "b3f7a1c2-4d5e-4f6a-8b9c-0d1e2f3a4b5c";
+        let narrow = encode(
+            &k,
+            unfiltered(),
+            None,
+            &TaskPosition::new("2026-01-03T00:00:00+00:00", id),
+        );
+        let wide = encode(
+            &k,
+            unfiltered(),
+            None,
+            &TaskPosition::new("2026-01-03T00:00:00.123456789+00:00", id),
+        );
+        assert_eq!(
+            narrow.len(),
+            wide.len(),
+            "tokens must not leak the named row's field widths: {narrow} vs {wide}"
+        );
+        // The padded token still decodes to the exact stored string.
+        assert_eq!(
+            decode(&k, unfiltered(), None, &wide).unwrap(),
+            TaskPosition::new("2026-01-03T00:00:00.123456789+00:00", id)
+        );
+    }
+
+    /// A token minted before the fixed-width padding landed (unpadded payload,
+    /// tag over the raw bytes) must still verify: `decode` MACs whatever
+    /// plaintext the keystream recovers and `serde_json` tolerates the
+    /// missing trailing whitespace. This pins the back-compat claim in the
+    /// `encode` docstring with a frozen v1 artifact, so a change to the v1
+    /// recipe pins (domains, MAC input, keystream, segment layout, field
+    /// names) breaks this test instead of silently re-deriving under the
+    /// new internals. It does not pin the padding: `decode` never consults
+    /// `PAYLOAD_BUCKET` and the fixture is unpadded, so the padding-width
+    /// claim belongs to `oversized_payload_rounds_up_to_next_bucket`.
+    ///
+    /// Fixture expiry is fixed at 2100-01-01 (`4102444800`): it must stay in
+    /// the future whenever the test runs.
+    #[test]
+    fn unpadded_legacy_token_still_verifies() {
+        let k = key();
+        let filter = unfiltered();
+        let position = TaskPosition::new("2026-01-03T00:00:00+00:00", "legacy-task");
+        // Pre-padding recipe minted once and frozen: serialize with no
+        // padding, tag, and encrypt. Deterministic by construction (SIV needs
+        // no randomness), so this literal is stable across runs.
+        let token = "v1.ILJyy7JZScm_h-HM1-CggA.l4kJUoHTbqSGTVKL0DP4hORnbOS1_gHYV2fwJYXd2QtM-6TBMCKh-wvluIiaEYC9rUSUPVSteAKkp7jBCmK_bR2D";
+        assert_eq!(
+            decode(&k, filter, None, token).unwrap(),
+            position,
+            "pre-padding token must verify under the current decode"
+        );
+        // The fixture is a genuine pre-padding artifact, so its decoded
+        // body must stay below one bucket: a literal re-minted under the
+        // padded recipe would retire this back-compat pin silently.
+        let body = token.split('.').nth(2).expect("token has a body part");
+        let raw = URL_SAFE_NO_PAD.decode(body).unwrap();
+        assert!(
+            raw.len() < PAYLOAD_BUCKET,
+            "legacy fixture must be the unpadded shape: {} bytes",
+            raw.len()
+        );
+    }
+
+    /// The `PAYLOAD_BUCKET` docstring promises an oversized payload rounds up
+    /// to the next multiple instead of failing. Mint a position whose id
+    /// pushes the serialized payload past one bucket and require the token
+    /// to round-trip (at two buckets).
+    #[test]
+    fn oversized_payload_rounds_up_to_next_bucket() {
+        let k = key();
+        // ~140-char id: payload crosses the 128-byte bucket.
+        let long_id = "a".repeat(140);
+        let position = TaskPosition::new("2026-01-03T00:00:00+00:00", long_id.clone());
+        let probe = serde_json::to_vec(&CursorPayload {
+            t: &position.created_at,
+            i: &position.id,
+            e: 1_700_000_000,
+        })
+        .expect("cursor payload is plain strings and an integer");
+        assert!(
+            probe.len() > PAYLOAD_BUCKET,
+            "fixture payload must exceed one bucket: {} bytes",
+            probe.len()
+        );
+        assert!(
+            probe.len() <= 2 * PAYLOAD_BUCKET,
+            "fixture payload must fit in two buckets: {} bytes",
+            probe.len()
+        );
+        let token = encode(&k, unfiltered(), None, &position);
+        assert_eq!(
+            decode(&k, unfiltered(), None, &token).unwrap(),
+            position,
+            "oversized payload must round-trip at two buckets"
+        );
+        // The padded body must be exactly two buckets, not merely longer
+        // than one: the padding claim is an exact width, not a direction.
+        let body = token.split('.').nth(2).expect("token has a body part");
+        let raw = URL_SAFE_NO_PAD.decode(body).unwrap();
+        assert_eq!(
+            raw.len(),
+            2 * PAYLOAD_BUCKET,
+            "oversized payload must pad to exactly two buckets"
+        );
+    }
+
+    /// Callers paste the token straight into a query string, so it must carry
+    /// no character that needs percent-encoding.
+    #[test]
+    fn token_is_url_safe_verbatim() {
+        let token = encode(
+            &key(),
+            TaskFilter {
+                status: Some("pending"),
+                assignee_did: Some("did:key:z6MkAssignee"),
+            },
+            None,
+            &TaskPosition::new("2026-01-03T00:00:00.123456789+00:00", "task-a"),
+        );
+        assert!(
+            token
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')),
+            "token must be query-safe without encoding: {token}"
+        );
+    }
+
+    /// Flipping any byte of a token must fail the tag, not decode to a
+    /// different position: the keystream is malleable on its own, the tag is
+    /// what stops a chosen-position forgery.
+    #[test]
+    fn rejects_any_tampered_byte() {
+        let k = key();
+        let token = encode(
+            &k,
+            unfiltered(),
+            None,
+            &TaskPosition::new("2026-01-03T00:00:00+00:00", "task-a"),
+        );
+        let parts: Vec<&str> = token.split('.').collect();
+        for part in [1usize, 2] {
+            for position in [0usize, 3] {
+                let mut bytes = parts[part].as_bytes().to_vec();
+                bytes[position] = if bytes[position] == b'A' { b'B' } else { b'A' };
+                let mut mangled: Vec<String> = parts.iter().map(|p| p.to_string()).collect();
+                mangled[part] = String::from_utf8(bytes).unwrap();
+                assert!(
+                    decode(&k, unfiltered(), None, &mangled.join(".")).is_err(),
+                    "byte {position} of part {part} must not be malleable"
+                );
+            }
+        }
+        // Sanity: the untouched token still decodes, so the loop above is not
+        // passing because every token is rejected.
+        assert!(decode(&k, unfiltered(), None, &token).is_ok());
+    }
+
+    #[test]
+    fn rejects_token_from_another_node() {
+        let pos = TaskPosition::new("2026-01-03T00:00:00+00:00", "task-a");
+        let token = encode(&TaskCursorKey::derive(&[1u8; 32]), unfiltered(), None, &pos);
+        assert!(decode(
+            &TaskCursorKey::derive(&[2u8; 32]),
+            unfiltered(),
+            None,
+            &token
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_cursor_moved_to_a_different_filter() {
+        let k = key();
+        let pos = TaskPosition::new("2026-01-03T00:00:00+00:00", "task-a");
+        let token = encode(
+            &k,
+            TaskFilter {
+                status: Some("pending"),
+                assignee_did: None,
+            },
+            None,
+            &pos,
+        );
+        assert!(decode(&k, unfiltered(), None, &token).is_err());
+        assert!(decode(
+            &k,
+            TaskFilter {
+                status: Some("claimed"),
+                assignee_did: None
+            },
+            None,
+            &token
+        )
+        .is_err());
+        assert!(decode(
+            &k,
+            TaskFilter {
+                status: Some("pending"),
+                assignee_did: None
+            },
+            None,
+            &token
+        )
+        .is_ok());
+    }
+
+    /// A filter of `Some("")` must not verify a token minted with `None`.
+    #[test]
+    fn distinguishes_absent_filter_from_empty_filter() {
+        let k = key();
+        let pos = TaskPosition::new("2026-01-03T00:00:00+00:00", "task-a");
+        let token = encode(&k, unfiltered(), None, &pos);
+        assert!(decode(
+            &k,
+            TaskFilter {
+                status: Some(""),
+                assignee_did: None
+            },
+            None,
+            &token
+        )
+        .is_err());
+    }
+
+    /// A cursor names how far a scan got under one caller's visibility. Moved
+    /// to a different presenting identity it would start that caller's scan
+    /// past rows they are entitled to read, so it must fail to verify rather
+    /// than silently under-report (#327 review).
+    #[test]
+    fn rejects_cursor_moved_to_a_different_caller() {
+        let k = key();
+        let pos = TaskPosition::new("2026-01-03T00:00:00+00:00", "task-a");
+        let alice = Some("did:key:z6MkAlice");
+        let bob = Some("did:key:z6MkBob");
+
+        let anon_token = encode(&k, unfiltered(), None, &pos);
+        assert!(
+            decode(&k, unfiltered(), alice, &anon_token).is_err(),
+            "an anonymously minted cursor must not resume an authenticated scan"
+        );
+        assert!(decode(&k, unfiltered(), None, &anon_token).is_ok());
+
+        let alice_token = encode(&k, unfiltered(), alice, &pos);
+        assert!(
+            decode(&k, unfiltered(), bob, &alice_token).is_err(),
+            "one caller's cursor must not resume another caller's scan"
+        );
+        assert!(
+            decode(&k, unfiltered(), None, &alice_token).is_err(),
+            "an authenticated cursor must not resume an anonymous scan"
+        );
+        assert!(decode(&k, unfiltered(), alice, &alice_token).is_ok());
+    }
+
+    /// The binding is on identity, not spelling: `did:key:X` and bare `X` are
+    /// one caller everywhere else on the read path (`did_matches`), so a caller
+    /// who presents the other form of their own DID must keep their own page.
+    #[test]
+    fn caller_binding_is_normalized_across_did_key_spellings() {
+        let k = key();
+        let pos = TaskPosition::new("2026-01-03T00:00:00+00:00", "task-a");
+        let token = encode(&k, unfiltered(), Some("did:key:z6MkAlice"), &pos);
+        assert_eq!(
+            decode(&k, unfiltered(), Some("z6MkAlice"), &token).unwrap(),
+            pos
+        );
+        // A different method sharing the base58 tail is a different principal.
+        assert!(decode(&k, unfiltered(), Some("did:web:z6MkAlice"), &token).is_err());
+    }
+
+    /// The filter binding is on identity, not spelling: `assignee_did` matches
+    /// normalized keys in SQL (`normalize_owner_key`), so minting under
+    /// `did:key:X` and resuming under bare `X` (or vice versa) must succeed,
+    /// while `did:web:X` remains distinct.
+    #[test]
+    fn assignee_filter_binding_is_normalized_across_did_key_spellings() {
+        let k = key();
+        let pos = TaskPosition::new("2026-01-03T00:00:00+00:00", "task-a");
+        let filter_did_key = TaskFilter {
+            status: Some("pending"),
+            assignee_did: Some("did:key:z6MkAssignee"),
+        };
+        let filter_bare = TaskFilter {
+            status: Some("pending"),
+            assignee_did: Some("z6MkAssignee"),
+        };
+        let filter_web = TaskFilter {
+            status: Some("pending"),
+            assignee_did: Some("did:web:z6MkAssignee"),
+        };
+
+        let token_from_did_key = encode(&k, filter_did_key, None, &pos);
+        assert_eq!(
+            decode(&k, filter_bare, None, &token_from_did_key).unwrap(),
+            pos
+        );
+        assert!(decode(&k, filter_web, None, &token_from_did_key).is_err());
+
+        let token_from_bare = encode(&k, filter_bare, None, &pos);
+        assert_eq!(
+            decode(&k, filter_did_key, None, &token_from_bare).unwrap(),
+            pos
+        );
+        assert!(decode(&k, filter_web, None, &token_from_bare).is_err());
+    }
+
+    /// Anonymous is a distinct binding from a caller whose normalized DID is
+    /// the empty string, the same way `Some("")` is distinct from `None` for
+    /// the filter fields.
+    #[test]
+    fn distinguishes_anonymous_from_empty_caller() {
+        let k = key();
+        let pos = TaskPosition::new("2026-01-03T00:00:00+00:00", "task-a");
+        let token = encode(&k, unfiltered(), None, &pos);
+        assert!(decode(&k, unfiltered(), Some(""), &token).is_err());
+    }
+
+    /// Length-prefixing must stop a status/assignee pair from being re-split.
+    #[test]
+    fn rejects_field_boundary_shift() {
+        let k = key();
+        let pos = TaskPosition::new("2026-01-03T00:00:00+00:00", "task-a");
+        let token = encode(
+            &k,
+            TaskFilter {
+                status: Some("pend"),
+                assignee_did: Some("ing"),
+            },
+            None,
+            &pos,
+        );
+        assert!(decode(
+            &k,
+            TaskFilter {
+                status: Some("pending"),
+                assignee_did: Some("")
+            },
+            None,
+            &token
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_expired_token() {
+        let k = key();
+        // Minted the same way `encode` does, but already past its expiry.
+        let mut payload = serde_json::to_vec(&CursorPayload {
+            t: "2026-01-03T00:00:00+00:00",
+            i: "task-a",
+            e: chrono::Utc::now().timestamp() - 1,
+        })
+        .unwrap();
+        let iv = siv(&k, unfiltered(), None, &payload);
+        apply_keystream(&k, &iv, &mut payload);
+        let expired = format!(
+            "v1.{}.{}",
+            URL_SAFE_NO_PAD.encode(iv),
+            URL_SAFE_NO_PAD.encode(&payload)
+        );
+        let err = decode(&k, unfiltered(), None, &expired).unwrap_err();
+        assert!(err.to_string().contains(INVALID_CURSOR));
+    }
+
+    #[test]
+    fn rejects_malformed_shapes() {
+        let k = key();
+        for bad in [
+            "",
+            "v1",
+            "v1.",
+            "v1.abc",
+            "v2.abc.def",
+            "v1.abc.def.ghi",
+            "v1.!!!.def",
+        ] {
+            assert!(
+                decode(&k, unfiltered(), None, bad).is_err(),
+                "must reject {bad:?}"
+            );
+        }
+    }
+
+    /// Every rejection path renders the same text, so a caller cannot tell a
+    /// forged token from an expired one from a filter mismatch.
+    #[test]
+    fn every_rejection_is_indistinguishable() {
+        let k = key();
+        for bad in ["v1.abc.def", "not-a-cursor", "v1..", "v9.a.b"] {
+            assert_eq!(
+                decode(&k, unfiltered(), None, bad).unwrap_err().to_string(),
+                format!("invalid request: {INVALID_CURSOR}")
+            );
+        }
+    }
+}
