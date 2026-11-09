@@ -152,6 +152,17 @@ pub struct Config {
     #[arg(long, env = "GITLAWB_AUTO_SYNC", default_value_t = false)]
     pub auto_sync: bool,
 
+    /// Enable the periodic reconciliation sweep that re-derives pin/seal sets
+    /// and fills durability gaps.  Defaults to true; set to false to disable
+    /// the sweep even when a pin backend (IPFS/Pinata) is configured.
+    #[arg(
+        long,
+        env = "GITLAWB_RECONCILIATION_SWEEP",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    pub reconciliation_sweep: bool,
+
     /// Irys URL for Arweave permanent anchoring.
     /// Leave empty to disable. Use https://devnet.irys.xyz for free devnet.
     #[arg(long, env = "GITLAWB_IRYS_URL", default_value = "")]
@@ -802,6 +813,20 @@ pub struct Config {
         value_parser = clap::builder::RangedU64ValueParser::<i32>::new().range(1..=1000)
     )]
     pub effects_max_attempts: i32,
+    /// Per-client-IP rate limit for the anonymous task read routes
+    /// (`GET /api/v1/tasks`, `GET /api/v1/tasks/{id}`), in requests per hour.
+    /// Both are publicly reachable (`optional_signature`). `GET /api/v1/tasks`
+    /// runs `collect_visible_tasks` and returns a visibility-filtered page;
+    /// `GET /api/v1/tasks/{id}` runs `get_visible_task` and returns an opaque 404
+    /// when the task is hidden or missing. These reads can require task,
+    /// repository, and visibility-rule queries even when no task is returned,
+    /// so the brake bounds the cost of anonymous probes. Keyed on the resolved
+    /// client IP via `GITLAWB_TRUSTED_PROXY`. `0` disables. Default: 1200 (a list page
+    /// followed by per-task reads is a normal client pattern, so this sits above
+    /// the `/ipfs` budget). GraphQL `tasks` / `task` queries, including WebSocket
+    /// operations, share this per-IP budget with REST task reads.
+    #[arg(long, env = "GITLAWB_TASK_READ_RATE_LIMIT", default_value_t = 1200)]
+    pub task_read_rate_limit: usize,
 }
 
 impl Config {
