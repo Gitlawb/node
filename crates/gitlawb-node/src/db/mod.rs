@@ -7,6 +7,20 @@ use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use tracing::info;
 use uuid::Uuid;
 
+/// Maximum visible repositories per page, plus one internal look-ahead row.
+pub(crate) const MAX_VISIBLE_REPO_PAGE_SIZE: usize = 200;
+
+/// Maximum repository name length in bytes. `repo_cursor` embeds the name in
+/// a base64(JSON) cursor that `parse_repo_cursor` rejects over 4096 bytes, so
+/// every write path must bound the name: a cursor the server emits must
+/// always parse back (#465 4th round). 100 bytes keeps the longest possible
+/// cursor an order of magnitude under the parse limit.
+pub(crate) const MAX_REPO_NAME_LEN: usize = 100;
+
+/// Maximum agent tasks returned per query. Shared by the GraphQL `tasks`
+/// complexity meter and the resolver clamp so they can't drift.
+pub(crate) const MAX_VISIBLE_TASK_PAGE_SIZE: i64 = 200;
+
 // ── Public data types ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -417,9 +431,12 @@ impl Db {
         Self { pool }
     }
 
-    /// Test-only: the raw pool for assertions the `Db` surface does not
-    /// expose. The reconciliation sweep's sqlx tests seed and verify rows
-    /// through it directly.
+    /// Test-only: access the underlying Postgres connection pool.
+    ///
+    /// The production accessor was removed on main (ed76adf) once every
+    /// production caller had migrated to typed `Db` methods; this restores
+    /// it for tests only, for the raw-SQL fixtures and closed-pool cases in
+    /// this change that have no typed equivalent.
     #[cfg(test)]
     pub fn pool(&self) -> &PgPool {
         &self.pool
@@ -1789,6 +1806,16 @@ impl Db {
         machine_id: Option<&str>,
         quarantined: bool,
     ) -> Result<()> {
+        // Peer-supplied names are bound like the local write paths: an
+        // unbounded name would make reposPage emit a cursor longer than the
+        // 4096-byte parse limit, dead-ending pagination for every caller past
+        // that row (#465 4th round). The sync caller drops the error and skips
+        // the mirror.
+        if name.len() > MAX_REPO_NAME_LEN {
+            anyhow::bail!(
+                "mirror repo name exceeds {MAX_REPO_NAME_LEN} bytes: refusing to register"
+            );
+        }
         let now = Utc::now().to_rfc3339();
         let id = format!("{owner_short}/{name}");
         // `quarantined` is set only on first insert (the admission decision).
@@ -2107,6 +2134,73 @@ impl Db {
             .fetch_all(&self.pool)
             .await?;
 
+        Ok(rows.into_iter().map(row_to_repo).collect())
+    }
+
+    /// A bounded, mirror-deduplicated page ordered by owner key and repository
+    /// name. Apply root visibility before LIMIT: private rows must not consume
+    /// page slots or influence continuation metadata. The root-rule predicate
+    /// mirrors `visibility::listable_at_root`; a differential test pins it.
+    /// Malformed reader JSON denies that repo to non-owners without failing the page.
+    /// Cursors only select a position and never confer read authority.
+    ///
+    /// Performance note: the page orders and keyset-filters on
+    /// `(owner_key, name)` under `COLLATE "C"`, but the existing
+    /// `idx_repos_owner_key_name` index is built on the database default
+    /// collation and cannot serve that ordering, so each page sorts the full
+    /// deduped repo set before the keyset filter applies: O(total repos) work
+    /// per page. This is accepted (pages are capped at
+    /// `MAX_VISIBLE_REPO_PAGE_SIZE` rows over a narrow projection). A
+    /// C-collation expression index was deliberately not added in a migration:
+    /// versions 27-35 are claimed by other in-flight branches (Gitlawb/node#384
+    /// claims 27-35, #464 claims 27-28) and the runner keys applied migrations
+    /// on the version integer alone, so a colliding entry would be silently
+    /// skipped on whichever side merges second. Revisit once that range lands
+    /// or clears.
+    pub async fn list_visible_repos_page(
+        &self,
+        caller: Option<&str>,
+        after: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<Vec<RepoRecord>> {
+        let sql = format!(
+            "{}
+             SELECT d.id, d.name, d.owner_did, d.description, d.is_public,
+                 d.default_branch, d.created_at, d.updated_at, d.disk_path,
+                 d.forked_from, d.machine_id
+             FROM deduped d
+             LEFT JOIN LATERAL (
+                 SELECT reader_dids FROM visibility_rules v
+                 WHERE v.repo_id = d.id AND v.path_glob ~ '^/*([*][*])*$'
+                 ORDER BY v.path_glob DESC LIMIT 1
+             ) root_rule ON TRUE
+             WHERE (
+                 ($2::text IS NOT NULL AND ({key}) = $2)
+                 OR CASE WHEN root_rule.reader_dids IS NULL THEN d.is_public
+                    WHEN NOT pg_input_is_valid(root_rule.reader_dids, 'jsonb') THEN FALSE
+                    WHEN jsonb_typeof(root_rule.reader_dids::jsonb) = 'array' THEN
+                        COALESCE(root_rule.reader_dids::jsonb ? $3::text, FALSE)
+                        AND NOT EXISTS (
+                            SELECT 1 FROM jsonb_array_elements(root_rule.reader_dids::jsonb) reader
+                            WHERE jsonb_typeof(reader) <> 'string'
+                        )
+                    ELSE FALSE END
+             )
+             AND ($4::text IS NULL OR (({key}) COLLATE \"C\", d.name COLLATE \"C\") > ($4, $5::text))
+             ORDER BY ({key}) COLLATE \"C\", d.name COLLATE \"C\"
+             LIMIT $6",
+            Self::dedup_cte(),
+            key = OWNER_KEY_CASE_SQL,
+        );
+        let rows = sqlx::query(&sql)
+            .bind(None::<&str>)
+            .bind(caller.map(normalize_owner_key))
+            .bind(caller)
+            .bind(after.map(|(owner, _)| normalize_owner_key(owner)))
+            .bind(after.map(|(_, name)| name))
+            .bind(limit.min(MAX_VISIBLE_REPO_PAGE_SIZE + 1) as i64)
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows.into_iter().map(row_to_repo).collect())
     }
 

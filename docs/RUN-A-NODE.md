@@ -8,6 +8,7 @@ Step-by-step guide to staking $GITLAWB, registering your node on-chain, and earn
 
 - A wallet with at least **10,000 $GITLAWB** (minimum stake) plus a small amount of ETH on Base for gas
 - Docker or Rust 1.91+ (for running the node process)
+- PostgreSQL 16+ — the node uses `pg_input_is_valid`, which exists only on PostgreSQL 16 and later. The bundled `docker-compose.yml` pins `postgres:16-alpine`; if you supply your own `DATABASE_URL`, the server must be 16+.
 - A public HTTP URL (your-host.com) — can be a VPS, Fly.io app, or anything reachable. A Fly.io config is provided at `infra/fly/fly.toml` (deploy from the repo root with `fly deploy -c infra/fly/fly.toml`)
 
 ---

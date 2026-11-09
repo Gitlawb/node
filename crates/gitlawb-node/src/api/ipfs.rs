@@ -8785,6 +8785,7 @@ mod tests {
     #[tokio::test]
     async fn get_by_cid_per_source_cap_sheds_same_source_admits_other() {
         let mut state = crate::test_support::test_state_lazy();
+        state.db.pool().close().await;
         // Global pool has room; the per-source cap is 1.
         state.git_ipfs_walk_semaphore = Arc::new(Semaphore::new(8));
         state.git_ipfs_walk_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
@@ -8811,16 +8812,23 @@ mod tests {
             "a source at its per-source /ipfs walk cap must shed 503 with global capacity free"
         );
 
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "overloaded");
+
         // A DIFFERENT source is NOT shed by the per-source cap: it clears admission and
-        // proceeds (then errors on the lazy DB, which is not a 503).
+        // proceeds to the closed DB, which has a distinct db_unavailable error code.
         let resp = ipfs_router(state)
             .oneshot(get_cid(&cid, Some(other)))
             .await
             .unwrap();
-        assert_ne!(
-            resp.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "a different source must not be shed by the per-source cap"
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["error"],
+            crate::error::DB_UNAVAILABLE_CODE,
+            "a different source must clear admission and reach the closed database"
         );
     }
 

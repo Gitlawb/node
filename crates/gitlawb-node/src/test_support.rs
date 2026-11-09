@@ -28,6 +28,9 @@ use gitlawb_core::identity::Keypair;
 use crate::auth::AuthenticatedDid;
 use crate::state::AppState;
 
+#[path = "test_git_shim.rs"]
+mod git_shim;
+
 /// Build an [`AppState`] over a real, migrated Postgres pool (from `#[sqlx::test]`).
 /// Runs the schema migrations first, because the per-test database starts empty.
 ///
@@ -706,11 +709,12 @@ mod tests {
     /// #174 (SC1, load-bearing): a saturated READ pool must NOT shed an
     /// authenticated push — the write pool is a separate budget. Read pool at zero,
     /// write pool with capacity: the push proceeds PAST admission (it then errors on
-    /// the placeholder DB, but crucially it is not a 503). Route git-receive-pack
+    /// the closed DB, with db_unavailable rather than overloaded). Route git-receive-pack
     /// back to the read pool and this goes red — that is the isolation proof.
     #[tokio::test]
     async fn git_receive_pack_not_shed_by_exhausted_read_pool() {
         let mut state = test_state_lazy();
+        state.db.pool().close().await;
         // Read pool exhausted as if a flood of anonymous clones held every slot.
         state.git_read_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
         // Write pool keeps its default capacity from test_state_lazy.
@@ -732,10 +736,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert_ne!(
-            resp.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "an exhausted READ pool must not shed a push — the write pool is a separate budget (#174)"
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["error"],
+            crate::error::DB_UNAVAILABLE_CODE,
+            "the push must clear admission and reach the deliberately closed database"
         );
     }
 
@@ -11378,14 +11385,10 @@ mod tests {
         seed_legacy_pin(&pool, &bare, &fx.public_oid, Some(&repo.id)).await;
 
         // A git that takes 300ms per invocation (the read makes two: type, then content).
-        let slow_git = std::env::temp_dir().join(format!("gl-slow-git-{short}"));
-        std::fs::write(&slow_git, "#!/bin/sh\nsleep 0.3\nexec git \"$@\"\n").expect("write shim");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&slow_git, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod shim");
-        }
+        let slow_git = git_shim::create(
+            &format!("gl-slow-git-{short}"),
+            git_shim::Behavior::Delay(300),
+        );
 
         let ticks = std::sync::Arc::new(AtomicUsize::new(0));
         let ticker = {
@@ -12332,19 +12335,6 @@ mod tests {
         );
     }
 
-    /// Write an executable `git` stand-in and return its path.
-    fn write_git_shim(name: &str, script: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(name);
-        std::fs::write(&path, script).expect("write the git shim");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod the git shim");
-        }
-        path
-    }
-
     /// F6 scenario 1 (#173 round 13): one hung candidate must not starve the rows behind
     /// it in the same pass. `DiscoveryCtx` is loaded once per pass, so before the per-row
     /// slice every source-less row in a pass shared ONE deadline: the first row's wedged
@@ -12384,23 +12374,9 @@ mod tests {
 
         // The type stage feeds the oid on STDIN (`cat-file --batch-check`) and the
         // content stage puts it in argv, so the stand-in has to look in both places.
-        let git_bin = write_git_shim(
+        let git_bin = git_shim::create(
             &format!("gl-hung-git-{short}"),
-            &format!(
-                "#!/bin/sh\n\
-                 if [ \"$2\" = \"--batch-check\" ]; then\n\
-                 \x20 oid=$(cat)\n\
-                 \x20 case \"$oid\" in\n\
-                 \x20   {hung_oid}) sleep 30; exit 1 ;;\n\
-                 \x20 esac\n\
-                 \x20 printf '%s\\n' \"$oid\" | git \"$@\"\n\
-                 \x20 exit $?\n\
-                 fi\n\
-                 case \"$*\" in\n\
-                 \x20 *{hung_oid}*) sleep 30; exit 1 ;;\n\
-                 esac\n\
-                 exec git \"$@\"\n"
-            ),
+            git_shim::Behavior::HangOid(&hung_oid),
         );
 
         let stats = tokio::time::timeout(
@@ -12485,10 +12461,7 @@ mod tests {
 
         // Wedges on every invocation, so no row can ever be repaired and the only
         // question left is what each one COSTS.
-        let git_bin = write_git_shim(
-            &format!("gl-spent-git-{short}"),
-            "#!/bin/sh\nsleep 30\nexit 1\n",
-        );
+        let git_bin = git_shim::create(&format!("gl-spent-git-{short}"), git_shim::Behavior::Hang);
 
         let stats = tokio::time::timeout(
             std::time::Duration::from_secs(60),
@@ -13092,10 +13065,7 @@ mod tests {
             seed_legacy_pin(&pool, &src, oid, None).await;
         }
 
-        let git_bin = write_git_shim(
-            &format!("gl-starve-git-{short}"),
-            "#!/bin/sh\nsleep 30\nexit 1\n",
-        );
+        let git_bin = git_shim::create(&format!("gl-starve-git-{short}"), git_shim::Behavior::Hang);
 
         tokio::time::timeout(
             std::time::Duration::from_secs(120),
@@ -13163,9 +13133,9 @@ mod tests {
         let (raw_cid, provider_cid) = seed_legacy_pin(&pool, &src, &fx.public_oid, None).await;
 
         // Wedges only inside the position-nine repo, which the sweep enters by cwd.
-        let git_bin = write_git_shim(
+        let git_bin = git_shim::create(
             &format!("gl-mid-git-{short}"),
-            "#!/bin/sh\ncase \"$(pwd)\" in\n  */midcand9.git) sleep 30; exit 1 ;;\nesac\nexec git \"$@\"\n",
+            git_shim::Behavior::HangRepo("midcand9.git"),
         );
 
         let first = tokio::time::timeout(
@@ -13327,19 +13297,9 @@ mod tests {
 
         let log = std::env::temp_dir().join(format!("gl-ali-log-{short}"));
         let _ = std::fs::remove_file(&log);
-        let git_bin = write_git_shim(
+        let git_bin = git_shim::create(
             &format!("gl-ali-git-{short}"),
-            &format!(
-                "#!/bin/sh\n\
-                 if [ \"$2\" = \"--batch-check\" ]; then\n\
-                 \x20 oid=$(cat)\n\
-                 \x20 printf '%s %s\\n' \"$oid\" \"$(basename $(pwd))\" >> {log}\n\
-                 \x20 printf '%s\\n' \"$oid\" | git \"$@\"\n\
-                 \x20 exit $?\n\
-                 fi\n\
-                 exec git \"$@\"\n",
-                log = log.display()
-            ),
+            git_shim::Behavior::LogTypes(&log),
         );
 
         let mut traversal = crate::ipfs_pin::DiscoveryTraversalState::default();
