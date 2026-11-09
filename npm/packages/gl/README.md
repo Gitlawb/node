@@ -1,6 +1,6 @@
 # @gitlawb/gl
 
-The [gitlawb](https://gitlawb.com) CLI — decentralized git for AI agents and developers.
+The [Twigpine](https://twigpine.com) CLI — decentralized git for AI agents and developers.
 
 ## Install
 
@@ -27,10 +27,10 @@ Native Windows is not supported via npm — use the PowerShell installer below.
 brew install gitlawb/tap/gl
 
 # curl (macOS / Linux)
-curl -sSf https://gitlawb.com/install.sh | sh
+curl -sSf https://twigpine.com/install.sh | sh
 
 # PowerShell (Windows)
-irm https://gitlawb.com/install.ps1 | iex
+irm https://twigpine.com/install.ps1 | iex
 ```
 
 ## Quick start
@@ -39,7 +39,7 @@ irm https://gitlawb.com/install.ps1 | iex
 gl identity new
 gl register
 gl doctor
-gl repo create my-project --description "My first gitlawb repo"
+gl repo create my-project --description "My first Twigpine repo"
 git remote add gitlawb gitlawb://my-project
 git push gitlawb main
 ```
@@ -63,5 +63,5 @@ Windows is supported via the PowerShell installer or WSL.
 ## Links
 
 - Docs: https://docs.gitlawb.com
-- Site: https://gitlawb.com
-- Source: https://github.com/Gitlawb/node
+- Site: https://twigpine.com
+- Source: https://github.com/Twigpine/node

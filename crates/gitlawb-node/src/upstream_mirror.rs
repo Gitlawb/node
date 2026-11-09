@@ -170,14 +170,25 @@ fn parse_git_version(output: &str) -> Option<(u64, u64)> {
 }
 
 fn ensure_safe_git_runtime(git_bin: &str) -> Result<()> {
-    let output = std::process::Command::new(git_bin)
-        .arg("--version")
-        .output()
-        .with_context(|| format!("running {git_bin} --version for upstream mirror safety check"))?;
-    if !output.status.success() {
-        anyhow::bail!("{git_bin} --version failed");
+    // Bounded runner like every other git spawn on this path: --version does
+    // no I/O of its own, but the child still takes a permit and the deadline.
+    let (status, stdout, stderr) = crate::git::visibility_pack::run_bounded_git_raw_isolated_https(
+        git_bin,
+        &["--version"],
+        &std::env::temp_dir(),
+        b"",
+        Instant::now() + Duration::from_secs(10),
+    )?;
+    if !status.success() {
+        anyhow::bail!(
+            "{git_bin} --version failed: {}",
+            String::from_utf8_lossy(&stderr)
+                .chars()
+                .take(256)
+                .collect::<String>()
+        );
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&stdout);
     let version = parse_git_version(&stdout).context("parsing git version")?;
     if version < MIN_CURL_OPT_RESOLVE_GIT {
         anyhow::bail!(
@@ -399,11 +410,11 @@ impl Worker {
         let current = match self.db.get_repo_mirror_state(&target.repo_id).await {
             Ok(Some(current)) => current,
             Ok(None) => {
-                guard.release(false).await;
+                let _ = guard.release(false).await;
                 anyhow::bail!("inbound mirror state disappeared before fetch");
             }
             Err(error) => {
-                guard.release(false).await;
+                let _ = guard.release(false).await;
                 return Err(error);
             }
         };
@@ -412,7 +423,7 @@ impl Worker {
             || current.transition_phase.is_some()
             || current.upstream_url != target.upstream_url
         {
-            guard.release(false).await;
+            let _ = guard.release(false).await;
             info!(repo_id = %target.repo_id, "upstream mirror state changed before fetch; skipping stale target");
             return Ok(FetchOutcome::SkippedStale);
         }
@@ -425,7 +436,10 @@ impl Worker {
         .await
         .context("upstream mirror fetch task panicked")?;
         let success = fetch.is_ok();
-        guard.release(success).await;
+        let outcome = guard.release(success).await;
+        // A refused publish (fenced or unknowable upload) must not report
+        // Updated; surface it as the failure it is before mapping the fetch.
+        outcome.into_result()?;
         fetch.map(|()| FetchOutcome::Updated)
     }
 
@@ -529,7 +543,7 @@ mod tests {
         let db = Arc::new(Db::for_testing(pool.clone()));
         db.run_migrations().await.unwrap();
         let repos = tempfile::tempdir().unwrap();
-        let config = Arc::new(Config::parse_from([
+        let mut config = Config::parse_from([
             "gitlawb-node".to_string(),
             "--upstream-mirror-enabled".to_string(),
             "--enforce-owner-push".to_string(),
@@ -537,8 +551,9 @@ mod tests {
             "5".to_string(),
             "--upstream-mirror-page-size".to_string(),
             page_size.to_string(),
-        ]));
+        ]);
         config.validate().unwrap();
+        let config = Arc::new(config);
         let worker = Worker {
             db: Arc::clone(&db),
             config,

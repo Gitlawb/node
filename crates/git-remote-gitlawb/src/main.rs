@@ -199,9 +199,7 @@ fn handle_connect<R: Read>(
         other => bail!("unsupported git service: {other}"),
     }
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .build()?;
+    let client = build_http_client()?;
 
     // ── Phase 1: ref advertisement (GET /info/refs?service=<service>) ─────────
     //
@@ -289,8 +287,10 @@ fn handle_connect<R: Read>(
     //    this into one POST deadlocks a multi-round fetch (#117).
     //
     //  git-receive-pack (push):
-    //    Git sends ref-update commands + the complete PACK blob, then closes its
-    //    write pipe. read_to_end is safe and correct here, a single POST.
+    //    Git sends the ref-update command list (pkt-lines ending in a flush),
+    //    then the complete PACK blob only when a command has a non-zero new-oid.
+    //    A delete-only push sends no pack, and git holds its write pipe open for
+    //    the report-status response, so EOF cannot delimit the request (#369).
 
     let post_url = format!("{}/{}", repo_base, service);
 
@@ -298,10 +298,7 @@ fn handle_connect<R: Read>(
         return negotiate_upload_pack(&client, &post_url, service, signing_key, stdin, &mut stdout);
     }
 
-    let mut request_body = Vec::new();
-    stdin
-        .read_to_end(&mut request_body)
-        .context("reading receive-pack request")?;
+    let request_body = read_receive_pack_request(stdin)?;
     tracing::debug!("pack request: {} bytes from git", request_body.len());
 
     if request_body.is_empty() {
@@ -318,6 +315,58 @@ fn handle_connect<R: Read>(
         request_body,
         &mut stdout,
     )
+}
+
+// ── HTTP client ───────────────────────────────────────────────────────────────
+
+/// Total request timeout. A pack transfer can be large and slow, so this is far
+/// wider than the CLI's.
+const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The one client both phases use, with the redirect policy the signing surfaces
+/// need.
+///
+/// Every request this client sends can carry RFC 9421 `Signature` and
+/// `Signature-Input` headers: a push signs from the first request, and a fetch of a
+/// private repo signs on the retry. reqwest strips only `Authorization`, `Cookie`,
+/// `Proxy-Authorization` and `WWW-Authenticate` across hosts, so under the default
+/// `Policy::limited(10)` those signature headers rode a 302 to whatever origin the
+/// node named, and on a 307/308 the pack body went with them. Scope the follow to the
+/// origin that issued the redirect AND to an identical request-target, which is the
+/// same predicate `gl` uses.
+fn build_http_client() -> Result<reqwest::blocking::Client> {
+    Ok(reqwest::blocking::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::custom(same_origin_redirect))
+        .build()?)
+}
+
+/// Refuse any redirect that leaves the issuing origin or rewrites the request-target,
+/// and bound the chain.
+///
+/// Refusal is `stop`, not `error`: the 3xx comes back as an ordinary response and
+/// the caller reports it through the status path it already has.
+///
+/// `Policy::custom` replaces reqwest's built-in limit, so the chain bound is
+/// restated. It is not what makes the request finite (`HTTP_TIMEOUT` covers the whole
+/// chain); it is what keeps a node that redirects to itself from costing a request
+/// per round trip until that timeout. `>` and not `>=` because reqwest pushes the
+/// redirecting URL onto `previous` before consulting the policy, which is how
+/// `Policy::limited` reads the same counter.
+fn same_origin_redirect(attempt: reqwest::redirect::Attempt<'_>) -> reqwest::redirect::Action {
+    let Some(previous) = attempt.previous().last() else {
+        // Unreachable through reqwest, which pushes the redirecting URL first, but
+        // the safe reading of "cannot prove same-origin" is to refuse.
+        return attempt.stop();
+    };
+    if attempt.previous().len() > gitlawb_core::redirect::MAX_REDIRECTS {
+        return attempt.stop();
+    }
+    if gitlawb_core::redirect::may_follow(previous, attempt.url()) {
+        attempt.follow()
+    } else {
+        attempt.stop()
+    }
 }
 
 // ── Smart-protocol request builders ───────────────────────────────────────────
@@ -483,6 +532,108 @@ fn read_upload_pack_round<R: Read>(stdin: &mut R) -> Result<(Vec<u8>, RoundEnd)>
         content.extend_from_slice(&len_bytes);
         content.extend_from_slice(&data);
     }
+}
+
+/// Read one git-receive-pack request: optional `shallow` lines, then EITHER a
+/// command list (pkt-lines terminated by a flush) or a push-cert block
+/// (pkt-lines terminated by a "push-cert-end" line), then the negotiated
+/// push-options block, then the pack ONLY when a command carries a non-zero
+/// new-oid.
+///
+/// A delete-only push sends no pack, and git holds its write pipe open waiting
+/// for the report-status response, so a plain read_to_end deadlocks the two
+/// (#369). A signed push is the other trap: when the client sends a push-cert
+/// it sends NO command list at all (the commands live inside the cert), so the
+/// request starts with a "push-cert" line and no flush ever arrives. The
+/// negotiated capability list is on the push-cert line, or on the first
+/// command line after its NUL when there is no cert. EOF at any point also
+/// ends the read, covering git versions that close the pipe early.
+fn read_receive_pack_request<R: Read>(stdin: &mut R) -> Result<Vec<u8>> {
+    /// Read one pkt-line into `body` (length prefix + data), returning its data
+    /// or `None` on flush or EOF. Malformed lengths bail rather than collapse
+    /// into a synthesized flush (#192 F5).
+    fn read_pkt<R: Read>(stdin: &mut R, body: &mut Vec<u8>) -> Result<Option<Vec<u8>>> {
+        let mut len_bytes = [0u8; 4];
+        match stdin.read_exact(&mut len_bytes) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+        let Ok(len_hex) = std::str::from_utf8(&len_bytes) else {
+            bail!("malformed pkt-line length prefix: non-UTF-8 bytes {len_bytes:02x?}");
+        };
+        let Ok(pkt_len) = usize::from_str_radix(len_hex, 16) else {
+            bail!("malformed pkt-line length prefix: non-hex {len_hex:?}");
+        };
+        body.extend_from_slice(&len_bytes);
+        if pkt_len == 0 {
+            return Ok(None);
+        }
+        if pkt_len < 4 {
+            bail!("invalid pkt-line length: {pkt_len}");
+        }
+        let mut data = vec![0u8; pkt_len - 4];
+        stdin
+            .read_exact(&mut data)
+            .context("reading pkt-line data")?;
+        body.extend_from_slice(&data);
+        Ok(Some(data))
+    }
+
+    /// "<40-hex old> <40-hex new> <refname>" — the command shape, whether it
+    /// appears in a command list or inside a push-cert.
+    fn is_command(data: &[u8]) -> bool {
+        data.len() >= 82
+            && data[..40].iter().all(|b| b.is_ascii_hexdigit())
+            && data[40] == b' '
+            && data[41..81].iter().all(|b| b.is_ascii_hexdigit())
+            && data[81] == b' '
+    }
+
+    let mut body = Vec::new();
+    let mut caps = String::new();
+    let mut pack_expected = false;
+    let mut in_cert = false;
+    loop {
+        let Some(data) = read_pkt(stdin, &mut body)? else {
+            // Flush ends a command list; EOF ends anything. A cert has no
+            // legal flush inside it, so the same break covers malformed
+            // input without hanging.
+            break;
+        };
+        if !in_cert && data.starts_with(b"push-cert") {
+            in_cert = true;
+            if let Some(nul) = data.iter().position(|&b| b == 0) {
+                caps = String::from_utf8_lossy(&data[nul + 1..]).into_owned();
+            }
+            continue;
+        }
+        if in_cert && data == b"push-cert-end\n" {
+            break;
+        }
+        if is_command(&data) {
+            if caps.is_empty() {
+                if let Some(nul) = data.iter().position(|&b| b == 0) {
+                    caps = String::from_utf8_lossy(&data[nul + 1..]).into_owned();
+                }
+            }
+            if data[41..81].iter().any(|&b| b != b'0') {
+                pack_expected = true;
+            }
+        }
+    }
+    // When both are negotiated the push-options block follows the cert; when
+    // only options are negotiated it follows the command flush. Either way it
+    // is pkt-lines to a flush.
+    if caps.split(' ').any(|c| c.starts_with("push-options")) {
+        while read_pkt(stdin, &mut body)?.is_some() {}
+    }
+    if pack_expected {
+        stdin
+            .read_to_end(&mut body)
+            .context("reading receive-pack pack")?;
+    }
+    Ok(body)
 }
 
 /// POST one self-contained stateless-RPC request body and stream the response to
@@ -858,6 +1009,438 @@ mod tests {
         String::from_utf8_lossy(&buf).into_owned()
     }
 
+    /// The signed headers must not survive a redirect off the node's origin, on
+    /// EITHER phase.
+    ///
+    /// This is the binary git runs for `clone`, `fetch` and `push`. It built its
+    /// client with a timeout and nothing else, so it ran reqwest's default
+    /// `Policy::limited(10)`, and reqwest's cross-host header stripping covers
+    /// `Authorization`, `Cookie`, `Proxy-Authorization` and `WWW-Authenticate` only.
+    /// `Signature` and `Signature-Input` came straight through. A push signs from the
+    /// first request, so a hostile node answering 302 was handed a working credential,
+    /// and a 307/308 would have taken the pack body along.
+    ///
+    /// Two mockito servers are two ports on one host, which is the boundary this
+    /// policy draws. The second server answers everything and expects nothing, with a
+    /// second mock matching on the `signature` header also at zero, so a followed
+    /// redirect fails whether or not the signature came with it. Phase 1 is driven
+    /// with a 302 and Phase 2 with a 308, the status that would carry the body.
+    ///
+    /// MUTATION (RED): drop the `.redirect(...)` line from `build_http_client`.
+    #[test]
+    fn signed_requests_do_not_follow_a_redirect_off_the_node_origin() {
+        let kp = Keypair::generate();
+        let client = build_http_client().unwrap();
+
+        let mut elsewhere = mockito::Server::new();
+        let never = elsewhere
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body("bytes from the redirect target")
+            .expect(0)
+            .create();
+        let never_post = elsewhere
+            .mock("POST", mockito::Matcher::Any)
+            .with_status(200)
+            .expect(0)
+            .create();
+        let signature_seen_get = elsewhere
+            .mock("GET", mockito::Matcher::Any)
+            .match_header("signature", mockito::Matcher::Any)
+            .with_status(200)
+            .expect(0)
+            .create();
+        let signature_seen_post = elsewhere
+            .mock("POST", mockito::Matcher::Any)
+            .match_header("signature", mockito::Matcher::Any)
+            .with_status(200)
+            .expect(0)
+            .create();
+
+        let mut node = mockito::Server::new();
+        let repo_base = format!("{}/zOwner/myrepo", node.url());
+        let bounce_get = node
+            .mock("GET", mockito::Matcher::Regex(r"/info/refs".to_string()))
+            .with_status(302)
+            .with_header("location", &format!("{}/info/refs", elsewhere.url()))
+            .expect(1)
+            .create();
+        let bounce_post = node
+            .mock(
+                "POST",
+                mockito::Matcher::Regex(r"/git-receive-pack$".to_string()),
+            )
+            .with_status(308)
+            .with_header("location", &format!("{}/git-receive-pack", elsewhere.url()))
+            .expect(1)
+            .create();
+
+        let refs_url = format!("{repo_base}/info/refs?service=git-receive-pack");
+        let advertisement = build_advertisement_request(&client, &refs_url, Some(&kp))
+            .send()
+            .unwrap();
+
+        let body = b"0009done\n".to_vec();
+        let post_url = format!("{repo_base}/git-receive-pack");
+        let pack_post =
+            build_pack_post_request(&client, &post_url, "git-receive-pack", &body, Some(&kp))
+                .body(body.clone())
+                .send()
+                .unwrap();
+
+        // The other origin first: it is the assertion that names the leak, and it must
+        // be the one that speaks when a followed redirect makes every one of these
+        // fail at once.
+        never.assert();
+        never_post.assert();
+        signature_seen_get.assert();
+        signature_seen_post.assert();
+        bounce_get.assert();
+        bounce_post.assert();
+
+        assert_eq!(
+            advertisement.status(),
+            302,
+            "a refused redirect stops rather than errors, so the caller sees the 3xx"
+        );
+        assert!(
+            !advertisement
+                .text()
+                .unwrap()
+                .contains("bytes from the redirect target"),
+            "the redirect target's bytes must never reach the caller"
+        );
+        assert_eq!(
+            pack_post.status(),
+            308,
+            "the pack POST stops at the redirect too"
+        );
+    }
+
+    /// A same-origin hop that REWRITES the request-target is refused, even though the
+    /// origin never changes.
+    ///
+    /// The signature binds `@path` as the literal path-and-query the helper signed, and
+    /// the node rebuilds it from the URI it received. An `info/refs` to `info/refs/`
+    /// bounce therefore presents a signature over a target the node never saw, so a
+    /// clone or push behind such a proxy 401s. Refusing the hop hands the caller the
+    /// 3xx that names what happened instead.
+    ///
+    /// The target mock expects zero hits and is asserted: mockito only checks
+    /// `.expect(N)` when `.assert()` runs, so an unbound or unasserted mock passes
+    /// vacuously.
+    #[test]
+    fn a_same_origin_path_changing_redirect_is_refused() {
+        let kp = Keypair::generate();
+        let client = build_http_client().unwrap();
+
+        let mut node = mockito::Server::new();
+        let bounce = node
+            .mock("GET", "/zOwner/myrepo/info/refs")
+            .with_status(301)
+            .with_header("location", "/zOwner/myrepo/info/refs/")
+            .expect(1)
+            .create();
+        let target = node
+            .mock("GET", "/zOwner/myrepo/info/refs/")
+            .with_status(200)
+            .with_body("bytes from the rewritten target")
+            .expect(0)
+            .create();
+
+        let refs_url = format!("{}/zOwner/myrepo/info/refs", node.url());
+        let resp = build_advertisement_request(&client, &refs_url, Some(&kp))
+            .send()
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            301,
+            "a refused redirect stops rather than errors, so the caller sees the 3xx"
+        );
+        assert!(
+            !resp
+                .text()
+                .unwrap()
+                .contains("bytes from the rewritten target"),
+            "the rewritten target's bytes must never reach the caller"
+        );
+        bounce.assert();
+        target.assert();
+    }
+
+    /// The other direction, and the only same-origin hop still followed: a redirect
+    /// that re-issues the IDENTICAL request-target.
+    ///
+    /// Without this the policy could be tightened to `Policy::none()` and nothing in
+    /// this crate would notice. It is also the first executed coverage of the chain
+    /// bound in `build_http_client`'s policy closure: the route answers 301 pointing at
+    /// itself, so bounded it is hit once for the original request plus `MAX_REDIRECTS`
+    /// follows and the call returns the 301 (a refused hop stops rather than errors).
+    /// Unbounded it would spin until `HTTP_TIMEOUT`, costing the node a request per
+    /// round trip. Its twin is `a_self_redirect_stops_at_the_chain_bound` in
+    /// `crates/gl/src/http.rs`.
+    #[test]
+    fn an_identical_target_redirect_is_still_followed_up_to_the_chain_bound() {
+        let kp = Keypair::generate();
+        let client = build_http_client().unwrap();
+
+        let mut node = mockito::Server::new();
+        let loop_route = node
+            .mock("GET", "/zOwner/myrepo/info/refs")
+            .with_status(301)
+            .with_header("location", "/zOwner/myrepo/info/refs")
+            .expect(gitlawb_core::redirect::MAX_REDIRECTS + 1)
+            .create();
+
+        let refs_url = format!("{}/zOwner/myrepo/info/refs", node.url());
+        let resp = build_advertisement_request(&client, &refs_url, Some(&kp))
+            .send()
+            .expect("the bound must end the chain, not the timeout");
+
+        assert_eq!(
+            resp.status(),
+            301,
+            "the chain ends by refusing the next hop, so the last 3xx is what comes back"
+        );
+        loop_route.assert();
+    }
+
+    // ── the node's own verification, run over what the helper actually sent ──
+
+    /// What the verifying mock made of a request that reached it.
+    ///
+    /// The empty slot (`None`) is its own state and means the mock was never hit at
+    /// all, which is what the refusal test asserts. It must stay distinguishable from
+    /// [`Verdict::WrongIdentity`], because "nobody verified anything" and "something
+    /// verified against the wrong key" are opposite findings.
+    ///
+    /// The payloads are read through `Debug` in the assertion messages and nowhere
+    /// else, which the dead-code pass does not count; they carry the detail that makes
+    /// a failure legible, so they stay.
+    #[derive(Debug)]
+    #[allow(dead_code)]
+    enum Verdict {
+        /// The chain accepted the signature AND the key it resolved is the test's DID.
+        Accepted,
+        /// The chain refused it. Carries the error so a failure reads as the actual
+        /// rejection rather than a bare hit count.
+        Rejected(String),
+        /// The chain accepted a signature made by somebody else. A key resolved from
+        /// the parsed `key_id` is read out of the artifact under verification, so an
+        /// accept on it alone proves consistency, never authenticity.
+        WrongIdentity { expected: String, got: String },
+    }
+
+    /// The node's `require_signature` verification, over a request this crate did not
+    /// necessarily build: parse the headers, recompute the content-digest from the
+    /// body, rebuild the signing string over `@method`/`@path`/`content-digest`,
+    /// Ed25519-verify. Returns the DID the signature resolved to, so a caller can pin
+    /// the identity.
+    ///
+    /// Its twin is the hand-copy in `crates/gl/src/http.rs`, which cannot import this
+    /// module (this is a binary crate's test module). Keep the two textually identical
+    /// apart from the mockito seam around them, so an edit to one is visibly an edit to
+    /// both.
+    ///
+    /// The production verifier both copies mirror is `crate::auth::require_signature` in
+    /// `crates/gitlawb-node/src/auth/mod.rs`. This is a re-implementation, not a call, so
+    /// an edit to that middleware has to land here too: otherwise the copies drift and
+    /// this test keeps passing against a rule the node has stopped applying.
+    ///
+    /// It asserts internally, which is deliberate but constrains its callers: inside
+    /// `with_body_from_request` those assertions fire on the server thread and reach
+    /// the client as a transport error, not as a recorded verdict. So the identity
+    /// check lives in the caller as a [`Verdict`] variant, never as an assert in here.
+    fn node_verifies(
+        method: &str,
+        path_and_query: &str,
+        body: &[u8],
+        sig_input: &str,
+        sig_header: &str,
+        content_digest: &str,
+    ) -> anyhow::Result<String> {
+        use gitlawb_core::http_sig::{build_signing_string, compute_content_digest, HttpSignature};
+        use gitlawb_core::identity::verify;
+        use std::collections::HashMap;
+
+        let sig = HttpSignature::parse(sig_input, sig_header)?;
+        sig.check_created()?;
+        assert!(
+            sig.missing_components().is_empty(),
+            "signature must cover all required components"
+        );
+        assert_eq!(sig.alg, "ed25519");
+        assert_eq!(
+            content_digest,
+            compute_content_digest(body),
+            "content-digest must match the body"
+        );
+        let vk = sig.key_id.to_verifying_key()?;
+        let mut values = HashMap::new();
+        values.insert("@method".to_string(), method.to_uppercase());
+        values.insert("@path".to_string(), path_and_query.to_string());
+        values.insert("content-digest".to_string(), content_digest.to_string());
+        let sig_params_value = sig_input.strip_prefix("sig1=").unwrap_or(sig_input);
+        let components: Vec<&str> = sig.components.iter().map(String::as_str).collect();
+        let signing_string = build_signing_string(&components, sig_params_value, &values)?;
+        let sig_array: [u8; 64] = sig.signature_bytes.as_slice().try_into()?;
+        verify(&vk, signing_string.as_bytes(), &sig_array)?;
+        Ok(sig.key_id.to_string())
+    }
+
+    /// Pull a header value off a received mockito request, or explain which one the
+    /// helper failed to send.
+    fn received_header(req: &mockito::Request, name: &str) -> String {
+        req.header(name)
+            .first()
+            .unwrap_or_else(|| panic!("the helper sent no {name} header"))
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Run [`node_verifies`] over a GET that arrived at the mock and record what the
+    /// node would have made of it, pinned to `expected_did`.
+    fn record_get_verdict(
+        req: &mockito::Request,
+        expected_did: &str,
+        slot: &std::sync::Arc<std::sync::Mutex<Option<Verdict>>>,
+    ) {
+        let verdict = match node_verifies(
+            "GET",
+            req.path_and_query(),
+            b"",
+            &received_header(req, "signature-input"),
+            &received_header(req, "signature"),
+            &received_header(req, "content-digest"),
+        ) {
+            Ok(did) if did == expected_did => Verdict::Accepted,
+            Ok(did) => Verdict::WrongIdentity {
+                expected: expected_did.to_string(),
+                got: did,
+            },
+            Err(e) => Verdict::Rejected(e.to_string()),
+        };
+        *slot.lock().unwrap() = Some(verdict);
+    }
+
+    /// The finding's repro, now a guard: a rewritten same-origin target must never
+    /// receive the advertisement's signature, and the proof is the node's own
+    /// verification, not a hit count.
+    ///
+    /// Post-fix the hop is refused, so the slot stays empty. Pre-fix the hop is
+    /// followed and the slot records the Ed25519 rejection of a signature made over
+    /// `.../info/refs?service=git-upload-pack` and presented at `.../info/refs/...`,
+    /// which is the 401 an operator behind such a proxy actually sees. The verdict is
+    /// asserted first, so a failure speaks about verification rather than about
+    /// reachability.
+    ///
+    /// Its paired positive control is
+    /// `a_direct_signed_advertisement_verifies_under_the_node_verifier`: without it, an
+    /// empty slot would be satisfied just as well by a harness that can never record
+    /// anything.
+    #[test]
+    fn a_rewritten_target_never_receives_the_signature() {
+        let kp = Keypair::generate();
+        let expected_did = kp.did().to_string();
+        let client = build_http_client().unwrap();
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None::<Verdict>));
+
+        let mut node = mockito::Server::new();
+        let bounce = node
+            .mock("GET", "/zOwner/myrepo/info/refs?service=git-upload-pack")
+            .with_status(301)
+            .with_header(
+                "location",
+                "/zOwner/myrepo/info/refs/?service=git-upload-pack",
+            )
+            .expect(1)
+            .create();
+        let recorder = slot.clone();
+        let did_for_target = expected_did.clone();
+        let target = node
+            .mock("GET", "/zOwner/myrepo/info/refs/?service=git-upload-pack")
+            .with_status(200)
+            .with_body_from_request(move |req| {
+                record_get_verdict(req, &did_for_target, &recorder);
+                Vec::new()
+            })
+            .expect(0)
+            .create();
+
+        let refs_url = format!(
+            "{}/zOwner/myrepo/info/refs?service=git-upload-pack",
+            node.url()
+        );
+        let resp = build_advertisement_request(&client, &refs_url, Some(&kp))
+            .send()
+            .unwrap();
+
+        let verdict = slot.lock().unwrap().take();
+        assert!(
+            verdict.is_none(),
+            "the node's own verifier must never see this request: the signature covers \
+             /zOwner/myrepo/info/refs?service=git-upload-pack and the rewritten target \
+             adds a trailing slash, so what arrives there is a stale request-target; \
+             recorded verdict: {verdict:?}"
+        );
+        assert_eq!(
+            resp.status(),
+            301,
+            "the caller sees the 3xx, not the rewritten target's answer"
+        );
+        bounce.assert();
+        target.assert();
+    }
+
+    /// The positive control for the test above, and the proof that the helper signs the
+    /// query it sends.
+    ///
+    /// A direct signed advertisement GET, no redirect anywhere, through the same
+    /// verifying mock. The verdict must be `Accepted`, which is what makes the refusal
+    /// test's empty slot attributable to the refusal rather than to a harness that
+    /// cannot record. The advertisement URL carries `?service=`, so a helper that
+    /// signed the bare path would land here as `Rejected`.
+    #[test]
+    fn a_direct_signed_advertisement_verifies_under_the_node_verifier() {
+        let kp = Keypair::generate();
+        let expected_did = kp.did().to_string();
+        let client = build_http_client().unwrap();
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None::<Verdict>));
+
+        let mut node = mockito::Server::new();
+        let recorder = slot.clone();
+        let did_for_target = expected_did.clone();
+        let route = node
+            .mock("GET", "/zOwner/myrepo/info/refs?service=git-upload-pack")
+            .with_status(200)
+            .with_body_from_request(move |req| {
+                record_get_verdict(req, &did_for_target, &recorder);
+                Vec::new()
+            })
+            .expect(1)
+            .create();
+
+        let refs_url = format!(
+            "{}/zOwner/myrepo/info/refs?service=git-upload-pack",
+            node.url()
+        );
+        let resp = build_advertisement_request(&client, &refs_url, Some(&kp))
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let verdict = slot.lock().unwrap().take();
+        assert!(
+            matches!(verdict, Some(Verdict::Accepted)),
+            "a direct signed advertisement must verify under the node's own chain and \
+             resolve to {expected_did}, or the refusal test's empty slot proves \
+             nothing; recorded verdict: {verdict:?}"
+        );
+        route.assert();
+    }
+
     /// The regression that round-1 missed: the Phase-2 `git-upload-pack` POST was
     /// left unsigned, so an owner's fetch of a private repo cleared the (now signed)
     /// advertisement and then 404'd on the pack POST. Drive BOTH request builders
@@ -1137,49 +1720,13 @@ mod tests {
     /// to end (sign here, verify with the node's verifier), not reasoned.
     #[test]
     fn client_signature_verifies_under_node_verification_for_both_services() {
-        use gitlawb_core::http_sig::{build_signing_string, compute_content_digest, HttpSignature};
-        use gitlawb_core::identity::verify;
-        use std::collections::HashMap;
-
         let kp = Keypair::generate();
         let client = reqwest::blocking::Client::new();
         let body = b"0009done\n".to_vec();
 
-        // Re-implements the node's require_signature verification (auth/mod.rs):
-        // parse headers, recompute content-digest from the body, rebuild the signing
-        // string over @method/@path/content-digest, Ed25519-verify. Ok iff the node
-        // would accept it.
-        let node_verifies = |method: &str,
-                             path_and_query: &str,
-                             body: &[u8],
-                             sig_input: &str,
-                             sig_header: &str,
-                             content_digest: &str|
-         -> anyhow::Result<()> {
-            let sig = HttpSignature::parse(sig_input, sig_header)?;
-            sig.check_created()?;
-            assert!(
-                sig.missing_components().is_empty(),
-                "signature must cover all required components"
-            );
-            assert_eq!(sig.alg, "ed25519");
-            assert_eq!(
-                content_digest,
-                compute_content_digest(body),
-                "content-digest must match the body"
-            );
-            let vk = sig.key_id.to_verifying_key()?;
-            let mut values = HashMap::new();
-            values.insert("@method".to_string(), method.to_uppercase());
-            values.insert("@path".to_string(), path_and_query.to_string());
-            values.insert("content-digest".to_string(), content_digest.to_string());
-            let sig_params_value = sig_input.strip_prefix("sig1=").unwrap_or(sig_input);
-            let components: Vec<&str> = sig.components.iter().map(String::as_str).collect();
-            let signing_string = build_signing_string(&components, sig_params_value, &values)?;
-            let sig_array: [u8; 64] = sig.signature_bytes.as_slice().try_into()?;
-            verify(&vk, signing_string.as_bytes(), &sig_array)?;
-            Ok(())
-        };
+        // The verification chain is [`node_verifies`], the test-module helper the
+        // redirect verdict tests share. Same primitives the node's require_signature
+        // runs, over the request-target this crate transmits.
         // @path exactly as the node reconstructs it from the request it receives.
         let path_and_query = |req: &reqwest::blocking::Request| match req.url().query() {
             Some(q) => format!("{}?{}", req.url().path(), q),
@@ -1569,6 +2116,184 @@ mod tests {
         assert!(help.contains("--help"));
         assert!(help.contains("GITLAWB_NODE"));
         assert!(help.ends_with('\n'));
+    }
+
+    // ── #369 delete-only push deadlock ───────────────────────────────────────
+
+    /// A delete-only receive-pack request ends at the command flush; git then
+    /// holds the write pipe open for the report and sends no pack. A reader that
+    /// blocks after the command list reproduces the hang that a Cursor (EOF)
+    /// hides. The read must return at the flush, inside the timeout.
+    #[test]
+    fn delete_only_receive_pack_request_returns_at_command_flush() {
+        let old = "a".repeat(40);
+        let zero = "0".repeat(40);
+        let mut seed = Vec::new();
+        seed.extend_from_slice(&pkt(&format!("{old} {zero} refs/heads/gone\n")));
+        seed.extend_from_slice(b"0000"); // command-list flush; git then blocks
+
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let mut reader = BlockAfterSeed {
+            seed: io::Cursor::new(seed),
+            gate: rx,
+        };
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let handle = std::thread::spawn(move || {
+            let _ = done_tx.send(read_receive_pack_request(&mut reader).unwrap());
+        });
+
+        let got = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        let _ = tx.send(()); // unblock the reader so the thread can exit
+        let _ = handle.join();
+
+        let body = got.expect(
+            "read_receive_pack_request blocked past the command flush waiting for \
+             a pack a delete-only push never sends (#369)",
+        );
+        assert!(
+            body.ends_with(b"0000"),
+            "the request body keeps the command list and its flush terminator"
+        );
+    }
+
+    /// A push carrying objects still reads the pack through to EOF, and the
+    /// command flush sits between the commands and the pack in the body.
+    #[test]
+    fn receive_pack_request_with_pack_reads_through_eof() {
+        let old = "a".repeat(40);
+        let new = "b".repeat(40);
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&pkt(&format!(
+            "{old} {new} refs/heads/main\0 report-status-v2\n"
+        )));
+        stream.extend_from_slice(b"0000");
+        stream.extend_from_slice(b"PACK\x00\x00\x00\x02fakepack");
+
+        let mut stdin = io::Cursor::new(stream);
+        let body = read_receive_pack_request(&mut stdin).unwrap();
+        let pos = body.windows(4).position(|w| w == b"0000").unwrap();
+        assert_eq!(
+            &body[pos + 4..],
+            b"PACK\x00\x00\x00\x02fakepack",
+            "a non-zero new-oid means the pack follows the flush"
+        );
+    }
+
+    /// A signed delete-only push sends NO command list: the request starts
+    /// with the "push-cert" line, the commands live inside the cert, and the
+    /// cert ends with a "push-cert-end" pkt-line (not a flush). The reader
+    /// must return after push-cert-end without waiting on the pipe.
+    #[test]
+    fn signed_delete_only_push_returns_after_push_cert_end() {
+        let old = "a".repeat(40);
+        let zero = "0".repeat(40);
+        let mut seed = Vec::new();
+        seed.extend_from_slice(&pkt("push-cert\0 report-status-v2 push-cert\n"));
+        seed.extend_from_slice(&pkt("certificate version 0.1\n"));
+        seed.extend_from_slice(&pkt("pusher did:key:z6Mk\n"));
+        seed.extend_from_slice(&pkt("\n")); // empty line ends the headers
+        seed.extend_from_slice(&pkt(&format!("{old} {zero} refs/heads/gone\n")));
+        seed.extend_from_slice(&pkt("sig-line\n"));
+        seed.extend_from_slice(&pkt("push-cert-end\n"));
+        // git now blocks for the report; the pipe stays open.
+
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let mut reader = BlockAfterSeed {
+            seed: io::Cursor::new(seed),
+            gate: rx,
+        };
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let handle = std::thread::spawn(move || {
+            let _ = done_tx.send(read_receive_pack_request(&mut reader).unwrap());
+        });
+        let got = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        let _ = tx.send(());
+        let _ = handle.join();
+
+        let body = got.expect(
+            "read_receive_pack_request blocked past push-cert-end on a signed \
+             delete-only push (#369)",
+        );
+        assert!(
+            body.windows(6).any(|w| w == b"pusher"),
+            "the cert block is part of the request body"
+        );
+    }
+
+    /// A signed pack-bearing push: cert with the commands inside, then the
+    /// pack. Everything must land in the body.
+    #[test]
+    fn signed_pack_push_keeps_cert_and_pack() {
+        let old = "a".repeat(40);
+        let new = "b".repeat(40);
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&pkt("push-cert\0 report-status-v2 push-cert\n"));
+        stream.extend_from_slice(&pkt("certificate version 0.1\n"));
+        stream.extend_from_slice(&pkt("\n"));
+        stream.extend_from_slice(&pkt(&format!("{old} {new} refs/heads/main\n")));
+        stream.extend_from_slice(&pkt("push-cert-end\n"));
+        stream.extend_from_slice(b"PACK\x00\x00\x00\x02fakepack");
+
+        let mut stdin = io::Cursor::new(stream);
+        let body = read_receive_pack_request(&mut stdin).unwrap();
+        assert!(
+            body.windows(5).any(|w| w == b"PACK\x00"),
+            "the pack follows the cert into the body"
+        );
+    }
+
+    /// A negotiated push-options block is pkt-lines ending in its own flush.
+    /// With no cert it follows the command flush; with a cert it follows
+    /// push-cert-end.
+    #[test]
+    fn receive_pack_request_consumes_a_push_options_block() {
+        let old = "a".repeat(40);
+        let new = "b".repeat(40);
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&pkt(&format!(
+            "{old} {new} refs/heads/main\0 report-status-v2 push-options\n"
+        )));
+        stream.extend_from_slice(b"0000"); // command flush
+        stream.extend_from_slice(&pkt("ci.skip\n"));
+        stream.extend_from_slice(b"0000"); // options flush
+        stream.extend_from_slice(b"PACK\x00\x00\x00\x02fakepack");
+
+        let mut stdin = io::Cursor::new(stream);
+        let body = read_receive_pack_request(&mut stdin).unwrap();
+        assert!(body.windows(7).any(|w| w == b"ci.skip"), "options survived");
+        assert!(
+            body.ends_with(b"PACK\x00\x00\x00\x02fakepack"),
+            "the pack lands after the options block"
+        );
+    }
+
+    /// Cert and options together: the cert comes first and the options block
+    /// sits between push-cert-end and the pack.
+    #[test]
+    fn signed_push_with_options_reads_cert_then_options_then_pack() {
+        let old = "a".repeat(40);
+        let new = "b".repeat(40);
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&pkt(
+            "push-cert\0 report-status-v2 push-cert push-options\n",
+        ));
+        stream.extend_from_slice(&pkt("certificate version 0.1\n"));
+        stream.extend_from_slice(&pkt("\n"));
+        stream.extend_from_slice(&pkt(&format!("{old} {new} refs/heads/main\n")));
+        stream.extend_from_slice(&pkt("push-cert-end\n"));
+        stream.extend_from_slice(&pkt("ci.skip\n"));
+        stream.extend_from_slice(b"0000"); // options flush
+        stream.extend_from_slice(b"PACK\x00\x00\x00\x02fakepack");
+
+        let mut stdin = io::Cursor::new(stream);
+        let body = read_receive_pack_request(&mut stdin).unwrap();
+        assert!(body.windows(7).any(|w| w == b"ci.skip"), "options survived");
+        assert!(
+            body.ends_with(b"PACK\x00\x00\x00\x02fakepack"),
+            "the pack lands after the options block"
+        );
     }
 
     // ── #117 multi-round fetch negotiation ───────────────────────────────────

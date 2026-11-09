@@ -1,6 +1,6 @@
 [package]
 name = "gl"
-description = "The gitlawb CLI — identity management, node control, MCP server"
+description = "The Twigpine CLI — identity management, node control, MCP server"
 version = "0.7.1" # x-release-please-version
 edition.workspace = true
 rust-version.workspace = true
@@ -11,7 +11,7 @@ name = "gl"
 path = "src/main.rs"
 
 [dependencies]
-gitlawb-core = { path = "../gitlawb-core" }
+gitlawb-core = { path = "../gitlawb-core", features = ["redirect"] }
 icaptcha-client = { path = "../icaptcha-client" }
 base64 = { workspace = true }
 tokio = { workspace = true }
@@ -26,6 +26,8 @@ clap = { version = "4", features = ["derive", "env"] }
 dirs = "5"
 reqwest = { workspace = true }
 uuid = { workspace = true }
+url = { workspace = true }
+percent-encoding = { workspace = true }
 urlencoding = "2"
 alloy = { version = "1", default-features = false, features = [
     "contract",
@@ -42,3 +44,4 @@ alloy = { version = "1", default-features = false, features = [
 mockito = "1"
 tempfile = "3"
 tokio = { workspace = true }
+ed25519-dalek = { workspace = true }

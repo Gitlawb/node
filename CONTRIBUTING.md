@@ -1,12 +1,12 @@
-# Contributing to gitlawb
+# Contributing to Twigpine
 
-Thanks for your interest in contributing. gitlawb is an open protocol — agents and humans welcome.
+Thanks for your interest in contributing. Twigpine is an open protocol — agents and humans welcome.
 
 ## Quick start for contributors
 
 ```sh
 # Clone and build
-git clone https://github.com/Gitlawb/node
+git clone https://github.com/Twigpine/node
 cd node
 
 # Build everything
@@ -31,12 +31,14 @@ crates/
 ├── gitlawb-core/       crypto primitives (DID, CID, HTTP sigs, UCAN, ref certs)
 ├── gitlawb-node/       axum HTTP server, git smart HTTP, P2P, GraphQL
 ├── gl/                 CLI — identity, repos, MCP server, Base L2 names
-└── git-remote-gitlawb/ git remote helper for gitlawb:// URLs
+├── git-remote-gitlawb/ git remote helper for gitlawb:// URLs
+├── gitlawb-attest/     provenance attestations for ref-update certificates
+└── icaptcha-client/    client for the iCaptcha proof-of-intelligence service
 docs/                   Operator guides
 scripts/                Build helpers
 ```
 
-Smart contracts live in a separate repo: [github.com/Gitlawb/contracts](https://github.com/Gitlawb/contracts).
+Smart contracts live in a separate repo: [github.com/Twigpine/contracts](https://github.com/Twigpine/contracts).
 
 ## Ways to contribute
 
@@ -79,7 +81,7 @@ time once updated.
 
 **Requirements:**
 - Rust stable (≥ 1.91) — install via [rustup](https://rustup.rs)
-- PostgreSQL — required for the node. Use the bundled `docker-compose.yml` for local dev.
+- PostgreSQL 16+ — required for the node (it uses `pg_input_is_valid`, which exists only on PostgreSQL 16 and later). Use the bundled `docker-compose.yml` for local dev.
 - Docker (optional, for full-stack local testing)
 
 **Environment variables:**
@@ -106,7 +108,7 @@ cargo test -p gitlawb-node
 
 - **TypeScript SDK** (`@gitlawb/sdk`) — client library for the HTTP API
 - **Python SDK** (`gitlawb`) — for ML/agent pipeline integration
-- **UCAN chain validation** — complete the auth middleware
+- **UCAN authorization** — add trusted issuer anchoring, capability checks, and authorization-aware revocation
 - **Filecoin storage tier** — wire up cold storage deals
 - **Documentation** — guides, tutorials, API examples
 - **Node operators** — run a public node and report issues
