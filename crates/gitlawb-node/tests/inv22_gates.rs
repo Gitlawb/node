@@ -553,9 +553,25 @@ fn inv22_replication_tail_spawns_at_the_durability_boundary() {
         .match_indices("tokio::spawn(post_receive_replication_tail(")
         .enumerate()
     {
-        let gate = production[..pos]
-            .rfind("disposition.spawn_tail")
-            .expect("U5 gate missing: every tail spawn must be gated on disposition.spawn_tail");
+        let gate = production[..pos].rfind("if disposition.spawn_tail").expect(
+            "U5 gate missing: every tail spawn must be gated on `if disposition.spawn_tail`",
+        );
+        // The spawn must sit inside the gate's block: brace depth at the
+        // spawn position must still be positive measured from the `if`.
+        // An ungated spawn after the block closes fails this, as does a
+        // stray `disposition.spawn_tail` mention in a comment.
+        let mut depth = 0i32;
+        for ch in production[gate..pos].chars() {
+            match ch {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        assert!(
+            depth >= 1,
+            "U5 gate bypassed: tail #{i} sits outside the `if disposition.spawn_tail` block"
+        );
         assert!(
             !production[gate..pos].contains("post_receive_replication_tail"),
             "U5 gate bypassed: a second tail spawn sits between the gate and its spawn"
@@ -700,7 +716,7 @@ fn inv26_step3_live_and_drain_share_apply_request_effects() {
 
 /// #26 Split PR 1 step 4 — the periodic queue-lifecycle purge is
 /// wired in `main.rs` and the contract is enforced by the `idx_receive_pack_requests_completed_at`
-/// partial index from v30.
+/// partial index from v41.
 ///
 /// Assertions:
 /// 1. `main.rs` calls `purge_request_queue` once at boot (well, on

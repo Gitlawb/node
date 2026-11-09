@@ -5349,10 +5349,23 @@ mod drain_tests {
 
         // A git shim that fails only on the marker ref read, so every
         // earlier gate still succeeds and only the marker read errors.
+        // The real git is resolved from PATH at test time: a hardcoded
+        // /usr/bin/git would break on hosts where git lives elsewhere and
+        // the failing shim would leave the row prepared for the wrong reason.
+        let real_git = std::env::var_os("PATH")
+            .and_then(|paths| {
+                std::env::split_paths(&paths)
+                    .map(|p| p.join("git"))
+                    .find(|p| p.is_file())
+            })
+            .expect("git must be on PATH for the shim passthrough");
         let shim = tmp.path().join("git-shim");
         std::fs::write(
             &shim,
-            "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in refs/gitlawb/requests/*) exit 1;; esac; done\nexec /usr/bin/git \"$@\"\n",
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in refs/gitlawb/requests/*) exit 1;; esac; done\nexec \"{}\" \"$@\"\n",
+                real_git.display()
+            ),
         )
         .unwrap();
         #[cfg(unix)]

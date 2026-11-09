@@ -1724,9 +1724,19 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE INDEX IF NOT EXISTS idx_agent_tasks_status_assignee_key_created_at_id ON agent_tasks (status, (CASE WHEN assignee_did LIKE 'did:key:%' AND position(':' in substr(assignee_did, 9)) = 0 THEN substr(assignee_did, 9) ELSE assignee_did END), created_at DESC, id DESC)",
         ],
     },
-    // Reservation: open branches currently claim migration versions through
-    // v29. Gaps are valid, while reusing a version can silently skip one
-    // branch's schema when both eventually land. v30 and v31 are intentionally
+    // v29 is a placeholder so the ledger stays linear from v26 under this
+    // PR's split-ledger test: the branch's real migrations moved past the
+    // v30-v37 window main already owns. A sibling branch that claimed v29
+    // collides loudly on merge through the (version, name) runner guard
+    // and renumbers, instead of silently skipping its schema.
+    Migration {
+        version: 29,
+        name: "v29_split_ledger_placeholder",
+        stmts: &[
+            "COMMENT ON TABLE schema_migrations IS 'v29: placeholder keeping the split ledger linear from v26; sibling claims renumber on merge'",
+        ],
+    },
+    // v30 and v31 are intentionally
     // separate so validation does not inherit v30's stronger table lock.
     Migration {
         version: 30,
@@ -1999,220 +2009,7 @@ const MIGRATIONS: &[Migration] = &[
         ],
     },
     Migration {
-        // #26 Split PR 1 round 6 — request-level data model.
-        //
-        // Reviewer finding: the request's push event was encoded into
-        // a mutable per-ref column (`first_ref_name`) whose correct
-        // value is knowable only after git, and the correction was
-        // not committed atomically with the per-ref outcomes. A
-        // crash between git updating a later ref and the rewrite
-        // left the durable rows naming the rejected ref, and
-        // `derive_one`'s `row.ref_name == row.first_ref_name` guard
-        // then meant no push event ever landed for the accepted
-        // child.
-        //
-        // The state-transition model (see
-        // .gravirei/plans/state-model-durable-post-receive.md)
-        // replaces `first_ref_name` with a request-level record
-        // that owns the push event and the trust score. The per-ref
-        // child becomes an ordinal child of that request. The
-        // push event id is keyed on
-        // `(request_id, accepted_ordinal)` — not on `ref_name` —
-        // so a mixed first-rejected/later-accepted push still
-        // produces exactly one push event under the request that
-        // did land.
-        //
-        // Version is 30 on this branch (the v29 migration is the
-        // highest here; the cert-compat branch had renumbered its
-        // own v28 to v37 independently). Re-check the floor on
-        // every push — the open PR list moves it.
         version: 38,
-        name: "receive_pack_requests",
-        stmts: &[
-            // The new request table. The push event and trust
-            // score are written in the same database transaction as
-            // the per-ref child outcomes, so a crash between git
-            // and effect-write rolls everything back together; the
-            // drain sees a coherent row in `outcomes_committed`
-            // (or its retry variant) and re-runs the same effect
-            // pipeline.
-            r#"CREATE TABLE IF NOT EXISTS receive_pack_requests (
-                id                 TEXT NOT NULL PRIMARY KEY,
-                repo_id            TEXT NOT NULL,
-                pusher_did         TEXT NOT NULL,
-                node_did           TEXT NOT NULL,
-                request_bytes      BYTEA NOT NULL,
-                request_bytes_hash BYTEA NOT NULL,
-                state              TEXT NOT NULL,
-                git_exit_ok        BOOLEAN,
-                parsed_report      JSONB,
-                accepted_ordinal   INTEGER,
-                attempt_count      INTEGER NOT NULL DEFAULT 0,
-                last_error         TEXT,
-                next_attempt_at    TEXT,
-                created_at         TEXT NOT NULL,
-                completed_at       TEXT
-            )"#,
-            // The state-transition gate: the recovery drain
-            // selects rows in `outcomes_committed` (and its retry
-            // variant) and walks them by `(created_at, id)`. A
-            // composite index lets the drain do a single index scan
-            // without sorting.
-            "CREATE INDEX IF NOT EXISTS idx_receive_pack_requests_state_created ON receive_pack_requests (state, created_at, id)",
-            // The drain's retry predicate. `next_attempt_at IS NULL OR
-            // next_attempt_at < now()` is a frequent lookup; the
-            // partial index keeps the index small.
-            "CREATE INDEX IF NOT EXISTS idx_receive_pack_requests_state_next_attempt ON receive_pack_requests (state, next_attempt_at) WHERE state IN ('outcomes_committed', 'effects_pending')",
-            // The 7-day bounded-retirement predicate. The purge
-            // task deletes `complete` and `rejected_at_git` rows
-            // older than the retention interval.
-            "CREATE INDEX IF NOT EXISTS idx_receive_pack_requests_completed_at ON receive_pack_requests (completed_at) WHERE state IN ('complete', 'rejected_at_git')",
-            // The new ordinal column on the per-ref child. The
-            // drain and the effect executor both read this in
-            // `ORDER BY request_id, ordinal` order to reproduce
-            // the live path's ref-walk sequence.
-            "ALTER TABLE pending_ref_transitions ADD COLUMN IF NOT EXISTS ordinal INTEGER NOT NULL DEFAULT 0",
-            // The git-side marker's snapshot kind. Recovery
-            // re-derives this from the per-ref report if it is
-            // null, so the column is informational and the
-            // migration does not need to backfill it.
-            "ALTER TABLE pending_ref_transitions ADD COLUMN IF NOT EXISTS git_target_kind TEXT",
-            // Drop `first_ref_name`. The push event identity is
-            // now `(request_id, accepted_ordinal)` and lives on
-            // the request row, not on a child. The live handler
-            // never writes this column after this migration; the
-            // drain and the effect executor do not read it. The
-            // column is `IF EXISTS` so a fresh database that never
-            // ran v28 is unaffected.
-            //
-            // P3 (reviewer round 5): the recovery gate had been
-            // patching `first_ref_name` after git returned; the
-            // patch is the bug, the drop closes it. The model
-            // forbids the pattern (request-level event identity
-            // is encoded in mutable per-ref state) so removing
-            // the column is the structural fix, not a workaround.
-            "ALTER TABLE pending_ref_transitions DROP COLUMN IF EXISTS first_ref_name",
-            // Document the new relationship. The `comment on
-            // column` form leaves a discoverable note for anyone
-            // reading the schema in psql.
-            "COMMENT ON COLUMN pending_ref_transitions.ordinal IS 'v30: ordinal position in the parsed ref_updates list, 0-indexed. The drain and the effect executor read in ORDER BY request_id, ordinal to reproduce the live path'",
-        ],
-    },
-    Migration {
-        // #26 Split PR 1 — step 5. The `quarantined` state is the
-        // operator-attended terminal state for requests whose
-        // git-side marker is missing or hash-mismatched (or whose
-        // attempt_count exceeds the configured bound). The schema
-        // does not need a CHECK constraint change because the
-        // `state` column is TEXT; this migration is a comment +
-        // index.
-        version: 39,
-        name: "receive_pack_requests_quarantined",
-        stmts: &[
-            // Operator-attended state. Pinned in a comment so a
-            // reader of the schema in psql finds the convention.
-            "COMMENT ON TABLE receive_pack_requests IS 'v31: added quarantined state for marker-mismatch / reflog-ambiguity / max-attempts; operator reclassifies to complete or rejected_at_git'",
-            // Operator queries (e.g. `SELECT … WHERE state =
-            // 'quarantined' ORDER BY created_at`) need an index. A
-            // partial index on a low-cardinality state column is
-            // small and cheap.
-            "CREATE INDEX IF NOT EXISTS idx_receive_pack_requests_quarantined ON receive_pack_requests (created_at) WHERE state = 'quarantined'",
-        ],
-    },
-    Migration {
-        // #26 Split PR 1 — durable authorization proof on the
-        // request aggregate. Children carry the verified RFC 9421
-        // headers but are deleted after effects; without a
-        // request-level copy the only proof is retired before its
-        // declared downstream consumer (cert/anchor in PR #386)
-        // can use it. Nullable so pre-v32 rows remain valid; new
-        // intents always populate all three.
-        version: 40,
-        name: "receive_pack_requests_proof",
-        stmts: &[
-            "ALTER TABLE receive_pack_requests ADD COLUMN IF NOT EXISTS signature_header TEXT",
-            "ALTER TABLE receive_pack_requests ADD COLUMN IF NOT EXISTS signature_input TEXT",
-            "ALTER TABLE receive_pack_requests ADD COLUMN IF NOT EXISTS content_digest TEXT",
-            "COMMENT ON COLUMN receive_pack_requests.signature_header IS 'v32: verified RFC 9421 Signature header copied at intent time; bound to request_bytes_hash'",
-        ],
-    },
-    Migration {
-        // v33: occurrence lifecycle — proof record, landing history,
-        // marker tombstones, occurrence-keyed anchors.
-        version: 41,
-        name: "request_occurrence_lifecycle",
-        stmts: &[
-            r#"CREATE TABLE IF NOT EXISTS request_proofs (
-                request_id TEXT NOT NULL PRIMARY KEY,
-                repo_id TEXT NOT NULL,
-                pusher_did TEXT NOT NULL,
-                body_digest BYTEA NOT NULL,
-                signature_header TEXT NOT NULL,
-                signature_input TEXT NOT NULL,
-                content_digest TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                acked_at TEXT
-            )"#,
-            "CREATE INDEX IF NOT EXISTS idx_request_proofs_repo ON request_proofs (repo_id, created_at)",
-            r#"CREATE TABLE IF NOT EXISTS ref_landing_history (
-                request_id TEXT NOT NULL,
-                ordinal INTEGER NOT NULL,
-                repo_id TEXT NOT NULL,
-                ref_name TEXT NOT NULL,
-                old_sha TEXT NOT NULL,
-                new_sha TEXT NOT NULL,
-                landed_at TEXT NOT NULL,
-                PRIMARY KEY (request_id, ordinal)
-            )"#,
-            "CREATE INDEX IF NOT EXISTS idx_landing_history_tuple ON ref_landing_history (repo_id, ref_name, old_sha, new_sha, landed_at)",
-            r#"CREATE TABLE IF NOT EXISTS marker_cleanup_queue (
-                request_id TEXT NOT NULL PRIMARY KEY,
-                repo_id TEXT NOT NULL,
-                attempts INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                last_error TEXT
-            )"#,
-            "ALTER TABLE anchor_jobs ADD COLUMN IF NOT EXISTS request_id TEXT",
-            "ALTER TABLE anchor_jobs ADD COLUMN IF NOT EXISTS request_ordinal INTEGER",
-            // Drop tuple-uniqueness so recurrence creates distinct
-            // occurrence rows; keep a non-unique lookup index.
-            "DROP INDEX IF EXISTS idx_anchor_jobs_repo_ref_transition",
-            "CREATE INDEX IF NOT EXISTS idx_anchor_jobs_tuple ON anchor_jobs (repo_id, ref_name, old_sha, new_sha)",
-            "CREATE INDEX IF NOT EXISTS idx_anchor_jobs_request ON anchor_jobs (request_id, request_ordinal)",
-        ],
-    },
-    Migration {
-        // v34: occurrence delivery ledger, marker cleanup scheduling.
-        version: 42,
-        name: "occurrence_delivery_and_cleanup_progress",
-        stmts: &[
-            r#"CREATE TABLE IF NOT EXISTS webhook_deliveries (
-                delivery_id TEXT NOT NULL PRIMARY KEY,
-                request_id TEXT NOT NULL,
-                repo_id TEXT NOT NULL,
-                event TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )"#,
-            "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_request ON webhook_deliveries (request_id, event)",
-            "ALTER TABLE marker_cleanup_queue ADD COLUMN IF NOT EXISTS next_attempt_at TEXT",
-            "ALTER TABLE marker_cleanup_queue ADD COLUMN IF NOT EXISTS dead_letter BOOLEAN NOT NULL DEFAULT FALSE",
-            "CREATE INDEX IF NOT EXISTS idx_marker_cleanup_due ON marker_cleanup_queue (dead_letter, next_attempt_at, created_at)",
-        ],
-    },
-    Migration {
-        // v35: webhook delivery sent-state so the ledger cannot claim a
-        // delivery that never fired. Claim inserts pending; the sender
-        // marks sent after the HTTP response; recovery re-fires stale
-        // pending rows.
-        version: 43,
-        name: "webhook_delivery_sent_state",
-        stmts: &[
-            "ALTER TABLE webhook_deliveries ADD COLUMN IF NOT EXISTS sent_at TEXT",
-            "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_pending ON webhook_deliveries (sent_at, created_at)",
-        ],
-    },
-    Migration {
-        version: 44,
         name: "pending_ref_transitions_durable_outbox",
         stmts: &[
             // #26 Split PR 1 — durable post-receive lifecycle.
@@ -2301,7 +2098,7 @@ const MIGRATIONS: &[Migration] = &[
         ],
     },
     Migration {
-        version: 45,
+        version: 39,
         name: "pending_ref_transitions_add_first_ref_name",
         stmts: &[
             // #26 Split PR 1 P2-B: the recovery drain must reproduce the
@@ -2326,7 +2123,7 @@ const MIGRATIONS: &[Migration] = &[
         ],
     },
     Migration {
-        version: 46,
+        version: 40,
         name: "pending_ref_transitions_add_uncertain_state",
         stmts: &[
             // No schema change: the `state` column is TEXT and the new
@@ -2334,7 +2131,219 @@ const MIGRATIONS: &[Migration] = &[
             // The comment-only migration documents the state-machine
             // extension so the migration test's non-empty-stmts
             // assertion is satisfied.
-            "COMMENT ON TABLE pending_ref_transitions IS 'v29: added uncertain state for receive-pack errors where some refs may have landed'",
+            "COMMENT ON TABLE pending_ref_transitions IS 'v40: added uncertain state for receive-pack errors where some refs may have landed'",
+        ],
+    },
+    Migration {
+        // #26 Split PR 1 round 6 — request-level data model.
+        //
+        // Reviewer finding: the request's push event was encoded into
+        // a mutable per-ref column (`first_ref_name`) whose correct
+        // value is knowable only after git, and the correction was
+        // not committed atomically with the per-ref outcomes. A
+        // crash between git updating a later ref and the rewrite
+        // left the durable rows naming the rejected ref, and
+        // `derive_one`'s `row.ref_name == row.first_ref_name` guard
+        // then meant no push event ever landed for the accepted
+        // child.
+        //
+        // The state-transition model (see
+        // .gravirei/plans/state-model-durable-post-receive.md)
+        // replaces `first_ref_name` with a request-level record
+        // that owns the push event and the trust score. The per-ref
+        // child becomes an ordinal child of that request. The
+        // push event id is keyed on
+        // `(request_id, accepted_ordinal)` — not on `ref_name` —
+        // so a mixed first-rejected/later-accepted push still
+        // produces exactly one push event under the request that
+        // did land.
+        //
+        // Version is 41 on this branch: the pending_ref_transitions trio
+        // moved to v38-v40 so its CREATE TABLE precedes the ALTERs here.
+        // Re-check the floor on every push — the open PR list moves it.
+        version: 41,
+        name: "receive_pack_requests",
+        stmts: &[
+            // The new request table. The push event and trust
+            // score are written in the same database transaction as
+            // the per-ref child outcomes, so a crash between git
+            // and effect-write rolls everything back together; the
+            // drain sees a coherent row in `outcomes_committed`
+            // (or its retry variant) and re-runs the same effect
+            // pipeline.
+            r#"CREATE TABLE IF NOT EXISTS receive_pack_requests (
+                id                 TEXT NOT NULL PRIMARY KEY,
+                repo_id            TEXT NOT NULL,
+                pusher_did         TEXT NOT NULL,
+                node_did           TEXT NOT NULL,
+                request_bytes      BYTEA NOT NULL,
+                request_bytes_hash BYTEA NOT NULL,
+                state              TEXT NOT NULL,
+                git_exit_ok        BOOLEAN,
+                parsed_report      JSONB,
+                accepted_ordinal   INTEGER,
+                attempt_count      INTEGER NOT NULL DEFAULT 0,
+                last_error         TEXT,
+                next_attempt_at    TEXT,
+                created_at         TEXT NOT NULL,
+                completed_at       TEXT
+            )"#,
+            // The state-transition gate: the recovery drain
+            // selects rows in `outcomes_committed` (and its retry
+            // variant) and walks them by `(created_at, id)`. A
+            // composite index lets the drain do a single index scan
+            // without sorting.
+            "CREATE INDEX IF NOT EXISTS idx_receive_pack_requests_state_created ON receive_pack_requests (state, created_at, id)",
+            // The drain's retry predicate. `next_attempt_at IS NULL OR
+            // next_attempt_at < now()` is a frequent lookup; the
+            // partial index keeps the index small.
+            "CREATE INDEX IF NOT EXISTS idx_receive_pack_requests_state_next_attempt ON receive_pack_requests (state, next_attempt_at) WHERE state IN ('outcomes_committed', 'effects_pending')",
+            // The 7-day bounded-retirement predicate. The purge
+            // task deletes `complete` and `rejected_at_git` rows
+            // older than the retention interval.
+            "CREATE INDEX IF NOT EXISTS idx_receive_pack_requests_completed_at ON receive_pack_requests (completed_at) WHERE state IN ('complete', 'rejected_at_git')",
+            // The new ordinal column on the per-ref child. The
+            // drain and the effect executor both read this in
+            // `ORDER BY request_id, ordinal` order to reproduce
+            // the live path's ref-walk sequence.
+            "ALTER TABLE pending_ref_transitions ADD COLUMN IF NOT EXISTS ordinal INTEGER NOT NULL DEFAULT 0",
+            // The git-side marker's snapshot kind. Recovery
+            // re-derives this from the per-ref report if it is
+            // null, so the column is informational and the
+            // migration does not need to backfill it.
+            "ALTER TABLE pending_ref_transitions ADD COLUMN IF NOT EXISTS git_target_kind TEXT",
+            // Drop `first_ref_name`. The push event identity is
+            // now `(request_id, accepted_ordinal)` and lives on
+            // the request row, not on a child. The live handler
+            // never writes this column after this migration; the
+            // drain and the effect executor do not read it. The
+            // column is `IF EXISTS` so a fresh database that never
+            // ran v39 is unaffected.
+            //
+            // P3 (reviewer round 5): the recovery gate had been
+            // patching `first_ref_name` after git returned; the
+            // patch is the bug, the drop closes it. The model
+            // forbids the pattern (request-level event identity
+            // is encoded in mutable per-ref state) so removing
+            // the column is the structural fix, not a workaround.
+            "ALTER TABLE pending_ref_transitions DROP COLUMN IF EXISTS first_ref_name",
+            // Document the new relationship. The `comment on
+            // column` form leaves a discoverable note for anyone
+            // reading the schema in psql.
+            "COMMENT ON COLUMN pending_ref_transitions.ordinal IS 'v41: ordinal position in the parsed ref_updates list, 0-indexed. The drain and the effect executor read in ORDER BY request_id, ordinal to reproduce the live path'",
+        ],
+    },
+    Migration {
+        // #26 Split PR 1 — step 5. The `quarantined` state is the
+        // operator-attended terminal state for requests whose
+        // git-side marker is missing or hash-mismatched (or whose
+        // attempt_count exceeds the configured bound). The schema
+        // does not need a CHECK constraint change because the
+        // `state` column is TEXT; this migration is a comment +
+        // index.
+        version: 42,
+        name: "receive_pack_requests_quarantined",
+        stmts: &[
+            // Operator-attended state. Pinned in a comment so a
+            // reader of the schema in psql finds the convention.
+            "COMMENT ON TABLE receive_pack_requests IS 'v42: added quarantined state for marker-mismatch / reflog-ambiguity / max-attempts; operator reclassifies to complete or rejected_at_git'",
+            // Operator queries (e.g. `SELECT … WHERE state =
+            // 'quarantined' ORDER BY created_at`) need an index. A
+            // partial index on a low-cardinality state column is
+            // small and cheap.
+            "CREATE INDEX IF NOT EXISTS idx_receive_pack_requests_quarantined ON receive_pack_requests (created_at) WHERE state = 'quarantined'",
+        ],
+    },
+    Migration {
+        // #26 Split PR 1 — durable authorization proof on the
+        // request aggregate. Children carry the verified RFC 9421
+        // headers but are deleted after effects; without a
+        // request-level copy the only proof is retired before its
+        // declared downstream consumer (cert/anchor in PR #386)
+        // can use it. Nullable so pre-v43 rows remain valid; new
+        // intents always populate all three.
+        version: 43,
+        name: "receive_pack_requests_proof",
+        stmts: &[
+            "ALTER TABLE receive_pack_requests ADD COLUMN IF NOT EXISTS signature_header TEXT",
+            "ALTER TABLE receive_pack_requests ADD COLUMN IF NOT EXISTS signature_input TEXT",
+            "ALTER TABLE receive_pack_requests ADD COLUMN IF NOT EXISTS content_digest TEXT",
+            "COMMENT ON COLUMN receive_pack_requests.signature_header IS 'v43: verified RFC 9421 Signature header copied at intent time; bound to request_bytes_hash'",
+        ],
+    },
+    Migration {
+        // v44: occurrence lifecycle — proof record, landing history,
+        // marker tombstones, occurrence-keyed anchors.
+        version: 44,
+        name: "request_occurrence_lifecycle",
+        stmts: &[
+            r#"CREATE TABLE IF NOT EXISTS request_proofs (
+                request_id TEXT NOT NULL PRIMARY KEY,
+                repo_id TEXT NOT NULL,
+                pusher_did TEXT NOT NULL,
+                body_digest BYTEA NOT NULL,
+                signature_header TEXT NOT NULL,
+                signature_input TEXT NOT NULL,
+                content_digest TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                acked_at TEXT
+            )"#,
+            "CREATE INDEX IF NOT EXISTS idx_request_proofs_repo ON request_proofs (repo_id, created_at)",
+            r#"CREATE TABLE IF NOT EXISTS ref_landing_history (
+                request_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                repo_id TEXT NOT NULL,
+                ref_name TEXT NOT NULL,
+                old_sha TEXT NOT NULL,
+                new_sha TEXT NOT NULL,
+                landed_at TEXT NOT NULL,
+                PRIMARY KEY (request_id, ordinal)
+            )"#,
+            "CREATE INDEX IF NOT EXISTS idx_landing_history_tuple ON ref_landing_history (repo_id, ref_name, old_sha, new_sha, landed_at)",
+            r#"CREATE TABLE IF NOT EXISTS marker_cleanup_queue (
+                request_id TEXT NOT NULL PRIMARY KEY,
+                repo_id TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                last_error TEXT
+            )"#,
+            "ALTER TABLE anchor_jobs ADD COLUMN IF NOT EXISTS request_id TEXT",
+            "ALTER TABLE anchor_jobs ADD COLUMN IF NOT EXISTS request_ordinal INTEGER",
+            // Drop tuple-uniqueness so recurrence creates distinct
+            // occurrence rows; keep a non-unique lookup index.
+            "DROP INDEX IF EXISTS idx_anchor_jobs_repo_ref_transition",
+            "CREATE INDEX IF NOT EXISTS idx_anchor_jobs_tuple ON anchor_jobs (repo_id, ref_name, old_sha, new_sha)",
+            "CREATE INDEX IF NOT EXISTS idx_anchor_jobs_request ON anchor_jobs (request_id, request_ordinal)",
+        ],
+    },
+    Migration {
+        // v45: occurrence delivery ledger, marker cleanup scheduling.
+        version: 45,
+        name: "occurrence_delivery_and_cleanup_progress",
+        stmts: &[
+            r#"CREATE TABLE IF NOT EXISTS webhook_deliveries (
+                delivery_id TEXT NOT NULL PRIMARY KEY,
+                request_id TEXT NOT NULL,
+                repo_id TEXT NOT NULL,
+                event TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )"#,
+            "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_request ON webhook_deliveries (request_id, event)",
+            "ALTER TABLE marker_cleanup_queue ADD COLUMN IF NOT EXISTS next_attempt_at TEXT",
+            "ALTER TABLE marker_cleanup_queue ADD COLUMN IF NOT EXISTS dead_letter BOOLEAN NOT NULL DEFAULT FALSE",
+            "CREATE INDEX IF NOT EXISTS idx_marker_cleanup_due ON marker_cleanup_queue (dead_letter, next_attempt_at, created_at)",
+        ],
+    },
+    Migration {
+        // v46: webhook delivery sent-state so the ledger cannot claim a
+        // delivery that never fired. Claim inserts pending; the sender
+        // marks sent after the HTTP response; recovery re-fires stale
+        // pending rows.
+        version: 46,
+        name: "webhook_delivery_sent_state",
+        stmts: &[
+            "ALTER TABLE webhook_deliveries ADD COLUMN IF NOT EXISTS sent_at TEXT",
+            "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_pending ON webhook_deliveries (sent_at, created_at)",
         ],
     },
 ];
@@ -10070,7 +10079,7 @@ mod migration_tests {
     fn split_migration_ledger_is_linear_from_main_v26() {
         // Split PRs must form one ordered ledger from main's v26:
         // versions unique (strictly increasing covers it), names distinct
-        // (covered above), and the split-1 range v27..=v34 contiguous so a
+        // (covered above), and the split-1 range v27..=v35 contiguous so a
         // sibling claiming any of those numbers collides loudly via the
         // (version, name) runner guard instead of silently skipping.
         let versions: Vec<i64> = MIGRATIONS.iter().map(|m| m.version).collect();
