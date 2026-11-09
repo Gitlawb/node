@@ -109,16 +109,16 @@ pub async fn run(args: InitArgs) -> Result<()> {
                 .dir
                 .clone()
                 .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".gitlawb"));
-            std::fs::create_dir_all(&ucan_dir)?;
+            crate::secret_file::create_dir(&ucan_dir)?;
             let record = json!({
                 "ucan": ucan,
                 "node": args.node,
                 "did": did.to_string(),
                 "saved_at": chrono::Utc::now().to_rfc3339(),
             });
-            std::fs::write(
-                ucan_dir.join("ucan.json"),
-                serde_json::to_string_pretty(&record)?,
+            crate::secret_file::write(
+                &ucan_dir.join("ucan.json"),
+                serde_json::to_string_pretty(&record)?.as_bytes(),
             )?;
         }
     }
@@ -232,22 +232,13 @@ fn generate_identity(dir: Option<&std::path::Path>) -> Result<gitlawb_core::iden
             .context("could not determine home directory")?
             .join(".gitlawb")
     };
-    std::fs::create_dir_all(&base)?;
+    crate::secret_file::create_dir(&base)?;
 
     let keypair = gitlawb_core::identity::Keypair::generate();
     let pem = keypair.to_pem()?;
     let path = base.join("identity.pem");
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(&path, pem.as_bytes())?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&path, pem.as_bytes())?;
-    }
+    crate::secret_file::write(&path, pem.as_bytes())?;
 
     Ok(keypair)
 }

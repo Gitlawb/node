@@ -152,23 +152,13 @@ async fn cmd_new_with_reader(
         }
     }
 
-    fs::create_dir_all(&dir)
+    crate::secret_file::create_dir(&dir)
         .with_context(|| format!("failed to create directory {}", dir.display()))?;
 
     let keypair = Keypair::generate();
     let pem = keypair.to_pem()?;
 
-    // Write with restricted permissions
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::write(&path, pem.as_bytes())?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-    }
-    #[cfg(not(unix))]
-    {
-        fs::write(&path, pem.as_bytes())?;
-    }
+    crate::secret_file::write(&path, pem.as_bytes())?;
 
     let did = keypair.did();
     println!("✓ Generated new identity");
@@ -223,16 +213,7 @@ async fn cmd_backup(out: Option<PathBuf>, dir: Option<PathBuf>) -> Result<()> {
             .join("identity.pem.bak")
     });
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::write(&dest, pem.as_bytes())?;
-        fs::set_permissions(&dest, fs::Permissions::from_mode(0o600))?;
-    }
-    #[cfg(not(unix))]
-    {
-        fs::write(&dest, pem.as_bytes())?;
-    }
+    crate::secret_file::write(&dest, pem.as_bytes())?;
 
     println!("✓ Identity backed up");
     println!("  DID:  {}", keypair.did());
@@ -283,19 +264,10 @@ async fn cmd_restore_with_reader(
         }
     }
 
-    fs::create_dir_all(&base)
+    crate::secret_file::create_dir(&base)
         .with_context(|| format!("failed to create directory {}", base.display()))?;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::write(&dest, pem.as_bytes())?;
-        fs::set_permissions(&dest, fs::Permissions::from_mode(0o600))?;
-    }
-    #[cfg(not(unix))]
-    {
-        fs::write(&dest, pem.as_bytes())?;
-    }
+    crate::secret_file::write(&dest, pem.as_bytes())?;
 
     println!("✓ Identity restored");
     println!("  DID:  {}", keypair.did());

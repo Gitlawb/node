@@ -100,14 +100,17 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
                 let payload: Value = resp.json().await.unwrap_or_default();
                 let ucan = payload["ucan"].as_str().unwrap_or("");
                 if !ucan.is_empty() {
-                    std::fs::create_dir_all(&dir)?;
+                    crate::secret_file::create_dir(&dir)?;
                     let record = json!({
                         "ucan": ucan,
                         "node": args.node,
                         "did": did,
                         "saved_at": chrono::Utc::now().to_rfc3339(),
                     });
-                    std::fs::write(&ucan_path, serde_json::to_string_pretty(&record)?)?;
+                    crate::secret_file::write(
+                        &ucan_path,
+                        serde_json::to_string_pretty(&record)?.as_bytes(),
+                    )?;
                     let trust = payload["trust_score"].as_f64().unwrap_or(0.0);
                     println!("  ✓  Registered successfully");
                     println!("     Trust score: {trust:.2}");
@@ -233,23 +236,15 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-fn generate_identity(dir: &PathBuf) -> Result<gitlawb_core::identity::Keypair> {
-    std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+fn generate_identity(dir: &std::path::Path) -> Result<gitlawb_core::identity::Keypair> {
+    crate::secret_file::create_dir(dir)
+        .with_context(|| format!("failed to create {}", dir.display()))?;
 
     let keypair = gitlawb_core::identity::Keypair::generate();
     let pem = keypair.to_pem()?;
     let path = dir.join("identity.pem");
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(&path, pem.as_bytes())?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&path, pem.as_bytes())?;
-    }
+    crate::secret_file::write(&path, pem.as_bytes())?;
 
     let did = keypair.did();
     println!("  ✓  Generated new identity");

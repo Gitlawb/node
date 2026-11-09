@@ -26,6 +26,7 @@ mod protect;
 mod quickstart;
 mod register;
 mod repo;
+mod secret_file;
 mod star;
 mod status;
 mod sync;
