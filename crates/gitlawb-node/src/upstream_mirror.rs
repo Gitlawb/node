@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use crate::config::Config;
-use crate::db::{Db, InboundMirrorTarget, MirrorStatus};
+use crate::db::{Db, InboundMirrorTarget, MirrorStatus, MirrorTransitionPhase};
 use crate::git::repo_store::RepoStore;
 use crate::state::{repo_identity_key, RepoWriteLeases};
 
@@ -418,9 +418,14 @@ impl Worker {
                 return Err(error);
             }
         };
+        // Both stable shapes the CHECK admits: never transitioned, or a
+        // completed transition whose metadata is retained as audit. Only an
+        // in-flight transition makes the target stale.
+        let stable = (current.transition_id.is_none() && current.transition_phase.is_none())
+            || (current.transition_id.is_some()
+                && current.transition_phase == Some(MirrorTransitionPhase::Completed));
         if current.status != MirrorStatus::Inbound
-            || current.transition_id.is_some()
-            || current.transition_phase.is_some()
+            || !stable
             || current.upstream_url != target.upstream_url
         {
             let _ = guard.release(false).await;

@@ -190,6 +190,16 @@ pub struct Config {
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_000)
     )]
     pub upstream_mirror_page_size: usize,
+    /// Enable the periodic reconciliation sweep that re-derives pin/seal sets
+    /// and fills durability gaps.  Defaults to true; set to false to disable
+    /// the sweep even when a pin backend (IPFS/Pinata) is configured.
+    #[arg(
+        long,
+        env = "GITLAWB_RECONCILIATION_SWEEP",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    pub reconciliation_sweep: bool,
 
     /// Irys URL for Arweave permanent anchoring.
     /// Leave empty to disable. Use https://devnet.irys.xyz for free devnet.

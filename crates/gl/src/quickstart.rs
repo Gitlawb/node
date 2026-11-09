@@ -108,11 +108,18 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
                         "saved_at": chrono::Utc::now().to_rfc3339(),
                     });
                     std::fs::write(&ucan_path, serde_json::to_string_pretty(&record)?)?;
+                    let trust = payload["trust_score"].as_f64().unwrap_or(0.0);
+                    println!("  ✓  Registered successfully");
+                    println!("     Trust score: {trust:.2}");
+                    println!("     UCAN saved to {}", ucan_path.display());
+                } else {
+                    // A 2xx without a usable ucan is not a registration; the
+                    // response may not even be JSON. Saying success here would
+                    // also leave a stale ucan.json from another node in place.
+                    println!("  ✗  Registration returned no UCAN (unexpected response body)");
+                    // No retry hint here: a `gl register` instruction without
+                    // this invocation's --dir would load a different identity.
                 }
-                let trust = payload["trust_score"].as_f64().unwrap_or(0.0);
-                println!("  ✓  Registered successfully");
-                println!("     Trust score: {trust:.2}");
-                println!("     UCAN saved to {}", ucan_path.display());
                 println!();
             }
             Ok(resp) => {
