@@ -71,7 +71,6 @@ pub fn fire_event_occurrence(
             payload,
             request_id.as_deref(),
             ref_name.as_deref(),
-            false,
             None,
         )
         .await;
@@ -88,7 +87,7 @@ pub fn fire_event_occurrence_with_claimed_hooks(
     payload: serde_json::Value,
     request_id: Option<&str>,
     ref_name: Option<&str>,
-    claimed_hook_ids: Vec<String>,
+    claimed_hooks: Vec<crate::db::Webhook>,
 ) {
     let repo_id = repo_id.to_string();
     let event = event.to_string();
@@ -103,8 +102,7 @@ pub fn fire_event_occurrence_with_claimed_hooks(
             payload,
             request_id.as_deref(),
             ref_name.as_deref(),
-            true,
-            Some(claimed_hook_ids),
+            Some(claimed_hooks),
         )
         .await;
     });
@@ -124,7 +122,7 @@ pub async fn claim_webhook_delivery_before_spawn(
     event: &str,
     request_id: Option<&str>,
     ref_name: Option<&str>,
-) -> Option<Vec<String>> {
+) -> Option<Vec<crate::db::Webhook>> {
     let mut claimed_hooks = Vec::new();
 
     // Only claim when we have occurrence context (request_id + ref_name)
@@ -143,7 +141,7 @@ pub async fn claim_webhook_delivery_before_spawn(
                 .claim_webhook_delivery(&delivery_id, req, repo_id, event)
                 .await
             {
-                Ok(true) => claimed_hooks.push(hook.id),
+                Ok(true) => claimed_hooks.push(hook),
                 Ok(false) => continue, // Already claimed
                 // Send fallback (legacy best-effort): a transient claim
                 // error must not drop the delivery while children are
@@ -151,7 +149,7 @@ pub async fn claim_webhook_delivery_before_spawn(
                 // anyway on claim error; keep that here.
                 Err(e) => {
                     tracing::warn!(err = %e, hook_id = %hook.id, "webhook claim failed; sending anyway");
-                    claimed_hooks.push(hook.id);
+                    claimed_hooks.push(hook);
                 }
             }
         }
@@ -169,15 +167,21 @@ async fn fire_event_async_occurrence(
     payload: serde_json::Value,
     request_id: Option<&str>,
     ref_name: Option<&str>,
-    skip_claim: bool,
-    claimed_hook_ids: Option<Vec<String>>,
+    claimed_hooks: Option<Vec<crate::db::Webhook>>,
 ) {
-    let hooks = match db.list_webhooks_for_event(repo_id, event).await {
-        Ok(h) => h,
-        Err(e) => {
-            tracing::warn!(err = %e, "failed to list webhooks for event {event}");
-            return;
-        }
+    // A caller that already claimed deliveries hands the claimed hook rows
+    // through; the send path must not re-list, because a list failure here
+    // would silently drop deliveries already claimed in the ledger.
+    let already_claimed = claimed_hooks.is_some();
+    let hooks = match claimed_hooks {
+        Some(h) => h,
+        None => match db.list_webhooks_for_event(repo_id, event).await {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(err = %e, "failed to list webhooks for event {event}");
+                return;
+            }
+        },
     };
 
     if hooks.is_empty() {
@@ -206,7 +210,7 @@ async fn fire_event_async_occurrence(
         // delivery per occurrence. Failures to record fall back to
         // sending (legacy best-effort) rather than dropping.
         // Skip claim if already done by caller (durable_outbox path).
-        if !skip_claim && request_id.is_some() {
+        if !already_claimed && request_id.is_some() {
             match db
                 .clone()
                 .claim_webhook_delivery(&delivery_id, request_id.unwrap_or(""), repo_id, event)
@@ -215,13 +219,6 @@ async fn fire_event_async_occurrence(
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(_) => {}
-            }
-        } else if skip_claim {
-            // Skip hooks that weren't claimed by the caller
-            if let Some(ref claimed) = claimed_hook_ids {
-                if !claimed.contains(&hook.id) {
-                    continue;
-                }
             }
         }
 

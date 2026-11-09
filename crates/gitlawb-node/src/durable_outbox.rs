@@ -369,11 +369,13 @@ async fn reconcile_prepared_page(
                 }
             };
             let marker_ref = format!("refs/gitlawb/requests/{}", row.request_id);
-            // Bounded like the list_refs above: each read degrades to
-            // "marker unreadable" (quarantine signal) on expiry, never a
-            // hung startup.
+            // Bounded like the list_refs above so a read can never hang
+            // startup. An Err (read failure or deadline) is UNPROVEN: the
+            // row stays prepared and the next reconcile retries. Only a
+            // successfully read marker can prove missing or mismatch, and
+            // only proof quarantines.
             let git_timeout = reconcile_git_timeout(&state);
-            let marker_ok = match crate::git::store::read_ref_bounded(
+            let marker_read = match crate::git::store::read_ref_bounded(
                 &state.git_bin,
                 disk_path,
                 &marker_ref,
@@ -381,7 +383,20 @@ async fn reconcile_prepared_page(
             )
             .await
             {
-                Ok(Some(value)) => match crate::git::store::marker_value_for_bounded(
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        err = %e,
+                        request_id = %row.request_id,
+                        "reconcile: marker read failed; staying prepared"
+                    );
+                    continue;
+                }
+            };
+            let quarantine_reason = match marker_read {
+                // A successful read proving absence is confirmed missing.
+                None => Some("missing marker ref"),
+                Some(value) => match crate::git::store::marker_value_for_bounded(
                     &state.git_bin,
                     disk_path,
                     &request.request_bytes_hash,
@@ -389,38 +404,20 @@ async fn reconcile_prepared_page(
                 )
                 .await
                 {
-                    Ok(expected) => value == expected,
+                    // Successful derive + compare: mismatch is proven.
+                    Ok(expected) if value == expected => None,
+                    Ok(_) => Some("marker hash mismatch"),
                     Err(e) => {
                         tracing::warn!(
                             err = %e,
                             request_id = %row.request_id,
                             "reconcile: marker_value_for failed; staying prepared"
                         );
-                        false
+                        continue;
                     }
                 },
-                Ok(None) => false,
-                Err(e) => {
-                    tracing::warn!(
-                        err = %e,
-                        request_id = %row.request_id,
-                        "reconcile: marker read failed; staying prepared"
-                    );
-                    false
-                }
             };
-            if !marker_ok {
-                let reason = match crate::git::store::read_ref_bounded(
-                    &state.git_bin,
-                    disk_path,
-                    &marker_ref,
-                    git_timeout,
-                )
-                .await
-                {
-                    Ok(Some(_)) => "marker hash mismatch",
-                    _ => "missing marker ref",
-                };
+            if let Some(reason) = quarantine_reason {
                 if let Err(e) = state
                     .db
                     .mark_request_quarantined(&row.request_id, reason)
@@ -1420,7 +1417,7 @@ async fn run_effect_bundle(
             )
             .await;
 
-            let claimed_hook_ids = match claimed_opt {
+            let claimed_hooks = match claimed_opt {
                 Some(ids) => ids,
                 None => {
                     let payload = serde_json::json!({
@@ -1452,7 +1449,7 @@ async fn run_effect_bundle(
                 }
             };
 
-            if !claimed_hook_ids.is_empty() {
+            if !claimed_hooks.is_empty() {
                 let payload = serde_json::json!({
                     "ref": child.ref_name,
                     "before": child.old_sha,
@@ -1478,7 +1475,7 @@ async fn run_effect_bundle(
                     payload,
                     Some(&req.id),
                     Some(&child.ref_name),
-                    claimed_hook_ids,
+                    claimed_hooks,
                 );
             }
         }
@@ -5321,6 +5318,77 @@ mod drain_tests {
             "missing marker cancels the child"
         );
         assert!(child[0].cancelled_at.is_some(), "cancelled_at is stamped");
+    }
+
+    /// An unreadable marker is unproven, not missing: a bounded read that
+    /// errors (or times out) must leave the request prepared for the next
+    /// reconcile rather than quarantine it as "missing marker ref".
+    #[sqlx::test]
+    async fn cell_marker_read_error_does_not_quarantine(pool: sqlx::PgPool) {
+        let mut state = crate::test_support::test_state(pool).await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bare = tmp.path().join("repo.git");
+        crate::git::store::init_bare(&bare).expect("init_bare");
+        let on_disk_sha = seed_ref_on_bare(&bare, "refs/heads/main");
+
+        let repo_id = seed_repo_row(&state, bare.to_str().unwrap()).await;
+        seed_parent_request(&state.db, "req-marker-err", &repo_id, vec![0xa4; 32]).await;
+        // Stage a VALID marker: without the injected failure the gate would
+        // pass, so a quarantine here can only come from the error path.
+        stage_marker(&bare, "req-marker-err", &[0xa4; 32]).await;
+        let mut row = make_row(&repo_id, "refs/heads/main", &"0".repeat(40), &on_disk_sha);
+        row.request_id = "req-marker-err".to_string();
+        row.state = pending_state::PREPARED.to_string();
+        row.applied_at = None;
+        state
+            .db
+            .insert_pending_ref_transition_for_test(&row)
+            .await
+            .unwrap();
+
+        // A git shim that fails only on the marker ref read, so every
+        // earlier gate still succeeds and only the marker read errors.
+        let shim = tmp.path().join("git-shim");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in refs/gitlawb/requests/*) exit 1;; esac; done\nexec /usr/bin/git \"$@\"\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        state.git_bin = shim.to_str().unwrap().to_string();
+
+        let _ = reconcile_prepared_from_disk(state.clone(), 100)
+            .await
+            .unwrap();
+
+        // The unproven read must NOT quarantine: parent and child keep
+        // their pre-reconcile states for the next pass.
+        let parent = state
+            .db
+            .get_receive_pack_request("req-marker-err")
+            .await
+            .unwrap()
+            .expect("parent row exists");
+        assert_ne!(
+            parent.state,
+            request_state::QUARANTINED,
+            "an unproven marker read must not quarantine the request"
+        );
+        let child = state
+            .db
+            .list_pending_ref_transitions_for_request("req-marker-err")
+            .await
+            .unwrap();
+        assert_eq!(
+            child[0].state,
+            pending_state::PREPARED,
+            "an unproven marker read leaves the child prepared"
+        );
     }
 
     /// The marker is present but the value mismatches the parent's

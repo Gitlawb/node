@@ -538,9 +538,35 @@ fn inv22_replication_tail_spawns_at_the_durability_boundary() {
     let success_flag = production
         .find("post_git_disposition(")
         .expect("U5 gate missing: the tail's disposition must be bound before the gate");
-    let gate_open = production
-        .find("if disposition.spawn_tail {")
-        .expect("U5 gate missing: the tail spawn must be gated on the push having succeeded");
+    // One tail per push, on the proven-landed ref set. Either spawn
+    // position (carve-out early, or durability-bound at release) must sit
+    // inside a `disposition.spawn_tail` gate and feed `landed_refs` —
+    // never the unfiltered `ref_updates`.
+    let spawn_count = production
+        .matches("tokio::spawn(post_receive_replication_tail(")
+        .count();
+    assert!(
+        spawn_count >= 1,
+        "U5 gate missing: the replication tail must be spawned by git_receive_pack"
+    );
+    for (i, (pos, _)) in production
+        .match_indices("tokio::spawn(post_receive_replication_tail(")
+        .enumerate()
+    {
+        let gate = production[..pos]
+            .rfind("disposition.spawn_tail")
+            .expect("U5 gate missing: every tail spawn must be gated on disposition.spawn_tail");
+        assert!(
+            !production[gate..pos].contains("post_receive_replication_tail"),
+            "U5 gate bypassed: a second tail spawn sits between the gate and its spawn"
+        );
+        let call_end = production[pos..].find(");").unwrap() + pos;
+        let call = &production[pos..call_end];
+        assert!(
+            call.contains("landed_refs"),
+            "U5 gate bypassed: tail #{i} must carry the proven-landed ref set, not unfiltered ref_updates"
+        );
+    }
     let spawn = production
         .find("tokio::spawn(post_receive_replication_tail(")
         .expect("U5 gate missing: the replication tail must be spawned by git_receive_pack");
@@ -561,15 +587,8 @@ fn inv22_replication_tail_spawns_at_the_durability_boundary() {
         .expect("U5 gate stale: git_receive_pack no longer calls apply_request_effects inline");
 
     assert!(
-        success_flag < gate_open && gate_open < spawn,
-        "U5 gate bypassed: the tail must be spawned inside `if disposition.spawn_tail`, or a \
-         rejected push spawns a tail that pins and announces a half-applied repo"
-    );
-    // Still inside that block: no `}` may close it between the gate and the spawn.
-    assert!(
-        !production[gate_open + "if disposition.spawn_tail {".len()..spawn].contains('}'),
-        "U5 gate bypassed: the tail spawn left the `if disposition.spawn_tail` block, so a \
-         rejected push now spawns a tail"
+        success_flag < spawn,
+        "U5 gate bypassed: the disposition must be bound before any tail spawn"
     );
     assert!(
         spawn < release && spawn < touch && spawn < effects_executor,
@@ -1038,5 +1057,52 @@ fn issue_26_namespace_gate_and_refusal_wiring() {
         "P2 gate missing: the visibility exemption must be narrowed to requests/ and \
          issues/ only (the push gate is the premise; any other refs/gitlawb/* ref is \
          denied on push and must fail closed in the pack path)"
+    );
+}
+
+/// Claimed-webhook delivery must not re-list hooks: the durable path claims
+/// synchronously, hands the claimed hook rows to the sender, and a list
+/// failure in the send task would silently drop already-claimed deliveries.
+#[test]
+fn inv26_claimed_hook_delivery_never_relists() {
+    let webhooks = src("webhooks.rs");
+    let production = webhooks
+        .split("\nmod tests {")
+        .next()
+        .expect("split always yields a first chunk");
+
+    // The claimed entry point exists and passes hook ROWS (not ids) so the
+    // sender never needs the hook table again.
+    let entry = production
+        .find("fire_event_occurrence_with_claimed_hooks(")
+        .expect("claimed-hooks sender missing");
+    let claimed_rows = production
+        .find("claimed_hooks: Vec<crate::db::Webhook>")
+        .expect("claimed path must carry Webhook rows, not ids");
+    let list_call = production
+        .find("db.list_webhooks_for_event(repo_id, event)")
+        .expect("unclaimed path still lists hooks");
+    assert!(
+        entry < claimed_rows && claimed_rows < list_call,
+        "claimed sender must hand rows through before any list fallback"
+    );
+
+    // Inside the async worker, the claimed branch must bypass the list.
+    // Inside the async worker (which starts after the claim helper), the
+    // claimed branch must be selected before the list fallback can run.
+    let worker = production
+        .find("async fn fire_event_async_occurrence(")
+        .expect("occurrence worker missing");
+    let already_claimed = production[worker..]
+        .find("let already_claimed = claimed_hooks.is_some();")
+        .map(|i| worker + i)
+        .expect("claimed path must short-circuit before re-listing");
+    let worker_list = production[worker..]
+        .find("db.list_webhooks_for_event(repo_id, event)")
+        .map(|i| worker + i)
+        .expect("unclaimed path still lists hooks");
+    assert!(
+        already_claimed < worker_list,
+        "the claimed branch must be selected before list_webhooks_for_event can run"
     );
 }

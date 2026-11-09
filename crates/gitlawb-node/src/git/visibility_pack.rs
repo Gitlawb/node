@@ -1529,14 +1529,17 @@ fn pair_decision(
     }
 }
 
-/// Reachable blob AND withheld-subtree tree OIDs the anonymous (or `caller`)
-/// replication audience must not receive. The single source for
-/// `replication_withheld_set`: a blob-only set handed to [`replicable_objects`]
-/// reintroduces #172 (withheld trees pin to public IPFS).
-///
-/// Strict where [`tree_paths`] is lenient. This feeds a withheld filter, so
-/// absence means replicate; a missed reachable tree would leak. The walk
-
+/// Root tree oid of every reachable commit, at "/". `ls-tree` never emits a commit's
+/// own root tree (it lists entries *under* a tree), so it is added explicitly here.
+/// Resolved in ONE bounded `git log --no-walk --format=%T --stdin` pass over the
+/// shared commit set — not a per-commit `rev-parse` — so a tree-set walk costs the
+/// same subprocess order as the blob walk. The commit oids go on STDIN, not argv: a
+/// long history has tens of thousands of reachable commits, and passing them all as
+/// arguments overflows ARG_MAX so `git log` fails to spawn — which the caller treats
+/// as a walk error and fail-closed 404s an authorized reader of a reachable/root
+/// tree (#173 P2). `run_bounded_git` drains stdout concurrently with the stdin
+/// write, so a large history cannot deadlock the pipes. A commit whose root tree git
+/// cannot resolve fails the pass (bail), failing closed.
 fn root_tree_pairs(
     repo_path: &Path,
     git_bin: &str,
@@ -1568,6 +1571,18 @@ fn root_tree_pairs(
     Ok(set)
 }
 
+/// Reachable blob AND withheld-subtree tree OIDs the anonymous (or `caller`)
+/// replication audience must not receive. The single source for
+/// `replication_withheld_set`: a blob-only set handed to [`replicable_objects`]
+/// reintroduces #172 (withheld trees pin to public IPFS).
+///
+/// Strict where [`tree_paths`] is lenient. This feeds a withheld filter, so
+/// absence means replicate; a missed reachable tree would leak. The walk
+/// therefore matches [`blob_paths`]: [`assert_all_refs_are_commits`] first, then
+/// a failing `rev-list --all [HEAD]` is an error, then [`object_paths`] (already
+/// fail-closed on ls-tree / non-UTF-8) plus [`root_tree_pairs`]. [`tree_paths`]
+/// stays the lenient allow-list walk for GET /ipfs/{cid} and the full-scan
+/// allowed-tree set, where absence withholds.
 pub fn withheld_object_oids_bounded(
     repo_path: &Path,
     git_bin: &str,

@@ -3241,26 +3241,29 @@ pub async fn git_receive_pack(
     let disposition =
         post_git_disposition(exit_ok, any_ref_ok, outcome_commit_ok, report.is_none());
 
-    if disposition.spawn_tail {
-        // Spawn the replication tail only for refs that landed.
-        // Filtering at spawn-time keeps the tail's input accurate
-        // even for a mixed push.
+    // One replication tail per push, on the proven-landed ref set the
+    // disposition selected. When a release ordering is armed below, the
+    // tail spawns there carrying the durability slot; otherwise it fires
+    // here for the carve-out path (replication on in-memory knowledge).
+    let landed_refs: Vec<RefUpdate> = if disposition.spawn_tail {
         let landed_names: std::collections::HashSet<&str> = ok_names.iter().copied().collect();
-        let landed_refs: Vec<RefUpdate> = ref_updates
+        ref_updates
             .iter()
             .filter(|u| landed_names.contains(u.ref_name.as_str()))
             .cloned()
-            .collect();
-        if !landed_refs.is_empty() {
-            tokio::spawn(post_receive_replication_tail(
-                state.clone(),
-                record.clone(),
-                landed_refs,
-                disk_path.clone(),
-                auth.0.to_string(),
-                None,
-            ));
-        }
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if disposition.spawn_tail && !push_succeeded && !landed_refs.is_empty() {
+        tokio::spawn(post_receive_replication_tail(
+            state.clone(),
+            record.clone(),
+            landed_refs.clone(),
+            disk_path.clone(),
+            auth.0.to_string(),
+            None,
+        ));
     }
 
     // Always release the advisory lock — even on error — to prevent stale locks
@@ -3280,14 +3283,16 @@ pub async fn git_receive_pack(
         // `release` is classified by how far the publish actually got rather
         // than by the mere fact that release was entered.
         publish_durability.arm_for_release(reclaimed.publish_stage());
-        tokio::spawn(post_receive_replication_tail(
-            state.clone(),
-            record.clone(),
-            ref_updates.clone(),
-            disk_path.clone(),
-            auth.0.to_string(),
-            Some(publish_durability.arc()),
-        ));
+        if disposition.spawn_tail && !landed_refs.is_empty() {
+            tokio::spawn(post_receive_replication_tail(
+                state.clone(),
+                record.clone(),
+                landed_refs,
+                disk_path.clone(),
+                auth.0.to_string(),
+                Some(publish_durability.arc()),
+            ));
+        }
     }
     // Short-circuit on a refused publish BEFORE anything downstream observes
     // the push. The pack is on local disk but not in object storage, so
