@@ -441,14 +441,27 @@ pub async fn read_ref_bounded(
     let output = run_git_bounded(
         git_bin,
         repo_path,
-        &["show-ref", "--verify", "--hash", ref_name],
+        &["show-ref", "--verify", "--hash", "--quiet", ref_name],
         b"",
         timeout,
         "git show-ref",
     )
     .await?;
     if !output.status.success() {
-        return Ok(None);
+        // `--quiet` maps a proven-absent ref to exit 1; every other
+        // failure (128 on fatal errors, signal, I/O) is UNPROVEN —
+        // surfacing it as Err is what keeps an infra fault from
+        // impersonating "the ref does not exist" to the caller.
+        return match output.status.code() {
+            Some(1) => Ok(None),
+            _ => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!(
+                    "git show-ref --verify {ref_name} failed: {}",
+                    stderr.chars().take(256).collect::<String>()
+                )
+            }
+        };
     }
     let sha = String::from_utf8(output.stdout)
         .context("git show-ref output is not utf-8")?

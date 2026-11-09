@@ -14627,6 +14627,7 @@ mod tests {
         owner: &str,
         name: &str,
         gate: Arc<crate::git::tigris::BlockingGate>,
+        report_ok: bool,
     ) -> (
         AppState,
         std::path::PathBuf,
@@ -14634,7 +14635,23 @@ mod tests {
         tokio::task::JoinHandle<()>,
     ) {
         let log = tmp.join("git.log");
-        let git_bin = f2a_logging_git(tmp, &log);
+        // `report_ok` fakes a report-status `ok refs/heads/main` so the push
+        // proves a landing and `disposition.spawn_tail` admits the live tail;
+        // the plain logging shim leaves the push report-absent, which under
+        // the proven-refs gate spawns no tail at all.
+        let git_bin = if report_ok {
+            write_fake_git(
+                tmp,
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\n\
+                     case \"$1\" in receive-pack) cat >/dev/null 2>/dev/null; printf '0022\\001unpack ok\\nok refs/heads/main\\n0000'; exit 0 ;; esac\n\
+                     exec git \"$@\"\n",
+                    log.display()
+                ),
+            )
+        } else {
+            f2a_logging_git(tmp, &log)
+        };
         let repos_dir = tmp.join("repos");
         std::fs::create_dir_all(&repos_dir).unwrap();
         let (endpoint, puts, server) = p3_put_counting_store().await;
@@ -14708,7 +14725,8 @@ mod tests {
         // Shut: every compression from this store parks until the gate opens.
         let gate = Arc::new(crate::git::tigris::BlockingGate::shut());
         let (state, log, puts, server) =
-            p3_compression_gated_state(pool, tmp.path(), "z6p3comp", "c1", Arc::clone(&gate)).await;
+            p3_compression_gated_state(pool, tmp.path(), "z6p3comp", "c1", Arc::clone(&gate), true)
+                .await;
 
         let mut fut = Box::pin(p2_push(&state, "z6p3comp", "c1"));
         let mut ran = false;
@@ -14776,7 +14794,7 @@ mod tests {
         let gate = Arc::new(crate::git::tigris::BlockingGate::shut());
         gate.open();
         let (state, log, puts, server) =
-            p3_compression_gated_state(pool, tmp.path(), "z6p3ctrl", "c1", gate).await;
+            p3_compression_gated_state(pool, tmp.path(), "z6p3ctrl", "c1", gate, true).await;
 
         p2_push(&state, "z6p3ctrl", "c1")
             .await
@@ -14841,8 +14859,15 @@ mod tests {
     async fn receive_pack_cancelled_during_compression_leaves_no_servable_refs(pool: sqlx::PgPool) {
         let tmp = tempfile::TempDir::new().unwrap();
         let gate = Arc::new(crate::git::tigris::BlockingGate::shut());
-        let (state, log, puts, server) =
-            p3_compression_gated_state(pool, tmp.path(), "z6p3quar", "c1", Arc::clone(&gate)).await;
+        let (state, log, puts, server) = p3_compression_gated_state(
+            pool,
+            tmp.path(),
+            "z6p3quar",
+            "c1",
+            Arc::clone(&gate),
+            false,
+        )
+        .await;
         let rec = state.db.get_repo("z6p3quar", "c1").await.unwrap().unwrap();
         let repos_dir = tmp.path().join("repos");
         let live =
@@ -14917,8 +14942,15 @@ mod tests {
     ) {
         let tmp = tempfile::TempDir::new().unwrap();
         let gate = Arc::new(crate::git::tigris::BlockingGate::shut());
-        let (mut state, _log, _puts, server) =
-            p3_compression_gated_state(pool, tmp.path(), "z6p3disc", "c1", Arc::clone(&gate)).await;
+        let (mut state, _log, _puts, server) = p3_compression_gated_state(
+            pool,
+            tmp.path(),
+            "z6p3disc",
+            "c1",
+            Arc::clone(&gate),
+            false,
+        )
+        .await;
         // Its own directory: `write_fake_git` always writes `fakegit`, and the
         // state builder has already put the logging shim at that name.
         let gitdir = tmp.path().join("hanging-git");
@@ -15009,6 +15041,7 @@ exit 0
             "z6p3rwin",
             "c1",
             Arc::clone(&gate),
+            false,
         )
         .await;
         let gitdir = tmp.path().join("hanging-git");
@@ -15132,7 +15165,7 @@ exit 0
         let gate = Arc::new(crate::git::tigris::BlockingGate::shut());
         gate.open();
         let (state, _log, puts, server) =
-            p3_compression_gated_state(pool, tmp.path(), "z6p3serv", "c1", gate).await;
+            p3_compression_gated_state(pool, tmp.path(), "z6p3serv", "c1", gate, false).await;
         let rec = state.db.get_repo("z6p3serv", "c1").await.unwrap().unwrap();
         let repos_dir = tmp.path().join("repos");
         let marker = p3_quarantine_marker(&repos_dir, &rec.owner_did, "c1");

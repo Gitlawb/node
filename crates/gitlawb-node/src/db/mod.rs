@@ -14035,16 +14035,18 @@ mod ref_certificate_tests {
     }
 
     /// #26 Split PR 1 — upgrade-path test: a node at v26 must be able to
-    /// apply the v27..v34 split ledger when sibling splits land. The
+    /// apply the split ledger when sibling splits land. The
     /// collision guard in `run_pending_migrations` catches a name mismatch,
     /// but only if both migrations are registered. This test exercises the
-    /// v27 application through the real `run_migrations()` path so it stays
+    /// v38 application through the real `run_migrations()` path so it stays
     /// in sync with the `MIGRATIONS` entry rather than hand-copying SQL.
+    /// v38 owns the `pending_ref_transitions` CREATE since the trio moved
+    /// ahead of the outbox ALTERs.
     ///
-    /// MUTATION (RED): delete the v27 entry from `MIGRATIONS` and the
+    /// MUTATION (RED): delete the v38 entry from `MIGRATIONS` and the
     /// fresh-chain round-trip fails on the missing `pending_ref_transitions` table.
     #[sqlx::test]
-    async fn v27_pending_ref_transitions_outbox_applies_on_upgrade(pool: PgPool) {
+    async fn v38_pending_ref_transitions_outbox_applies_on_upgrade(pool: PgPool) {
         async fn outbox_tables_exist(pool: &PgPool) -> bool {
             let has_transitions = sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM information_schema.tables
@@ -14072,7 +14074,7 @@ mod ref_certificate_tests {
             "the fresh migration chain must create pending_ref_transitions and anchor_jobs"
         );
 
-        // Simulate a node at pre-v27: drop the tables and their migration record.
+        // Simulate a node at pre-v38: drop the tables and their migration record.
         sqlx::query("DROP TABLE IF EXISTS anchor_jobs")
             .execute(&pool)
             .await
@@ -14081,19 +14083,19 @@ mod ref_certificate_tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("DELETE FROM schema_migrations WHERE version = 27")
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 38")
             .execute(&pool)
             .await
             .unwrap();
         assert!(
             !outbox_tables_exist(&pool).await,
-            "precondition: v27 tables and migration record removed"
+            "precondition: v38 tables and migration record removed"
         );
 
         db.run_migrations().await.unwrap();
         assert!(
             outbox_tables_exist(&pool).await,
-            "v27 must create pending_ref_transitions and anchor_jobs on an upgrading node"
+            "v38 must create pending_ref_transitions and anchor_jobs on an upgrading node"
         );
     }
 

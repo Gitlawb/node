@@ -5363,7 +5363,7 @@ mod drain_tests {
         std::fs::write(
             &shim,
             format!(
-                "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in refs/gitlawb/requests/*) exit 1;; esac; done\nexec \"{}\" \"$@\"\n",
+                "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in refs/gitlawb/requests/*) exit 128;; esac; done\nexec \"{}\" \"$@\"\n",
                 real_git.display()
             ),
         )
