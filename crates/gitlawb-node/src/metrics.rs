@@ -20,6 +20,9 @@
 //!     `gitlawb_pack_size_bytes`
 //!   * a single `gitlawb_info{version, did}` gauge = 1, for joins/dashboards
 //!   * currently-connected peer count — `gitlawb_peers_connected`
+//!   * reconciliation sweep gaps found and filled —
+//!     `gitlawb_reconciliation_gaps_found_total` /
+//!     `gitlawb_reconciliation_gaps_filled_total`
 //!
 //! All metrics live in a single process-wide registry initialized by
 //! [`init`]. Increment helpers (`record_push`, `record_auth_failure`, ...)
@@ -58,6 +61,8 @@ static GOSSIP_INGEST: OnceLock<IntCounterVec> = OnceLock::new();
 static GOSSIP_REPLAY_GUARD_SATURATED: OnceLock<IntCounter> = OnceLock::new();
 static PACK_SIZE: OnceLock<Histogram> = OnceLock::new();
 static PEERS_CONNECTED: OnceLock<IntGauge> = OnceLock::new();
+static RECONCILIATION_GAPS_FOUND: OnceLock<IntCounter> = OnceLock::new();
+static RECONCILIATION_GAPS_FILLED: OnceLock<IntCounter> = OnceLock::new();
 /// 1 when the node started without its p2p identity because the key storage
 /// could not be used. The node keeps serving HTTP in that state and /health
 /// stays green, so without this the outage is visible only to whoever reads
@@ -241,6 +246,29 @@ fn init_inner(version: &str, node_did: &str) {
         .set(peers_connected)
         .expect("set PEERS_CONNECTED once");
 
+    let gaps_found = IntCounter::with_opts(Opts::new(
+        "gitlawb_reconciliation_gaps_found_total",
+        "Total reconciliation sweep gaps detected (objects that should be pinned but are not)",
+    ))
+    .expect("gitlawb_reconciliation_gaps_found_total definition");
+    registry
+        .register(Box::new(gaps_found.clone()))
+        .expect("register gitlawb_reconciliation_gaps_found_total");
+    RECONCILIATION_GAPS_FOUND
+        .set(gaps_found)
+        .expect("set RECONCILIATION_GAPS_FOUND once");
+
+    let gaps_filled = IntCounter::with_opts(Opts::new(
+        "gitlawb_reconciliation_gaps_filled_total",
+        "Total reconciliation sweep gaps successfully filled (objects pinned by the sweep)",
+    ))
+    .expect("gitlawb_reconciliation_gaps_filled_total definition");
+    registry
+        .register(Box::new(gaps_filled.clone()))
+        .expect("register gitlawb_reconciliation_gaps_filled_total");
+    RECONCILIATION_GAPS_FILLED
+        .set(gaps_filled)
+        .expect("set RECONCILIATION_GAPS_FILLED once");
     let p2p_key_load_failed = IntGauge::with_opts(Opts::new(
         "gitlawb_p2p_identity_key_load_failed",
         "1 if the node is running without p2p because its identity key could not be loaded",
@@ -397,6 +425,20 @@ pub fn set_peers_connected(count: i64) {
     }
 }
 
+/// Record reconciliation sweep gaps found (objects that should be pinned but are not).
+pub fn record_reconciliation_gaps_found(count: u64) {
+    if let Some(c) = RECONCILIATION_GAPS_FOUND.get() {
+        c.inc_by(count);
+    }
+}
+
+/// Record reconciliation sweep gaps filled (objects successfully pinned by the sweep).
+pub fn record_reconciliation_gaps_filled(count: u64) {
+    if let Some(c) = RECONCILIATION_GAPS_FILLED.get() {
+        c.inc_by(count);
+    }
+}
+
 /// Record whether the node is running without its p2p identity.
 pub fn set_p2p_key_load_failed(failed: bool) {
     if let Some(g) = P2P_KEY_LOAD_FAILED.get() {
@@ -441,6 +483,8 @@ mod tests {
             .expect("PUSHES set after init")
             .with_label_values(&["alice/repo"])
             .inc();
+        record_reconciliation_gaps_found(7);
+        record_reconciliation_gaps_filled(3);
 
         let body = encode().expect("encode should succeed after init");
         assert!(
@@ -454,6 +498,14 @@ mod tests {
         assert!(
             body.contains("gitlawb_pushes_total{repo=\"alice/repo\"} 1"),
             "expected the incremented counter to be visible in: {body}"
+        );
+        assert!(
+            body.contains("gitlawb_reconciliation_gaps_found_total 7"),
+            "expected the reconciliation gaps-found counter to be visible in: {body}"
+        );
+        assert!(
+            body.contains("gitlawb_reconciliation_gaps_filled_total 3"),
+            "expected the reconciliation gaps-filled counter to be visible in: {body}"
         );
     }
 
