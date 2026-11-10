@@ -735,17 +735,25 @@ mod tests {
 
     /// A body past the cap is refused rather than buffered, so a broken
     /// endpoint cannot make the node materialize an arbitrarily large document.
+    /// The body is a VALID JWKS (`jwks_body()`) padded with JSON whitespace past
+    /// the cap, so an unbounded read would still parse it; this test only passes
+    /// because the byte cap refuses it.
     #[tokio::test]
     async fn fetch_key_rejects_an_oversized_body() {
         let mut server = mockito::Server::new_async().await;
+        let mut oversized = jwks_body();
+        oversized.resize(KEY_MAX_BODY_BYTES + 1, b' ');
         let _m = server
             .mock("GET", "/v1/pubkey")
             .with_status(200)
             .with_header("Content-Type", "application/json")
-            .with_body(vec![b'x'; KEY_MAX_BODY_BYTES + 1])
+            .with_body(oversized)
             .create_async()
             .await;
 
-        assert!(fetch_key(&server.url()).await.is_none());
+        assert!(
+            fetch_key(&server.url()).await.is_none(),
+            "an oversized body must be refused even when it is a valid JWKS"
+        );
     }
 }
