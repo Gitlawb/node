@@ -238,49 +238,32 @@ pub async fn close_issue(
     headers: axum::http::HeaderMap,
     crate::rate_limit::PeerAddr(peer): crate::rate_limit::PeerAddr,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
-
-    // READ-GATE before any snapshot work or rate charging. The author fallback below
-    // needs the issue blob, which needs the repo tree, so authorship cannot be established
-    // without a download; but a caller who cannot even READ the repo must be
-    // stopped here, cheaply, before any Tigris transfer or extraction happens.
-    // Without this, any signed non-owner could issue parallel close requests for
-    // arbitrary issue ids and drive unbounded downloads and blocking extraction
-    // (a disposable-identity DoS), because the route has no other pre-authorization.
+    // READ-GATE before any snapshot work or rate charging, through the shared
+    // authorize_repo_read gate so quarantined repos are opaque here too. The
+    // author fallback below needs the issue blob, which needs the repo tree, so
+    // authorship cannot be established without a download; but a caller who
+    // cannot even READ the repo must be stopped here, cheaply, before any
+    // Tigris transfer or extraction happens. Without this, any signed non-owner
+    // could issue parallel close requests for arbitrary issue ids and drive
+    // unbounded downloads and blocking extraction (a disposable-identity DoS),
+    // because the route has no other pre-authorization.
     //
-    // Rate limiting runs AFTER this gate so a 429 cannot distinguish a hidden repo
-    // from a missing one (INV-12 read-denial status contract).
+    // Rate limiting runs AFTER this gate so a 429 cannot distinguish a hidden
+    // repo from a missing one (INV-12 read-denial status contract).
     //
     // mirror-rows-handled: a repo row synced from a peer is stored public and
-    // carries none of the owner's visibility rules, so for such a row this check
-    // can only return allow. That is deliberate rather than overlooked, and it is
-    // the same verdict every other read gate in this API reaches for one. Refusing
-    // instead would deny the repo's real owner and the issue's real author on any
-    // node whose only copy of the repo is a synced one, which is an ordinary state
-    // here, and it would not buy the protection it appears to, because a synced
-    // row's recorded owner comes from the peer that sent it. The expensive work
-    // this check guards is bounded ahead of it by the per-IP limiter and the read
-    // pool slot taken below, and the authoritative owner-or-author decision still
-    // runs below and again under the write lock.
-    {
-        // mirror-rows-handled: synced mirror rows carry no owner rules; read gate only.
-        let rules = state.db.list_visibility_rules(&record.id).await?;
-        let caller = auth.0.as_str();
-        if crate::visibility::visibility_check(
-            &rules,
-            record.is_public,
-            &record.owner_did,
-            Some(caller),
-            "/",
-        ) == crate::visibility::Decision::Deny
-        {
-            return Err(AppError::RepoNotFound(format!("{owner}/{repo}")));
-        }
-    }
+    // carries none of the owner's visibility rules, so for such a row this gate
+    // can only return allow. That is deliberate rather than overlooked, and it
+    // is the same verdict every other read gate in this API reaches for one.
+    // Refusing instead would deny the repo's real owner and the issue's real
+    // author on any node whose only copy of the repo is a synced one, which is
+    // an ordinary state here, and it would not buy the protection it appears
+    // to, because a synced row's recorded owner comes from the peer that sent
+    // it. The expensive work this check guards is bounded ahead of it by the
+    // per-IP limiter and the read pool slot taken below, and the authoritative
+    // owner-or-author decision still runs below and again under the write lock.
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, Some(auth.0.as_str()), "/").await?;
 
     // Per-IP flood brake, layered on the same shared limiter and trusted-proxy
     // policy as the push advertisement. The pre-lock snapshot downloads the
@@ -502,6 +485,15 @@ mod tests {
             .await
             .expect("get_repo")
             .expect("repo exists");
+        // upsert_mirror_repo seeds the row quarantined, and the read gate now
+        // hides quarantined rows as opaque 404 before the owner-or-author check
+        // this test names. Release it so the stranger is refused by the 403, not
+        // by the quarantine short-circuit.
+        state
+            .db
+            .set_repo_quarantine(&record.id, false)
+            .await
+            .expect("release seed quarantine");
 
         // An independent session holds the repo's write lock for the whole call.
         let key = crate::git::repo_store::advisory_lock_key_for_test(
@@ -703,6 +695,15 @@ mod tests {
             .await
             .expect("get_repo")
             .expect("seeded repo exists");
+        // upsert_mirror_repo seeds the admission flag as quarantined, but the
+        // gate now hides quarantined rows from every caller class. Release it
+        // so these tests exercise what they name: the owner-or-author check
+        // after the read gate, not the quarantine short-circuit.
+        state
+            .db
+            .set_repo_quarantine(&record.id, false)
+            .await
+            .expect("release seed quarantine");
         let _ = owner_did;
         let path = state
             .repo_store
@@ -726,6 +727,40 @@ mod tests {
         .expect("serialize seeded issue");
         crate::git::issues::create_issue(&path, issue_id, &json).expect("seed issue blob");
         path
+    }
+
+    /// The read gate blocks the owner (and any caller) before the
+    /// owner-or-author checks: even the owner gets the opaque 404 on a
+    /// quarantined repo, and the seeded row's quarantined flag is left set
+    /// deliberately. The released-mirror variants above exercise the
+    /// owner-or-author path.
+    #[sqlx::test]
+    async fn quarantined_repo_close_is_opaque_404(pool: PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let owner_did = "did:key:z6MkT1Owner";
+        state
+            .db
+            .upsert_mirror_repo("z6MkT1Owner", "tquar", "/unused", None, true)
+            .await
+            .expect("seed repo row");
+
+        let res = close_issue(
+            axum::extract::State(state.clone()),
+            axum::Extension(crate::auth::AuthenticatedDid(owner_did.to_string())),
+            axum::extract::Path((
+                "z6MkT1Owner".to_string(),
+                "tquar".to_string(),
+                "1".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            crate::rate_limit::PeerAddr(Some("203.0.113.70:5000".parse().unwrap())),
+        )
+        .await;
+        assert!(
+            matches!(res, Err(crate::error::AppError::RepoNotFound(_))),
+            "a quarantined repo must 404 close_issue for every caller: {:?}",
+            res.ok().map(|_| "unexpected success")
+        );
     }
 
     /// INV-21(c) positive twin 1: the OWNER can still close. The reorder moved the

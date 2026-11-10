@@ -199,11 +199,8 @@ pub async fn merge_pr(
     Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, name, number)): Path<(String, String, i64)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, Some(auth.0.as_str()), "/").await?;
 
     // Owner-only merge (N7). Merging writes the served tree, so this is the same
     // trust boundary as owner-only push; it subsumes branch protection (a
@@ -274,11 +271,8 @@ pub async fn close_pr(
     Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, name, number)): Path<(String, String, i64)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, Some(auth.0.as_str()), "/").await?;
 
     let pr = state
         .db

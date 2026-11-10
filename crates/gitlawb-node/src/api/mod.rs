@@ -177,13 +177,22 @@ mod authz_guard {
             "\nasync fn ",
             "\npub fn ",
             "\nfn ",
+            "#[cfg(test)]",
         ]
         .iter()
         .filter_map(|p| rest[1..].find(p).map(|i| i + 1))
         .min()
         .unwrap_or(rest.len());
-        rest[..end]
-            .lines()
+        // Strip block comments too: a marker surviving only inside /* */ would
+        // otherwise satisfy a row with the real gate deleted.
+        let mut body = rest[..end].to_string();
+        while let Some(open) = body.find("/*") {
+            match body[open..].find("*/").map(|i| open + i + 2) {
+                Some(close) => body.replace_range(open..close, ""),
+                None => break,
+            }
+        }
+        body.lines()
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n")
@@ -209,9 +218,14 @@ mod authz_guard {
 
         // (source, handler, expected gate marker)
         let rows: &[(&str, &str, &str)] = &[
-            // Bucket A — owner-gate (require_repo_owner -> 403)
+            // Bucket A — owner-gate (require_repo_owner -> 403), now behind
+            // the shared read gate first so a hidden repo 404s for every
+            // caller class before the owner check can answer 403.
+            (pulls, "merge_pr", "authorize_repo_read("),
             (pulls, "merge_pr", "require_repo_owner("),
+            (webhooks, "create_webhook", "authorize_repo_read("),
             (webhooks, "create_webhook", "require_repo_owner("),
+            (webhooks, "delete_webhook", "authorize_repo_read("),
             (webhooks, "delete_webhook", "require_repo_owner("),
             // Bucket A/B hybrid — list_webhooks is read-visibility THEN owner:
             // authorize_repo_read 404s a non-reader of a private repo, then
@@ -220,10 +234,15 @@ mod authz_guard {
             // (existence hiding) and require_repo_owner guards the owner half.
             (webhooks, "list_webhooks", "authorize_repo_read("),
             (webhooks, "list_webhooks", "require_repo_owner("),
+            (labels, "add_label", "authorize_repo_read("),
             (labels, "add_label", "require_repo_owner("),
+            (labels, "remove_label", "authorize_repo_read("),
             (labels, "remove_label", "require_repo_owner("),
-            // Bucket A' — owner OR author (did_matches against the author)
+            // Bucket A' — owner OR author (did_matches against the author),
+            // also behind the shared read gate first.
+            (pulls, "close_pr", "authorize_repo_read("),
             (pulls, "close_pr", "did_matches("),
+            (issues, "close_issue", "authorize_repo_read("),
             (issues, "close_issue", "did_matches("),
             // Bucket B — read-gate (authorize_repo_read)
             (pulls, "create_review", "authorize_repo_read("),
@@ -269,20 +288,65 @@ mod authz_guard {
             (bounties, "dispute_bounty", "did_matches("),
             (replicas, "register_replica", "did_matches("),
             (replicas, "unregister_replica", "replica_did = &auth.0"),
-            // PRE-GATED — already owner-gated, in-scope group; guard the gate itself
+            // PRE-GATED — owner-gated behind the shared read gate; guard both
+            (protect, "protect_branch", "authorize_repo_read("),
             (protect, "protect_branch", "did_matches("),
+            (protect, "unprotect_branch", "authorize_repo_read("),
             (protect, "unprotect_branch", "did_matches("),
+            (visibility, "set_visibility", "authorize_repo_read("),
             (visibility, "set_visibility", "require_owner("),
+            (visibility, "remove_visibility", "authorize_repo_read("),
             (visibility, "remove_visibility", "require_owner("),
+            (visibility, "list_visibility", "authorize_repo_read("),
             (visibility, "list_visibility", "require_owner("),
         ];
 
-        // The visibility rows prove require_owner is CALLED; this proves the helper
-        // itself does DID-safe matching, not a raw/trailing-segment compare.
+        // Rows above prove each visibility handler calls authorize_repo_read and
+        // require_owner; this proves the helper itself does DID-safe matching.
         assert!(
             fn_body(visibility, "require_owner").contains("did_matches("),
             "visibility::require_owner must use did_matches for DID-safe owner matching"
         );
+
+        // Order matters as much as presence: hoisting the owner/author check
+        // above the read gate would 403 a non-owner on a hidden repo, an
+        // existence oracle. Pin read-gate-then-owner on every handler that
+        // takes both; the owner marker differs per bucket (require_repo_owner
+        // for owner-only, require_owner for visibility, did_matches for the
+        // owner-or-author and protect paths).
+        for (src, func, owner_marker) in [
+            (visibility, "set_visibility", "require_owner("),
+            (visibility, "remove_visibility", "require_owner("),
+            (visibility, "list_visibility", "require_owner("),
+            (pulls, "merge_pr", "require_repo_owner("),
+            (webhooks, "list_webhooks", "require_repo_owner("),
+            (webhooks, "create_webhook", "require_repo_owner("),
+            (webhooks, "delete_webhook", "require_repo_owner("),
+            (labels, "add_label", "require_repo_owner("),
+            (labels, "remove_label", "require_repo_owner("),
+            (pulls, "close_pr", "did_matches("),
+            (issues, "close_issue", "did_matches("),
+            (protect, "protect_branch", "did_matches("),
+            (protect, "unprotect_branch", "did_matches("),
+        ] {
+            let body = fn_body(src, func);
+            let gate = body.find("authorize_repo_read(").expect("gate marker");
+            let owner = body.find(owner_marker).expect("owner marker");
+            assert!(
+                gate < owner,
+                "{func} must run authorize_repo_read before {owner_marker}"
+            );
+            // The owner-or-author and protect handlers also carry
+            // require_repo_owner: a hoist of that call above the read gate is
+            // the same 403-vs-404 oracle, so pin it too where it exists.
+            if func == "close_pr" || func == "close_issue" {
+                let owner_gate = body.find("require_repo_owner(").expect("owner marker");
+                assert!(
+                    gate < owner_gate,
+                    "{func} must run authorize_repo_read before require_repo_owner("
+                );
+            }
+        }
 
         // The CID read surface (#173) enforces its gate inside the shared
         // `gate_and_serve`, which BOTH the provenance path and the legacy scan call, so
