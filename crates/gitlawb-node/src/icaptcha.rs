@@ -136,7 +136,7 @@ const KEY_MAX_BODY_BYTES: usize = 8 * 1024;
 /// exactly like a network error or a timeout (fail safe, never a partial key).
 async fn read_key_body(mut resp: reqwest::Response) -> Option<Vec<u8>> {
     let mut buf = Vec::with_capacity(1024);
-    while buf.len() < KEY_MAX_BODY_BYTES {
+    loop {
         match resp.chunk().await {
             Ok(Some(chunk)) => {
                 let take = (KEY_MAX_BODY_BYTES - buf.len()).min(chunk.len());
@@ -149,7 +149,6 @@ async fn read_key_body(mut resp: reqwest::Response) -> Option<Vec<u8>> {
             Err(_) => return None,
         }
     }
-    None
 }
 
 async fn fetch_key(url: &str) -> Option<VerifyingKey> {
@@ -168,6 +167,12 @@ async fn fetch_key(url: &str) -> Option<VerifyingKey> {
         .build()
         .ok()?;
     let resp = client.get(&endpoint).send().await.ok()?;
+    // A non-2xx response body is not a key: with Policy::none() a 3xx is
+    // surfaced rather than followed, but its own body must not be parsed
+    // either, or the redirect would move the anchor after all.
+    if !resp.status().is_success() {
+        return None;
+    }
     let body = read_key_body(resp).await?;
     let jwks: Jwks = serde_json::from_slice(&body).ok()?;
     decode_key(&jwks.keys.first()?.x)
@@ -713,6 +718,7 @@ mod tests {
         let mut target = mockito::Server::new_async().await;
         let _t = target
             .mock("GET", "/v1/pubkey")
+            .expect(0)
             .with_status(200)
             .with_header("Content-Type", "application/json")
             .with_body(jwks_body())
@@ -720,10 +726,13 @@ mod tests {
             .await;
 
         let mut redirector = mockito::Server::new_async().await;
+        // Location points at the target's /v1/pubkey, so a client that DID
+        // follow the redirect would fetch the real key and return Some: the
+        // assertion below only holds while Policy::none() is in place.
         let _r = redirector
             .mock("GET", "/v1/pubkey")
             .with_status(302)
-            .with_header("Location", &target.url())
+            .with_header("Location", &format!("{}/v1/pubkey", target.url()))
             .create_async()
             .await;
 
@@ -755,5 +764,52 @@ mod tests {
             fetch_key(&server.url()).await.is_none(),
             "an oversized body must be refused even when it is a valid JWKS"
         );
+    }
+
+    /// A body of exactly the cap still parses: the contract refuses bodies that
+    /// EXCEED it, not bodies that reach it (the padded JWKS is exactly
+    /// KEY_MAX_BODY_BYTES bytes of otherwise-valid JSON).
+    #[tokio::test]
+    async fn fetch_key_accepts_a_body_at_the_cap() {
+        let mut server = mockito::Server::new_async().await;
+        let mut at_cap = jwks_body();
+        at_cap.resize(KEY_MAX_BODY_BYTES, b' ');
+        let _m = server
+            .mock("GET", "/v1/pubkey")
+            .with_status(200)
+            .with_header("Content-Type", "application/json")
+            .with_body(at_cap)
+            .create_async()
+            .await;
+
+        let key = fetch_key(&server.url()).await.expect("at-cap JWKS parses");
+        assert_eq!(key, decode_key(PUBKEY_X).unwrap());
+    }
+
+    /// A non-2xx response never supplies the anchor, even when its body is a
+    /// perfectly valid JWKS: the redirect pin only stops the hop, and the
+    /// status gate is what stops the 3xx's own body from being adopted.
+    #[tokio::test]
+    async fn fetch_key_rejects_a_non_success_status() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/v1/pubkey")
+            .with_status(500)
+            .with_header("Content-Type", "application/json")
+            .with_body(jwks_body())
+            .create_async()
+            .await;
+
+        assert!(
+            fetch_key(&server.url()).await.is_none(),
+            "a non-2xx body must not be adopted as the anchor even when it parses"
+        );
+    }
+
+    /// An unreachable endpoint is the same fail-safe None as every other fetch
+    /// error: the gate stays inert rather than the node failing to start.
+    #[tokio::test]
+    async fn fetch_key_returns_none_when_the_endpoint_is_unreachable() {
+        assert!(fetch_key("http://127.0.0.1:1").await.is_none());
     }
 }
