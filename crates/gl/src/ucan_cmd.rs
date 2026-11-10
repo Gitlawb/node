@@ -836,20 +836,65 @@ pub struct VerifyReport {
     /// Whether every link in the proof chain carries an expiry — the node's
     /// push-delegation requirement that `is_valid` does not cover.
     pub bounded_lifetime: bool,
-    /// Whether any capability is push-class, i.e. the token is judged for
-    /// push readiness rather than general UCAN validity.
+    /// Whether any leaf capability names a push-class action the way import
+    /// and the node admit it (`git/push`, `repo/admin`, or `*`, unconstrained).
     pub push_class: bool,
+    /// Whether a push-class token would pass the import and node push gates:
+    /// `is_valid`, a bounded chain, and `chain_grants_push_to` satisfied for
+    /// every concrete `gitlawb://repos/...` push capability on the leaf.
+    pub push_ready: bool,
 }
 
 impl VerifyReport {
     pub fn of(ucan: &Ucan) -> Self {
+        let signature = ucan.verify_signature().map_err(|e| e.to_string());
+        let expired = ucan.is_expired();
+        let chain = ucan
+            .verify_chain()
+            .map(|root| root.to_string())
+            .map_err(|e| e.to_string());
+        let bounded_lifetime = ucan.chain_lifetime_is_bounded();
+        // The same two predicates import and the node apply: a capability
+        // counts for push only when `is_push_action` admits it unconstrained,
+        // and it authorizes push only when every link grants the repository it
+        // names. A wildcard proof behind a concrete leaf verifies
+        // cryptographically yet fails this walk, which is exactly the
+        // false-green this field exists to surface.
+        let push_class =
+            ucan.payload.att.iter().any(|c| {
+                gitlawb_core::ucan::push::is_push_action(&c.can) && c.constraints.is_none()
+            });
+        let mut chain_grants = true;
+        if let Ok(root) = &chain {
+            for cap in &ucan.payload.att {
+                if !gitlawb_core::ucan::push::is_push_action(&cap.can) || cap.constraints.is_some()
+                {
+                    continue;
+                }
+                let granted = gitlawb_core::ucan::push::parse_repo_resource(&cap.with).is_some_and(
+                    |(owner, repo)| {
+                        gitlawb_core::ucan::push::did_key_eq(owner, root)
+                            && ucan.chain_grants_push_to(
+                                owner,
+                                gitlawb_core::ucan::push::canonical_repo_name(repo),
+                            )
+                    },
+                );
+                if !granted {
+                    chain_grants = false;
+                }
+            }
+        }
+        let push_ready = push_class
+            && signature.is_ok()
+            && !expired
+            && chain.is_ok()
+            && bounded_lifetime
+            && chain_grants;
         Self {
-            signature: ucan.verify_signature().map_err(|e| e.to_string()),
-            expired: ucan.is_expired(),
-            chain: ucan
-                .verify_chain()
-                .map(|root| root.to_string())
-                .map_err(|e| e.to_string()),
+            signature,
+            expired,
+            chain,
             issuer: ucan.payload.iss.to_string(),
             audience: ucan.payload.aud.to_string(),
             capabilities: ucan
@@ -859,27 +904,15 @@ impl VerifyReport {
                 .map(|c| (c.with.clone(), c.can.clone()))
                 .collect(),
             expires: ucan.payload.exp,
-            bounded_lifetime: ucan.chain_lifetime_is_bounded(),
-            push_class: ucan
-                .payload
-                .att
-                .iter()
-                .any(|c| c.can == gitlawb_core::ucan::caps::GIT_PUSH),
+            bounded_lifetime,
+            push_class,
+            push_ready,
         }
     }
 
     /// Signature good, not expired, and the proof chain walks to a root.
     pub fn is_valid(&self) -> bool {
         self.signature.is_ok() && !self.expired && self.chain.is_ok()
-    }
-
-    /// Whether a push-class token would pass the import/node push gates:
-    /// `is_valid` plus a bounded chain — the property `gl ucan import`
-    /// refuses on ("an unbounded link, and a node refuses an unbounded push
-    /// chain") and the node enforces on `git-receive-pack`. False for
-    /// non-push tokens, which are judged by `is_valid` alone.
-    pub fn push_ready(&self) -> bool {
-        self.push_class && self.is_valid() && self.bounded_lifetime
     }
 
     /// The MCP shape. `valid` is [`Self::is_valid`]; the rest is there so a
@@ -902,7 +935,7 @@ impl VerifyReport {
                 .collect::<Vec<_>>(),
             "expires": self.expires,
             "bounded_lifetime": self.bounded_lifetime,
-            "push_ready": self.push_ready(),
+            "push_ready": self.push_ready,
         })
     }
 
@@ -935,7 +968,7 @@ impl VerifyReport {
             "Bounded:   no — a node refuses an unbounded push chain\n"
         });
         if self.push_class {
-            out.push_str(if self.push_ready() {
+            out.push_str(if self.push_ready {
                 "Push-ready: yes\n"
             } else {
                 "Push-ready: no — import and the node would refuse this token for push\n"
@@ -1176,8 +1209,72 @@ mod verify_report_tests {
         assert!(!report.bounded_lifetime);
         assert!(report.push_class);
         assert!(
-            !report.push_ready(),
+            !report.push_ready,
             "import and the node refuse an unbounded push chain"
+        );
+    }
+
+    /// `repo/admin` and `*` are push actions the same way `git/push` is: a
+    /// bounded, owner-rooted token carrying either must read push-ready, not
+    /// silently classify as non-push.
+    #[test]
+    fn repo_admin_and_wildcard_action_tokens_are_push_ready() {
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+        for action in ["repo/admin", "*"] {
+            let ucan = Ucan::issue(
+                &owner,
+                agent.did(),
+                vec![Capability::new(
+                    format!("gitlawb://repos/{}/myrepo", owner.did()),
+                    action,
+                )],
+                Some(hour),
+            )
+            .expect("issue");
+            let report = VerifyReport::of(&ucan);
+            assert!(
+                report.push_ready,
+                "a bounded owner-rooted {action} token must be push-ready"
+            );
+        }
+    }
+
+    /// A leaf naming a concrete repository under a wildcard proof verifies
+    /// cryptographically (attenuation allows the narrowing), but every link
+    /// must grant the repository, and `*` grants none: the report must say
+    /// not push-ready even though `is_valid` is true.
+    #[test]
+    fn a_wildcard_proof_behind_a_concrete_leaf_is_not_push_ready() {
+        let owner = Keypair::generate();
+        let intermediary = Keypair::generate();
+        let agent = Keypair::generate();
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+        let proof = Ucan::issue(
+            &owner,
+            intermediary.did(),
+            vec![Capability::new("*", gitlawb_core::ucan::caps::GIT_PUSH)],
+            Some(hour),
+        )
+        .expect("issue wildcard proof");
+        let leaf = Ucan::delegate(
+            &intermediary,
+            agent.did(),
+            vec![Capability::new(
+                format!("gitlawb://repos/{}/myrepo", owner.did()),
+                gitlawb_core::ucan::caps::GIT_PUSH,
+            )],
+            Some(hour),
+            &proof,
+        )
+        .expect("delegate concrete leaf");
+        let report = VerifyReport::of(&leaf);
+        assert!(report.is_valid(), "the chain itself verifies");
+        assert!(report.push_class);
+        assert!(
+            !report.push_ready,
+            "a `*` proof grants no repository, so the node would refuse this"
         );
     }
 
