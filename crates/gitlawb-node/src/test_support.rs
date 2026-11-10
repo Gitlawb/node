@@ -18923,7 +18923,10 @@ mod tests {
                     "/api/v1/repos/{owner}/{repo}/withheld-paths",
                     axum::routing::get(crate::api::visibility::withheld_paths),
                 )
-                .layer(axum::middleware::from_fn(crate::auth::optional_signature))
+                .layer(axum::middleware::from_fn_with_state(
+                    crate::auth::SignatureBodyLimit(crate::server::SIGNED_BODY_LIMIT),
+                    crate::auth::optional_signature,
+                ))
                 .with_state(state.clone())
                 .oneshot(signed_request_as(
                     caller,
@@ -18986,6 +18989,59 @@ mod tests {
                 resp.status(),
                 StatusCode::NOT_FOUND,
                 "owner form {caller} remove_visibility must 404 while quarantined"
+            );
+        }
+
+        // A signed non-owner must get 404 too, never 403: this leg is what pins
+        // the quarantine-before-owner ordering. If require_owner were hoisted
+        // above authorize_repo_read the same caller would read Forbidden, an
+        // existence oracle on a hidden repo.
+        let stranger = "did:key:zSTRANGERQUARAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let vis = format!("/api/v1/repos/{short}/vis-quar/visibility");
+        for (method, path, body) in [
+            (Method::GET, withheld.as_str(), Body::empty()),
+            (Method::GET, vis.as_str(), Body::empty()),
+            (
+                Method::PUT,
+                vis.as_str(),
+                Body::from(r#"{"path_glob":"/extra/**","reader_dids":[]}"#),
+            ),
+            (
+                Method::DELETE,
+                vis.as_str(),
+                Body::from(r#"{"path_glob":"/secret/**"}"#),
+            ),
+        ] {
+            let handler: axum::routing::MethodRouter<crate::state::AppState> = match method.clone()
+            {
+                Method::GET => axum::routing::get(crate::api::visibility::list_visibility),
+                Method::PUT => axum::routing::put(crate::api::visibility::set_visibility),
+                _ => axum::routing::delete(crate::api::visibility::remove_visibility),
+            };
+            let router = if path == withheld.as_str() {
+                Router::new()
+                    .route(
+                        "/api/v1/repos/{owner}/{repo}/withheld-paths",
+                        axum::routing::get(crate::api::visibility::withheld_paths),
+                    )
+                    .layer(axum::middleware::from_fn_with_state(
+                        crate::auth::SignatureBodyLimit(crate::server::SIGNED_BODY_LIMIT),
+                        crate::auth::optional_signature,
+                    ))
+                    .with_state(state.clone())
+            } else {
+                Router::new()
+                    .route("/api/v1/repos/{owner}/{repo}/visibility", handler)
+                    .with_state(state.clone())
+            };
+            let resp = router
+                .oneshot(signed_request_as(stranger, method.clone(), path, body))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "non-owner {method} {path} must 404 (not 403) while quarantined"
             );
         }
 

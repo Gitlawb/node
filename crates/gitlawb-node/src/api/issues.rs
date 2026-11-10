@@ -238,49 +238,32 @@ pub async fn close_issue(
     headers: axum::http::HeaderMap,
     crate::rate_limit::PeerAddr(peer): crate::rate_limit::PeerAddr,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
-
-    // READ-GATE before any snapshot work or rate charging. The author fallback below
-    // needs the issue blob, which needs the repo tree, so authorship cannot be established
-    // without a download; but a caller who cannot even READ the repo must be
-    // stopped here, cheaply, before any Tigris transfer or extraction happens.
-    // Without this, any signed non-owner could issue parallel close requests for
-    // arbitrary issue ids and drive unbounded downloads and blocking extraction
-    // (a disposable-identity DoS), because the route has no other pre-authorization.
+    // READ-GATE before any snapshot work or rate charging, through the shared
+    // authorize_repo_read gate so quarantined repos are opaque here too. The
+    // author fallback below needs the issue blob, which needs the repo tree, so
+    // authorship cannot be established without a download; but a caller who
+    // cannot even READ the repo must be stopped here, cheaply, before any
+    // Tigris transfer or extraction happens. Without this, any signed non-owner
+    // could issue parallel close requests for arbitrary issue ids and drive
+    // unbounded downloads and blocking extraction (a disposable-identity DoS),
+    // because the route has no other pre-authorization.
     //
-    // Rate limiting runs AFTER this gate so a 429 cannot distinguish a hidden repo
-    // from a missing one (INV-12 read-denial status contract).
+    // Rate limiting runs AFTER this gate so a 429 cannot distinguish a hidden
+    // repo from a missing one (INV-12 read-denial status contract).
     //
     // mirror-rows-handled: a repo row synced from a peer is stored public and
-    // carries none of the owner's visibility rules, so for such a row this check
-    // can only return allow. That is deliberate rather than overlooked, and it is
-    // the same verdict every other read gate in this API reaches for one. Refusing
-    // instead would deny the repo's real owner and the issue's real author on any
-    // node whose only copy of the repo is a synced one, which is an ordinary state
-    // here, and it would not buy the protection it appears to, because a synced
-    // row's recorded owner comes from the peer that sent it. The expensive work
-    // this check guards is bounded ahead of it by the per-IP limiter and the read
-    // pool slot taken below, and the authoritative owner-or-author decision still
-    // runs below and again under the write lock.
-    {
-        // mirror-rows-handled: synced mirror rows carry no owner rules; read gate only.
-        let rules = state.db.list_visibility_rules(&record.id).await?;
-        let caller = auth.0.as_str();
-        if crate::visibility::visibility_check(
-            &rules,
-            record.is_public,
-            &record.owner_did,
-            Some(caller),
-            "/",
-        ) == crate::visibility::Decision::Deny
-        {
-            return Err(AppError::RepoNotFound(format!("{owner}/{repo}")));
-        }
-    }
+    // carries none of the owner's visibility rules, so for such a row this gate
+    // can only return allow. That is deliberate rather than overlooked, and it
+    // is the same verdict every other read gate in this API reaches for one.
+    // Refusing instead would deny the repo's real owner and the issue's real
+    // author on any node whose only copy of the repo is a synced one, which is
+    // an ordinary state here, and it would not buy the protection it appears
+    // to, because a synced row's recorded owner comes from the peer that sent
+    // it. The expensive work this check guards is bounded ahead of it by the
+    // per-IP limiter and the read pool slot taken below, and the authoritative
+    // owner-or-author decision still runs below and again under the write lock.
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, Some(auth.0.as_str()), "/").await?;
 
     // Per-IP flood brake, layered on the same shared limiter and trusted-proxy
     // policy as the push advertisement. The pre-lock snapshot downloads the

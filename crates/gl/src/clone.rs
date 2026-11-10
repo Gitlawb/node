@@ -267,7 +267,24 @@ async fn fetch_withheld(node: &str, owner: &str, name: &str) -> Result<(Vec<Stri
     };
     let resp = match resp {
         Ok(r) if r.status().is_success() => r,
-        Ok(r) if matches!(r.status().as_u16(), 404 | 501) => return Ok((Vec::new(), Vec::new())),
+        Ok(r) if matches!(r.status().as_u16(), 404 | 501) => {
+            // Two 404s share this status and must be told apart before the
+            // legacy empty-glob fallback is taken: a route miss on a node that
+            // predates withheld-paths has an empty body, while a current node
+            // returns the JSON AppError body for absent/denied/quarantined
+            // repos. The JSON body proves the route exists, so the repo is
+            // unavailable to this caller and cloning cannot proceed.
+            if r.status().as_u16() == 404 {
+                let status = r.status();
+                let body = r.text().await.unwrap_or_default();
+                if !body.trim().is_empty() {
+                    bail!(
+                        "repository {owner}/{name} is not available on this node ({status}): {body}"
+                    );
+                }
+            }
+            return Ok((Vec::new(), Vec::new()));
+        }
         Ok(r) => bail!("withheld-paths lookup failed: {}", r.status()),
         Err(err) => return Err(err).context("fetching withheld paths"),
     };
@@ -327,7 +344,12 @@ async fn recover_encrypted_blobs(
         .await
     {
         Ok(r) if r.status().is_success() => r,
-        _ => return Ok(vec![]),
+        // Discovery failure is not an empty inventory: a denied, quarantined,
+        // erroring, or unreachable node must surface so the caller can warn
+        // and still run the Arweave fallback rather than report a clean clone
+        // with authorized blobs silently missing.
+        Ok(r) => bail!("encrypted-blobs inventory unavailable: {}", r.status()),
+        Err(err) => return Err(err).context("fetching encrypted-blobs inventory"),
     };
     let body: EncryptedBlobsResponse = resp.json().await.context("parsing encrypted-blobs")?;
     if body.blobs.is_empty() {
