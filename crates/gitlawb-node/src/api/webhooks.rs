@@ -274,4 +274,44 @@ mod tests {
             .unwrap();
         assert_eq!(again, 0);
     }
+
+    /// A legacy plaintext secret that literally begins with the seal prefix is
+    /// not ciphertext: prefix-matching alone would skip it forever while
+    /// `reveal` fails to open it, wedging the hook. Classification is by
+    /// `open`, so the pass seals it and the literal secret survives.
+    #[sqlx::test]
+    async fn reencrypt_seals_a_prefixed_plaintext_secret(pool: PgPool) {
+        let state = test_state(pool).await;
+        let literal = format!(
+            "{}not-a-real-ciphertext",
+            crate::webhook_secret::SEAL_PREFIX
+        );
+        let hook = crate::db::Webhook {
+            id: Uuid::new_v4().to_string(),
+            repo_id: "owner/prefixed-repo".to_string(),
+            url: "https://hooks.example.com/prefixed".to_string(),
+            secret: Some(crate::webhook_secret::WebhookSecret::new(literal.clone())),
+            events: vec!["*".to_string()],
+            created_by_did: "did:key:zLEGACYOWNER".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            active: true,
+        };
+        state.db.create_webhook(&hook).await.unwrap();
+
+        let rewritten = state
+            .db
+            .reencrypt_legacy_webhook_secrets(state.webhook_secret_key.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(rewritten, 1, "the prefixed plaintext row is rewritten");
+
+        let stored = state.db.get_webhook(&hook.id).await.unwrap().unwrap();
+        let secret = stored.secret.unwrap();
+        assert!(secret.is_sealed());
+        assert_eq!(
+            crate::webhook_secret::reveal(state.webhook_secret_key.as_ref(), &secret).as_deref(),
+            Some(literal.as_str()),
+            "the literal plaintext, prefix included, is the recovered secret"
+        );
+    }
 }

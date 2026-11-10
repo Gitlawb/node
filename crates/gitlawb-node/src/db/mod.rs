@@ -3939,20 +3939,37 @@ impl Db {
     /// (rows written before at-rest encryption shipped). Runs once at startup; a
     /// schema migration cannot do this because the node-held key never reaches
     /// Postgres. Returns the number of rows rewritten.
+    ///
+    /// "Already sealed" means "opens under the node key", not "has the prefix":
+    /// a plaintext secret that literally begins with the `enc:v1:` prefix, or a
+    /// value sealed under another identity, fails `open` and is re-sealed raw,
+    /// which preserves whatever the stored value was rather than wedging it.
+    /// A prefixed value that does not open is also warned on, since it is more
+    /// likely corrupt ciphertext than a colliding plaintext.
     pub async fn reencrypt_legacy_webhook_secrets(&self, key: &[u8; 32]) -> Result<usize> {
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT id, secret FROM webhooks WHERE secret IS NOT NULL AND secret NOT LIKE $1",
-        )
-        .bind(format!("{}%", crate::webhook_secret::SEAL_PREFIX))
-        .fetch_all(&self.pool)
-        .await?;
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, secret FROM webhooks WHERE secret IS NOT NULL")
+                .fetch_all(&self.pool)
+                .await?;
 
         let mut rewritten = 0usize;
-        for (id, plaintext) in rows {
-            let sealed = crate::webhook_secret::seal(key, &plaintext);
-            sqlx::query("UPDATE webhooks SET secret = $2 WHERE id = $1")
+        for (id, stored) in rows {
+            if crate::webhook_secret::open(key, &stored).is_some() {
+                continue; // already sealed under this node's key
+            }
+            if stored.starts_with(crate::webhook_secret::SEAL_PREFIX) {
+                tracing::warn!(
+                    webhook_id = %id,
+                    "webhook secret has the sealed prefix but does not open under                      the node key; sealing the raw value"
+                );
+            }
+            let sealed = crate::webhook_secret::seal(key, &stored);
+            // Compare-and-set on the value read above: a concurrent secret
+            // update between SELECT and UPDATE must not be clobbered.
+            sqlx::query("UPDATE webhooks SET secret = $2 WHERE id = $1 AND secret = $3")
                 .bind(&id)
                 .bind(sealed)
+                .bind(&stored)
                 .execute(&self.pool)
                 .await?;
             rewritten += 1;

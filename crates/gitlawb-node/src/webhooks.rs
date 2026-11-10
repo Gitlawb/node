@@ -30,6 +30,31 @@ fn sign_payload(secret: &str, payload: &[u8]) -> String {
     format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
 }
 
+/// What the signing step decided for one hook. Keeping this a decision (not a
+/// bare `Option`) lets the delivery path tell "hook has no secret" (send
+/// unsigned) apart from "hook has a secret that could not be opened" (withhold:
+/// an unsigned POST would present a broken hook as working while the ledger
+/// marks the event delivered).
+enum SigningOutcome {
+    NoSecret,
+    Signed(String),
+    Withhold,
+}
+
+fn signing_decision(
+    secret_key: &[u8; 32],
+    secret: Option<&crate::webhook_secret::WebhookSecret>,
+    bytes: &[u8],
+) -> SigningOutcome {
+    match secret {
+        None => SigningOutcome::NoSecret,
+        Some(s) => match crate::webhook_secret::reveal(secret_key, s) {
+            Some(plain) => SigningOutcome::Signed(sign_payload(&plain, bytes)),
+            None => SigningOutcome::Withhold,
+        },
+    }
+}
+
 /// Fire webhooks for `event` on `repo_id`. Spawns background tasks — never blocks.
 pub fn fire_event(
     db: Arc<Db>,
@@ -257,11 +282,27 @@ async fn fire_event_async_occurrence(
 
             let delivery_for_mark = delivery_id.clone();
             // Open the secret only at signing time; at rest it stays sealed.
-            let signature = hook
-                .secret
-                .as_ref()
-                .and_then(|s| crate::webhook_secret::reveal(secret_key.as_ref(), s))
-                .map(|plain| sign_payload(&plain, &bytes));
+            let signature =
+                match signing_decision(secret_key.as_ref(), hook.secret.as_ref(), &bytes) {
+                    SigningOutcome::NoSecret => None,
+                    SigningOutcome::Signed(sig) => Some(sig),
+                    // A hook that HAS a secret must sign with it or not deliver at
+                    // all: `reveal` returning None means the stored value could
+                    // not be opened (a foreign or rotated key, a truncated
+                    // ciphertext), and sending unsigned would present a broken
+                    // hook as a working one while the ledger marks the event
+                    // delivered. The row stays pending, like a network error, so
+                    // a fixed key can still land it.
+                    SigningOutcome::Withhold => {
+                        crate::metrics::record_webhook_delivery("secret_unopenable");
+                        tracing::warn!(
+                            hook_id = %hook.id,
+                            delivery_id = %delivery_for_mark,
+                            "webhook secret could not be opened; delivery withheld"
+                        );
+                        return;
+                    }
+                };
 
             let mut req = client
                 .post(&hook.url)
@@ -304,5 +345,61 @@ async fn fire_event_async_occurrence(
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key() -> [u8; 32] {
+        [7u8; 32]
+    }
+
+    /// A hook with no secret delivers unsigned, as before.
+    #[test]
+    fn signing_decision_no_secret_is_unsigned() {
+        assert!(matches!(
+            signing_decision(&key(), None, b"{}"),
+            SigningOutcome::NoSecret
+        ));
+    }
+
+    /// A sealed secret that opens signs with the revealed plaintext.
+    #[test]
+    fn signing_decision_sealed_secret_signs() {
+        let k = key();
+        let sealed =
+            crate::webhook_secret::WebhookSecret::new(crate::webhook_secret::seal(&k, "topsecret"));
+        match signing_decision(&k, Some(&sealed), b"{}") {
+            SigningOutcome::Signed(sig) => {
+                assert_eq!(sig, sign_payload("topsecret", b"{}"))
+            }
+            _ => panic!("an openable sealed secret must produce a signature"),
+        }
+    }
+
+    /// A stored value that carries the sealed prefix but cannot be opened
+    /// (foreign key, truncated ciphertext) must withhold, never send unsigned.
+    #[test]
+    fn signing_decision_unopenable_secret_withholds() {
+        let garbage =
+            crate::webhook_secret::WebhookSecret::new("enc:v1:bm90LWNoaXBoZXJ0ZXh0".to_string());
+        assert!(matches!(
+            signing_decision(&key(), Some(&garbage), b"{}"),
+            SigningOutcome::Withhold
+        ));
+    }
+
+    /// A legacy plaintext value signs with itself unchanged.
+    #[test]
+    fn signing_decision_legacy_plaintext_signs() {
+        let legacy = crate::webhook_secret::WebhookSecret::new("plainsecret".to_string());
+        match signing_decision(&key(), Some(&legacy), b"{}") {
+            SigningOutcome::Signed(sig) => {
+                assert_eq!(sig, sign_payload("plainsecret", b"{}"))
+            }
+            _ => panic!("legacy plaintext must keep signing"),
+        }
     }
 }

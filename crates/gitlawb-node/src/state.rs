@@ -27,9 +27,11 @@ const SCAN_TOKEN_KEY_INFO: &[u8] = b"gitlawb/ipfs-scan-token/v1";
 const WEBHOOK_SECRET_KEY_SALT: &[u8] = b"gitlawb/hkdf-salt/webhook-secret";
 
 /// HKDF `info` for [`AppState::derive_webhook_secret_key`]: the domain
-/// separation AND the rotation handle in one string. Distinct from
-/// [`SCAN_TOKEN_KEY_INFO`], so the webhook-secret key is unrelated to the
-/// scan-token key that shares its input; bumping the trailing version rotates it.
+/// separation from the scan-token key that shares the same input keying
+/// material. Unlike the scan-token key, bumping the version is NOT a safe
+/// rotation: sealed secrets persist, `open` has no old-key fallback, and a new
+/// version renders every stored ciphertext permanently unopenable until a
+/// re-seal path exists.
 const WEBHOOK_SECRET_KEY_INFO: &[u8] = b"gitlawb/webhook-secret/v1";
 
 #[derive(Clone, Debug)]
@@ -447,22 +449,11 @@ impl AppState {
     ///     identity, the token format, or any caller, so rotation is a constant change
     ///     rather than a fork of this derivation.
     pub(crate) fn derive_scan_token_key(keypair: &Keypair) -> [u8; 32] {
-        use hmac::{Hmac, Mac};
-        type HmacSha256 = Hmac<sha2::Sha256>;
-
-        let seed = keypair.to_seed();
-        // HKDF-Extract: PRK = HMAC(salt, ikm).
-        let mut extract =
-            HmacSha256::new_from_slice(SCAN_TOKEN_KEY_SALT).expect("HMAC takes a key of any size");
-        extract.update(seed.as_slice());
-        let prk = extract.finalize().into_bytes();
-        // HKDF-Expand, one block: T(1) = HMAC(PRK, info || 0x01). One 32-byte output
-        // needs exactly one block of SHA-256, so there is no counter loop to get wrong.
-        let mut expand =
-            HmacSha256::new_from_slice(prk.as_slice()).expect("HMAC takes a key of any size");
-        expand.update(SCAN_TOKEN_KEY_INFO);
-        expand.update(&[0x01]);
-        expand.finalize().into_bytes().into()
+        Self::hkdf_sha256(
+            SCAN_TOKEN_KEY_SALT,
+            SCAN_TOKEN_KEY_INFO,
+            keypair.to_seed().as_slice(),
+        )
     }
 
     /// Derive the at-rest webhook-secret sealing key from the node identity.
@@ -475,19 +466,28 @@ impl AppState {
     /// boot-random key) is the right trade: the secret's confidentiality still
     /// rests on the node's private seed, and rotation is a version bump.
     pub(crate) fn derive_webhook_secret_key(keypair: &Keypair) -> [u8; 32] {
+        Self::hkdf_sha256(
+            WEBHOOK_SECRET_KEY_SALT,
+            WEBHOOK_SECRET_KEY_INFO,
+            keypair.to_seed().as_slice(),
+        )
+    }
+
+    /// HKDF-Extract-then-Expand (RFC 5869) over the node seed: PRK =
+    /// HMAC(salt, ikm), then one expand block T(1) = HMAC(PRK, info || 0x01).
+    /// One 32-byte output needs exactly one block of SHA-256, so there is no
+    /// counter loop to get wrong. Salt and info are the caller's domain
+    /// separation; shared by every identity-derived key in this module.
+    fn hkdf_sha256(salt: &[u8], info: &[u8], ikm: &[u8]) -> [u8; 32] {
         use hmac::{Hmac, Mac};
         type HmacSha256 = Hmac<sha2::Sha256>;
 
-        let seed = keypair.to_seed();
-        // HKDF-Extract: PRK = HMAC(salt, ikm).
-        let mut extract = HmacSha256::new_from_slice(WEBHOOK_SECRET_KEY_SALT)
-            .expect("HMAC takes a key of any size");
-        extract.update(seed.as_slice());
+        let mut extract = HmacSha256::new_from_slice(salt).expect("HMAC takes a key of any size");
+        extract.update(ikm);
         let prk = extract.finalize().into_bytes();
-        // HKDF-Expand, one block: T(1) = HMAC(PRK, info || 0x01).
         let mut expand =
             HmacSha256::new_from_slice(prk.as_slice()).expect("HMAC takes a key of any size");
-        expand.update(WEBHOOK_SECRET_KEY_INFO);
+        expand.update(info);
         expand.update(&[0x01]);
         expand.finalize().into_bytes().into()
     }

@@ -169,6 +169,13 @@ mod tests {
     }
 
     #[test]
+    fn reveal_opens_a_sealed_value() {
+        let k = new_key();
+        let sealed = WebhookSecret::new(seal(&k, "s3cr3t-value"));
+        assert_eq!(reveal(&k, &sealed).as_deref(), Some("s3cr3t-value"));
+    }
+
+    #[test]
     fn legacy_plaintext_is_revealed_unchanged() {
         let k = new_key();
         let legacy = WebhookSecret::new("plaintext-secret".into());
