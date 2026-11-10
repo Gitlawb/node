@@ -351,9 +351,10 @@ async fn fire_event_async_occurrence(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::Rng;
 
     fn key() -> [u8; 32] {
-        [7u8; 32]
+        chacha20poly1305::aead::OsRng.gen()
     }
 
     /// A hook with no secret delivers unsigned, as before.

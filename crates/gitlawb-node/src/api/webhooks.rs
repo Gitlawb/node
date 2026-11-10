@@ -148,6 +148,7 @@ mod tests {
     use crate::db::RepoRecord;
     use crate::error::AppError;
     use crate::test_support::test_state;
+    use rand::Rng;
 
     // create_webhook gates req.url through is_public_http_url. Pin the exact
     // SSRF targets from issue #81 so the webhook path can never regress to the
@@ -312,6 +313,50 @@ mod tests {
             crate::webhook_secret::reveal(state.webhook_secret_key.as_ref(), &secret).as_deref(),
             Some(literal.as_str()),
             "the literal plaintext, prefix included, is the recovered secret"
+        );
+    }
+
+    /// A well-formed sealed payload that does not open under this node's key
+    /// (foreign or rotated ciphertext) must survive the re-encrypt pass
+    /// untouched: re-wrapping it would make `reveal` return the outer blob as
+    /// a signing secret and flip a broken hook from withheld into garbage
+    /// signatures.
+    #[sqlx::test]
+    async fn reencrypt_leaves_foreign_ciphertext_untouched(pool: PgPool) {
+        let state = test_state(pool).await;
+        let foreign_key: [u8; 32] = chacha20poly1305::aead::OsRng.gen();
+        let foreign_ciphertext = crate::webhook_secret::seal(&foreign_key, "owner-real-secret");
+        let hook = crate::db::Webhook {
+            id: Uuid::new_v4().to_string(),
+            repo_id: "owner/foreign-repo".to_string(),
+            url: "https://hooks.example.com/foreign".to_string(),
+            secret: Some(crate::webhook_secret::WebhookSecret::new(
+                foreign_ciphertext.clone(),
+            )),
+            events: vec!["*".to_string()],
+            created_by_did: "did:key:zLEGACYOWNER".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            active: true,
+        };
+        state.db.create_webhook(&hook).await.unwrap();
+
+        let rewritten = state
+            .db
+            .reencrypt_legacy_webhook_secrets(state.webhook_secret_key.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(rewritten, 0, "foreign ciphertext is left unchanged");
+
+        let stored = state.db.get_webhook(&hook.id).await.unwrap().unwrap();
+        let secret = stored.secret.unwrap();
+        assert_eq!(
+            secret.as_str(),
+            foreign_ciphertext,
+            "the stored value is still the unopenable ciphertext, not a re-wrap"
+        );
+        assert!(
+            crate::webhook_secret::reveal(state.webhook_secret_key.as_ref(), &secret).is_none(),
+            "delivery still withholds: reveal cannot open the foreign blob"
         );
     }
 }

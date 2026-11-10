@@ -464,7 +464,10 @@ impl AppState {
     /// readable) yet domain-separated from the signing key and the scan-token
     /// key. The doc on [`SCAN_TOKEN_KEY_INFO`] argues why derivation (not a
     /// boot-random key) is the right trade: the secret's confidentiality still
-    /// rests on the node's private seed, and rotation is a version bump.
+    /// rests on the node's private seed. Rotation is NOT a version bump here,
+    /// unlike for the scan-token key: [`WEBHOOK_SECRET_KEY_INFO`] explains that
+    /// bumping renders every stored ciphertext unopenable until a re-seal path
+    /// exists.
     pub(crate) fn derive_webhook_secret_key(keypair: &Keypair) -> [u8; 32] {
         Self::hkdf_sha256(
             WEBHOOK_SECRET_KEY_SALT,

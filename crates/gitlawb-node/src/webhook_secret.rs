@@ -105,6 +105,20 @@ pub fn open(key: &[u8; 32], stored: &str) -> Option<String> {
     String::from_utf8(plaintext).ok()
 }
 
+/// Whether a stored value has the structural shape of a sealed payload:
+/// [`SEAL_PREFIX`] plus a base64url blob long enough to hold a nonce and
+/// ciphertext. This is a shape check, not an authentication check: a
+/// well-formed blob sealed under a different key satisfies it while [`open`]
+/// still fails. The re-encryption pass uses the distinction to leave
+/// well-formed-but-foreign ciphertext alone instead of re-wrapping it as
+/// plaintext, which would let `reveal` return the outer blob as a signing key.
+pub fn has_seal_shape(stored: &str) -> bool {
+    stored
+        .strip_prefix(SEAL_PREFIX)
+        .and_then(|rest| B64URL.decode(rest).ok())
+        .is_some_and(|raw| raw.len() > NONCE_LEN)
+}
+
 /// Resolve a stored secret to its plaintext for signing. Sealed values are opened
 /// with the node key; legacy plaintext is returned unchanged so a hook created
 /// before this fix keeps signing until the startup re-encryption pass runs.
