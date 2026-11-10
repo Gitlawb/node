@@ -33,11 +33,8 @@ pub async fn create_webhook(
     Path((owner, name)): Path<(String, String)>,
     Json(req): Json<CreateWebhookRequest>,
 ) -> Result<(StatusCode, Json<Webhook>)> {
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, Some(auth.0.as_str()), "/").await?;
     crate::api::require_repo_owner(&record, &auth.0)?;
 
     // Gate the target through the same hardened public-host validator the peer
@@ -118,11 +115,8 @@ pub async fn delete_webhook(
     Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, name, id)): Path<(String, String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, Some(auth.0.as_str()), "/").await?;
     crate::api::require_repo_owner(&record, &auth.0)?;
 
     // Verify the webhook belongs to this repo

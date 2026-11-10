@@ -578,7 +578,18 @@ async fn replicate_encrypted_blobs(
     let url = format!("{origin_url}/api/v1/repos/{owner}/{repo}/encrypted-blobs/replicate");
     let resp = match client.get(&url).send().await {
         Ok(r) if r.status().is_success() => r,
-        _ => return,
+        // A peer that predates the replicate route answers 404: expected and
+        // quiet. Anything else is the route existing and refusing or failing,
+        // which should be observable rather than read as route-absent.
+        Ok(r) if r.status().as_u16() == 404 => return,
+        Ok(r) => {
+            tracing::warn!(repo = %repo, status = %r.status(), "encrypted-blobs replicate refused; skipping");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(repo = %repo, error = %e, "encrypted-blobs replicate request failed; skipping");
+            return;
+        }
     };
     let parsed: ReplicateResponse = match resp.json().await {
         Ok(p) => p,

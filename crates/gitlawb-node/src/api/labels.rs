@@ -44,11 +44,8 @@ pub async fn add_label(
 ) -> Result<(StatusCode, Json<serde_json::Value>)> {
     let label = canonicalize_label(&req.label)?;
 
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, Some(auth.0.as_str()), "/").await?;
     crate::api::require_repo_owner(&record, &auth.0)?;
 
     let added = state.db.add_label(&record.id, &label).await?;
@@ -71,11 +68,8 @@ pub async fn remove_label(
 ) -> Result<Json<serde_json::Value>> {
     let label = canonicalize_label(&label)?;
 
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, Some(auth.0.as_str()), "/").await?;
     crate::api::require_repo_owner(&record, &auth.0)?;
 
     let removed = state.db.remove_label(&record.id, &label).await?;
