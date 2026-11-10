@@ -1,4 +1,4 @@
-# gitlawb node on AWS (Terraform)
+# Twigpine node on AWS (Terraform)
 
 Single EC2 instance running the published node image + Postgres via Docker
 compose, with a persistent encrypted EBS volume, Elastic IP, SSM access, and
@@ -7,7 +7,7 @@ daily snapshots.
 ```text
 Elastic IP ──► EC2 t4g.small (Amazon Linux 2023, arm64)
   7545/tcp       docker compose:
-  7546/udp        ├─ node      (ghcr.io/gitlawb/node, pulled — not built)
+  7546/udp        ├─ node      (ghcr.io/twigpine/node, pulled — not built)
                   └─ postgres:16-alpine
                  EBS gp3 volume mounted at /mnt/data
                   ├─ node/   → container /data (repos + identity key)

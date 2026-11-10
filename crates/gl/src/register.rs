@@ -1,4 +1,4 @@
-//! `gl register` — register this agent identity with a gitlawb node.
+//! `gl register` — register this agent identity with a Twigpine node.
 //!
 //! Sends a signed POST /api/register request and saves the returned bootstrap
 //! UCAN token as `ucan.json` beside the identity key, where the other commands
@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result};
 use clap::Args;
-use serde_json::{json, Value};
+use serde_json::json;
 use std::path::PathBuf;
 
 use crate::http::NodeClient;
@@ -15,7 +15,11 @@ use crate::identity::load_keypair_from_dir;
 #[derive(Args)]
 pub struct RegisterArgs {
     /// Node URL to register with
-    #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+    #[arg(
+        long,
+        default_value = "https://node.twigpine.com",
+        env = "GITLAWB_NODE"
+    )]
     pub node: String,
 
     /// Capabilities to advertise (comma-separated)
@@ -56,16 +60,7 @@ pub async fn run(args: RegisterArgs) -> Result<()> {
         .await
         .context("failed to connect to node")?;
 
-    let status = resp.status();
-    let payload: Value = resp.json().await.context("invalid JSON response")?;
-
-    if !status.is_success() {
-        let msg = payload
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown error");
-        anyhow::bail!("registration failed ({status}): {msg}");
-    }
+    let payload = crate::http::read_json(resp, "registration").await?;
 
     // Save bootstrap UCAN
     let ucan = payload.get("ucan").and_then(|v| v.as_str()).unwrap_or("");
@@ -80,7 +75,10 @@ pub async fn run(args: RegisterArgs) -> Result<()> {
             "did": did.to_string(),
             "saved_at": chrono::Utc::now().to_rfc3339(),
         });
-        std::fs::write(&path, serde_json::to_string_pretty(&record)?)?;
+        crate::secret_file::write(
+            &path,
+            serde_json::to_string_pretty(&record)?.as_bytes(),
+        )?;
         tracing::debug!("saved UCAN to {}", path.display());
         Some(path)
     };
@@ -130,7 +128,7 @@ pub async fn run(args: RegisterArgs) -> Result<()> {
 /// directory and report an unregistered identity.
 fn ucan_path(dir: Option<&std::path::Path>) -> Result<PathBuf> {
     let base = crate::identity::gitlawb_dir(dir.map(std::path::Path::to_path_buf))?;
-    std::fs::create_dir_all(&base)
+    crate::secret_file::create_dir(&base)
         .with_context(|| format!("failed to create {}", base.display()))?;
     Ok(base.join("ucan.json"))
 }
@@ -231,6 +229,7 @@ mod tests {
             .with_status(401)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"invalid signature"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -247,6 +246,8 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("invalid signature"));
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]

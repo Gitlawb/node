@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use crate::http::NodeClient;
 use crate::identity::load_keypair_from_dir;
 
-const PUBLIC_NODE: &str = "https://node.gitlawb.com";
+const PUBLIC_NODE: &str = "https://node.twigpine.com";
 
 #[derive(Args)]
 pub struct QuickstartArgs {
@@ -110,19 +110,22 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
                 // The messaging below derives from what was actually persisted, not
                 // from the 2xx: a success response carrying no `ucan` skips the write,
                 // and saying "UCAN saved" anyway sends the operator looking for a file
-                // that was never created — then resurfaces later as a push rejection
+                // that was never created - then resurfaces later as a push rejection
                 // with nothing pointing back here.
                 let saved = if ucan.is_empty() {
                     false
                 } else {
-                    std::fs::create_dir_all(&dir)?;
+                    crate::secret_file::create_dir(&dir)?;
                     let record = json!({
                         "ucan": ucan,
                         "node": args.node,
                         "did": did,
                         "saved_at": chrono::Utc::now().to_rfc3339(),
                     });
-                    std::fs::write(&ucan_path, serde_json::to_string_pretty(&record)?)?;
+                    crate::secret_file::write(
+                        &ucan_path,
+                        serde_json::to_string_pretty(&record)?.as_bytes(),
+                    )?;
                     true
                 };
                 let trust = payload["trust_score"].as_f64().unwrap_or(0.0);
@@ -131,11 +134,10 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
                 if saved {
                     println!("     UCAN saved to {}", ucan_path.display());
                 } else {
-                    println!("     The node returned no bootstrap UCAN, so registration-gated");
-                    println!(
-                        "     workflows are unavailable. Retry with: gl register --node {}",
-                        args.node
-                    );
+                    // A 2xx without a usable ucan is not a registration; the
+                    // response may not even be JSON. Saying success here would
+                    // also leave a stale ucan.json from another node in place.
+                    println!("  \u{00d7}  Registration returned no UCAN (unexpected response body)");
                 }
                 println!();
             }
@@ -251,24 +253,16 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 fn generate_identity(
-    dir: &PathBuf,
+    dir: &std::path::Path,
     path: &std::path::Path,
 ) -> Result<gitlawb_core::identity::Keypair> {
-    std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    crate::secret_file::create_dir(dir)
+        .with_context(|| format!("failed to create {}", dir.display()))?;
 
     let keypair = gitlawb_core::identity::Keypair::generate();
     let pem = keypair.to_pem()?;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(path, pem.as_bytes())?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, pem.as_bytes())?;
-    }
+    crate::secret_file::write(&path, pem.as_bytes())?;
 
     let did = keypair.did();
     println!("  ✓  Generated new identity");

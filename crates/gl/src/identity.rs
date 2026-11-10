@@ -134,6 +134,27 @@ pub fn load_keypair_from_dir(dir: Option<&std::path::Path>) -> Result<Keypair> {
     Keypair::from_pem(&pem).context("failed to load keypair from PEM")
 }
 
+/// Load keypair from an optional directory override, distinguishing missing default
+/// identity (clean anonymous) from an explicit directory error or corrupt PEM.
+pub fn load_optional_keypair(dir: Option<&std::path::Path>) -> Result<Option<Keypair>> {
+    if let Some(d) = dir {
+        return load_keypair_from_dir(Some(d)).map(Some);
+    }
+    let base = match dirs::home_dir() {
+        Some(h) => h.join(".gitlawb"),
+        None => return Ok(None),
+    };
+    let path = key_path_for(Some(&base))?;
+    match fs::read_to_string(&path) {
+        Ok(pem) => Keypair::from_pem(&pem)
+            .context("failed to load keypair from PEM")
+            .map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::Error::from(e)
+            .context(format!("failed to read identity from {}", path.display()))),
+    }
+}
+
 async fn cmd_new(dir: Option<PathBuf>, force: bool) -> Result<()> {
     cmd_new_with_reader(dir, force, &mut std::io::stdin().lock()).await
 }
@@ -169,30 +190,20 @@ async fn cmd_new_with_reader(
         }
     }
 
-    fs::create_dir_all(&dir)
+    crate::secret_file::create_dir(&dir)
         .with_context(|| format!("failed to create directory {}", dir.display()))?;
 
     let keypair = Keypair::generate();
     let pem = keypair.to_pem()?;
 
-    // Write with restricted permissions
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::write(&path, pem.as_bytes())?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-    }
-    #[cfg(not(unix))]
-    {
-        fs::write(&path, pem.as_bytes())?;
-    }
+    crate::secret_file::write(&path, pem.as_bytes())?;
 
     let did = keypair.did();
     println!("✓ Generated new identity");
     println!("  DID:  {did}");
     println!("  Key:  {}", path.display());
     println!();
-    println!("  Your DID is your identity on the gitlawb network.");
+    println!("  Your DID is your identity on the Twigpine network.");
     println!("  Keep your key file safe — it cannot be recovered if lost.");
 
     Ok(())
@@ -239,16 +250,7 @@ async fn cmd_backup(out: Option<PathBuf>, dir: Option<PathBuf>) -> Result<()> {
             .join("identity.pem.bak")
     });
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::write(&dest, pem.as_bytes())?;
-        fs::set_permissions(&dest, fs::Permissions::from_mode(0o600))?;
-    }
-    #[cfg(not(unix))]
-    {
-        fs::write(&dest, pem.as_bytes())?;
-    }
+    crate::secret_file::write(&dest, pem.as_bytes())?;
 
     println!("✓ Identity backed up");
     println!("  DID:  {}", keypair.did());
@@ -302,19 +304,10 @@ async fn cmd_restore_with_reader(
         }
     }
 
-    fs::create_dir_all(&base)
+    crate::secret_file::create_dir(&base)
         .with_context(|| format!("failed to create directory {}", base.display()))?;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::write(&dest, pem.as_bytes())?;
-        fs::set_permissions(&dest, fs::Permissions::from_mode(0o600))?;
-    }
-    #[cfg(not(unix))]
-    {
-        fs::write(&dest, pem.as_bytes())?;
-    }
+    crate::secret_file::write(&dest, pem.as_bytes())?;
 
     println!("✓ Identity restored");
     println!("  DID:  {}", keypair.did());

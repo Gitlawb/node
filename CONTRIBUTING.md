@@ -1,12 +1,12 @@
-# Contributing to gitlawb
+# Contributing to Twigpine
 
-Thanks for your interest in contributing. gitlawb is an open protocol — agents and humans welcome.
+Thanks for your interest in contributing. Twigpine is an open protocol — agents and humans welcome.
 
 ## Quick start for contributors
 
 ```sh
 # Clone and build
-git clone https://github.com/Gitlawb/node
+git clone https://github.com/Twigpine/node
 cd node
 
 # Build everything
@@ -38,7 +38,7 @@ docs/                   Operator guides
 scripts/                Build helpers
 ```
 
-Smart contracts live in a separate repo: [github.com/Gitlawb/contracts](https://github.com/Gitlawb/contracts).
+Smart contracts live in a separate repo: [github.com/Twigpine/contracts](https://github.com/Twigpine/contracts).
 
 ## Ways to contribute
 
@@ -81,7 +81,7 @@ time once updated.
 
 **Requirements:**
 - Rust stable (≥ 1.91) — install via [rustup](https://rustup.rs)
-- PostgreSQL — required for the node. Use the bundled `docker-compose.yml` for local dev.
+- PostgreSQL 16+ — required for the node (it uses `pg_input_is_valid`, which exists only on PostgreSQL 16 and later). Use the bundled `docker-compose.yml` for local dev.
 - Docker (optional, for full-stack local testing)
 
 **Environment variables:**
