@@ -2305,6 +2305,25 @@ pub async fn git_receive_pack(
         return Err(AppError::RepoNotFound(format!("{owner}/{name}")));
     }
 
+    // The reader gate applies to the write path too, and the POST cannot lean
+    // on info/refs having checked it: a caller can skip the advertisement and
+    // hit this route directly. Without the check here a delegate (or any signed
+    // caller with a valid signature) could write to a private repo it cannot
+    // read, which is precisely the "delegates must also be readers" rule the
+    // advertisement already enforces.
+    let rules = state.db.list_visibility_rules(&record.id).await?;
+    if visibility_check(
+        &rules,
+        record.is_public,
+        &record.owner_did,
+        Some(auth.0.as_str()),
+        "/",
+    ) == Decision::Deny
+    {
+        tracing::debug!(repo = %name, caller = %auth.0, "receive-pack denied by visibility");
+        return Err(AppError::RepoNotFound(format!("{owner}/{name}")));
+    }
+
     // Parse ref updates from pkt-line body before handing to git. The count
     // cap and duplicate-refusal live inside `parse_ref_updates`, so both fire
     // before any per-request materialization, gate, or durable write below.
@@ -9697,6 +9716,7 @@ mod tests {
             State(state.clone()),
             Path((owner.to_string(), name.to_string())),
             Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            None,
             crate::rate_limit::PeerAddr(Some(peer)),
             axum::http::HeaderMap::new(),
             ref_update_body("1111111111111111111111111111111111111111"),
@@ -9897,6 +9917,7 @@ mod tests {
                     State(state.clone()),
                     Path((owner.to_string(), name.to_string())),
                     Extension(crate::auth::AuthenticatedDid("did:key:z6disc".to_string())),
+                    None,
                     crate::rate_limit::PeerAddr(Some(
                         "203.0.113.81:5000".parse::<SocketAddr>().unwrap(),
                     )),
@@ -10055,6 +10076,7 @@ mod tests {
                     State(state.clone()),
                     Path((owner.to_string(), name.to_string())),
                     Extension(crate::auth::AuthenticatedDid("did:key:z6succ".to_string())),
+                    None,
                     crate::rate_limit::PeerAddr(Some(
                         "203.0.113.83:5000".parse::<SocketAddr>().unwrap(),
                     )),
@@ -10149,6 +10171,7 @@ mod tests {
             State(state.clone()),
             Path((owner.to_string(), name.to_string())),
             Extension(crate::auth::AuthenticatedDid(pusher.to_string())),
+            None,
             crate::rate_limit::PeerAddr(Some("203.0.113.84:5000".parse::<SocketAddr>().unwrap())),
             axum::http::HeaderMap::new(),
             ref_update_body("5555555555555555555555555555555555555555"),
@@ -10929,6 +10952,7 @@ mod tests {
             State(state.clone()),
             Path((owner.to_string(), name.to_string())),
             Extension(crate::auth::AuthenticatedDid(pusher.to_string())),
+            None,
             crate::rate_limit::PeerAddr(Some(peer)),
             axum::http::HeaderMap::new(),
             ref_update_body_many(MAX_REF_UPDATES + 1),
@@ -10998,6 +11022,7 @@ mod tests {
             State(state.clone()),
             Path((owner.to_string(), name.to_string())),
             Extension(crate::auth::AuthenticatedDid(pusher.to_string())),
+            None,
             crate::rate_limit::PeerAddr(Some(peer)),
             axum::http::HeaderMap::new(),
             ref_update_body_many(MAX_REF_UPDATES),
@@ -11078,6 +11103,7 @@ mod tests {
             State(state.clone()),
             Path((owner.to_string(), name.to_string())),
             Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            None,
             crate::rate_limit::PeerAddr(Some(peer)),
             axum::http::HeaderMap::new(),
             ref_update_body_cmds(&[
@@ -11153,6 +11179,7 @@ mod tests {
             Extension(crate::auth::AuthenticatedDid(
                 "did:key:z6noreport".to_string(),
             )),
+            None,
             crate::rate_limit::PeerAddr(Some(peer)),
             axum::http::HeaderMap::new(),
             ref_update_body("3333333333333333333333333333333333333333"),
@@ -11254,6 +11281,7 @@ mod tests {
             State(state.clone()),
             Path(("z6empty".to_string(), "e1".to_string())),
             Extension(crate::auth::AuthenticatedDid("did:key:z6empty".to_string())),
+            None,
             crate::rate_limit::PeerAddr(Some(peer)),
             axum::http::HeaderMap::new(),
             axum::body::Bytes::from_static(b"0000"),
@@ -11357,6 +11385,7 @@ mod tests {
             Extension(crate::auth::AuthenticatedDid(
                 "did:key:z6unpack".to_string(),
             )),
+            None,
             crate::rate_limit::PeerAddr(Some(peer)),
             axum::http::HeaderMap::new(),
             ref_update_body("4444444444444444444444444444444444444444"),

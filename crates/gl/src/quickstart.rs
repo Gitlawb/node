@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use crate::http::NodeClient;
+use crate::http::{sanitize_node_msg, NodeClient};
 use crate::identity::load_keypair_from_dir;
 
 const PUBLIC_NODE: &str = "https://node.twigpine.com";
@@ -137,7 +137,9 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
                     // A 2xx without a usable ucan is not a registration; the
                     // response may not even be JSON. Saying success here would
                     // also leave a stale ucan.json from another node in place.
-                    println!("  \u{00d7}  Registration returned no UCAN (unexpected response body)");
+                    println!(
+                        "  \u{00d7}  Registration returned no UCAN (unexpected response body)"
+                    );
                 }
                 println!();
             }
@@ -145,7 +147,10 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
                 let status = resp.status();
                 let body: Value = resp.json().await.unwrap_or_default();
                 let msg = body["message"].as_str().unwrap_or("unknown");
-                println!("  ✗  Registration failed ({status}): {msg}");
+                println!(
+                    "  ✗  Registration failed ({status}): {}",
+                    sanitize_node_msg(msg)
+                );
                 println!("     You can retry with: gl register --node {}", args.node);
                 println!();
                 // Non-fatal — continue to repo creation
@@ -231,7 +236,10 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
             let status = resp.status();
             let payload: Value = resp.json().await.unwrap_or_default();
             let msg = payload["message"].as_str().unwrap_or("unknown");
-            println!("  ✗  Repo creation failed ({status}): {msg}");
+            println!(
+                "  ✗  Repo creation failed ({status}): {}",
+                sanitize_node_msg(msg)
+            );
             println!(
                 "     Try manually: gl repo create {repo_name} --node {}",
                 args.node

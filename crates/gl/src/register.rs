@@ -9,7 +9,7 @@ use clap::Args;
 use serde_json::json;
 use std::path::PathBuf;
 
-use crate::http::NodeClient;
+use crate::http::{sanitize_node_msg, NodeClient};
 use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
@@ -75,10 +75,7 @@ pub async fn run(args: RegisterArgs) -> Result<()> {
             "did": did.to_string(),
             "saved_at": chrono::Utc::now().to_rfc3339(),
         });
-        crate::secret_file::write(
-            &path,
-            serde_json::to_string_pretty(&record)?.as_bytes(),
-        )?;
+        crate::secret_file::write(&path, serde_json::to_string_pretty(&record)?.as_bytes())?;
         tracing::debug!("saved UCAN to {}", path.display());
         Some(path)
     };
@@ -97,9 +94,9 @@ pub async fn run(args: RegisterArgs) -> Result<()> {
         .unwrap_or("");
 
     println!();
-    println!("  {message}");
+    println!("  {}", sanitize_node_msg(message));
     println!("  Trust score:  {trust:.2}");
-    println!("  UCAN expires: {expires}");
+    println!("  UCAN expires: {}", sanitize_node_msg(expires));
     println!();
     // The real path, not the default one: `GITLAWB_KEY` moves it, and an operator
     // told to look in `~/.gitlawb` would find nothing there.

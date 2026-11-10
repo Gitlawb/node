@@ -256,7 +256,9 @@ pub(crate) async fn import_delegation(
     let me = crate::identity::load_keypair_from_dir(dir)
         .context("cannot tell who this delegation is for without a local identity")?;
     let my_did = me.did().to_string();
-    if !gitlawb_core::ucan::push::did_key_eq(&ucan.payload.aud.to_string(), &my_did) {
+    // Exact compare, matching the node's proof.payload.aud == iss linkage: a
+    // bare-form aud would import cleanly here and then 401 on every push.
+    if ucan.payload.aud.to_string() != my_did {
         anyhow::bail!(
             "this delegation is addressed to {}, but the local identity is {my_did}. \
              Ask the owner to re-issue it with `--to {my_did}`.",
@@ -266,9 +268,9 @@ pub(crate) async fn import_delegation(
 
     // Verify before it can displace a working delegation: a token the node would
     // refuse is not worth overwriting a good one for.
-    let root = ucan
-        .verify_chain()
-        .map_err(|e| anyhow::anyhow!("this delegation does not verify: {e}"))?;
+    let root = ucan.verify_chain().map_err(|e| {
+        anyhow::anyhow!("this delegation does not verify: {}", shown(&e.to_string()))
+    })?;
     if ucan.is_expired() {
         anyhow::bail!("this delegation has already expired");
     }
@@ -692,7 +694,19 @@ async fn cmd_delegate(
         );
     }
 
-    let exp = expiry.map(|h| chrono::Utc::now() + chrono::Duration::hours(h as i64));
+    // Chrono panics on a DateTime overflow, and a u64 that wraps negative when
+    // cast issues an already-expired token. Anything past ~100k years is
+    // refused as unusable rather than trusted into arithmetic.
+    const MAX_EXPIRY_HOURS: u64 = 900_000_000;
+    let exp = expiry
+        .map(|h| -> Result<chrono::DateTime<chrono::Utc>> {
+            anyhow::ensure!(
+                h <= MAX_EXPIRY_HOURS,
+                "--expiry is out of range ({h} hours)"
+            );
+            Ok(chrono::Utc::now() + chrono::Duration::hours(h as i64))
+        })
+        .transpose()?;
     let ucan = Ucan::issue(&keypair, audience, vec![Capability::new(&cap, &can)], exp)?;
     let encoded = ucan.encode()?;
 

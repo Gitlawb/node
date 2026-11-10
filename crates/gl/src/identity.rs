@@ -140,11 +140,16 @@ pub fn load_optional_keypair(dir: Option<&std::path::Path>) -> Result<Option<Key
     if let Some(d) = dir {
         return load_keypair_from_dir(Some(d)).map(Some);
     }
-    let base = match dirs::home_dir() {
-        Some(h) => h.join(".gitlawb"),
-        None => return Ok(None),
-    };
-    let path = key_path_for(Some(&base))?;
+    // Route the default lookup through key_path_for(None), not a hand-built
+    // ~/.gitlawb/identity.pem: that path pinned the conventional basename and
+    // ignored GITLAWB_KEY, so callers on this helper (task list/view, the MCP
+    // identity fallback) signed as a stale DID or went anonymous while every
+    // sibling command read the configured key. A host with no home and no
+    // GITLAWB_KEY still resolves to anonymous rather than refusing.
+    if std::env::var_os("GITLAWB_KEY").is_none() && dirs::home_dir().is_none() {
+        return Ok(None);
+    }
+    let path = key_path_for(None)?;
     match fs::read_to_string(&path) {
         Ok(pem) => Keypair::from_pem(&pem)
             .context("failed to load keypair from PEM")

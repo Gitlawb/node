@@ -1276,6 +1276,10 @@ async fn call_tool(
             if hours < 1 {
                 anyhow::bail!("expiry_hours must be at least 1: a token that has already expired grants nothing");
             }
+            anyhow::ensure!(
+                hours <= 900_000_000,
+                "expiry_hours is out of range ({hours}): a DateTime cannot represent it"
+            );
             let exp = Some(chrono::Utc::now() + chrono::Duration::hours(hours));
 
             let ucan = gitlawb_core::ucan::Ucan::issue(

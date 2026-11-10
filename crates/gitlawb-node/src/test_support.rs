@@ -6019,7 +6019,10 @@ mod tests {
                     state.clone(),
                     crate::auth::require_ucan_chain,
                 ))
-                .layer(axum::middleware::from_fn(crate::auth::require_signature))
+                .layer(axum::middleware::from_fn_with_state(
+                    crate::auth::SignatureBodyLimit(crate::server::SIGNED_BODY_LIMIT),
+                    crate::auth::require_signature,
+                ))
                 .with_state(state.clone())
         };
 
@@ -6175,7 +6178,10 @@ mod tests {
                     "/{owner}/{repo}/info/refs",
                     axum::routing::get(crate::api::repos::git_info_refs),
                 )
-                .layer(axum::middleware::from_fn(crate::auth::optional_signature))
+                .layer(axum::middleware::from_fn_with_state(
+                    crate::auth::SignatureBodyLimit(crate::server::SIGNED_BODY_LIMIT),
+                    crate::auth::optional_signature,
+                ))
                 .with_state(state.clone())
         };
         let receive_pack = || {
@@ -6188,7 +6194,10 @@ mod tests {
                     state.clone(),
                     crate::auth::require_ucan_chain,
                 ))
-                .layer(axum::middleware::from_fn(crate::auth::require_signature))
+                .layer(axum::middleware::from_fn_with_state(
+                    crate::auth::SignatureBodyLimit(crate::server::SIGNED_BODY_LIMIT),
+                    crate::auth::require_signature,
+                ))
                 .with_state(state.clone())
         };
 
@@ -6265,8 +6274,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             resp.status(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "the push gate must clear on the delegation alone and reach git"
+            StatusCode::NOT_FOUND,
+            "a non-reader delegate is refused on the POST itself, not just the              advertisement: the receive-pack route runs the same visibility gate              because a caller can skip info/refs entirely"
         );
 
         // 2. The owner makes the agent a reader of the whole repository — what
@@ -6387,7 +6396,10 @@ mod tests {
                 state.clone(),
                 crate::auth::require_ucan_chain,
             ))
-            .layer(axum::middleware::from_fn(crate::auth::require_signature))
+            .layer(axum::middleware::from_fn_with_state(
+                crate::auth::SignatureBodyLimit(crate::server::SIGNED_BODY_LIMIT),
+                crate::auth::require_signature,
+            ))
             .with_state(state.clone());
 
         let path = format!("/{short}/protrepo.git/git-receive-pack");
