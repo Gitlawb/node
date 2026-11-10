@@ -90,7 +90,7 @@ async fn cmd_delegate(
     let encoded = ucan.encode()?;
 
     if let Some(path) = out {
-        std::fs::write(&path, &encoded)?;
+        crate::secret_file::write(&path, encoded.as_bytes())?;
         println!("UCAN saved to {}", path.display());
         return Ok(());
     }
