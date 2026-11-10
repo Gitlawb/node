@@ -276,10 +276,17 @@ async fn fetch_withheld(node: &str, owner: &str, name: &str) -> Result<(Vec<Stri
             // unavailable to this caller and cloning cannot proceed.
             if r.status().as_u16() == 404 {
                 let status = r.status();
-                let body = r.text().await.unwrap_or_default();
-                if !body.trim().is_empty() {
+                let body = crate::http::read_body_capped(r, 4096).await;
+                if body.read_failed {
+                    // The read died part-way: we cannot classify the denial,
+                    // and a failed read must not collapse into the legacy
+                    // route-miss arm and start a clone.
+                    bail!("withheld-paths 404 body from this node could not be read");
+                }
+                if !body.text.trim().is_empty() {
                     bail!(
-                        "repository {owner}/{name} is not available on this node ({status}): {body}"
+                        "repository {owner}/{name} is not available on this node ({status}): {}",
+                        sanitize_node_msg(&body.text)
                     );
                 }
             }

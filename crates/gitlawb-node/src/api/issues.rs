@@ -485,6 +485,15 @@ mod tests {
             .await
             .expect("get_repo")
             .expect("repo exists");
+        // upsert_mirror_repo seeds the row quarantined, and the read gate now
+        // hides quarantined rows as opaque 404 before the owner-or-author check
+        // this test names. Release it so the stranger is refused by the 403, not
+        // by the quarantine short-circuit.
+        state
+            .db
+            .set_repo_quarantine(&record.id, false)
+            .await
+            .expect("release seed quarantine");
 
         // An independent session holds the repo's write lock for the whole call.
         let key = crate::git::repo_store::advisory_lock_key_for_test(
@@ -686,6 +695,15 @@ mod tests {
             .await
             .expect("get_repo")
             .expect("seeded repo exists");
+        // upsert_mirror_repo seeds the admission flag as quarantined, but the
+        // gate now hides quarantined rows from every caller class. Release it
+        // so these tests exercise what they name: the owner-or-author check
+        // after the read gate, not the quarantine short-circuit.
+        state
+            .db
+            .set_repo_quarantine(&record.id, false)
+            .await
+            .expect("release seed quarantine");
         let _ = owner_did;
         let path = state
             .repo_store
@@ -709,6 +727,39 @@ mod tests {
         .expect("serialize seeded issue");
         crate::git::issues::create_issue(&path, issue_id, &json).expect("seed issue blob");
         path
+    }
+
+    /// Quarantine precedes every caller class: even the owner gets the opaque
+    /// 404 on a quarantined repo, and the seeded row's quarantined flag is left
+    /// set deliberately. The released-mirror variants above exercise the
+    /// owner-or-author path.
+    #[sqlx::test]
+    async fn quarantined_repo_close_is_opaque_404(pool: PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let owner_did = "did:key:z6MkT1Owner";
+        state
+            .db
+            .upsert_mirror_repo("z6MkT1Owner", "tquar", "/unused", None, true)
+            .await
+            .expect("seed repo row");
+
+        let res = close_issue(
+            axum::extract::State(state.clone()),
+            axum::Extension(crate::auth::AuthenticatedDid(owner_did.to_string())),
+            axum::extract::Path((
+                "z6MkT1Owner".to_string(),
+                "tquar".to_string(),
+                "1".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            crate::rate_limit::PeerAddr(Some("203.0.113.70:5000".parse().unwrap())),
+        )
+        .await;
+        assert!(
+            matches!(res, Err(crate::error::AppError::RepoNotFound(_))),
+            "a quarantined repo must 404 close_issue for every caller: {:?}",
+            res.ok().map(|_| "unexpected success")
+        );
     }
 
     /// INV-21(c) positive twin 1: the OWNER can still close. The reorder moved the
