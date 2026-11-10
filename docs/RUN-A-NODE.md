@@ -192,7 +192,8 @@ treat it as temporary: while it is off, your node accepts a push to any reposito
 from anyone who can generate a keypair.
 
 - **When `true`** — a push whose authenticated DID is not the repo owner is
-  rejected (HTTP 403) before any ref update is applied. The owner is matched in
+  rejected (HTTP 403) before any ref update is applied, unless it carries a
+  valid delegation (the next bullet). The owner is matched in
   both the full `did:key:z6Mk…` form and its bare `z6Mk…` suffix.
 - **A delegated key can still push.** A non-owner clears this gate by presenting a
   UCAN whose proof chain roots at the repo owner and which carries `git/push` for
@@ -202,6 +203,13 @@ from anyone who can generate a keypair.
 
 The owner issues a capability, the agent stores it, and the git helper presents it
 automatically on every push:
+
+Before anything below, set `GITLAWB_KEY` to an **absolute** path to the
+identity PEM (`gl identity new` prints it). `gl ucan import` and
+`git-remote-gitlawb` both resolve the delegation store from that key's parent
+directory, so do not pass `import --dir` pointing anywhere else: an import that
+succeeds elsewhere leaves the push unsigned. The README and `.env.example`
+cover the layout.
 
 ```bash
 # Owner, once per agent per repo:

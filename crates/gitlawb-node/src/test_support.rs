@@ -6431,6 +6431,104 @@ mod tests {
             "the refusal must come from branch protection, not the owner gate; got {text}"
         );
     }
+    /// A delegated push whose branch-protection lookup FAILS must be refused,
+    /// not silently allowed: the lookup is fail-closed for non-owners, so a
+    /// database error on a protected branch cannot be pushed through.
+    #[sqlx::test]
+    async fn delegated_push_fails_closed_when_protection_lookup_errors(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+        use gitlawb_core::ucan::{caps, Capability, Ucan};
+        use std::sync::Arc;
+
+        const ZERO: &str = "0000000000000000000000000000000000000000";
+        let new_sha = "1111111111111111111111111111111111111111";
+
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+
+        let mut state = test_state(pool).await;
+        let mut cfg = (*state.config).clone();
+        cfg.enforce_owner_push = true;
+        state.config = Arc::new(cfg);
+
+        let rec = seed_repo(&owner_did, "protrepo");
+        state.db.create_repo(&rec).await.expect("seed repo");
+        state
+            .db
+            .protect_branch(&rec.id, "main", &owner_did)
+            .await
+            .expect("protect main");
+
+        // Poison the lookup: is_branch_protected SELECTs this table, so every
+        // call after the drop returns Err.
+        sqlx::query("DROP TABLE protected_branches")
+            .execute(state.db.pool())
+            .await
+            .expect("drop protected_branches");
+
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+        let delegation = Ucan::issue(
+            &owner,
+            agent.did(),
+            vec![Capability::new(
+                format!("gitlawb://repos/{owner_did}/protrepo"),
+                caps::GIT_PUSH,
+            )],
+            Some(hour),
+        )
+        .expect("issue delegation");
+        let invocation = Ucan::delegate(
+            &agent,
+            state.node_did.clone(),
+            delegation.payload.att.clone(),
+            Some(hour),
+            &delegation,
+        )
+        .expect("wrap")
+        .encode()
+        .expect("encode");
+
+        let router = Router::new()
+            .route(
+                "/{owner}/{repo}/git-receive-pack",
+                axum::routing::post(crate::api::repos::git_receive_pack),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::auth::require_ucan_chain,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                crate::auth::SignatureBodyLimit(crate::server::SIGNED_BODY_LIMIT),
+                crate::auth::require_signature,
+            ))
+            .with_state(state.clone());
+
+        let path = format!("/{short}/protrepo.git/git-receive-pack");
+        let line = format!("{ZERO} {new_sha} refs/heads/main");
+        let body = format!("{:04x}{}0000", line.len() + 4, line).into_bytes();
+
+        let signed = sign_request(&agent, "POST", &path, &body);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(&path)
+            .header("content-type", "application/x-git-receive-pack-request")
+            .header("content-digest", signed.content_digest)
+            .header("signature-input", signed.signature_input)
+            .header("signature", signed.signature)
+            .header("x-ucan", invocation)
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert!(
+            !resp.status().is_success(),
+            "a failed protection lookup must refuse the push, got {}",
+            resp.status()
+        );
+    }
 
     /// A1 Phase-2 contract: the `git-upload-pack` POST (the actual fetch, after
     /// the advertisement) is itself read-visibility gated. An ANONYMOUS upload-pack

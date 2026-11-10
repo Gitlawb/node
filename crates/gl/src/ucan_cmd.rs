@@ -833,6 +833,12 @@ pub struct VerifyReport {
     pub audience: String,
     pub capabilities: Vec<(String, String)>,
     pub expires: Option<i64>,
+    /// Whether every link in the proof chain carries an expiry — the node's
+    /// push-delegation requirement that `is_valid` does not cover.
+    pub bounded_lifetime: bool,
+    /// Whether any capability is push-class, i.e. the token is judged for
+    /// push readiness rather than general UCAN validity.
+    pub push_class: bool,
 }
 
 impl VerifyReport {
@@ -853,12 +859,27 @@ impl VerifyReport {
                 .map(|c| (c.with.clone(), c.can.clone()))
                 .collect(),
             expires: ucan.payload.exp,
+            bounded_lifetime: ucan.chain_lifetime_is_bounded(),
+            push_class: ucan
+                .payload
+                .att
+                .iter()
+                .any(|c| c.can == gitlawb_core::ucan::caps::GIT_PUSH),
         }
     }
 
     /// Signature good, not expired, and the proof chain walks to a root.
     pub fn is_valid(&self) -> bool {
         self.signature.is_ok() && !self.expired && self.chain.is_ok()
+    }
+
+    /// Whether a push-class token would pass the import/node push gates:
+    /// `is_valid` plus a bounded chain — the property `gl ucan import`
+    /// refuses on ("an unbounded link, and a node refuses an unbounded push
+    /// chain") and the node enforces on `git-receive-pack`. False for
+    /// non-push tokens, which are judged by `is_valid` alone.
+    pub fn push_ready(&self) -> bool {
+        self.push_class && self.is_valid() && self.bounded_lifetime
     }
 
     /// The MCP shape. `valid` is [`Self::is_valid`]; the rest is there so a
@@ -880,6 +901,8 @@ impl VerifyReport {
                 .map(|(with, can)| serde_json::json!({ "with": shown(with), "can": shown(can) }))
                 .collect::<Vec<_>>(),
             "expires": self.expires,
+            "bounded_lifetime": self.bounded_lifetime,
+            "push_ready": self.push_ready(),
         })
     }
 
@@ -905,6 +928,18 @@ impl VerifyReport {
         out.push_str(&format!("Audience:  {}\n", shown(&self.audience)));
         for (with, can) in &self.capabilities {
             out.push_str(&format!("Cap:       {} → {}\n", shown(with), shown(can)));
+        }
+        out.push_str(if self.bounded_lifetime {
+            "Bounded:   yes\n"
+        } else {
+            "Bounded:   no — a node refuses an unbounded push chain\n"
+        });
+        if self.push_class {
+            out.push_str(if self.push_ready() {
+                "Push-ready: yes\n"
+            } else {
+                "Push-ready: no — import and the node would refuse this token for push\n"
+            });
         }
         out
     }
@@ -1118,6 +1153,32 @@ mod verify_report_tests {
         assert_eq!(json["signature_valid"], true);
         assert_eq!(json["chain_valid"], false);
         assert!(json["root_issuer"].is_null());
+    }
+
+    /// A push-shaped delegation with an unbounded link verifies
+    /// cryptographically but is not push-ready: import and the node refuse it.
+    #[test]
+    fn unbounded_push_shaped_delegation_is_not_push_ready() {
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let ucan = Ucan::issue(
+            &owner,
+            agent.did(),
+            vec![Capability::new(
+                format!("gitlawb://repos/{}/myrepo", owner.did()),
+                gitlawb_core::ucan::caps::GIT_PUSH,
+            )],
+            None,
+        )
+        .expect("issue unbounded delegation");
+        let report = VerifyReport::of(&ucan);
+        assert!(report.is_valid(), "an unexpired well-formed chain verifies");
+        assert!(!report.bounded_lifetime);
+        assert!(report.push_class);
+        assert!(
+            !report.push_ready(),
+            "import and the node refuse an unbounded push chain"
+        );
     }
 
     /// Everything the report prints came out of the token, and `Did` deserializes

@@ -2373,22 +2373,35 @@ pub async fn git_receive_pack(
             .ref_name
             .strip_prefix("refs/heads/")
             .unwrap_or(&update.ref_name);
-        if state
-            .db
-            .is_branch_protected(&record.id, branch)
-            .await
-            .unwrap_or(false)
-            && !crate::api::did_matches(&auth.0, &record.owner_did)
-        {
-            tracing::warn!(
-                branch = %branch,
-                pusher = %auth.0,
-                owner_did = %record.owner_did,
-                "branch protection: rejecting push from non-owner"
-            );
-            return Err(AppError::Forbidden(format!(
-                "branch '{branch}' is protected — only the repo owner can push to it"
-            )));
+        if !crate::api::did_matches(&auth.0, &record.owner_did) {
+            // A non-owner (delegated pusher included) must fail closed when the
+            // protection lookup errors: treating Err as unprotected lets a
+            // protected branch be pushed through a database hiccup.
+            match state.db.is_branch_protected(&record.id, branch).await {
+                Ok(true) => {
+                    tracing::warn!(
+                        branch = %branch,
+                        pusher = %auth.0,
+                        owner_did = %record.owner_did,
+                        "branch protection: rejecting push from non-owner"
+                    );
+                    return Err(AppError::Forbidden(format!(
+                        "branch '{branch}' is protected — only the repo owner can push to it"
+                    )));
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        branch = %branch,
+                        pusher = %auth.0,
+                        err = %e,
+                        "branch protection lookup failed; refusing non-owner push"
+                    );
+                    return Err(AppError::Internal(anyhow::anyhow!(
+                        "failed to check branch protection: {e}"
+                    )));
+                }
+            }
         }
     }
 
