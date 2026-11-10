@@ -2,7 +2,7 @@
 //!
 //! Runs a JSON-RPC 2.0 server over stdin/stdout using LSP-style
 //! `Content-Length` framing.  Exposes 15 tools that give LLM agents
-//! structured access to the gitlawb network.
+//! structured access to the Twigpine network.
 //!
 //! # Tools
 //!   identity_show    — current agent DID
@@ -43,7 +43,6 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
 use crate::http::NodeClient;
-use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
 pub struct McpArgs {
@@ -56,7 +55,11 @@ pub enum McpCmd {
     /// Start the MCP server (stdin/stdout JSON-RPC)
     Serve {
         /// Node URL to connect to
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         /// Identity directory
         #[arg(long)]
@@ -181,12 +184,12 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "node_info",
-            "description": "Get metadata about the connected gitlawb node: DID, version, network, protocols.",
+            "description": "Get metadata about the connected Twigpine node: DID, version, network, protocols.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
             "name": "node_health",
-            "description": "Check if the gitlawb node is alive and responding.",
+            "description": "Check if the Twigpine node is alive and responding.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -204,12 +207,12 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "repo_list",
-            "description": "List all repositories on the connected gitlawb node.",
+            "description": "List all repositories on the connected Twigpine node.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
             "name": "repo_list_federated",
-            "description": "List repositories across ALL nodes in the gitlawb network (federation). Returns repos from this node and all known peer nodes, each annotated with node_url and node_did.",
+            "description": "List repositories across ALL nodes in the Twigpine network (federation). Returns repos from this node and all known peer nodes, each annotated with node_url and node_did.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -262,7 +265,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "agent_register",
-            "description": "Register this agent with the gitlawb node to get a bootstrap UCAN token.",
+            "description": "Register this agent with the Twigpine node to get a bootstrap UCAN token.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -278,7 +281,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "agent_capabilities",
-            "description": "List all available UCAN capability strings in the gitlawb protocol.",
+            "description": "List all available UCAN capability strings in the Twigpine protocol.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -512,7 +515,8 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "status": { "type": "string", "description": "Filter by status: pending, claimed, completed, failed" },
                     "assignee_did": { "type": "string", "description": "Filter by assignee DID" },
-                    "limit": { "type": "integer", "description": "Max results (default: 50)", "default": 50 }
+                    "limit": { "type": "integer", "minimum": 1, "description": "Total results to return (default: 50). Must be positive; a non-positive limit is rejected rather than answered with an empty list. Values above the node's 200-row page cap are gathered by following continuation tokens.", "default": 50 },
+                    "cursor": { "type": "string", "description": "Resume from a previous call's next_cursor. Must be paired with the same status/assignee_did filter that produced it." }
                 }
             }
         },
@@ -636,7 +640,14 @@ async fn call_tool(
     node: &str,
     dir: Option<&std::path::Path>,
 ) -> Result<String> {
-    let keypair = load_keypair_from_dir(dir).ok();
+    // An explicit dir with no identity file is a clean anonymous caller
+    // (main's unsigned `webhook_list` path lets the node answer the denial);
+    // a present but unloadable identity is an error, never a silent
+    // downgrade to anonymous (this PR's `load_optional_keypair` contract).
+    let keypair = match dir {
+        Some(d) if !d.join("identity.pem").exists() => None,
+        _ => crate::identity::load_optional_keypair(dir)?,
+    };
     let client = NodeClient::new(node, keypair.clone());
 
     match name {
@@ -654,12 +665,13 @@ async fn call_tool(
         }
 
         "node_info" => {
-            let info: Value = client.get("/").await?.json().await?;
+            let info = crate::http::read_json(client.get("/").await?, "node info").await?;
             Ok(serde_json::to_string_pretty(&info)?)
         }
 
         "node_health" => {
-            let health: Value = client.get("/health").await?.json().await?;
+            let health =
+                crate::http::read_json(client.get("/health").await?, "node health").await?;
             Ok(serde_json::to_string_pretty(&health)?)
         }
 
@@ -670,39 +682,48 @@ async fn call_tool(
                 "description": args["description"],
                 "is_public": args["is_public"].as_bool().unwrap_or(true),
             }))?;
-            let resp: Value = client.post("/api/v1/repos", &body).await?.json().await?;
+            let resp =
+                crate::http::read_json(client.post("/api/v1/repos", &body).await?, "create repo")
+                    .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
         "repo_list" => {
-            let repos: Value = client.get("/api/v1/repos").await?.json().await?;
+            let repos =
+                crate::http::read_json(client.get("/api/v1/repos").await?, "list repos").await?;
             Ok(serde_json::to_string_pretty(&repos)?)
         }
 
         "repo_list_federated" => {
-            let result: Value = client.get("/api/v1/repos/federated").await?.json().await?;
+            let result = crate::http::read_json(
+                client.get("/api/v1/repos/federated").await?,
+                "list federated repos",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&result)?)
         }
 
         "repo_get" => {
             let name = args["name"].as_str().context("missing 'name'")?;
             let owner = resolve_owner(&args, &client).await?;
-            let repo: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{name}"))
-                .await?
-                .json()
-                .await?;
+            let repo = crate::http::read_json(
+                client.get(&format!("/api/v1/repos/{owner}/{name}")).await?,
+                "repo",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&repo)?)
         }
 
         "repo_commits" => {
             let name = args["name"].as_str().context("missing 'name'")?;
             let owner = resolve_owner(&args, &client).await?;
-            let commits: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{name}/commits"))
-                .await?
-                .json()
-                .await?;
+            let commits = crate::http::read_json(
+                client
+                    .get(&format!("/api/v1/repos/{owner}/{name}/commits"))
+                    .await?,
+                "commits",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&commits)?)
         }
 
@@ -710,17 +731,19 @@ async fn call_tool(
             let name = args["name"].as_str().context("missing 'name'")?;
             let path = args["path"].as_str().unwrap_or("");
             let owner = resolve_owner(&args, &client).await?;
-            let tree: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{name}/tree/{path}"))
-                .await?
-                .json()
-                .await?;
+            let tree = crate::http::read_json(
+                client
+                    .get(&format!("/api/v1/repos/{owner}/{name}/tree/{path}"))
+                    .await?,
+                "tree",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&tree)?)
         }
 
         "repo_clone_url" => {
             let name = args["name"].as_str().context("missing 'name'")?;
-            let info: Value = client.get("/").await?.json().await?;
+            let info = crate::http::read_json(client.get("/").await?, "node info").await?;
             let did = info["did"].as_str().context("node info missing DID")?;
             Ok(format!("gitlawb://{}/{}", did, name))
         }
@@ -736,7 +759,11 @@ async fn call_tool(
                 "capabilities": caps,
                 "model": args["model"],
             }))?;
-            let resp: Value = client.post("/api/register", &body).await?.json().await?;
+            let resp = crate::http::read_json(
+                client.post("/api/register", &body).await?,
+                "register agent",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -775,13 +802,15 @@ async fn call_tool(
             let did: gitlawb_core::did::Did = did_str
                 .parse()
                 .map_err(|e: gitlawb_core::Error| anyhow::anyhow!("{e}"))?;
-            if let Ok(vk) = did.to_verifying_key() {
-                let doc = gitlawb_core::did::DidDocument::new(did, &vk);
-                Ok(serde_json::to_string_pretty(&doc)?)
-            } else {
-                Err(anyhow::anyhow!(
-                    "cannot resolve '{did_str}' locally — only did:key is supported without a resolver"
-                ))
+            let is_did_key = did.is_did_key();
+            match did.to_verifying_key() {
+                Ok(vk) => {
+                    let doc = gitlawb_core::did::DidDocument::new(did, &vk);
+                    Ok(serde_json::to_string_pretty(&doc)?)
+                }
+                Err(e) => Err(anyhow::anyhow!(did_resolve_failure_message(
+                    did_str, is_did_key, &e
+                ))),
             }
         }
 
@@ -793,6 +822,10 @@ async fn call_tool(
                     "/{owner}/{name}/info/refs?service=git-upload-pack"
                 ))
                 .await?;
+            let status = resp.status();
+            if !status.is_success() {
+                anyhow::bail!("git refs failed ({status})");
+            }
             let bytes = resp.bytes().await?;
             // Parse pkt-line refs
             let refs = parse_info_refs(&bytes);
@@ -814,22 +847,26 @@ async fn call_tool(
                 "source_branch": head,
                 "target_branch": base,
             }))?;
-            let resp: Value = client
-                .post(&format!("/api/v1/repos/{owner}/{repo}/pulls"), &body)
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .post(&format!("/api/v1/repos/{owner}/{repo}/pulls"), &body)
+                    .await?,
+                "create pull request",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
         "pr_list" => {
             let repo = args["repo"].as_str().context("missing 'repo'")?;
             let owner = resolve_owner(&args, &client).await?;
-            let resp: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{repo}/pulls"))
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .get(&format!("/api/v1/repos/{owner}/{repo}/pulls"))
+                    .await?,
+                "pull requests",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -837,18 +874,22 @@ async fn call_tool(
             let repo = args["repo"].as_str().context("missing 'repo'")?;
             let number = args["number"].as_i64().context("missing 'number'")?;
             let owner = resolve_owner(&args, &client).await?;
-            let pr: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}"))
-                .await?
-                .json()
-                .await?;
-            let reviews: Value = client
-                .get(&format!(
-                    "/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews"
-                ))
-                .await?
-                .json()
-                .await?;
+            let pr = crate::http::read_json(
+                client
+                    .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}"))
+                    .await?,
+                "pull request",
+            )
+            .await?;
+            let reviews = crate::http::read_json(
+                client
+                    .get(&format!(
+                        "/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews"
+                    ))
+                    .await?,
+                "reviews",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(
                 &json!({ "pr": pr, "reviews": reviews["reviews"] }),
             )?)
@@ -858,11 +899,13 @@ async fn call_tool(
             let repo = args["repo"].as_str().context("missing 'repo'")?;
             let number = args["number"].as_i64().context("missing 'number'")?;
             let owner = resolve_owner(&args, &client).await?;
-            let resp: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/diff"))
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/diff"))
+                    .await?,
+                "diff",
+            )
+            .await?;
             let diff = resp["diff"].as_str().unwrap_or("(empty diff)");
             Ok(diff.to_string())
         }
@@ -879,14 +922,16 @@ async fn call_tool(
                 "status": status,
                 "body": args["body"],
             }))?;
-            let resp: Value = client
-                .post(
-                    &format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews"),
-                    &body,
-                )
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .post(
+                        &format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews"),
+                        &body,
+                    )
+                    .await?,
+                "submit review",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -895,14 +940,16 @@ async fn call_tool(
             let number = args["number"].as_i64().context("missing 'number'")?;
             let owner = resolve_owner(&args, &client).await?;
             let body = serde_json::to_vec(&json!({}))?;
-            let resp: Value = client
-                .post(
-                    &format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/merge"),
-                    &body,
-                )
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .post(
+                        &format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/merge"),
+                        &body,
+                    )
+                    .await?,
+                "merge pull request",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -916,61 +963,60 @@ async fn call_tool(
                 .as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
                 .unwrap_or_else(|| vec!["*"]);
-            let owner = resolve_owner(&args, &client).await?;
+            let (owner, name) = resolve_owner_repo(&args, repo, &keypair, &client).await?;
             let body = serde_json::to_vec(&json!({
                 "url": url,
                 "secret": args["secret"],
                 "events": events,
             }))?;
-            let resp: Value = client
-                .post(&format!("/api/v1/repos/{owner}/{repo}/hooks"), &body)
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .post(&format!("/api/v1/repos/{owner}/{name}/hooks"), &body)
+                    .await?,
+                "create webhook",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
         "webhook_list" => {
             let repo = args["repo"].as_str().context("missing 'repo'")?;
-            // Owner-gated route: an explicit `owner` arg wins, otherwise default to
-            // the signing keypair's short DID (NOT the node DID). The request is
-            // signed by this keypair, so the path owner must match it or the node
+            // Owner-gated route: `owner/repo` splits first, an explicit `owner`
+            // arg wins next, otherwise the signing keypair's short DID (NOT the
+            // node DID that resolve_owner returns). The request is signed by
+            // this keypair, so the path owner must match it or the node
             // returns 403/404.
-            let owner = if let Some(o) = args.get("owner").and_then(|v| v.as_str()) {
-                o.to_string()
-            } else {
-                let kp = keypair
-                    .as_ref()
-                    .context("no identity found — run `gl identity new` first")?;
-                let did = kp.did().to_string();
-                did.split(':').next_back().unwrap_or(&did).to_string()
-            };
-            // Owner-gated route: must be signed (get_signed), not a plain get().
-            let resp = client
-                .get_signed(&format!("/api/v1/repos/{owner}/{repo}/hooks"))
-                .await?;
-            // Check the HTTP status before deserializing: a 401/403/404 JSON error
-            // body (missing identity, wrong owner, private/deleted repo) must fail
-            // the tool call, not be returned as a successful result.
-            let status = resp.status();
-            let body: Value = resp.json().await?;
-            if !status.is_success() {
-                let msg = body["message"].as_str().unwrap_or("unknown error");
-                anyhow::bail!("webhook_list failed ({status}): {msg}");
-            }
-            Ok(serde_json::to_string_pretty(&body)?)
+            let (owner, name) = resolve_owner_repo(&args, repo, &keypair, &client).await?;
+            // Owner-gated AND auth-required route (list_webhooks 401s a headerless
+            // caller, then 403s a non-owner). get_maybe_signed signs when an
+            // identity is present (so the owner is authorized) and otherwise sends
+            // unsigned — the node then returns the 401/403/404 denial, which
+            // read_json (#186) surfaces as an error instead of a fake result, with
+            // a bounded error read. Unlike get_signed, this still ISSUES the request
+            // without a local identity (surfacing the node's denial) rather than
+            // failing client-side before the node is contacted.
+            let resp = crate::http::read_json(
+                client
+                    .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}/hooks"))
+                    .await?,
+                "webhook_list",
+            )
+            .await?;
+            Ok(serde_json::to_string_pretty(&resp)?)
         }
 
         "webhook_delete" => {
             let repo = args["repo"].as_str().context("missing 'repo'")?;
             let id = args["id"].as_str().context("missing 'id'")?;
-            let owner = resolve_owner(&args, &client).await?;
+            let (owner, name) = resolve_owner_repo(&args, repo, &keypair, &client).await?;
             let body = serde_json::to_vec(&json!({}))?;
-            let resp: Value = client
-                .delete(&format!("/api/v1/repos/{owner}/{repo}/hooks/{id}"), &body)
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .delete(&format!("/api/v1/repos/{owner}/{name}/hooks/{id}"), &body)
+                    .await?,
+                "delete webhook",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -990,17 +1036,17 @@ async fn call_tool(
                 }
                 u
             };
-            let resp: Value = client.get_authed(&url).await?.json().await?;
+            let resp = crate::http::read_json(client.get_authed(&url).await?, "bounties").await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
         "bounty_show" => {
             let id = args["id"].as_str().context("missing 'id'")?;
-            let resp: Value = client
-                .get_authed(&format!("/api/v1/bounties/{id}"))
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client.get_authed(&format!("/api/v1/bounties/{id}")).await?,
+                "bounty",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1013,28 +1059,32 @@ async fn call_tool(
                 "issue_id": args.get("issue_id").and_then(|v| v.as_str()),
                 "tx_hash": args.get("tx_hash").and_then(|v| v.as_str()),
             });
-            let resp: Value = client
-                .post(
-                    &format!("/api/v1/repos/{owner}/{name}/bounties"),
-                    &serde_json::to_vec(&body)?,
-                )
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .post(
+                        &format!("/api/v1/repos/{owner}/{name}/bounties"),
+                        &serde_json::to_vec(&body)?,
+                    )
+                    .await?,
+                "create bounty",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
         "bounty_claim" => {
             let id = args["id"].as_str().context("missing 'id'")?;
             let body = json!({ "wallet": args.get("wallet").and_then(|v| v.as_str()) });
-            let resp: Value = client
-                .post(
-                    &format!("/api/v1/bounties/{id}/claim"),
-                    &serde_json::to_vec(&body)?,
-                )
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .post(
+                        &format!("/api/v1/bounties/{id}/claim"),
+                        &serde_json::to_vec(&body)?,
+                    )
+                    .await?,
+                "claim bounty",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1042,34 +1092,53 @@ async fn call_tool(
             let id = args["id"].as_str().context("missing 'id'")?;
             let pr_id = args["pr_id"].as_str().context("missing 'pr_id'")?;
             let body = json!({ "pr_id": pr_id });
-            let resp: Value = client
-                .post(
-                    &format!("/api/v1/bounties/{id}/submit"),
-                    &serde_json::to_vec(&body)?,
-                )
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .post(
+                        &format!("/api/v1/bounties/{id}/submit"),
+                        &serde_json::to_vec(&body)?,
+                    )
+                    .await?,
+                "submit bounty",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
         "bounty_stats" => {
-            let resp: Value = client.get("/api/v1/bounties/stats").await?.json().await?;
+            let resp =
+                crate::http::read_json(client.get("/api/v1/bounties/stats").await?, "bounty stats")
+                    .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
         // ── Task tools ────────────────────────────────────────────────────
         "task_list" => {
-            let limit = args["limit"].as_i64().unwrap_or(50);
-            let mut path = format!("/api/v1/tasks?limit={limit}");
-            if let Some(s) = args.get("status").and_then(|v| v.as_str()) {
-                path.push_str(&format!("&status={}", urlencoding::encode(s)));
+            // Follows the node's opaque `next_cursor` so a limit above the
+            // 200-row server page cap returns what was asked for instead of a
+            // silently truncated page, and reports an explicit incomplete
+            // result when a guard or the node's scan ceiling stops it (#327).
+            let limit = match args.get("limit") {
+                None | Some(Value::Null) => 50,
+                Some(val) => val.as_i64().context("invalid limit: expected an integer")?,
+            };
+            let cursor = match args.get("cursor") {
+                None | Some(Value::Null) => None,
+                Some(val) => Some(val.as_str().context("invalid cursor: expected a string")?),
+            };
+            let result = crate::task::fetch_tasks(
+                &client,
+                args.get("status").and_then(|v| v.as_str()),
+                args.get("assignee_did").and_then(|v| v.as_str()),
+                limit,
+                cursor,
+            )
+            .await?;
+            let mut out = result.to_json();
+            if let Some(warning) = result.truncation_warning() {
+                out["warning"] = Value::String(warning);
             }
-            if let Some(a) = args.get("assignee_did").and_then(|v| v.as_str()) {
-                path.push_str(&format!("&assignee_did={}", urlencoding::encode(a)));
-            }
-            let resp: Value = client.get(&path).await?.json().await?;
-            Ok(serde_json::to_string_pretty(&resp)?)
+            Ok(serde_json::to_string_pretty(&out)?)
         }
 
         "task_create" => {
@@ -1085,7 +1154,9 @@ async fn call_tool(
                 "deadline": args.get("deadline").and_then(|v| v.as_str()),
                 "delegator_did": delegator_did,
             }))?;
-            let resp: Value = client.post("/api/v1/tasks", &body).await?.json().await?;
+            let resp =
+                crate::http::read_json(client.post("/api/v1/tasks", &body).await?, "create task")
+                    .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1094,11 +1165,13 @@ async fn call_tool(
             let assignee_did = kp.did().to_string();
             let id = args["id"].as_str().context("missing 'id'")?;
             let body = serde_json::to_vec(&json!({ "assignee_did": assignee_did }))?;
-            let resp: Value = client
-                .post(&format!("/api/v1/tasks/{id}/claim"), &body)
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .post(&format!("/api/v1/tasks/{id}/claim"), &body)
+                    .await?,
+                "claim task",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1110,11 +1183,13 @@ async fn call_tool(
                 "result": args.get("result").and_then(|v| v.as_str()),
                 "by_did": by_did,
             }))?;
-            let resp: Value = client
-                .post(&format!("/api/v1/tasks/{id}/complete"), &body)
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .post(&format!("/api/v1/tasks/{id}/complete"), &body)
+                    .await?,
+                "complete task",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1184,11 +1259,13 @@ async fn call_tool(
                 let owner = resolve_owner(&args, &client).await?;
                 (owner, repo.to_string())
             };
-            let resp: Value = client
-                .get_authed(&format!("/api/v1/repos/{owner}/{name}/issues"))
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .get_authed(&format!("/api/v1/repos/{owner}/{name}/issues"))
+                    .await?,
+                "issues",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1208,11 +1285,13 @@ async fn call_tool(
                 "title": title,
                 "body": args.get("body").and_then(|v| v.as_str()),
             }))?;
-            let resp: Value = client
-                .post(&format!("/api/v1/repos/{owner}/{name}/issues"), &body)
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .post(&format!("/api/v1/repos/{owner}/{name}/issues"), &body)
+                    .await?,
+                "create issue",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1230,14 +1309,16 @@ async fn call_tool(
                 (owner, repo.to_string())
             };
             let body = serde_json::to_vec(&json!({ "body": comment_body }))?;
-            let resp: Value = client
-                .post(
-                    &format!("/api/v1/repos/{owner}/{name}/issues/{issue_id}/comments"),
-                    &body,
-                )
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .post(
+                        &format!("/api/v1/repos/{owner}/{name}/issues/{issue_id}/comments"),
+                        &body,
+                    )
+                    .await?,
+                "comment on issue",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1252,9 +1333,41 @@ async fn resolve_owner(args: &Value, client: &NodeClient) -> Result<String> {
     if let Some(o) = args.get("owner").and_then(|v| v.as_str()) {
         return Ok(o.to_string());
     }
-    let info: Value = client.get("/").await?.json().await?;
+    let info = crate::http::read_json(client.get("/").await?, "node info").await?;
     let did = info["did"].as_str().context("node info missing DID")?;
     Ok(did.split(':').next_back().unwrap_or(did).to_string())
+}
+
+/// Resolve (owner, repo) for the webhook tools, matching the CLI's
+/// `resolve_owner_repo_pair` contract: an `owner/repo` string splits first, an
+/// explicit `owner` arg wins next, then the signing keypair's short DID. The
+/// last resort is the node root DID via `resolve_owner`, reachable only by
+/// callers that have no keypair — the unsigned `webhook_list` arm, and an
+/// unsigned `webhook_delete` the same way `resolve_owner` always served it —
+/// for a bare
+/// repo name under a signed caller the path owner must be the caller's DID or
+/// the node 403/404s the request under the wrong namespace.
+async fn resolve_owner_repo(
+    args: &Value,
+    repo: &str,
+    keypair: &Option<gitlawb_core::identity::Keypair>,
+    client: &NodeClient,
+) -> Result<(String, String)> {
+    if let Some((o, r)) = repo.split_once('/') {
+        return Ok((o.to_string(), r.to_string()));
+    }
+    if let Some(o) = args.get("owner").and_then(|v| v.as_str()) {
+        return Ok((o.to_string(), repo.to_string()));
+    }
+    if let Some(kp) = keypair {
+        let did = kp.did().to_string();
+        return Ok((
+            did.split(':').next_back().unwrap_or(&did).to_string(),
+            repo.to_string(),
+        ));
+    }
+    let owner = resolve_owner(args, client).await?;
+    Ok((owner, repo.to_string()))
 }
 
 /// Parse git pkt-line info/refs response into a list of {ref, sha} objects.
@@ -1339,6 +1452,76 @@ fn write_message(writer: &mut impl Write, value: &Value) -> Result<()> {
     write!(writer, "Content-Length: {}\r\n\r\n{}", json.len(), json)?;
     writer.flush()?;
     Ok(())
+}
+
+/// Message for a `did_resolve` failure. A `did:key` that fails to resolve is a
+/// different situation from a DID method we have no resolver for, so saying
+/// "only did:key is supported" about something that IS a did:key sends the
+/// reader looking for the wrong problem.
+fn did_resolve_failure_message(
+    did_str: &str,
+    is_did_key: bool,
+    err: &gitlawb_core::Error,
+) -> String {
+    if is_did_key {
+        format!("cannot resolve '{did_str}': {err}")
+    } else {
+        format!("cannot resolve '{did_str}' locally — only did:key is supported without a resolver")
+    }
+}
+
+#[cfg(test)]
+mod did_resolve_message_tests {
+    use super::did_resolve_failure_message;
+    use gitlawb_core::did::Did;
+    use std::str::FromStr;
+
+    /// A well-formed did:key encoding the compressed identity point, which is
+    /// small-order. Derived from the point bytes so the fixture states WHY it
+    /// is weak rather than pinning an opaque string (the literal also trips
+    /// secret scanners, which cannot tell a public DID from an API key).
+    fn weak_did_key() -> String {
+        let mut weak = [0u8; 32];
+        weak[0] = 1; // compressed identity point
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(&weak).expect("decompresses");
+        Did::from_verifying_key(&vk).to_string()
+    }
+
+    #[test]
+    fn test_did_key_failure_does_not_claim_did_key_is_unsupported() {
+        // Drive the real parse and the real resolution error rather than
+        // hardcoding the discriminator, so flipping it at the call site fails.
+        let did_str = &weak_did_key();
+        let did = Did::from_str(did_str).expect("well-formed did:key");
+        let err = did
+            .to_verifying_key()
+            .expect_err("a small-order did:key must not resolve");
+
+        let msg = did_resolve_failure_message(did_str, did.is_did_key(), &err);
+        assert!(
+            !msg.contains("only did:key is supported"),
+            "a did:key must not be told did:key is unsupported: {msg}"
+        );
+        assert!(
+            msg.contains("small-order"),
+            "the real cause must survive into the message: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_non_key_method_keeps_the_no_resolver_message() {
+        let did_str = "did:web:example.com";
+        let did = Did::from_str(did_str).expect("did:web parses");
+        let err = did
+            .to_verifying_key()
+            .expect_err("did:web has no local resolver");
+
+        let msg = did_resolve_failure_message(did_str, did.is_did_key(), &err);
+        assert!(
+            msg.contains("only did:key is supported"),
+            "an unresolvable method keeps its existing explanation: {msg}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1590,7 +1773,7 @@ mod tests {
             )
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"tasks":[{"id":"t1","kind":"test","status":"pending"}]}"#)
+            .with_body(r#"{"tasks":[{"id":"t1","kind":"test","status":"pending"}],"has_more":false,"incomplete":false,"next_cursor":null}"#)
             .create_async()
             .await;
 
@@ -1604,6 +1787,275 @@ mod tests {
         .unwrap();
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["tasks"][0]["id"], "t1");
+        assert_eq!(parsed["complete"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn test_task_list_via_mcp_uses_loaded_identity() {
+        let mut server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/api/v1/tasks\?".to_string()),
+            )
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"tasks":[{"id":"t1"}],"has_more":false,"incomplete":false,"next_cursor":null}"#,
+            )
+            .create_async()
+            .await;
+
+        let result = call_tool("task_list", json!({}), &server.url(), Some(dir.path()))
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["tasks"][0]["id"], "t1");
+        assert_eq!(parsed["complete"], json!(true));
+    }
+
+    /// #327 review: MCP `task_list` issued one request and exposed no
+    /// continuation, so a limit above the node's 200-row page cap returned a
+    /// silently truncated result the model had no way to detect. It now
+    /// follows cursors and, when a guard stops it, says so in the payload.
+    #[tokio::test]
+    async fn test_task_list_via_mcp_follows_cursors() {
+        let mut server = mockito::Server::new_async().await;
+        let first = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/tasks\?limit=200$".to_string()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"tasks":[{"id":"t1"}],"has_more":true,"incomplete":false,"next_cursor":"c1"}"#,
+            )
+            .create_async()
+            .await;
+        let second = server
+            .mock("GET", mockito::Matcher::Regex(r"cursor=c1".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"tasks":[{"id":"t2"}],"has_more":false,"next_cursor":null}"#)
+            .create_async()
+            .await;
+
+        let result = call_tool("task_list", json!({"limit": 500}), &server.url(), None)
+            .await
+            .unwrap();
+        first.assert_async().await;
+        second.assert_async().await;
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["count"], 2);
+        assert_eq!(parsed["tasks"][1]["id"], "t2");
+        assert_eq!(parsed["complete"], json!(true));
+        assert!(parsed.get("warning").is_none());
+    }
+
+    /// A truncated MCP result must carry an explicit warning and a resume
+    /// cursor, so the model cannot read it as the whole answer.
+    #[tokio::test]
+    async fn test_task_list_via_mcp_flags_incomplete_results() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"tasks":[{"id":"t1"}],"has_more":true,"incomplete":true,"next_cursor":"resume-me"}"#,
+            )
+            .create_async()
+            .await;
+
+        let result = call_tool("task_list", json!({"limit": 1}), &server.url(), None)
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["complete"], json!(false));
+        assert_eq!(parsed["incomplete"], json!(true));
+        assert_eq!(parsed["next_cursor"], "resume-me");
+        assert!(
+            parsed["warning"]
+                .as_str()
+                .unwrap()
+                .contains("result incomplete"),
+            "{parsed}"
+        );
+    }
+
+    /// A legacy response without pagination metadata is reported as incomplete via MCP.
+    #[tokio::test]
+    async fn test_task_list_via_mcp_legacy_response_is_incomplete() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"tasks":[{"id":"t1"}],"count":1}"#)
+            .create_async()
+            .await;
+
+        let result = call_tool("task_list", json!({"limit": 50}), &server.url(), None)
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["complete"], json!(false));
+        assert_eq!(parsed["incomplete"], json!(true));
+        assert!(parsed["next_cursor"].is_null());
+        assert!(
+            parsed["warning"]
+                .as_str()
+                .unwrap()
+                .contains("node does not support pagination metadata"),
+            "{parsed}"
+        );
+    }
+
+    /// A legacy response with limit > 200 stops after 1 page and does not claim completeness via MCP.
+    #[tokio::test]
+    async fn test_task_list_via_mcp_legacy_limit_above_page_cap() {
+        let mut server = mockito::Server::new_async().await;
+        let ids: Vec<String> = (0..200).map(|i| format!("t{i}")).collect();
+        let tasks_json: Vec<Value> = ids.iter().map(|id| json!({ "id": id })).collect();
+        let body = json!({ "tasks": tasks_json, "count": 200 }).to_string();
+
+        let m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/tasks\?limit=200$".to_string()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let result = call_tool("task_list", json!({"limit": 500}), &server.url(), None)
+            .await
+            .unwrap();
+        m.assert_async().await;
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["count"], 200);
+        assert_eq!(parsed["complete"], json!(false));
+        assert_eq!(parsed["incomplete"], json!(true));
+        assert!(parsed["next_cursor"].is_null());
+        assert!(
+            parsed["warning"]
+                .as_str()
+                .unwrap()
+                .contains("node does not support pagination metadata"),
+            "{parsed}"
+        );
+    }
+
+    /// A cursor the model passes back must reach the node.
+    #[tokio::test]
+    async fn test_task_list_via_mcp_forwards_cursor_argument() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"cursor=given-cursor".to_string()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"tasks":[],"has_more":false,"incomplete":false,"next_cursor":null}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        call_tool(
+            "task_list",
+            json!({"cursor": "given-cursor"}),
+            &server.url(),
+            None,
+        )
+        .await
+        .unwrap();
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_task_list_via_mcp_returns_http_errors() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/api/v1/tasks\?".to_string()),
+            )
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"failed"}"#)
+            .create_async()
+            .await;
+
+        let err = call_tool("task_list", json!({}), &server.url(), None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("500"));
+    }
+
+    /// Malformed server responses fail visibly in MCP.
+    #[tokio::test]
+    async fn test_task_list_via_mcp_malformed_response_errors() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/api/v1/tasks\?".to_string()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"tasks":"not-an-array"}"#)
+            .create_async()
+            .await;
+
+        let err = call_tool("task_list", json!({}), &server.url(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("malformed") || err.to_string().contains("invalid JSON"),
+            "{err}"
+        );
+    }
+
+    /// #327 review: a model that sends `limit: 0` used to get an empty list
+    /// marked complete, which reads as "this node has no tasks". The shared
+    /// helper rejects it, so the model sees an invalid argument instead.
+    #[tokio::test]
+    async fn test_task_list_via_mcp_rejects_non_positive_limit() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/api/v1/tasks\?".to_string()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"tasks":[],"has_more":false,"incomplete":false,"next_cursor":null}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let err = call_tool("task_list", json!({"limit": 0}), &server.url(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("limit must be a positive"),
+            "{err}"
+        );
+        m.assert_async().await;
     }
 
     #[tokio::test]
@@ -1880,6 +2332,52 @@ mod tests {
         assert!(result.contains("webhooks"), "got: {result}");
     }
 
+    /// The MCP tool deliberately diverges from the CLI here: `gl webhook list`
+    /// requires a local identity and fails client-side without one, while the MCP
+    /// tool issues the request unsigned and lets the node answer. Pin that path,
+    /// since the divergence is only defensible if the denial actually reaches the
+    /// caller as an error rather than as an empty webhook list.
+    #[tokio::test]
+    async fn test_webhook_list_unsigned_without_identity_surfaces_the_node_denial() {
+        let mut server = mockito::Server::new_async().await;
+
+        // No identity dir, and an explicit `owner`, so the tool cannot sign and
+        // does not fall back to the keypair for the owner segment. The node
+        // owner-gates /hooks and answers a headerless caller with 401.
+        let m = server
+            .mock("GET", mockito::Matcher::Regex(r"/hooks$".to_string()))
+            .match_header("signature", mockito::Matcher::Missing)
+            .with_status(401)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"signature required"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        // Point at an EMPTY dir rather than passing `None`: `None` falls back to
+        // the ambient ~/.gitlawb/identity.pem, which exists on a dev box and not
+        // on CI, so the request would be signed here and unsigned there.
+        let empty = tempfile::TempDir::new().unwrap();
+        let err = call_tool(
+            "webhook_list",
+            json!({"owner": "alice", "repo": "myrepo"}),
+            &server.url(),
+            Some(empty.path()),
+        )
+        .await
+        .expect_err("a 401 must surface as an error, not an empty webhook list");
+
+        let err = err.to_string();
+        assert!(err.contains("401"), "must name the status: {err}");
+        assert!(
+            err.contains("signature required"),
+            "must carry the node's own reason: {err}"
+        );
+        // The request must actually have been issued unsigned; failing
+        // client-side before contacting the node would leave this unmatched.
+        m.assert_async().await;
+    }
+
     #[tokio::test]
     async fn test_webhook_list_default_owner_is_keypair_not_node_did() {
         // When `owner` is omitted, the owner segment must come from the signing
@@ -2009,11 +2507,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_webhook_list_without_keypair_errors() {
-        // No identity loaded and no explicit owner → the tool must error rather
-        // than fall back to the node DID and issue an unsigned, mis-scoped GET.
-        let server = mockito::Server::new_async().await;
+    async fn test_webhook_list_without_keypair_surfaces_node_denial() {
+        // No identity loaded and no explicit owner → the tool falls back to the
+        // node DID for the path and still issues the GET unsigned, so the node
+        // itself answers the denial (list_webhooks 401s a headerless caller)
+        // rather than the client inventing a failure before contact.
+        let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap(); // empty: no identity.pem
+        let _root = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"did":"did:key:z6MkNodeOperator"}"#)
+            .create_async()
+            .await;
+        let _hooks = server
+            .mock("GET", "/api/v1/repos/z6MkNodeOperator/myrepo/hooks")
+            .with_status(401)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"signature required"}"#)
+            .create_async()
+            .await;
 
         let err = call_tool(
             "webhook_list",
@@ -2022,8 +2536,93 @@ mod tests {
             Some(dir.path()),
         )
         .await
-        .expect_err("must error without an identity");
-        assert!(err.to_string().contains("no identity found"), "got: {err}");
+        .expect_err("unsigned list must surface the node denial");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("401") || msg.contains("signature required"),
+            "got: {msg}"
+        );
+        _hooks.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_task_list_invalid_limit_rejected() {
+        let server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+
+        let err = call_tool(
+            "task_list",
+            json!({"limit": "50"}),
+            &server.url(),
+            Some(dir.path()),
+        )
+        .await
+        .expect_err("string limit must be rejected");
+        assert!(
+            err.to_string()
+                .contains("invalid limit: expected an integer"),
+            "got: {err}"
+        );
+
+        let err_float = call_tool(
+            "task_list",
+            json!({"limit": 50.5}),
+            &server.url(),
+            Some(dir.path()),
+        )
+        .await
+        .expect_err("float limit must be rejected");
+        assert!(
+            err_float
+                .to_string()
+                .contains("invalid limit: expected an integer"),
+            "got: {err_float}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_task_list_invalid_cursor_rejected() {
+        let server = mockito::Server::new_async().await;
+        for invalid in [json!(123), json!({}), json!([]), json!(true)] {
+            let err = call_tool("task_list", json!({"cursor": invalid}), &server.url(), None)
+                .await
+                .expect_err("non-string cursor must be rejected");
+            assert!(
+                err.to_string()
+                    .contains("invalid cursor: expected a string"),
+                "for {invalid}: got {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_task_list_null_or_absent_cursor_accepted() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/api/v1/tasks\?".to_string()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"tasks":[],"has_more":false,"incomplete":false,"next_cursor":null}"#)
+            .expect(2)
+            .create_async()
+            .await;
+
+        call_tool("task_list", json!({}), &server.url(), None)
+            .await
+            .unwrap();
+
+        call_tool("task_list", json!({"cursor": null}), &server.url(), None)
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -2031,5 +2630,642 @@ mod tests {
         let tools = tool_definitions();
         let count = tools.as_array().unwrap().len();
         assert_eq!(count, 40, "expected 40 tools, got {count}");
+    }
+
+    // ── Gated read arms surface node denials, not fabricated results (#123) ──
+
+    #[tokio::test]
+    async fn repo_get_surfaces_denial_not_fabricated_repo() {
+        // The node returns the opaque 404 for a private repo the caller cannot read.
+        // The tool must Err surfacing it, NOT Ok with the error body serialized as the repo.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/secret")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let result = call_tool(
+            "repo_get",
+            json!({"owner": "alice", "name": "secret"}),
+            &server.url(),
+            None,
+        )
+        .await;
+
+        let err = result
+            .expect_err("repo_get must Err on a 404, not fabricate a repo")
+            .to_string();
+        assert!(err.contains("404"), "err={err}");
+        assert!(err.contains("not found"), "err={err}");
+        // Prove the gated route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn repo_get_returns_repo_on_200() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/myrepo")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"name":"myrepo","owner_did":"did:gitlawb:alice"}"#)
+            .create_async()
+            .await;
+        let result = call_tool(
+            "repo_get",
+            json!({"owner": "alice", "name": "myrepo"}),
+            &server.url(),
+            None,
+        )
+        .await
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["name"], "myrepo");
+    }
+
+    #[tokio::test]
+    async fn repo_commits_surfaces_denial_not_empty_list() {
+        // Before the fix a 404 rendered as "no commits" (empty). Now it must Err.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/secret/commits")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = call_tool(
+            "repo_commits",
+            json!({"owner": "alice", "name": "secret"}),
+            &server.url(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "repo_commits must Err on 404");
+        assert!(result.unwrap_err().to_string().contains("not found"));
+        // Prove the gated route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn repo_tree_surfaces_denial_not_fabricated_tree() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/secret/tree/")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = call_tool(
+            "repo_tree",
+            json!({"owner": "alice", "name": "secret"}),
+            &server.url(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "repo_tree must Err on 404");
+        // Prove the gated route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn pr_list_surfaces_denial_not_empty() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/secret/pulls")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = call_tool(
+            "pr_list",
+            json!({"owner": "alice", "repo": "secret"}),
+            &server.url(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "pr_list must Err on 404");
+        // Prove the gated route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn webhook_list_surfaces_denial_not_hook_targets() {
+        // Client half of #94: a non-owner hooks read must surface the denial,
+        // never render the webhook target URLs as a result.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/secret/hooks")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = call_tool(
+            "webhook_list",
+            json!({"owner": "alice", "repo": "secret"}),
+            &server.url(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "webhook_list must Err on 404");
+        // Prove the gated route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn issue_list_surfaces_denial_not_empty() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/secret/issues")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = call_tool(
+            "issue_list",
+            json!({"repo": "alice/secret"}),
+            &server.url(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "issue_list must Err on 404");
+        // Prove the gated route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn pr_view_surfaces_denial_not_stub() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/secret/pulls/1")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = call_tool(
+            "pr_view",
+            json!({"owner": "alice", "repo": "secret", "number": 1}),
+            &server.url(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "pr_view must Err on 404");
+        // Prove the gated route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn pr_diff_surfaces_denial_not_empty() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/secret/pulls/1/diff")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = call_tool(
+            "pr_diff",
+            json!({"owner": "alice", "repo": "secret", "number": 1}),
+            &server.url(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "pr_diff must Err on 404");
+        // Prove the gated route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
+    }
+
+    // ── Across the MCP twin: every tool that renders a node response must
+    //    surface a denial as an Err, not print the 4xx/5xx body as a success. ──
+
+    /// Drive one MCP tool against a node returning a 404 and assert it Errs
+    /// (surfacing the denial) rather than returning the error body as a result.
+    /// `.expect(1)` proves the tool hit the intended endpoint, so a wrong-path
+    /// request (mockito's 501) can't satisfy the Err assertion vacuously.
+    async fn assert_tool_surfaces_denial(
+        tool: &str,
+        method: &str,
+        path: mockito::Matcher,
+        args: Value,
+        with_identity: bool,
+    ) {
+        let mut server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        if with_identity {
+            let kp = gitlawb_core::identity::Keypair::generate();
+            std::fs::write(
+                dir.path().join("identity.pem"),
+                kp.to_pem().unwrap().as_bytes(),
+            )
+            .unwrap();
+        }
+        let _m = server
+            .mock(method, path)
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"denied"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let dir_opt = with_identity.then(|| dir.path());
+        let err = call_tool(tool, args, &server.url(), dir_opt)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("404"),
+            "{tool} must surface the 404 denial as an Err, got: {err}"
+        );
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn node_info_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "node_info",
+            "GET",
+            mockito::Matcher::Regex(r"^/$".to_string()),
+            json!({}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn node_health_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "node_health",
+            "GET",
+            mockito::Matcher::Regex(r"^/health$".to_string()),
+            json!({}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn repo_create_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "repo_create",
+            "POST",
+            mockito::Matcher::Regex(r"^/api/v1/repos$".to_string()),
+            json!({"name": "r"}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn repo_list_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "repo_list",
+            "GET",
+            mockito::Matcher::Regex(r"^/api/v1/repos$".to_string()),
+            json!({}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn repo_list_federated_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "repo_list_federated",
+            "GET",
+            mockito::Matcher::Regex(r"^/api/v1/repos/federated$".to_string()),
+            json!({}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn agent_register_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "agent_register",
+            "POST",
+            mockito::Matcher::Regex(r"^/api/register$".to_string()),
+            json!({}),
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pr_create_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "pr_create",
+            "POST",
+            mockito::Matcher::Regex(r"/pulls$".to_string()),
+            json!({"owner": "alice", "repo": "r", "head": "h", "title": "t"}),
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pr_review_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "pr_review",
+            "POST",
+            mockito::Matcher::Regex(r"/pulls/1/reviews$".to_string()),
+            json!({"owner": "alice", "repo": "r", "number": 1, "status": "approve"}),
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pr_merge_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "pr_merge",
+            "POST",
+            mockito::Matcher::Regex(r"/pulls/1/merge$".to_string()),
+            json!({"owner": "alice", "repo": "r", "number": 1}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn webhook_create_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "webhook_create",
+            "POST",
+            mockito::Matcher::Regex(r"/hooks$".to_string()),
+            json!({"owner": "alice", "repo": "r", "url": "http://example.com"}),
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn webhook_delete_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "webhook_delete",
+            "DELETE",
+            mockito::Matcher::Regex(r"/hooks/h1$".to_string()),
+            json!({"owner": "alice", "repo": "r", "id": "h1"}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn bounty_show_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "bounty_show",
+            "GET",
+            mockito::Matcher::Regex(r"/api/v1/bounties/b1$".to_string()),
+            json!({"id": "b1"}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn bounty_create_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "bounty_create",
+            "POST",
+            mockito::Matcher::Regex(r"/bounties$".to_string()),
+            json!({"repo": "a/b", "title": "t", "amount": 100}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn bounty_claim_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "bounty_claim",
+            "POST",
+            mockito::Matcher::Regex(r"/api/v1/bounties/b1/claim$".to_string()),
+            json!({"id": "b1"}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn bounty_submit_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "bounty_submit",
+            "POST",
+            mockito::Matcher::Regex(r"/api/v1/bounties/b1/submit$".to_string()),
+            json!({"id": "b1", "pr_id": "p1"}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn bounty_stats_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "bounty_stats",
+            "GET",
+            mockito::Matcher::Regex(r"^/api/v1/bounties/stats$".to_string()),
+            json!({}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn task_list_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "task_list",
+            "GET",
+            mockito::Matcher::Regex(r"/api/v1/tasks\?".to_string()),
+            json!({}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn task_create_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "task_create",
+            "POST",
+            mockito::Matcher::Regex(r"^/api/v1/tasks$".to_string()),
+            json!({"kind": "code-review"}),
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn task_claim_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "task_claim",
+            "POST",
+            mockito::Matcher::Regex(r"/api/v1/tasks/t1/claim$".to_string()),
+            json!({"id": "t1"}),
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn task_complete_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "task_complete",
+            "POST",
+            mockito::Matcher::Regex(r"/api/v1/tasks/t1/complete$".to_string()),
+            json!({"id": "t1"}),
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn issue_create_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "issue_create",
+            "POST",
+            mockito::Matcher::Regex(r"/issues$".to_string()),
+            json!({"owner": "alice", "repo": "r", "title": "t"}),
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn issue_comment_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "issue_comment",
+            "POST",
+            mockito::Matcher::Regex(r"/issues/i1/comments$".to_string()),
+            json!({"owner": "alice", "repo": "r", "issue_id": "i1", "body": "b"}),
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn git_refs_via_mcp_surfaces_denial() {
+        // git_refs reads pkt-line bytes, not JSON, so a 404 body would otherwise
+        // parse to an empty ref list and render as a successful (empty) result.
+        assert_tool_surfaces_denial(
+            "git_refs",
+            "GET",
+            mockito::Matcher::Regex(r"/info/refs".to_string()),
+            json!({"owner": "alice", "name": "r"}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn repo_clone_url_via_mcp_surfaces_denial() {
+        // repo_clone_url resolves the node DID via GET / (read_json). A gated 404
+        // there must Err (surfacing the status), not fabricate a clone URL.
+        assert_tool_surfaces_denial(
+            "repo_clone_url",
+            "GET",
+            mockito::Matcher::Regex(r"^/$".to_string()),
+            json!({"name": "r"}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn mcp_resolve_owner_surfaces_denial() {
+        // With no "owner" arg, resolve_owner GETs / for the node DID via read_json.
+        // A gated 404 there must Err (surfacing the status), proving the conversion
+        // is load-bearing rather than silently ignored.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"denied"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let err = resolve_owner(&json!({}), &NodeClient::new(server.url(), None))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"), "got: {err}");
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn resolve_owner_repo_splits_slash_form() {
+        let server = mockito::Server::new_async().await;
+        let (owner, name) = resolve_owner_repo(
+            &json!({}),
+            "alice/proj",
+            &None,
+            &NodeClient::new(server.url(), None),
+        )
+        .await
+        .unwrap();
+        assert_eq!((owner.as_str(), name.as_str()), ("alice", "proj"));
+    }
+
+    #[tokio::test]
+    async fn resolve_owner_repo_owner_arg_beats_keypair() {
+        let server = mockito::Server::new_async().await;
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let (owner, name) = resolve_owner_repo(
+            &json!({"owner": "bob"}),
+            "proj",
+            &Some(kp.clone()),
+            &NodeClient::new(server.url(), None),
+        )
+        .await
+        .unwrap();
+        assert_eq!((owner.as_str(), name.as_str()), ("bob", "proj"));
+    }
+
+    #[tokio::test]
+    async fn resolve_owner_repo_bare_repo_uses_keypair_did() {
+        let mut server = mockito::Server::new_async().await;
+        // A root mock answering with a different DID must never be consulted:
+        // under a signed caller the path owner is the keypair's short DID.
+        let _m = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_body(r#"{"did":"did:key:z6MkNodeOperator"}"#)
+            .expect(0)
+            .create_async()
+            .await;
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let short = kp
+            .did()
+            .to_string()
+            .split(':')
+            .next_back()
+            .unwrap()
+            .to_string();
+        let (owner, name) = resolve_owner_repo(
+            &json!({}),
+            "proj",
+            &Some(kp),
+            &NodeClient::new(server.url(), None),
+        )
+        .await
+        .unwrap();
+        assert_eq!((owner.as_str(), name.as_str()), (short.as_str(), "proj"));
+        _m.assert_async().await;
     }
 }

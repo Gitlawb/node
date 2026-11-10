@@ -85,11 +85,10 @@ pub async fn set_visibility(
     Path((owner, repo)): Path<(String, String)>,
     Json(req): Json<SetVisibilityRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>)> {
-    let record = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+    // Quarantine first (via authorize_repo_read), then owner — same posture as
+    // list_visibility so a quarantined repo cannot be mutated while reads 404.
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, Some(&auth.0), "/").await?;
     require_owner(&record, &auth.0)?;
     validate_path_glob(&req.path_glob)?;
 
@@ -141,11 +140,8 @@ pub async fn remove_visibility(
     Path((owner, repo)): Path<(String, String)>,
     Json(req): Json<RemoveVisibilityRequest>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, Some(&auth.0), "/").await?;
     require_owner(&record, &auth.0)?;
 
     state
@@ -171,14 +167,12 @@ pub async fn list_visibility(
     Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, repo)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+    // Quarantine first (via authorize_repo_read), then owner — a quarantined
+    // mirror must be opaque even to a caller matching owner_did.
+    let (record, rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, Some(&auth.0), "/").await?;
     require_owner(&record, &auth.0)?;
 
-    let rules = state.db.list_visibility_rules(&record.id).await?;
     let rules_json: Vec<_> = rules
         .into_iter()
         .map(|r| {
@@ -205,28 +199,18 @@ pub async fn list_visibility(
 /// denied one (`reinclude`), so a clean-clone client can sparse-exclude the
 /// denied subtrees while re-including the allowed nested paths. Unlike
 /// `list_visibility` this is not owner-gated and never exposes reader_dids.
+///
+/// Quarantined repos are opaque 404 via [`crate::api::authorize_repo_read`] —
+/// same posture as encrypted-blob discovery — so admission and private-subtree
+/// layout are not disclosed to anon, owner, or peers.
 pub async fn withheld_paths(
     State(state): State<AppState>,
     auth: Option<Extension<AuthenticatedDid>>,
     Path((owner, repo)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
-
-    let rules = state.db.list_visibility_rules(&record.id).await?;
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
-
-    // Whole-repo read gate: a caller who cannot read "/" gets repo-not-found,
-    // matching the git read endpoints, so this never discloses a private repo's
-    // existence or its path layout to an unauthorized caller.
-    if crate::visibility::visibility_check(&rules, record.is_public, &record.owner_did, caller, "/")
-        == crate::visibility::Decision::Deny
-    {
-        return Err(AppError::RepoNotFound(format!("{owner}/{repo}")));
-    }
+    let (record, rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, caller, "/").await?;
 
     let withheld =
         crate::visibility::withheld_globs(&rules, record.is_public, &record.owner_did, caller);
