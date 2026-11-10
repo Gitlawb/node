@@ -119,22 +119,18 @@ pub fn reveal(key: &[u8; 32], stored: &WebhookSecret) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::RngCore;
+    use rand::Rng;
 
     /// Test keys need no secrecy, but they still come from the OS CSPRNG so no
     /// hard-coded key material sits in the tree. A wrong key fails XChaCha20-Poly1305
     /// authentication with overwhelming probability, so the "wrong key" case stays
     /// deterministic in practice.
     fn new_key() -> [u8; 32] {
-        let mut key = [0u8; 32];
-        OsRng.fill_bytes(&mut key);
-        key
+        OsRng.gen()
     }
 
     fn other_key() -> [u8; 32] {
-        let mut key = [0u8; 32];
-        OsRng.fill_bytes(&mut key);
-        key
+        OsRng.gen()
     }
 
     #[test]
