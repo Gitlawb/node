@@ -178,17 +178,20 @@ mod authz_guard {
         .unwrap_or(rest.len());
         // Strip block comments too: a marker surviving only inside /* */ would
         // otherwise satisfy a row with the real gate deleted.
-        let mut body = rest[..end].to_string();
+        // Line comments first: a `//` line containing `/*` must not open a
+        // block range or real code (and gate markers) gets stripped with it.
+        let mut body = rest[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
         while let Some(open) = body.find("/*") {
             match body[open..].find("*/").map(|i| open + i + 2) {
                 Some(close) => body.replace_range(open..close, ""),
                 None => break,
             }
         }
-        body.lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n")
+        body
     }
 
     #[test]

@@ -163,17 +163,20 @@ A `git push` crosses two independent gates, and this section is about the second
 
 1. **Read visibility**, enforced twice on a push: on the `info/refs` advertisement
    that precedes every fetch *and* every push, and again on the `git-receive-pack`
-   POST itself, because a client can skip the advertisement entirely. The node
-   admits the owner, anyone on a public repository, and a caller that a
-   visibility rule names among its readers; everyone else gets a 404, since a
-   private repository is not confirmed to exist for a non-reader. A UCAN plays
-   no part here — a delegation grants no read access.
+   POST itself, because a client can skip the advertisement entirely. The
+   owner always passes. A visibility rule that matches `/` is an allow-list:
+   only the DIDs in its reader list pass, on a public repository as much as on
+   a private one. With no matching rule the repository's own flag decides:
+   public admits everyone, private denies every non-reader with the same 404 a
+   missing repository gets. A UCAN plays no part here — a delegation grants
+   no read access.
 2. **Push authorization**, on the `git-receive-pack` POST: the owner, or an
    owner-rooted, bounded, repository-scoped push delegation.
 
-Both must pass. On a public repository the first is open to everyone, so a
-delegation alone is enough; on a private one the delegate must also be a reader —
-see *Private repositories* below.
+Both must pass. With no `/` rule on a public repository the first is open to
+everyone, so a delegation alone is enough; with a `/` rule, or on a private
+repository, the delegate must also be a reader — see *Private repositories and
+`/` rules* below.
 
 ### Turning it off
 
@@ -227,9 +230,11 @@ What the node requires, and why:
 | No `nb` constraints | Constraints are reserved but not yet interpreted, so a capability carrying them authorizes nothing rather than silently granting more than the owner intended. |
 | The token is addressed to the pusher | The node requires the proof's audience to equal the invocation's issuer, and `gl ucan import` refuses a token addressed to another identity rather than storing one that can only fail. |
 
-**Private repositories.** A delegation clears the push gate only. The `info/refs`
-advertisement that `git push` fetches first is read-gated, and a UCAN grants no
-read access, so on a private repository the delegate must also be a reader:
+**Private repositories and `/` rules.** A delegation clears the push gate
+only. The `info/refs` advertisement that `git push` fetches first is read-gated,
+and a UCAN grants no read access, so on a private repository the delegate must
+also be a reader — and the same holds on a public repository that has a `/`
+rule, because a matching rule is an allow-list that replaces the public flag:
 
 ```bash
 # Owner: check the existing rules first — a `/` rule you already set has a mode
@@ -247,7 +252,8 @@ because a private repository is not confirmed to exist for a non-reader. A
 normal `git push` sees it at the `info/refs` advertisement; a client that skips
 the advertisement sees the identical denial on the `git-receive-pack` POST
 itself. Either way the delegation is valid and would clear the push gate: the
-read gate is what refused it. On a public repository this step is unnecessary. The two gates are
+read gate is what refused it. On a public repository with no `/` rule this
+step is unnecessary. The two gates are
 independent in the other direction as well: a reader with no delegation is still
 refused on the push.
 
