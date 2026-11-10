@@ -571,6 +571,17 @@ fn delegation_header(
 
     let dir = resolve_identity_dir()?;
     let path = delegation_path(&dir, &owner, &repo);
+    // The same cap `gl ucan import` applies to a token file
+    // (MAX_TOKEN_FILE_BYTES in gl/src/ucan_cmd.rs): an oversize store entry is
+    // treated like an unreadable one, not slurped into memory on every push.
+    const MAX_DELEGATION_FILE_BYTES: u64 = 1 << 20;
+    if std::fs::metadata(&path)
+        .map(|m| m.len() > MAX_DELEGATION_FILE_BYTES)
+        .unwrap_or(false)
+    {
+        tracing::warn!("stored delegation at {path:?} is larger than any UCAN token; ignoring it");
+        return None;
+    }
     let raw = std::fs::read_to_string(&path).ok()?;
 
     let delegation = match gitlawb_core::ucan::Ucan::decode(raw.trim()) {
@@ -580,6 +591,17 @@ fn delegation_header(
             return None;
         }
     };
+
+    // The same push-readiness refusal import applies before storing a token:
+    // an expired or unbounded delegation the node would refuse at middleware
+    // must not become a header that produces a distinguishable invalid_ucan
+    // 401; omitting it keeps the denial on the unified owner-push 403 path.
+    if delegation.is_expired() || !delegation.chain_lifetime_is_bounded() {
+        tracing::warn!(
+            "stored delegation at {path:?} is expired or has an unbounded link; pushing without X-Ucan"
+        );
+        return None;
+    }
 
     // The invocation must be addressed to the node that will execute it.
     // The shared client carries a 300s timeout, which is right for a pack transfer
@@ -3588,6 +3610,75 @@ mod delegated_push_tests {
         assert!(
             invocation.chain_lifetime_is_bounded(),
             "the node refuses an unbounded push chain, so every link must carry an expiry"
+        );
+    }
+
+    /// An expired stored delegation must not become a header: the node would
+    /// refuse it at middleware with a distinguishable error, so the helper
+    /// applies the same refusal import does and pushes without X-Ucan instead.
+    #[test]
+    fn delegation_header_is_omitted_for_an_expired_stored_delegation() {
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let owner_key = bare(&owner.did());
+
+        let delegation = Ucan::issue(
+            &owner,
+            agent.did(),
+            vec![Capability::new(
+                format!("gitlawb://repos/{owner_key}/r"),
+                caps::GIT_PUSH,
+            )],
+            Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+        )
+        .expect("issue expired delegation");
+
+        let mut server = mockito::Server::new();
+        let did_probe = server
+            .mock("GET", "/")
+            .with_header("content-type", "application/json")
+            .with_body(did_body(&Keypair::generate()))
+            .expect(0)
+            .create();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        store_delegation(
+            dir.path(),
+            &owner_key,
+            "r",
+            &delegation.encode().expect("encode"),
+        );
+
+        let post_url = format!("{}/{owner_key}/r/git-receive-pack", server.url());
+        let client = reqwest::blocking::Client::new();
+        let header =
+            with_identity_dir(dir.path(), || delegation_header(&client, &post_url, &agent));
+        assert!(
+            header.is_none(),
+            "an expired delegation must produce no X-Ucan"
+        );
+        did_probe.assert();
+    }
+
+    /// A store entry past the token-file cap is ignored like an unreadable
+    /// one instead of being read into memory on every push.
+    #[test]
+    fn delegation_header_is_omitted_for_an_oversized_store_entry() {
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let owner_key = bare(&owner.did());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oversized = "x".repeat((1 << 20) + 1);
+        store_delegation(dir.path(), &owner_key, "r", &oversized);
+
+        let post_url = format!("http://127.0.0.1:1/{owner_key}/r/git-receive-pack");
+        let client = reqwest::blocking::Client::new();
+        let header =
+            with_identity_dir(dir.path(), || delegation_header(&client, &post_url, &agent));
+        assert!(
+            header.is_none(),
+            "an oversize store entry must produce no X-Ucan"
         );
     }
 
