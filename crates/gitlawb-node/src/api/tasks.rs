@@ -1296,6 +1296,60 @@ mod visible_tasks_tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    /// An over-ceiling limit caps at MAX_VISIBLE_TASKS rather than scanning or
+    /// serializing the whole table (#405, adapted to the cursor handler).
+    #[sqlx::test]
+    async fn limit_ceiling_caps_at_200(pool: PgPool) {
+        let state = test_state(pool).await;
+        for i in 0..201 {
+            state
+                .db
+                .create_task(&task(&format!("ceil-{i}"), None, DELEGATOR))
+                .await
+                .unwrap();
+        }
+
+        let resp = list_router(state)
+            .oneshot(signed_request_as(
+                DELEGATOR,
+                Method::GET,
+                "/api/v1/tasks?limit=9223372036854775807",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(
+            body["count"], 200,
+            "i64::MAX must clamp to the 200 ceiling, not scan the table"
+        );
+    }
+
+    /// An omitted limit falls back to the 50-row default (#405).
+    #[sqlx::test]
+    async fn omitted_limit_uses_default_50(pool: PgPool) {
+        let state = test_state(pool).await;
+        for i in 0..60 {
+            state
+                .db
+                .create_task(&task(&format!("def-{i}"), None, DELEGATOR))
+                .await
+                .unwrap();
+        }
+
+        let resp = list_router(state)
+            .oneshot(signed_request_as(
+                DELEGATOR,
+                Method::GET,
+                "/api/v1/tasks",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["count"], 50, "omitted limit must default to 50");
+    }
+
     /// A negative limit must clamp to zero through `collect_visible_tasks`,
     /// not fall through to the visible set.
     #[sqlx::test]
