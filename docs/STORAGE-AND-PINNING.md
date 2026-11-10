@@ -1,8 +1,11 @@
 # Storage and pinning
 
-How a gitlawb node stores git objects and keeps them available. This documents
+How a gitlawb node's **optional post-push pinning tiers** work. This documents
 the behavior implemented in `crates/gitlawb-node/src/ipfs_pin.rs` and
-`crates/gitlawb-node/src/pinata.rs`; it does not change any behavior.
+`crates/gitlawb-node/src/pinata.rs`; it does not change any behavior. Primary
+git storage for clone/fetch lives in bare repos under `GITLAWB_REPOS_DIR`
+(with optional `GITLAWB_TIGRIS_BUCKET` backing), covered in the README
+Configuration table.
 
 ## Two-tier model
 
@@ -75,7 +78,10 @@ successful upload, can still cause a repeat upload attempt.
   objects, they are unreachable until it returns.
 - The **warm** tier adds off-node durability via Pinata's Filecoin-backed
   storage and makes objects reachable through the public IPFS gateway.
-- Running **both** gives a node-local hot copy plus an off-node warm copy.
+- Running **both** gives a node-local hot copy plus an off-node warm copy for
+  objects pinned while both sinks are enabled. An object warm-pinned before
+  Kubo was configured keeps only the warm copy (the dedup paragraph above)
+  unless something re-pins it.
 
 > The two sinks are currently invoked as separate call paths. Unifying them
 > behind a single pluggable backend interface (to add providers such as direct
