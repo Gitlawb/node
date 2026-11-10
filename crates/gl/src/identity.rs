@@ -326,6 +326,36 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[test]
+    fn load_optional_keypair_honors_gitlawb_key_basename() {
+        let dir = TempDir::new().unwrap();
+        let kp = Keypair::generate();
+        let custom = dir.path().join("ci-agent.pem");
+        std::fs::write(&custom, kp.to_pem().unwrap()).unwrap();
+        crate::identity::test_env::with_key(Some(custom.as_os_str()), || {
+            let loaded = load_optional_keypair(None).unwrap();
+            assert_eq!(
+                loaded.map(|k| k.did().to_string()),
+                Some(kp.did().to_string()),
+                "the configured basename must be read, not ~/.gitlawb/identity.pem"
+            );
+        });
+    }
+
+    #[test]
+    fn load_optional_keypair_none_when_unset_and_missing() {
+        let dir = TempDir::new().unwrap();
+        crate::identity::test_env::with_key(
+            Some(dir.path().join("absent.pem").as_os_str()),
+            || {
+                assert!(
+                    load_optional_keypair(None).unwrap().is_none(),
+                    "a configured-but-absent key resolves anonymous, not an error"
+                );
+            },
+        );
+    }
+
     #[tokio::test]
     async fn test_cmd_new_creates_pem() {
         let dir = TempDir::new().unwrap();
