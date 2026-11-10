@@ -79,7 +79,7 @@ pub enum IpfsCmd {
             env = "GITLAWB_NODE"
         )]
         node: String,
-        /// Identity directory (default: ~/.gitlawb)
+        /// Identity directory (default: the parent of $GITLAWB_KEY, else ~/.gitlawb)
         #[arg(long)]
         dir: Option<PathBuf>,
         /// Resume token from a scan that stopped at a bound, as printed by a

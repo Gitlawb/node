@@ -128,15 +128,16 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
                     )?;
                     true
                 };
-                let trust = payload["trust_score"].as_f64().unwrap_or(0.0);
-                println!("  ✓  Registered successfully");
-                println!("     Trust score: {trust:.2}");
                 if saved {
+                    // Success belongs to the saved branch: a 2xx without a
+                    // usable ucan is not a registration — the response may not
+                    // even be JSON, and saying success would also leave a
+                    // stale ucan.json from another node in place.
+                    let trust = payload["trust_score"].as_f64().unwrap_or(0.0);
+                    println!("  ✓  Registered successfully");
+                    println!("     Trust score: {trust:.2}");
                     println!("     UCAN saved to {}", ucan_path.display());
                 } else {
-                    // A 2xx without a usable ucan is not a registration; the
-                    // response may not even be JSON. Saying success here would
-                    // also leave a stale ucan.json from another node in place.
                     println!(
                         "  \u{00d7}  Registration returned no UCAN (unexpected response body)"
                     );

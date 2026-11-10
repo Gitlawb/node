@@ -446,9 +446,10 @@ fn delegation_path(dir: &std::path::Path, owner_did: &str, repo: &str) -> std::p
 /// `validate_ucan_chain` expects: it binds `iss` to the request signer and `aud`
 /// to its own DID, then walks `prf` to the root.
 ///
-/// Capabilities are copied from the delegation unchanged, so the invocation is
-/// never broader than what was delegated and cannot fail attenuation. No expiry
-/// is set: the delegation's own `exp` still bounds the chain, because
+/// The invocation carries the delegation's `git/push` capability narrowed to
+/// this repository (constrained or sibling capabilities are skipped rather than
+/// weakened), so the invocation is never broader than what was delegated and
+/// cannot fail attenuation. `exp` is copied from the delegation's expiry, and
 /// `verify_chain` checks each proof's expiry as it recurses.
 fn build_invocation(
     agent: &Keypair,
@@ -468,9 +469,9 @@ fn build_invocation(
     // leaf is selected so the message names the actual reason.
     if !delegation.chain_grants_push_to(owner, repo) {
         anyhow::bail!(
-            "stored delegation does not grant git/push for {resource} on every link of 
-             its chain — a proof behind it may be a wildcard or name another repository. 
-             Ask the owner to re-issue it against this repository and re-run 
+            "stored delegation does not grant git/push for {resource} on every link of \
+             its chain — a proof behind it may be a wildcard or name another repository. \
+             Ask the owner to re-issue it against this repository and re-run \
              `gl ucan import`."
         );
     }

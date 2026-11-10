@@ -821,11 +821,11 @@ async fn call_tool(
                 format!("could not read the saved UCAN at {}", ucan_path.display())
             })?;
             Ok(serde_json::to_string_pretty(&json!({
-                "issuer": ucan.payload.iss.to_string(),
-                "audience": ucan.payload.aud.to_string(),
+                "issuer": crate::ucan_cmd::shown(&ucan.payload.iss.to_string()),
+                "audience": crate::ucan_cmd::shown(&ucan.payload.aud.to_string()),
                 "version": ucan.payload.ucan,
                 "capabilities": ucan.payload.att.iter()
-                    .map(|c| json!({ "with": c.with, "can": c.can }))
+                    .map(|c| json!({ "with": crate::ucan_cmd::shown(&c.with), "can": crate::ucan_cmd::shown(&c.can) }))
                     .collect::<Vec<_>>(),
                 "expires": ucan.payload.exp.map(|e| {
                     chrono::DateTime::from_timestamp(e, 0)
@@ -1874,6 +1874,10 @@ mod tests {
     /// follows cursors and, when a guard stops it, says so in the payload.
     #[tokio::test]
     async fn test_task_list_via_mcp_follows_cursors() {
+        // The env-mutating suites serialize on test_env's lock; a resolver
+        // reader that skips it can observe a half-set GITLAWB_KEY mid-race.
+        // Taking it here (with the key absent) keeps this read deterministic.
+        let _key_guard = crate::identity::test_env::set_key(None::<&str>);
         let mut server = mockito::Server::new_async().await;
         let first = server
             .mock(
@@ -1911,6 +1915,8 @@ mod tests {
     /// cursor, so the model cannot read it as the whole answer.
     #[tokio::test]
     async fn test_task_list_via_mcp_flags_incomplete_results() {
+        let _key_guard = crate::identity::test_env::set_key(None::<&str>);
+
         let mut server = mockito::Server::new_async().await;
         let _m = server
             .mock("GET", mockito::Matcher::Any)
@@ -1941,6 +1947,7 @@ mod tests {
     /// A legacy response without pagination metadata is reported as incomplete via MCP.
     #[tokio::test]
     async fn test_task_list_via_mcp_legacy_response_is_incomplete() {
+        let _key_guard = crate::identity::test_env::set_key(None::<&str>);
         let mut server = mockito::Server::new_async().await;
         let _m = server
             .mock("GET", mockito::Matcher::Any)
@@ -1969,6 +1976,7 @@ mod tests {
     /// A legacy response with limit > 200 stops after 1 page and does not claim completeness via MCP.
     #[tokio::test]
     async fn test_task_list_via_mcp_legacy_limit_above_page_cap() {
+        let _key_guard = crate::identity::test_env::set_key(None::<&str>);
         let mut server = mockito::Server::new_async().await;
         let ids: Vec<String> = (0..200).map(|i| format!("t{i}")).collect();
         let tasks_json: Vec<Value> = ids.iter().map(|id| json!({ "id": id })).collect();
@@ -2080,6 +2088,7 @@ mod tests {
     /// helper rejects it, so the model sees an invalid argument instead.
     #[tokio::test]
     async fn test_task_list_via_mcp_rejects_non_positive_limit() {
+        let _key_guard = crate::identity::test_env::set_key(None::<&str>);
         let mut server = mockito::Server::new_async().await;
         let m = server
             .mock(

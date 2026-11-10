@@ -34,7 +34,11 @@ pub enum UcanCmd {
         /// A capability that authorizes a write must lapse on its own: there is no
         /// revocation path yet, so an unbounded delegation cannot be withdrawn once
         /// the token leaks. A node refuses an unbounded `git/push` chain outright.
-        #[arg(long, default_value_t = DEFAULT_DELEGATION_EXPIRY_HOURS)]
+        #[arg(
+            long,
+            default_value_t = DEFAULT_DELEGATION_EXPIRY_HOURS,
+            value_parser = clap::value_parser!(u64).range(1..=MAX_EXPIRY_HOURS)
+        )]
         expiry: u64,
         /// Issue with no expiry. The result cannot authorize a push, and cannot be
         /// withdrawn — only use it for advisory or read-shaped capabilities.
@@ -127,6 +131,11 @@ fn repo_from_resource(with: &str) -> Option<(String, String)> {
 /// Default delegation lifetime. Finite on purpose: an unbounded write capability
 /// cannot be withdrawn while there is no revocation path, and the node refuses one.
 pub const DEFAULT_DELEGATION_EXPIRY_HOURS: u64 = 720;
+/// Chrono panics on a DateTime overflow and a u64 that wraps negative when
+/// cast issues an already-expired token; anything past ~100k years is refused
+/// as unusable rather than trusted into arithmetic. The clap parser enforces
+/// this bound (and `0`) before `cmd_delegate` runs.
+pub(crate) const MAX_EXPIRY_HOURS: u64 = 900_000_000;
 
 pub async fn run(args: UcanArgs) -> Result<()> {
     match args.cmd {
@@ -211,7 +220,7 @@ const SHOWN_MAX_CHARS: usize = 512;
 /// ANSI or OSC sequence in one of them drives the operator's terminal (INV-6).
 /// The strip is the workspace's one definition; the cap keeps a megabyte of
 /// nonsense from scrolling the reason off the screen.
-fn shown(s: &str) -> String {
+pub(crate) fn shown(s: &str) -> String {
     let clean = gitlawb_core::sanitize::strip_terminal_controls(s);
     if clean.chars().count() > SHOWN_MAX_CHARS {
         let mut cut: String = clean.chars().take(SHOWN_MAX_CHARS).collect();
@@ -694,16 +703,8 @@ async fn cmd_delegate(
         );
     }
 
-    // Chrono panics on a DateTime overflow, and a u64 that wraps negative when
-    // cast issues an already-expired token. Anything past ~100k years is
-    // refused as unusable rather than trusted into arithmetic.
-    const MAX_EXPIRY_HOURS: u64 = 900_000_000;
     let exp = expiry
         .map(|h| -> Result<chrono::DateTime<chrono::Utc>> {
-            anyhow::ensure!(
-                h <= MAX_EXPIRY_HOURS,
-                "--expiry is out of range ({h} hours)"
-            );
             Ok(chrono::Utc::now() + chrono::Duration::hours(h as i64))
         })
         .transpose()?;
@@ -839,18 +840,20 @@ impl VerifyReport {
     /// The MCP shape. `valid` is [`Self::is_valid`]; the rest is there so a
     /// caller can see which check failed without re-running them.
     pub fn to_json(&self) -> serde_json::Value {
+        // Token-derived strings carry attacker-controlled bytes into MCP JSON
+        // as surely as into a terminal, so this shape sanitizes like render().
         serde_json::json!({
             "valid": self.is_valid(),
             "signature_valid": self.signature.is_ok(),
             "expired": self.expired,
             "chain_valid": self.chain.is_ok(),
-            "chain_error": self.chain.as_ref().err(),
-            "root_issuer": self.chain.as_ref().ok(),
-            "issuer": self.issuer,
-            "audience": self.audience,
+            "chain_error": self.chain.as_ref().err().map(|e| shown(&e.to_string())),
+            "root_issuer": self.chain.as_ref().ok().map(|r| shown(&r.to_string())),
+            "issuer": shown(&self.issuer.to_string()),
+            "audience": shown(&self.audience.to_string()),
             "capabilities": self.capabilities
                 .iter()
-                .map(|(with, can)| serde_json::json!({ "with": with, "can": can }))
+                .map(|(with, can)| serde_json::json!({ "with": shown(with), "can": shown(can) }))
                 .collect::<Vec<_>>(),
             "expires": self.expires,
         })

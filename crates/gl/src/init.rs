@@ -232,7 +232,16 @@ fn generate_identity(dir: Option<&std::path::Path>) -> Result<gitlawb_core::iden
     let keypair = gitlawb_core::identity::Keypair::generate();
     let pem = keypair.to_pem()?;
 
-    crate::secret_file::write(&path, pem.as_bytes())?;
+    crate::secret_file::write_new(&path, pem.as_bytes()).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            anyhow::anyhow!(
+                "identity key already exists at {} — refusing to overwrite; pass --dir for a fresh location or move the key",
+                path.display()
+            )
+        } else {
+            anyhow::anyhow!(e)
+        }
+    })?;
 
     Ok(keypair)
 }

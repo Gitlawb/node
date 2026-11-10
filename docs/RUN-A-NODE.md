@@ -208,6 +208,8 @@ gl ucan import <token-or-path>
 git push origin main          # git-remote-gitlawb attaches it as X-Ucan
 ```
 
+`--expiry` is measured in hours: 168 is 7 days, 720 is 30.
+
 What the node requires, and why:
 
 | Requirement | Reason |
@@ -223,8 +225,14 @@ advertisement that `git push` fetches first is read-gated, and a UCAN grants no
 read access, so on a private repository the delegate must also be a reader:
 
 ```bash
-# Owner: let the agent read the whole repository
-gl visibility set / --repo <repo> --readers did:key:z6MkAgent…
+# Owner: check the existing rules first — a `/` rule you already set has a mode
+# you want to keep, and `set` replaces its reader list wholesale.
+gl visibility list --repo <repo>
+
+# Then grant read to the agent AND every existing reader on `/`. The mode
+# (`a`/`b`) must match what `list` showed; only reach for `b` when no `/`
+# rule exists yet.
+gl visibility set / --repo <repo> --readers did:key:z6MkReader1,did:key:z6MkAgent…
 ```
 
 Without it the agent's push fails at the advertisement with a 404 — the same

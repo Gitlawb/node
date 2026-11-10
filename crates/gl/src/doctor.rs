@@ -69,6 +69,47 @@ impl Check {
     }
 }
 
+/// Resolve the config dir and key path without aborting on a refused resolver.
+/// The whole point of doctor is to explain a broken setup, so a `GITLAWB_KEY`
+/// or `--dir` the resolvers reject becomes `Check::fail` rows for the checks
+/// that depend on them, while node/git checks still run.
+fn resolve_config_paths(
+    args_dir: Option<PathBuf>,
+) -> (Option<PathBuf>, Option<PathBuf>, Vec<Check>) {
+    let dir = crate::identity::gitlawb_dir(args_dir.clone());
+    let mut checks = Vec::new();
+    let dir = match dir {
+        Ok(d) => Some(d),
+        Err(e) => {
+            checks.push(Check::fail(
+                "identity",
+                format!("could not resolve config dir: {e}"),
+                "fix GITLAWB_KEY or --dir",
+            ));
+            checks.push(Check::fail(
+                "registration",
+                "skipped: config dir unresolved",
+                "fix GITLAWB_KEY or --dir",
+            ));
+            None
+        }
+    };
+    let pem_path = match crate::identity::key_path_for(args_dir.as_deref()) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            if dir.is_some() {
+                checks.push(Check::fail(
+                    "identity",
+                    format!("could not resolve key path: {e}"),
+                    "fix GITLAWB_KEY or --dir",
+                ));
+            }
+            None
+        }
+    };
+    (dir, pem_path, checks)
+}
+
 pub async fn run(args: DoctorArgs) -> Result<()> {
     println!("gl doctor — checking your Twigpine setup");
     println!();
@@ -78,14 +119,13 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
     // make the one command whose job is to explain a broken setup the one that
     // misreports it.
     let args_dir = args.dir.clone();
-    let dir = crate::identity::gitlawb_dir(args.dir)?;
-
-    let mut checks = Vec::new();
+    let (dir, pem_path, resolver_rows) = resolve_config_paths(args_dir.clone());
+    let mut checks = resolver_rows;
 
     // ── 1. Identity ───────────────────────────────────────────────────────
-    let pem_path = crate::identity::key_path_for(args_dir.as_deref())?;
-    if pem_path.exists() {
-        match std::fs::read_to_string(&pem_path)
+    if pem_path.as_ref().is_some_and(|p| p.exists()) {
+        let pem_path = pem_path.as_ref().unwrap();
+        match std::fs::read_to_string(pem_path)
             .ok()
             .and_then(|pem| gitlawb_core::identity::Keypair::from_pem(&pem).ok())
         {
@@ -102,7 +142,7 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
                 ));
             }
         }
-    } else {
+    } else if let Some(pem_path) = &pem_path {
         checks.push(Check::fail(
             "identity",
             format!("not found at {}", pem_path.display()),
@@ -111,33 +151,35 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
     }
 
     // ── 2. Registration ───────────────────────────────────────────────────
-    let ucan_path = dir.join("ucan.json");
-    if ucan_path.exists() {
-        match std::fs::read_to_string(&ucan_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        {
-            Some(v) => {
-                let node = v["node"].as_str().unwrap_or("unknown");
-                checks.push(Check::pass(
-                    "registration",
-                    format!("registered with {node}"),
-                ));
+    if let Some(dir) = &dir {
+        let ucan_path = dir.join("ucan.json");
+        if ucan_path.exists() {
+            match std::fs::read_to_string(&ucan_path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            {
+                Some(v) => {
+                    let node = v["node"].as_str().unwrap_or("unknown");
+                    checks.push(Check::pass(
+                        "registration",
+                        format!("registered with {node}"),
+                    ));
+                }
+                None => {
+                    checks.push(Check::fail(
+                        "registration",
+                        "ucan.json exists but is malformed",
+                        "gl register",
+                    ));
+                }
             }
-            None => {
-                checks.push(Check::fail(
-                    "registration",
-                    "ucan.json exists but is malformed",
-                    "gl register",
-                ));
-            }
+        } else {
+            checks.push(Check::fail(
+                "registration",
+                "not registered with any node",
+                "gl register",
+            ));
         }
-    } else {
-        checks.push(Check::fail(
-            "registration",
-            "not registered with any node",
-            "gl register",
-        ));
     }
 
     // ── 3. GITLAWB_NODE env var ───────────────────────────────────────────
@@ -604,6 +646,24 @@ mod tests {
         let no_rc = fake_home(None, false);
         assert!(check_shell_alias_shadowing(Some(no_rc.path().to_path_buf())).is_none());
         assert!(check_shell_alias_shadowing(None).is_none());
+    }
+
+    #[test]
+    fn refused_resolver_becomes_check_rows_not_abort() {
+        // A relative GITLAWB_KEY makes both resolvers Err; doctor must turn
+        // that into fail rows for the dependent checks and keep going, not
+        // exit before the node/git checks ever run.
+        crate::identity::test_env::with_key(Some("relative/path"), || {
+            let (dir, pem_path, rows) = resolve_config_paths(None);
+            assert!(dir.is_none() && pem_path.is_none());
+            let fails: Vec<_> = rows
+                .iter()
+                .filter(|c| matches!(c.state, CheckState::Fail))
+                .map(|c| c.label)
+                .collect();
+            assert!(fails.contains(&"identity"), "rows: {fails:?}");
+            assert!(fails.contains(&"registration"), "rows: {fails:?}");
+        });
     }
 
     #[test]

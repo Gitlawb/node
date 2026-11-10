@@ -146,7 +146,11 @@ pub fn load_optional_keypair(dir: Option<&std::path::Path>) -> Result<Option<Key
     // identity fallback) signed as a stale DID or went anonymous while every
     // sibling command read the configured key. A host with no home and no
     // GITLAWB_KEY still resolves to anonymous rather than refusing.
-    if std::env::var_os("GITLAWB_KEY").is_none() && dirs::home_dir().is_none() {
+    // An empty GITLAWB_KEY counts as unconfigured, matching identity_key_path:
+    // set-but-empty should not force an anonymous resolution through a path
+    // that cannot resolve.
+    let key_configured = std::env::var_os("GITLAWB_KEY").is_some_and(|v| !v.is_empty());
+    if !key_configured && dirs::home_dir().is_none() {
         return Ok(None);
     }
     let path = key_path_for(None)?;
@@ -663,10 +667,14 @@ mod gitlawb_dir_tests {
     /// variable expanded into a wrapper script. Treated as unset, not as an error.
     #[test]
     fn an_empty_key_path_is_treated_as_unset() {
+        // A host without a home dir is a legitimate CI shape; the empty-is-unset
+        // rule resolves to anonymous there, so this assertion has nothing to
+        // compare against and is a pass, not a panic.
+        let Some(home) = dirs::home_dir() else { return };
         let result = with_key_env(Some(OsString::new()), || gitlawb_dir(None));
         assert_eq!(
             result.unwrap(),
-            dirs::home_dir().unwrap().join(".gitlawb"),
+            home.join(".gitlawb"),
             "an empty value selects the default directory"
         );
     }
