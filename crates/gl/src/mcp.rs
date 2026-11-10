@@ -963,7 +963,7 @@ async fn call_tool(
                 .as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
                 .unwrap_or_else(|| vec!["*"]);
-            let owner = resolve_owner(&args, &client).await?;
+            let (owner, name) = resolve_owner_repo(&args, repo, &keypair, &client).await?;
             let body = serde_json::to_vec(&json!({
                 "url": url,
                 "secret": args["secret"],
@@ -971,7 +971,7 @@ async fn call_tool(
             }))?;
             let resp = crate::http::read_json(
                 client
-                    .post(&format!("/api/v1/repos/{owner}/{repo}/hooks"), &body)
+                    .post(&format!("/api/v1/repos/{owner}/{name}/hooks"), &body)
                     .await?,
                 "create webhook",
             )
@@ -981,19 +981,12 @@ async fn call_tool(
 
         "webhook_list" => {
             let repo = args["repo"].as_str().context("missing 'repo'")?;
-            // Owner-gated route: an explicit `owner` arg wins, otherwise default to
-            // the signing keypair's short DID (NOT the node DID that resolve_owner
-            // returns). The request is signed by this keypair, so the path owner
-            // must match it or the node returns 403/404.
-            let owner = if let Some(o) = args.get("owner").and_then(|v| v.as_str()) {
-                o.to_string()
-            } else {
-                let kp = keypair
-                    .as_ref()
-                    .context("no identity found — run `gl identity new` first")?;
-                let did = kp.did().to_string();
-                did.split(':').next_back().unwrap_or(&did).to_string()
-            };
+            // Owner-gated route: `owner/repo` splits first, an explicit `owner`
+            // arg wins next, otherwise the signing keypair's short DID (NOT the
+            // node DID that resolve_owner returns). The request is signed by
+            // this keypair, so the path owner must match it or the node
+            // returns 403/404.
+            let (owner, name) = resolve_owner_repo(&args, repo, &keypair, &client).await?;
             // Owner-gated AND auth-required route (list_webhooks 401s a headerless
             // caller, then 403s a non-owner). get_maybe_signed signs when an
             // identity is present (so the owner is authorized) and otherwise sends
@@ -1004,7 +997,7 @@ async fn call_tool(
             // failing client-side before the node is contacted.
             let resp = crate::http::read_json(
                 client
-                    .get_maybe_signed(&format!("/api/v1/repos/{owner}/{repo}/hooks"))
+                    .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}/hooks"))
                     .await?,
                 "webhook_list",
             )
@@ -1015,11 +1008,11 @@ async fn call_tool(
         "webhook_delete" => {
             let repo = args["repo"].as_str().context("missing 'repo'")?;
             let id = args["id"].as_str().context("missing 'id'")?;
-            let owner = resolve_owner(&args, &client).await?;
+            let (owner, name) = resolve_owner_repo(&args, repo, &keypair, &client).await?;
             let body = serde_json::to_vec(&json!({}))?;
             let resp = crate::http::read_json(
                 client
-                    .delete(&format!("/api/v1/repos/{owner}/{repo}/hooks/{id}"), &body)
+                    .delete(&format!("/api/v1/repos/{owner}/{name}/hooks/{id}"), &body)
                     .await?,
                 "delete webhook",
             )
@@ -1343,6 +1336,36 @@ async fn resolve_owner(args: &Value, client: &NodeClient) -> Result<String> {
     let info = crate::http::read_json(client.get("/").await?, "node info").await?;
     let did = info["did"].as_str().context("node info missing DID")?;
     Ok(did.split(':').next_back().unwrap_or(did).to_string())
+}
+
+/// Resolve (owner, repo) for the webhook tools, matching the CLI's
+/// `resolve_owner_repo_pair` contract: an `owner/repo` string splits first, an
+/// explicit `owner` arg wins next, then the signing keypair's short DID. The
+/// last resort is the node root DID via `resolve_owner`, reachable only by
+/// callers that have no keypair (the unsigned webhook_list arm) — for a bare
+/// repo name under a signed caller the path owner must be the caller's DID or
+/// the node 403/404s the request under the wrong namespace.
+async fn resolve_owner_repo(
+    args: &Value,
+    repo: &str,
+    keypair: &Option<gitlawb_core::identity::Keypair>,
+    client: &NodeClient,
+) -> Result<(String, String)> {
+    if let Some((o, r)) = repo.split_once('/') {
+        return Ok((o.to_string(), r.to_string()));
+    }
+    if let Some(o) = args.get("owner").and_then(|v| v.as_str()) {
+        return Ok((o.to_string(), repo.to_string()));
+    }
+    if let Some(kp) = keypair {
+        let did = kp.did().to_string();
+        return Ok((
+            did.split(':').next_back().unwrap_or(&did).to_string(),
+            repo.to_string(),
+        ));
+    }
+    let owner = resolve_owner(args, client).await?;
+    Ok((owner, repo.to_string()))
 }
 
 /// Parse git pkt-line info/refs response into a list of {ref, sha} objects.
@@ -3159,6 +3182,67 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("404"), "got: {err}");
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn resolve_owner_repo_splits_slash_form() {
+        let server = mockito::Server::new_async().await;
+        let (owner, name) = resolve_owner_repo(
+            &json!({}),
+            "alice/proj",
+            &None,
+            &NodeClient::new(server.url(), None),
+        )
+        .await
+        .unwrap();
+        assert_eq!((owner.as_str(), name.as_str()), ("alice", "proj"));
+    }
+
+    #[tokio::test]
+    async fn resolve_owner_repo_owner_arg_beats_keypair() {
+        let server = mockito::Server::new_async().await;
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let (owner, name) = resolve_owner_repo(
+            &json!({"owner": "bob"}),
+            "proj",
+            &Some(kp.clone()),
+            &NodeClient::new(server.url(), None),
+        )
+        .await
+        .unwrap();
+        assert_eq!((owner.as_str(), name.as_str()), ("bob", "proj"));
+    }
+
+    #[tokio::test]
+    async fn resolve_owner_repo_bare_repo_uses_keypair_did() {
+        let mut server = mockito::Server::new_async().await;
+        // A root mock answering with a different DID must never be consulted:
+        // under a signed caller the path owner is the keypair's short DID.
+        let _m = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_body(r#"{"did":"did:key:z6MkNodeOperator"}"#)
+            .expect(0)
+            .create_async()
+            .await;
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let short = kp
+            .did()
+            .to_string()
+            .split(':')
+            .next_back()
+            .unwrap()
+            .to_string();
+        let (owner, name) = resolve_owner_repo(
+            &json!({}),
+            "proj",
+            &Some(kp),
+            &NodeClient::new(server.url(), None),
+        )
+        .await
+        .unwrap();
+        assert_eq!((owner.as_str(), name.as_str()), (short.as_str(), "proj"));
         _m.assert_async().await;
     }
 }
