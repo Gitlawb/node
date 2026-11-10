@@ -823,7 +823,7 @@ async fn call_tool(
             Ok(serde_json::to_string_pretty(&json!({
                 "issuer": crate::ucan_cmd::shown(&ucan.payload.iss.to_string()),
                 "audience": crate::ucan_cmd::shown(&ucan.payload.aud.to_string()),
-                "version": ucan.payload.ucan,
+                "version": crate::ucan_cmd::shown(&ucan.payload.ucan),
                 "capabilities": ucan.payload.att.iter()
                     .map(|c| json!({ "with": crate::ucan_cmd::shown(&c.with), "can": crate::ucan_cmd::shown(&c.can) }))
                     .collect::<Vec<_>>(),
@@ -1260,7 +1260,9 @@ async fn call_tool(
             // fails later with less context than this.
             if gitlawb_core::ucan::push::is_push_wildcard(resource, action) {
                 anyhow::bail!(
-                    "a wildcard resource cannot carry a push capability: a delegation is \n                     scoped to the repositories it names when issued, and `*` cannot say \n                     which those were. Use resource gitlawb://repos/<owner>/<repo>."
+                    "a wildcard resource cannot carry a push capability: a delegation is \
+                     scoped to the repositories it names when issued, and `*` cannot say \
+                     which those were. Use resource gitlawb://repos/<owner>/<repo>."
                 );
             }
 
@@ -1283,7 +1285,7 @@ async fn call_tool(
                 anyhow::bail!("expiry_hours must be at least 1: a token that has already expired grants nothing");
             }
             anyhow::ensure!(
-                hours <= 900_000_000,
+                hours <= crate::ucan_cmd::MAX_EXPIRY_HOURS as i64,
                 "expiry_hours is out of range ({hours}): a DateTime cannot represent it"
             );
             let exp = Some(chrono::Utc::now() + chrono::Duration::hours(hours));

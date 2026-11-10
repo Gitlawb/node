@@ -161,11 +161,13 @@ explicitly protected.
 
 A `git push` crosses two independent gates, and this section is about the second:
 
-1. **Read visibility**, on the `info/refs` advertisement that precedes every fetch
-   *and* every push. The node admits the owner, anyone on a public repository, and
-   a caller that a visibility rule names among its readers; everyone else gets a
-   404, since a private repository is not confirmed to exist for a non-reader. A
-   UCAN plays no part here — a delegation grants no read access.
+1. **Read visibility**, enforced twice on a push: on the `info/refs` advertisement
+   that precedes every fetch *and* every push, and again on the `git-receive-pack`
+   POST itself, because a client can skip the advertisement entirely. The node
+   admits the owner, anyone on a public repository, and a caller that a
+   visibility rule names among its readers; everyone else gets a 404, since a
+   private repository is not confirmed to exist for a non-reader. A UCAN plays
+   no part here — a delegation grants no read access.
 2. **Push authorization**, on the `git-receive-pack` POST: the owner, or an
    owner-rooted, bounded, repository-scoped push delegation.
 
@@ -237,13 +239,15 @@ gl visibility list --repo <repo>
 # Then grant read to the agent AND every existing reader on `/`. The mode
 # (`a`/`b`) must match what `list` showed; only reach for `b` when no `/`
 # rule exists yet.
-gl visibility set / --repo <repo> --readers did:key:z6MkReader1,did:key:z6MkAgent…
+gl visibility set / --repo <repo> --mode <a|b> --readers did:key:z6MkReader1,did:key:z6MkAgent…
 ```
 
-Without it the agent's push fails at the advertisement with a 404 — the same
-answer a stranger gets, because a private repository is not confirmed to exist
-for a non-reader — even though the delegation itself is valid and would clear the
-push gate. On a public repository this step is unnecessary. The two gates are
+Without it the agent's push fails with a 404 — the same answer a stranger gets,
+because a private repository is not confirmed to exist for a non-reader. A
+normal `git push` sees it at the `info/refs` advertisement; a client that skips
+the advertisement sees the identical denial on the `git-receive-pack` POST
+itself. Either way the delegation is valid and would clear the push gate: the
+read gate is what refused it. On a public repository this step is unnecessary. The two gates are
 independent in the other direction as well: a reader with no delegation is still
 refused on the push.
 

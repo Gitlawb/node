@@ -1685,6 +1685,7 @@ mod tests {
         let kp = Keypair::generate();
         let client = reqwest::blocking::Client::new();
         let body = b"0009done\n".to_vec();
+        let empty = tempfile::tempdir().expect("tempdir");
 
         for service in ["git-upload-pack", "git-receive-pack"] {
             let mut server = mockito::Server::new();
@@ -1712,10 +1713,14 @@ mod tests {
                 .with_status(200)
                 .create();
             let post_url = format!("{repo_base}/{service}");
-            let resp = build_pack_post_request(&client, &post_url, service, &body, Some(&kp))
-                .body(body.clone())
-                .send()
-                .unwrap();
+            // `build_pack_post_request` reaches `delegation_header`, whose store
+            // resolves from process-global `GITLAWB_KEY`. Point it at an empty dir
+            // under the shared lock so the read cannot race a sibling's mutation
+            // and cannot pick up a developer's real store.
+            let req = crate::delegated_push_tests::with_identity_dir(empty.path(), || {
+                build_pack_post_request(&client, &post_url, service, &body, Some(&kp))
+            });
+            let resp = req.body(body.clone()).send().unwrap();
             assert!(resp.status().is_success());
             post_mock.assert();
         }
@@ -3484,26 +3489,28 @@ mod delegated_push_tests {
     // local explanation.
 
     /// `delegation_header` resolves its store from `GITLAWB_KEY`, which is
-    /// process-global. Every case that sets it takes this lock.
-    ///
-    /// Only these cases need it. `advertisement_and_pack_post_are_signed_…` also
-    /// reaches `delegation_header` (through `build_pack_post_request` on
-    /// `git-receive-pack`), but it asserts on signature headers alone and is
-    /// unaffected by whichever store is in scope.
-    static KEY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// process-global. Every test that sets it, and every test that reaches the
+    /// resolver, takes this lock. `pub(crate)` so `tests::` cases that reach the
+    /// resolver without setting the variable can serialize their read too.
+    pub(crate) static KEY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Point `GITLAWB_KEY` at `dir/identity.pem` for the duration of `f`, so the
-    /// delegation store resolves to `dir/delegations`.
-    fn with_identity_dir<T>(dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
-        let _guard = KEY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let restore = std::env::var_os("GITLAWB_KEY");
-        std::env::set_var("GITLAWB_KEY", dir.join("identity.pem"));
-        let out = f();
-        match restore {
-            Some(v) => std::env::set_var("GITLAWB_KEY", v),
-            None => std::env::remove_var("GITLAWB_KEY"),
+    /// delegation store resolves to `dir/delegations`. The restore runs on drop:
+    /// a panic inside `f` cannot leak the tempdir path into later tests.
+    pub(crate) fn with_identity_dir<T>(dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("GITLAWB_KEY", v),
+                    None => std::env::remove_var("GITLAWB_KEY"),
+                }
+            }
         }
-        out
+        let _guard = KEY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = Restore(std::env::var_os("GITLAWB_KEY"));
+        std::env::set_var("GITLAWB_KEY", dir.join("identity.pem"));
+        f()
     }
 
     /// Write a token where `gl ucan import` would have left it.

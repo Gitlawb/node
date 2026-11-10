@@ -721,7 +721,9 @@ async fn cmd_delegate(
     // then fails every push.
     if gitlawb_core::ucan::push::is_push_wildcard(&cap, &can) {
         anyhow::bail!(
-            "a wildcard resource cannot carry a push capability: a delegation is scoped \n             to the repositories it names when issued, and `*` cannot say which those \n             were. Re-run with --cap gitlawb://repos/<owner>/<repo>."
+            "a wildcard resource cannot carry a push capability: a delegation is scoped \
+             to the repositories it names when issued, and `*` cannot say which those \
+             were. Re-run with --cap gitlawb://repos/<owner>/<repo>."
         );
     }
 

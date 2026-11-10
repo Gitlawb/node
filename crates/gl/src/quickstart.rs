@@ -53,11 +53,10 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
         // `args.dir.as_deref()`, not `Some(&dir)`. Passing the DIRECTORY made the
         // loader re-derive the basename as `identity.pem`, so with
         // `GITLAWB_KEY=/data/keys/ci-agent.pem` the check above found `ci-agent.pem`
-        // while the load looked for a sibling that need not exist — and the Err arm
-        // below then regenerated ONTO `ci-agent.pem`, destroying a working key and
-        // changing the DID that repository ownership, registrations, and delegations
-        // are all tied to. Regeneration must follow a failure to read the file that
-        // was actually selected, never the absence of a conventional sibling.
+        // while the load looked for a sibling that need not exist. The load must
+        // target the file that was actually selected, and a file that exists but
+        // fails to load is refused below, never regenerated over: `pem_path` can
+        // name any file, and repository ownership and delegations are tied to its DID.
         match load_keypair_from_dir(args.dir.as_deref()) {
             Ok(kp) => {
                 let did = kp.did();
@@ -67,9 +66,11 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
                 kp
             }
             Err(e) => {
-                println!("  Identity at {} is unreadable: {e}", pem_path.display());
-                println!("  Regenerating — the previous key cannot be recovered.");
-                generate_identity(&dir, &pem_path)?
+                anyhow::bail!(
+                    "identity at {} could not be loaded: {e}. Fix or move the file, \
+                     or run `gl identity new --force` to replace it deliberately.",
+                    pem_path.display()
+                );
             }
         }
     } else {
@@ -271,7 +272,17 @@ fn generate_identity(
     let keypair = gitlawb_core::identity::Keypair::generate();
     let pem = keypair.to_pem()?;
 
-    crate::secret_file::write(path, pem.as_bytes())?;
+    crate::secret_file::write_new(path, pem.as_bytes()).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            anyhow::anyhow!(
+                "identity key already exists at {}: refusing to overwrite; \
+                 pass --dir for a fresh location or move the existing key",
+                path.display()
+            )
+        } else {
+            anyhow::anyhow!(e)
+        }
+    })?;
 
     let did = keypair.did();
     println!("  ✓  Generated new identity");
