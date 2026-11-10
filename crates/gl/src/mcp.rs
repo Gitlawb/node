@@ -1342,7 +1342,9 @@ async fn resolve_owner(args: &Value, client: &NodeClient) -> Result<String> {
 /// `resolve_owner_repo_pair` contract: an `owner/repo` string splits first, an
 /// explicit `owner` arg wins next, then the signing keypair's short DID. The
 /// last resort is the node root DID via `resolve_owner`, reachable only by
-/// callers that have no keypair (the unsigned webhook_list arm) — for a bare
+/// callers that have no keypair — the unsigned `webhook_list` arm, and an
+/// unsigned `webhook_delete` the same way `resolve_owner` always served it —
+/// for a bare
 /// repo name under a signed caller the path owner must be the caller's DID or
 /// the node 403/404s the request under the wrong namespace.
 async fn resolve_owner_repo(
@@ -2505,11 +2507,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_webhook_list_without_keypair_errors() {
-        // No identity loaded and no explicit owner → the tool must error rather
-        // than fall back to the node DID and issue an unsigned, mis-scoped GET.
-        let server = mockito::Server::new_async().await;
+    async fn test_webhook_list_without_keypair_surfaces_node_denial() {
+        // No identity loaded and no explicit owner → the tool falls back to the
+        // node DID for the path and still issues the GET unsigned, so the node
+        // itself answers the denial (list_webhooks 401s a headerless caller)
+        // rather than the client inventing a failure before contact.
+        let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap(); // empty: no identity.pem
+        let _root = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"did":"did:key:z6MkNodeOperator"}"#)
+            .create_async()
+            .await;
+        let _hooks = server
+            .mock("GET", "/api/v1/repos/z6MkNodeOperator/myrepo/hooks")
+            .with_status(401)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"signature required"}"#)
+            .create_async()
+            .await;
 
         let err = call_tool(
             "webhook_list",
@@ -2518,8 +2536,13 @@ mod tests {
             Some(dir.path()),
         )
         .await
-        .expect_err("must error without an identity");
-        assert!(err.to_string().contains("no identity found"), "got: {err}");
+        .expect_err("unsigned list must surface the node denial");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("401") || msg.contains("signature required"),
+            "got: {msg}"
+        );
+        _hooks.assert_async().await;
     }
 
     #[tokio::test]
