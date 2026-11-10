@@ -34,11 +34,21 @@ fn sign_payload(secret: &str, payload: &[u8]) -> String {
 pub fn fire_event(
     db: Arc<Db>,
     http_client: Arc<reqwest::Client>,
+    secret_key: Arc<[u8; 32]>,
     repo_id: &str,
     event: &str,
     payload: serde_json::Value,
 ) {
-    fire_event_occurrence(db, http_client, repo_id, event, payload, None, None);
+    fire_event_occurrence(
+        db,
+        http_client,
+        secret_key,
+        repo_id,
+        event,
+        payload,
+        None,
+        None,
+    );
 }
 
 /// Occurrence-keyed variant: at most one delivery per
@@ -50,9 +60,11 @@ pub fn fire_event(
 /// to claim deliveries synchronously, then call
 /// `fire_event_occurrence_with_claimed_hooks` with the claimed hook IDs to
 /// spawn HTTP POST only for claimed hooks.
+#[allow(clippy::too_many_arguments)]
 pub fn fire_event_occurrence(
     db: Arc<Db>,
     http_client: Arc<reqwest::Client>,
+    secret_key: Arc<[u8; 32]>,
     repo_id: &str,
     event: &str,
     payload: serde_json::Value,
@@ -67,6 +79,7 @@ pub fn fire_event_occurrence(
         fire_event_async_occurrence(
             db,
             http_client,
+            secret_key,
             &repo_id,
             &event,
             payload,
@@ -83,6 +96,7 @@ pub fn fire_event_occurrence(
 pub fn fire_event_occurrence_with_claimed_hooks(
     db: Arc<Db>,
     http_client: Arc<reqwest::Client>,
+    secret_key: Arc<[u8; 32]>,
     repo_id: &str,
     event: &str,
     payload: serde_json::Value,
@@ -98,6 +112,7 @@ pub fn fire_event_occurrence_with_claimed_hooks(
         fire_event_async_occurrence(
             db,
             http_client,
+            secret_key,
             &repo_id,
             &event,
             payload,
@@ -163,6 +178,7 @@ pub async fn claim_webhook_delivery_before_spawn(
 async fn fire_event_async_occurrence(
     db: Arc<Db>,
     http_client: Arc<reqwest::Client>,
+    secret_key: Arc<[u8; 32]>,
     repo_id: &str,
     event: &str,
     payload: serde_json::Value,
@@ -224,6 +240,7 @@ async fn fire_event_async_occurrence(
         }
 
         let db_for_mark = db.clone();
+        let secret_key = Arc::clone(&secret_key);
         tokio::spawn(async move {
             // Policy skip, not a delivery failure: the stored URL predates the
             // create-time gate. The "invalid_url" label is documented on
@@ -239,7 +256,12 @@ async fn fire_event_async_occurrence(
             }
 
             let delivery_for_mark = delivery_id.clone();
-            let signature = hook.secret.as_deref().map(|s| sign_payload(s, &bytes));
+            // Open the secret only at signing time; at rest it stays sealed.
+            let signature = hook
+                .secret
+                .as_ref()
+                .and_then(|s| crate::webhook_secret::reveal(secret_key.as_ref(), s))
+                .map(|plain| sign_payload(&plain, &bytes));
 
             let mut req = client
                 .post(&hook.url)

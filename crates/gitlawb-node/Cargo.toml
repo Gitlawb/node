@@ -40,6 +40,7 @@ cid = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
+chacha20poly1305 = "0.10"
 http-body-util = "0.1"
 tokio-util = { version = "0.7", features = ["io"] }
 dirs-next = "2"

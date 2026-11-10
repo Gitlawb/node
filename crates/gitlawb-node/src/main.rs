@@ -27,6 +27,7 @@ mod sync;
 mod test_support;
 mod upstream_mirror;
 mod visibility;
+mod webhook_secret;
 mod webhooks;
 
 use anyhow::{anyhow, Context, Result};
@@ -99,6 +100,7 @@ async fn main() -> Result<()> {
     // Sealing key for the legacy-scan continuation tokens, DERIVED from the identity
     // just loaded so it is the same key after a restart (see `derive_scan_token_key`).
     let scan_token_key = AppState::derive_scan_token_key(&keypair);
+    let webhook_secret_key = AppState::derive_webhook_secret_key(&keypair);
     let node_did = keypair.did();
 
     // One-time metrics init. Must run before any handler that calls into
@@ -481,6 +483,7 @@ async fn main() -> Result<()> {
         ipfs_max_legacy_scan_rows: AppState::ipfs_legacy_scan_row_budget(&config),
         ipfs_max_legacy_scan_rule_bytes: crate::api::ipfs::MAX_LEGACY_SCAN_RULE_BYTES_PER_REQUEST,
         ipfs_scan_token_key: Arc::new(scan_token_key),
+        webhook_secret_key: Arc::new(webhook_secret_key),
         ipfs_max_served_object_bytes: crate::api::ipfs::MAX_SERVED_OBJECT_BYTES,
         push_limiter_trust,
         sync_trigger_rate_limiter,
@@ -569,6 +572,23 @@ async fn main() -> Result<()> {
         ),
         git_bin: "git".to_string(),
     };
+
+    // One-time re-encryption of any webhook HMAC secrets still resting as
+    // plaintext (written before at-rest encryption shipped). A SQL migration
+    // cannot do it — Postgres never sees the node-held key — so it runs here.
+    match state
+        .db
+        .reencrypt_legacy_webhook_secrets(state.webhook_secret_key.as_ref())
+        .await
+    {
+        Ok(0) => {}
+        Ok(n) => info!(
+            count = n,
+            "re-encrypted legacy webhook HMAC secrets at rest"
+        ),
+        Err(e) => warn!(err = %e, "failed to re-encrypt legacy webhook secrets"),
+    }
+
     if config.ipfs_rate_limit == 0 {
         tracing::warn!("GITLAWB_IPFS_RATE_LIMIT=0 — per-IP /ipfs rate limiting disabled");
     }

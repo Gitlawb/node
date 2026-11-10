@@ -21,6 +21,17 @@ const SCAN_TOKEN_KEY_SALT: &[u8] = b"gitlawb/hkdf-salt/ipfs-scan-token";
 /// front) and needs no migration, no config, and no change to this function.
 const SCAN_TOKEN_KEY_INFO: &[u8] = b"gitlawb/ipfs-scan-token/v1";
 
+/// HKDF salt for [`AppState::derive_webhook_secret_key`]. A constant, not a
+/// secret: the confidentiality of the derived key rests on the node's private
+/// seed being the input keying material, exactly as for the scan-token key.
+const WEBHOOK_SECRET_KEY_SALT: &[u8] = b"gitlawb/hkdf-salt/webhook-secret";
+
+/// HKDF `info` for [`AppState::derive_webhook_secret_key`]: the domain
+/// separation AND the rotation handle in one string. Distinct from
+/// [`SCAN_TOKEN_KEY_INFO`], so the webhook-secret key is unrelated to the
+/// scan-token key that shares its input; bumping the trailing version rotates it.
+const WEBHOOK_SECRET_KEY_INFO: &[u8] = b"gitlawb/webhook-secret/v1";
+
 #[derive(Clone, Debug)]
 pub struct RefUpdateBroadcast {
     pub repo: String,
@@ -173,6 +184,11 @@ pub struct AppState {
     /// already has on disk, so derivation is also the smaller mechanism. Rotation is a
     /// bump of the version in [`SCAN_TOKEN_KEY_INFO`].
     pub ipfs_scan_token_key: Arc<[u8; 32]>,
+    /// Key sealing webhook HMAC secrets at rest (#506), derived from the node's
+    /// persistent identity by [`AppState::derive_webhook_secret_key`]. The
+    /// webhook delivery path opens a secret with it only at signing time; the
+    /// `webhooks.secret` column stores the ciphertext (see `webhook_secret`).
+    pub webhook_secret_key: Arc<[u8; 32]>,
     /// Hard ceiling on the byte size of an object `GET /ipfs/{cid}` will buffer and
     /// serve (default `api::ipfs::MAX_SERVED_OBJECT_BYTES`). The serve reads via a
     /// blocking `git cat-file` and buffers the whole object; without a bound a large
@@ -445,6 +461,33 @@ impl AppState {
         let mut expand =
             HmacSha256::new_from_slice(prk.as_slice()).expect("HMAC takes a key of any size");
         expand.update(SCAN_TOKEN_KEY_INFO);
+        expand.update(&[0x01]);
+        expand.finalize().into_bytes().into()
+    }
+
+    /// Derive the at-rest webhook-secret sealing key from the node identity.
+    ///
+    /// Same HKDF construction as [`AppState::derive_scan_token_key`] under its
+    /// own [`WEBHOOK_SECRET_KEY_INFO`]/[`WEBHOOK_SECRET_KEY_SALT`] pair, so it
+    /// is derived (a restart re-derives the same key, and old secrets remain
+    /// readable) yet domain-separated from the signing key and the scan-token
+    /// key. The doc on [`SCAN_TOKEN_KEY_INFO`] argues why derivation (not a
+    /// boot-random key) is the right trade: the secret's confidentiality still
+    /// rests on the node's private seed, and rotation is a version bump.
+    pub(crate) fn derive_webhook_secret_key(keypair: &Keypair) -> [u8; 32] {
+        use hmac::{Hmac, Mac};
+        type HmacSha256 = Hmac<sha2::Sha256>;
+
+        let seed = keypair.to_seed();
+        // HKDF-Extract: PRK = HMAC(salt, ikm).
+        let mut extract = HmacSha256::new_from_slice(WEBHOOK_SECRET_KEY_SALT)
+            .expect("HMAC takes a key of any size");
+        extract.update(seed.as_slice());
+        let prk = extract.finalize().into_bytes();
+        // HKDF-Expand, one block: T(1) = HMAC(PRK, info || 0x01).
+        let mut expand =
+            HmacSha256::new_from_slice(prk.as_slice()).expect("HMAC takes a key of any size");
+        expand.update(WEBHOOK_SECRET_KEY_INFO);
         expand.update(&[0x01]);
         expand.finalize().into_bytes().into()
     }
