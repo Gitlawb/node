@@ -308,16 +308,32 @@ mod authz_guard {
             "visibility::require_owner must use did_matches for DID-safe owner matching"
         );
 
-        // Order matters as much as presence: hoisting require_owner above the
-        // read gate would 403 a non-owner on a hidden repo, an existence
-        // oracle. Pin quarantine-then-owner on every handler that takes both.
-        for func in ["set_visibility", "remove_visibility", "list_visibility"] {
-            let body = fn_body(visibility, func);
+        // Order matters as much as presence: hoisting the owner/author check
+        // above the read gate would 403 a non-owner on a hidden repo, an
+        // existence oracle. Pin read-gate-then-owner on every handler that
+        // takes both; the owner marker differs per bucket (require_repo_owner
+        // for owner-only, require_owner for visibility, did_matches for the
+        // owner-or-author and protect paths).
+        for (src, func, owner_marker) in [
+            (visibility, "set_visibility", "require_owner("),
+            (visibility, "remove_visibility", "require_owner("),
+            (visibility, "list_visibility", "require_owner("),
+            (pulls, "merge_pr", "require_repo_owner("),
+            (webhooks, "create_webhook", "require_repo_owner("),
+            (webhooks, "delete_webhook", "require_repo_owner("),
+            (labels, "add_label", "require_repo_owner("),
+            (labels, "remove_label", "require_repo_owner("),
+            (pulls, "close_pr", "did_matches("),
+            (issues, "close_issue", "did_matches("),
+            (protect, "protect_branch", "did_matches("),
+            (protect, "unprotect_branch", "did_matches("),
+        ] {
+            let body = fn_body(src, func);
             let gate = body.find("authorize_repo_read(").expect("gate marker");
-            let owner = body.find("require_owner(").expect("owner marker");
+            let owner = body.find(owner_marker).expect("owner marker");
             assert!(
                 gate < owner,
-                "visibility::{func} must run authorize_repo_read before require_owner"
+                "{func} must run authorize_repo_read before {owner_marker}"
             );
         }
 

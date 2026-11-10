@@ -729,9 +729,10 @@ mod tests {
         path
     }
 
-    /// Quarantine precedes every caller class: even the owner gets the opaque
-    /// 404 on a quarantined repo, and the seeded row's quarantined flag is left
-    /// set deliberately. The released-mirror variants above exercise the
+    /// The read gate blocks the owner (and any caller) before the
+    /// owner-or-author checks: even the owner gets the opaque 404 on a
+    /// quarantined repo, and the seeded row's quarantined flag is left set
+    /// deliberately. The released-mirror variants above exercise the
     /// owner-or-author path.
     #[sqlx::test]
     async fn quarantined_repo_close_is_opaque_404(pool: PgPool) {
