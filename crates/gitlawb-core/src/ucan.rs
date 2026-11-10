@@ -161,6 +161,20 @@ pub mod push {
         Some((owner, repo))
     }
 
+    /// The canonical repository name a capability or URL names: at most one
+    /// trailing `.git` stripped, the same normalization the node's smart-HTTP
+    /// routes apply (`smart_http_repo_name`). A git remote carries the suffix;
+    /// `RepoRecord.name` does not, so every boundary that compares a capability
+    /// to a record must go through the same strip or a `…/myrepo.git` capability
+    /// names a repository that never exists.
+    ///
+    /// At-most-once, not repeatedly: a repository literally named `foo.git`
+    /// (creatable via the peer mirror path, which skips API name validation) is
+    /// addressed as `foo.git.git`, and stripping twice would send it to `foo`.
+    pub fn canonical_repo_name(repo: &str) -> &str {
+        repo.strip_suffix(".git").unwrap_or(repo)
+    }
+
     /// A push-class capability whose resource is the wildcard. Refused at
     /// issuance, at import, by the helper, and by the node: a delegation's scope is
     /// fixed when it is issued, and `*` cannot say which repositories it covered
@@ -179,11 +193,16 @@ pub mod push {
         /// ignoring them would grant more than was intended. The owner segment is
         /// compared with [`did_key_eq`], so a token issued against the full DID
         /// matches a mirror row keyed on the bare form.
+        ///
+        /// The capability's repo segment goes through [`canonical_repo_name`]
+        /// while `repo` (a `RepoRecord.name`, already canonical) does not: a
+        /// delegation written `…/myrepo.git` authorizes `myrepo`, the same
+        /// mapping the smart-HTTP URL applies.
         pub fn grants_push_to(&self, owner: &str, repo: &str) -> bool {
             self.constraints.is_none()
                 && is_push_action(&self.can)
                 && parse_repo_resource(&self.with)
-                    .is_some_and(|(o, r)| did_key_eq(o, owner) && r == repo)
+                    .is_some_and(|(o, r)| did_key_eq(o, owner) && canonical_repo_name(r) == repo)
         }
     }
 
@@ -1209,6 +1228,31 @@ mod push_scope_tests {
                 "{can} covers git/push"
             );
         }
+    }
+
+    #[test]
+    fn a_git_suffixed_capability_names_the_canonical_repo() {
+        let owner = "did:key:z6MkOwner";
+        // A git remote carries `.git`; the record does not. The capability
+        // matches the repository the URL would reach, so a delegation pasted
+        // from the remote still authorizes.
+        assert!(Capability::new(
+            "gitlawb://repos/did:key:z6MkOwner/myrepo.git",
+            caps::GIT_PUSH
+        )
+        .grants_push_to(owner, "myrepo"));
+        // At most one suffix is stripped: a repo literally named `foo.git`
+        // (reachable as `foo.git.git` over smart HTTP) is a different
+        // repository from `foo`, and a single `.git` must not resolve to it.
+        assert!(Capability::new(
+            "gitlawb://repos/did:key:z6MkOwner/foo.git.git",
+            caps::GIT_PUSH
+        )
+        .grants_push_to(owner, "foo.git"));
+        assert!(
+            !Capability::new("gitlawb://repos/did:key:z6MkOwner/foo.git", caps::GIT_PUSH)
+                .grants_push_to(owner, "foo.git")
+        );
     }
 
     /// The chain walk, at every depth: a wildcard anywhere denies; concrete

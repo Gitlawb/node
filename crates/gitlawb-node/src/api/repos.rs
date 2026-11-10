@@ -594,10 +594,11 @@ pub async fn get_tree(
 // ── Git smart HTTP endpoints ──────────────────────────────────────────────
 
 fn smart_http_repo_name(repo: &str) -> Result<&str> {
-    // Strip at most one ".git" suffix: trim_end_matches strips repeatedly,
-    // which would misdirect a repo literally named "foo.git" (creatable via
-    // the peer mirror path, which skips API name validation) to repo "foo".
-    let name = repo.strip_suffix(".git").unwrap_or(repo);
+    // Strip at most one ".git" suffix — shared with the UCAN push matcher
+    // (`canonical_repo_name`), so a delegation and a remote URL name a
+    // repository the same way. At-most-once matters: a repo literally named
+    // "foo.git" is addressed as "foo.git.git".
+    let name = gitlawb_core::ucan::push::canonical_repo_name(repo);
     if name.is_empty() {
         return Err(AppError::BadRequest("missing repository name".into()));
     }

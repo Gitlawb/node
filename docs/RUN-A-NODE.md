@@ -210,6 +210,11 @@ git push origin main          # git-remote-gitlawb attaches it as X-Ucan
 
 `--expiry` is measured in hours: 168 is 7 days, 720 is 30.
 
+`<repo>` is the repository's canonical name: the record name without a `.git`
+suffix. A trailing `.git` in the capability (or pasted from the remote URL) is
+stripped the same way the git remote strips it, at most once, so
+`gitlawb://repos/<owner-did>/myrepo.git` delegates to `myrepo`.
+
 What the node requires, and why:
 
 | Requirement | Reason |

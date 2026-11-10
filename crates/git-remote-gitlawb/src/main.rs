@@ -531,7 +531,7 @@ fn split_pack_post_url(post_url: &str) -> Option<(String, String, String)> {
     let owner = segs[segs.len() - 3];
     let prefix = &segs[..segs.len() - 3];
 
-    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    let repo = gitlawb_core::ucan::push::canonical_repo_name(repo);
     if !is_safe_component(owner) || !is_safe_component(repo) {
         return None;
     }
@@ -3246,6 +3246,40 @@ mod delegated_push_tests {
         assert!(
             invocation.payload.att[0].is_attenuated_by(&delegation.payload.att[0]),
             "the narrowed capability must still attenuate under its parent"
+        );
+    }
+
+    /// A delegation issued against the remote's spelling (`r.git`) still mints
+    /// an invocation for the canonical repo: the URL split strips the suffix
+    /// the same way the matcher does, so the stored token is found and the
+    /// chain check passes.
+    #[test]
+    fn build_invocation_accepts_a_git_suffixed_capability() {
+        use gitlawb_core::ucan::{caps, Capability, Ucan};
+
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        let delegation = Ucan::issue(
+            &owner,
+            agent.did(),
+            vec![Capability::new(
+                format!("gitlawb://repos/{owner_did}/r.git"),
+                caps::GIT_PUSH,
+            )],
+            Some(hour),
+        )
+        .expect("issue");
+
+        let invocation = build_invocation(&agent, &node.did(), &delegation, &owner_did, "r")
+            .expect("a .git capability must grant push to the canonical repo");
+        assert_eq!(
+            invocation.payload.att[0].with,
+            format!("gitlawb://repos/{owner_did}/r.git"),
+            "the parent's resource is kept verbatim so attenuation still holds"
         );
     }
 

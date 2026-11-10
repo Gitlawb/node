@@ -1248,6 +1248,12 @@ async fn call_tool(
             let resource = args["resource"].as_str().context("missing 'resource'")?;
             let action = args["action"].as_str().context("missing 'action'")?;
 
+            // The same canonicalization `gl ucan delegate` applies, so a token
+            // minted here names the repository the way import, the helper, and
+            // the node all resolve it.
+            let resource = crate::ucan_cmd::canonical_resource(resource);
+            let resource = resource.as_str();
+
             // The same refusal `gl ucan delegate` applies. A push-class wildcard cannot
             // be honoured anywhere downstream — import refuses it, the helper refuses
             // it, the node refuses it — so issuing one only manufactures a token that

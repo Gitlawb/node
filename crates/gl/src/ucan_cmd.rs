@@ -122,10 +122,26 @@ fn repo_from_resource(with: &str) -> Option<(String, String)> {
     if parts.next().is_some() {
         return None;
     }
-    if !is_safe_component(owner) || !is_safe_component(name) {
+    // The store, the helper's lookup, and the node's record are all keyed on the
+    // canonical name: a capability written `…/myrepo.git` must file and match
+    // under `myrepo`, the same strip the smart-HTTP URL gets.
+    let name = gitlawb_core::ucan::push::canonical_repo_name(name);
+    if name.is_empty() || !is_safe_component(owner) || !is_safe_component(name) {
         return None;
     }
     Some((owner.to_string(), name.to_string()))
+}
+
+/// The canonical form of a `gitlawb://repos/<owner>/<repo>` capability resource,
+/// so a token `gl ucan delegate` or the MCP `ucan_delegate` tool mints carries
+/// the name every downstream boundary resolves it to. Anything that does not
+/// parse as a repo resource is returned unchanged and refused downstream as
+/// before.
+pub(crate) fn canonical_resource(with: &str) -> String {
+    match repo_from_resource(with) {
+        Some((owner, repo)) => format!("gitlawb://repos/{owner}/{repo}"),
+        None => with.to_string(),
+    }
 }
 
 /// Default delegation lifetime. Finite on purpose: an unbounded write capability
@@ -691,6 +707,12 @@ async fn cmd_delegate(
     let audience: Did = to
         .parse()
         .map_err(|e: gitlawb_core::Error| anyhow::anyhow!("{e}"))?;
+
+    // Mint the resource in its canonical form: the import store, the helper's
+    // lookup, and the node's record are all keyed on the name with at most one
+    // `.git` stripped, and carrying it here too keeps the token readable as the
+    // repository it actually names.
+    let cap = canonical_resource(&cap);
 
     // A push-class wildcard cannot be honoured: the node requires every link in the
     // chain to name the repository, because a delegation's scope is fixed when it is
@@ -1270,6 +1292,23 @@ mod delegation_store_tests {
     }
 
     #[test]
+    fn repo_from_resource_returns_the_canonical_repo_name() {
+        // The store and the node's record are keyed without `.git`, so a
+        // capability spelled like the remote must file under the stripped name.
+        assert_eq!(
+            repo_from_resource("gitlawb://repos/did:key:z6MkAbc/myrepo.git"),
+            Some(("did:key:z6MkAbc".to_string(), "myrepo".to_string()))
+        );
+        // At most one suffix comes off, same as the remote URL.
+        assert_eq!(
+            repo_from_resource("gitlawb://repos/z6MkAbc/foo.git.git"),
+            Some(("z6MkAbc".to_string(), "foo.git".to_string()))
+        );
+        // A `.git`-only segment strips to nothing and is refused outright.
+        assert!(repo_from_resource("gitlawb://repos/z6MkAbc/.git").is_none());
+    }
+
+    #[test]
     fn delegation_path_strips_the_did_prefix_and_separates_owner_from_repo() {
         let base = std::path::Path::new("/tmp/id");
         let expected = base.join("delegations").join("z6MkAbc__myrepo.ucan");
@@ -1404,6 +1443,29 @@ mod delegation_store_tests {
             let stored = delegation_path(dir.path(), &owner, "myrepo");
             assert!(stored.exists(), "{can} must leave a stored delegation");
         }
+    }
+
+    /// The helper looks a delegation up by the remote's canonical name, so a
+    /// capability written `myrepo.git` has to file under `myrepo`, not under
+    /// the suffixed spelling it arrived with.
+    #[tokio::test]
+    async fn import_files_a_git_suffixed_capability_under_the_canonical_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = seed_identity(dir.path());
+        let (token, owner) = owned_token(&agent, caps::GIT_PUSH, "myrepo.git");
+
+        cmd_import(token, Some(dir.path().to_path_buf()))
+            .await
+            .expect("a .git capability must import");
+
+        assert!(
+            delegation_path(dir.path(), &owner, "myrepo").exists(),
+            "must file under the canonical name"
+        );
+        assert!(
+            !delegation_path(dir.path(), &owner, "myrepo.git").exists(),
+            "the suffixed spelling must not produce a second file"
+        );
     }
 
     /// The store and the token file must never exist at a wider mode, not even

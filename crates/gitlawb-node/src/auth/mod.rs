@@ -1060,6 +1060,34 @@ mod ucan_push_tests {
         assert!(!ucan_grants_push(&rec, &v));
     }
 
+    /// A delegation can be issued against the remote's spelling (`myrepo.git`):
+    /// the matcher strips the same single `.git` the smart-HTTP routes do, so
+    /// the capability lands on the canonical record name.
+    #[test]
+    fn grants_push_when_the_capability_carries_the_git_suffix() {
+        let rec = repo(&owner_full(), "myrepo");
+        let v = verified(
+            &owner_full(),
+            vec![push_cap_for(&owner_full(), "myrepo.git")],
+        );
+        assert!(ucan_grants_push(&rec, &v));
+    }
+
+    /// Mirror-created rows can carry a literal `.git` name; reaching one takes
+    /// `foo.git.git`, the same spelling the remote URL uses. A single `.git`
+    /// capability resolves to `foo` and must not fall through to `foo.git`.
+    #[test]
+    fn a_repo_literally_named_dot_git_needs_the_doubled_suffix() {
+        let rec = repo(&owner_full(), "foo.git");
+        let single = verified(&owner_full(), vec![push_cap_for(&owner_full(), "foo.git")]);
+        assert!(!ucan_grants_push(&rec, &single));
+        let doubled = verified(
+            &owner_full(),
+            vec![push_cap_for(&owner_full(), "foo.git.git")],
+        );
+        assert!(ucan_grants_push(&rec, &doubled));
+    }
+
     #[test]
     fn refuses_a_capability_carrying_constraints() {
         // `nb` is not interpreted yet. An owner who writes {"refs": [...]} means
