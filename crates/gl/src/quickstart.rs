@@ -270,7 +270,7 @@ fn generate_identity(
     let keypair = gitlawb_core::identity::Keypair::generate();
     let pem = keypair.to_pem()?;
 
-    crate::secret_file::write(&path, pem.as_bytes())?;
+    crate::secret_file::write(path, pem.as_bytes())?;
 
     let did = keypair.did();
     println!("  ✓  Generated new identity");
