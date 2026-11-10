@@ -1,6 +1,6 @@
 //! Keypair generation, storage, and signing.
 //!
-//! A gitlawb identity is an Ed25519 keypair. The public key encodes into a
+//! A Twigpine identity is an Ed25519 keypair. The public key encodes into a
 //! `did:key` DID. The private key is stored as PKCS#8 PEM on disk.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -11,7 +11,7 @@ use zeroize::Zeroizing;
 use crate::did::Did;
 use crate::{Error, Result};
 
-/// An Ed25519 keypair that is the root identity for a gitlawb actor.
+/// An Ed25519 keypair that is the root identity for a Twigpine actor.
 #[derive(Clone)]
 pub struct Keypair {
     signing_key: SigningKey,
@@ -77,11 +77,18 @@ impl Keypair {
 }
 
 /// Verify an Ed25519 signature.
+///
+/// Strict verification: rejects small-order `R` and small-order public keys
+/// (the identity point, and any point of low order). Ordinary `verify` accepts
+/// a signature forged with the identity point as the public key plus
+/// `R = identity, S = 0`, which verifies for *any* message. `identity::verify`
+/// is the shared primitive behind HTTP request authentication, UCANs, and
+/// certificates, so weak-key acceptance is an authentication bypass, not a
+/// malleability nuance.
 pub fn verify(verifying_key: &VerifyingKey, msg: &[u8], sig_bytes: &[u8; 64]) -> Result<()> {
-    use ed25519_dalek::Verifier;
     let sig = Signature::from_bytes(sig_bytes);
     verifying_key
-        .verify(msg, &sig)
+        .verify_strict(msg, &sig)
         .map_err(|_| Error::SignatureInvalid)
 }
 
@@ -206,6 +213,60 @@ mod tests {
         assert!(
             result.is_err(),
             "signature from kp1 must not verify under kp2"
+        );
+    }
+
+    /// The identity-point forgery: with public key A = identity, R = identity,
+    /// and S = 0, the equation `[S]B = R + [k]A` holds for every message,
+    /// because `[k]·identity = identity`. Ordinary (non-strict) Ed25519
+    /// verification accepts it, so the shared `verify` primitive must use
+    /// strict verification, which rejects small-order R and public keys.
+    #[test]
+    fn verify_rejects_identity_point_forgery() {
+        use ed25519_dalek::Verifier;
+        // The identity point (0,1) compresses to y = 1 with sign bit 0.
+        let identity = [
+            1u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0,
+        ];
+        let vk = VerifyingKey::from_bytes(&identity).expect("identity point is on the curve");
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes[..32].copy_from_slice(&identity);
+        let msg = b"arbitrary message the key owner never signed";
+
+        // Prove the forged signature satisfies the ordinary verification
+        // equation, so the strict check below is what actually defends the
+        // boundary (not a signature that was already invalid everywhere).
+        assert!(
+            vk.verify(msg, &Signature::from_bytes(&sig_bytes)).is_ok(),
+            "identity-point forgery must satisfy ordinary verification (this is why strict is needed)"
+        );
+
+        assert!(
+            verify(&vk, msg, &sig_bytes).is_err(),
+            "strict verification must reject the identity-point forgery"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_weak_key_signature() {
+        // Regression guard for strict verification: a signature forged under a
+        // weak (small-order) public key satisfies the verification equation
+        // but must be rejected. The identity point is such a key: with R the
+        // identity and S = 0, [S]B - [k]A is the identity for any message.
+        let mut weak_key_bytes = [0u8; 32];
+        weak_key_bytes[0] = 1; // compressed identity point (y = 1, x = 0)
+        let weak_vk = VerifyingKey::from_bytes(&weak_key_bytes).unwrap();
+        assert!(weak_vk.is_weak(), "identity point must be a weak key");
+
+        let msg = b"forged message";
+        let mut forged = [0u8; 64];
+        forged[0] = 1; // R = identity point, S = 0
+
+        let result = verify(&weak_vk, msg, &forged);
+        assert!(
+            result.is_err(),
+            "signature under a weak (small-order) public key must be rejected"
         );
     }
 

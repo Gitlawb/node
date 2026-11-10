@@ -1,7 +1,7 @@
 //! UCAN (User Controlled Authorization Networks) — capability token types.
 //!
 //! UCANs let a DID delegate specific capabilities to another DID,
-//! with optional expiry and revocation. gitlawb uses UCANs for:
+//! with optional expiry and revocation. Twigpine uses UCANs for:
 //!   - Delegating push access to a branch to a CI agent
 //!   - Granting a reviewer the ability to approve PRs
 //!   - Bootstrap tokens issued at registration
@@ -57,7 +57,7 @@ impl Capability {
     }
 }
 
-/// Well-known gitlawb capability strings.
+/// Well-known Twigpine capability strings.
 pub mod caps {
     pub const GIT_PUSH: &str = "git/push";
     pub const GIT_FETCH: &str = "git/fetch";
@@ -187,11 +187,17 @@ impl Ucan {
     }
 
     /// Check if this UCAN grants a specific capability on a resource.
+    ///
+    /// Mirrors `Capability::is_attenuated_by`'s wildcard semantics: a stored
+    /// capability of `with: "*"` or `can: "*"` / `"repo/admin"` covers any
+    /// requested resource/action, since a valid delegation chain can produce
+    /// exactly that capability (see `is_attenuated_by`).
     pub fn can(&self, resource: &str, action: &str) -> bool {
-        self.payload
-            .att
-            .iter()
-            .any(|cap| cap.with == resource && cap.can == action)
+        self.payload.att.iter().any(|cap| {
+            let resource_ok = cap.with == resource || cap.with == "*";
+            let action_ok = cap.can == action || cap.can == "*" || cap.can == caps::REPO_ADMIN;
+            resource_ok && action_ok
+        })
     }
 
     /// Encode to a compact JSON string (the wire format).
@@ -310,6 +316,63 @@ mod tests {
         assert_eq!(ucan.payload.aud, audience);
         assert!(ucan.can("gitlawb://repos/test/repo", caps::GIT_PUSH));
         assert!(!ucan.can("gitlawb://repos/test/repo", caps::PR_MERGE));
+    }
+
+    #[test]
+    fn can_honors_resource_wildcard() {
+        let issuer = Keypair::generate();
+        let audience = Keypair::generate().did();
+
+        let ucan = Ucan::issue(
+            &issuer,
+            audience,
+            vec![Capability::new("*", caps::GIT_PUSH)],
+            None,
+        )
+        .unwrap();
+
+        assert!(ucan.can("gitlawb://repos/test/repo", caps::GIT_PUSH));
+        assert!(ucan.can("gitlawb://repos/other/repo", caps::GIT_PUSH));
+        assert!(!ucan.can("gitlawb://repos/test/repo", caps::PR_MERGE));
+    }
+
+    #[test]
+    fn can_honors_repo_admin_action_wildcard() {
+        let issuer = Keypair::generate();
+        let audience = Keypair::generate().did();
+
+        let ucan = Ucan::issue(
+            &issuer,
+            audience,
+            vec![Capability::new(
+                "gitlawb://repos/test/repo",
+                caps::REPO_ADMIN,
+            )],
+            None,
+        )
+        .unwrap();
+
+        assert!(ucan.can("gitlawb://repos/test/repo", caps::GIT_PUSH));
+        assert!(ucan.can("gitlawb://repos/test/repo", caps::PR_MERGE));
+        assert!(!ucan.can("gitlawb://repos/other/repo", caps::GIT_PUSH));
+    }
+
+    #[test]
+    fn can_honors_action_wildcard() {
+        let issuer = Keypair::generate();
+        let audience = Keypair::generate().did();
+
+        let ucan = Ucan::issue(
+            &issuer,
+            audience,
+            vec![Capability::new("gitlawb://repos/test/repo", "*")],
+            None,
+        )
+        .unwrap();
+
+        assert!(ucan.can("gitlawb://repos/test/repo", caps::GIT_PUSH));
+        assert!(ucan.can("gitlawb://repos/test/repo", caps::PR_MERGE));
+        assert!(!ucan.can("gitlawb://repos/other/repo", caps::GIT_PUSH));
     }
 
     #[test]

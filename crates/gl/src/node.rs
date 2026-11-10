@@ -20,7 +20,11 @@ pub struct NodeArgs {
 pub enum NodeCmd {
     /// Show a comprehensive status dashboard for the node
     Status {
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         /// Identity directory (default: ~/.gitlawb)
         #[arg(long)]
@@ -29,13 +33,21 @@ pub enum NodeCmd {
     /// Check trust score for a DID
     Trust {
         did: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
     },
     /// Resolve a DID to node info
     Resolve {
         did: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
     },
 
@@ -312,7 +324,7 @@ async fn cmd_status(node: String, dir: Option<PathBuf>) -> Result<()> {
 
     // ── Render dashboard ──────────────────────────────────────────────────
     println!("╔══════════════════════════════════════════════╗");
-    println!("║  gitlawb node status                         ║");
+    println!("║  Twigpine node status                        ║");
     println!("╚══════════════════════════════════════════════╝");
     println!();
 
@@ -401,7 +413,7 @@ async fn cmd_status(node: String, dir: Option<PathBuf>) -> Result<()> {
                     let ref_name = ev["ref"].as_str().unwrap_or("?");
                     let ts = ev["timestamp"]
                         .as_str()
-                        .map(|s| &s[..10.min(s.len())])
+                        .map(|s| crate::text::truncate(s, 10))
                         .unwrap_or("?");
                     println!("  {ts}  {repo}  {ref_name}");
                 }

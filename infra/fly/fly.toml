@@ -12,6 +12,7 @@ primary_region = "iad"
   GITLAWB_P2P_PORT = "7546"
   GITLAWB_REPOS_DIR = "/data/repos"
   GITLAWB_KEY = "/data/keys/identity.pem"
+  GITLAWB_P2P_KEY = "/data/keys/p2p.key"
   GITLAWB_PUBLIC_URL = "https://gitlawb-node-test.fly.dev"
   GITLAWB_BOOTSTRAP_PEERS = "https://node.gitlawb.com,https://node2.gitlawb.com,https://node3.gitlawb.com"
   GITLAWB_AUTO_SYNC = "true"
@@ -37,6 +38,16 @@ primary_region = "iad"
     # 120s, not 600: long idle windows let hung clients pin Fly's connection
     # slots (hard_limit) — root factor in the 2026-06-12 prod outage
     idle_timeout = 120
+
+  [[http_service.checks]]
+    # Gate routing (and deploys) on real readiness: /ready probes the DB, so a
+    # node stuck retrying a dead or misconfigured database is never routed to,
+    # and a deploy with a bad DATABASE_URL fails visibly instead of going green.
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "75s"
+    method = "GET"
+    path = "/ready"
 
 [[services]]
   protocol = "udp"

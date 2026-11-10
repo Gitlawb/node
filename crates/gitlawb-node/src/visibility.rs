@@ -25,15 +25,12 @@ fn nfc(s: &str) -> String {
     s.nfc().collect()
 }
 
-/// True if `caller` is the repo owner. Matches exactly or against the
-/// did:key short form — a non-key DID (did:gitlawb:/did:web:) in `owner_did`
-/// never matches a bare short segment, and a non-key DID in `caller` never
-/// matches a did:key owner's short form. Uses `normalize_owner_key` (not
-/// `did_matches`) so the did:key-only rule is stricter: cross-method matching
-/// would let a non-key canonical row bypass the #124 visibility gate.
+/// True if `caller` is the repo owner. Uses [`crate::api::did_matches`] so the
+/// owner check is representation-agnostic within `did:key` (full `did:key:z...`
+/// matches bare `z...` stored by mirror rows) while still denying cross-method
+/// collisions (`did:gitlawb:z...` vs bare `z...`).
 fn is_owner(owner_did: &str, caller: &str) -> bool {
-    let owner_short = crate::db::normalize_owner_key(owner_did);
-    caller == owner_did || caller == owner_short
+    crate::api::did_matches(owner_did, caller)
 }
 
 /// The match prefix for a glob: "/" stays "/", "/secret/**" becomes "/secret".
@@ -425,6 +422,60 @@ mod tests {
             ),
             Decision::Allow,
             "full non-key DID still matches itself"
+        );
+    }
+
+    // #153 forward guard: is_owner must match across bare-key / full-did:key
+    // representations should someone revert to single-side normalize_owner_key.
+    #[test]
+    fn bare_owner_full_caller_allows_owner() {
+        let rules = [rule("/", VisibilityMode::A, &[])];
+        assert_eq!(
+            visibility_check(&rules, false, "z6MkOwner", Some("did:key:z6MkOwner"), "/"),
+            Decision::Allow,
+            "bare owner + full did:key caller must match (guard against single-side revert)"
+        );
+    }
+
+    // #135 T1: a Mode-B rule on `/secret/**` must DENY the withheld directory's
+    // OWN path `/secret` (the `path == prefix` arm), not just strict descendants —
+    // otherwise get_by_cid's tree gate would serve the /secret tree object and leak
+    // its children. Pins parity with get_tree, which denies the /secret path.
+    #[test]
+    fn subtree_rule_denies_the_withheld_directory_itself() {
+        let reader = "did:key:z6MkReader";
+        let rules = [rule("/secret/**", VisibilityMode::B, &[reader])];
+        assert_eq!(
+            visibility_check(&rules, true, OWNER, None, "/secret"),
+            Decision::Deny,
+            "anon denied at the withheld directory's OWN path /secret"
+        );
+        assert_eq!(
+            visibility_check(&rules, true, OWNER, None, "/public"),
+            Decision::Allow,
+            "anon allowed at a sibling path outside the withheld subtree"
+        );
+        assert_eq!(
+            visibility_check(&rules, true, OWNER, Some(reader), "/secret"),
+            Decision::Allow,
+            "listed reader allowed at the withheld directory (caller-aware)"
+        );
+    }
+
+    // #153 regression: cross-method DID must still be denied even when the
+    // trailing segment collides with a bare owner key.
+    #[test]
+    fn cross_method_did_denied_with_bare_owner() {
+        let rules = [rule("/", VisibilityMode::A, &[])];
+        assert_eq!(
+            visibility_check(&rules, false, "z6MkFoo", Some("did:gitlawb:z6MkFoo"), "/"),
+            Decision::Deny,
+            "cross-method DID must not match a bare did:key owner"
+        );
+        assert_eq!(
+            visibility_check(&rules, false, "z6MkFoo", Some("did:web:z6MkFoo"), "/"),
+            Decision::Deny,
+            "did:web must not match a bare did:key owner"
         );
     }
 
