@@ -18807,10 +18807,10 @@ mod tests {
         }
         let get_path = format!("/api/v1/repos/{short}/enc-quar/encrypted-blob/deadbeef");
         let resp = router.oneshot(anon_get(&get_path)).await.unwrap();
-        assert_ne!(
-            resp.status(),
-            StatusCode::NOT_FOUND,
-            "released get must clear the quarantine 404 (may 5xx without IPFS)"
+        assert!(
+            resp.status() == StatusCode::OK || resp.status().is_server_error(),
+            "released get must admit (OK) or reach the backend (5xx); a 4xx              means the denial path still fires: {}",
+            resp.status()
         );
     }
 
@@ -18874,10 +18874,10 @@ mod tests {
         }
         let get_path = format!("/api/v1/repos/{short}/enc-mirror/encrypted-blob/aabbccdd");
         let resp = router.oneshot(anon_get(&get_path)).await.unwrap();
-        assert_ne!(
-            resp.status(),
-            StatusCode::NOT_FOUND,
-            "released get must clear the quarantine 404 (may 5xx without IPFS)"
+        assert!(
+            resp.status() == StatusCode::OK || resp.status().is_server_error(),
+            "released get must admit (OK) or reach the backend (5xx); a 4xx              means the denial path still fires: {}",
+            resp.status()
         );
     }
 

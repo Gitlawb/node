@@ -319,6 +319,7 @@ mod authz_guard {
             (visibility, "remove_visibility", "require_owner("),
             (visibility, "list_visibility", "require_owner("),
             (pulls, "merge_pr", "require_repo_owner("),
+            (webhooks, "list_webhooks", "require_repo_owner("),
             (webhooks, "create_webhook", "require_repo_owner("),
             (webhooks, "delete_webhook", "require_repo_owner("),
             (labels, "add_label", "require_repo_owner("),
@@ -335,6 +336,16 @@ mod authz_guard {
                 gate < owner,
                 "{func} must run authorize_repo_read before {owner_marker}"
             );
+            // The owner-or-author and protect handlers also carry
+            // require_repo_owner: a hoist of that call above the read gate is
+            // the same 403-vs-404 oracle, so pin it too where it exists.
+            if func == "close_pr" || func == "close_issue" {
+                let owner_gate = body.find("require_repo_owner(").expect("owner marker");
+                assert!(
+                    gate < owner_gate,
+                    "{func} must run authorize_repo_read before require_repo_owner("
+                );
+            }
         }
 
         // The CID read surface (#173) enforces its gate inside the shared
