@@ -22,6 +22,11 @@ pub struct RegisterArgs {
     )]
     pub node: String,
 
+    /// A pre-obtained iCaptcha proof token, forwarded on the register request
+    /// instead of making the client solve a fresh challenge.
+    #[arg(long, env = "GITLAWB_ICAPTCHA_PROOF")]
+    pub icaptcha_proof: Option<String>,
+
     /// Capabilities to advertise (comma-separated)
     #[arg(
         long,
@@ -56,7 +61,7 @@ pub async fn run(args: RegisterArgs) -> Result<()> {
     }))?;
 
     let resp = client
-        .post("/api/register", &body)
+        .post_with_proof("/api/register", &body, args.icaptcha_proof.as_deref())
         .await
         .context("failed to connect to node")?;
 
@@ -160,6 +165,7 @@ mod tests {
             capabilities: vec!["git:push".to_string(), "git:fetch".to_string()],
             model: None,
             dir: Some(dir.path().to_path_buf()),
+            icaptcha_proof: None,
         })
         .await
         .unwrap();
@@ -171,6 +177,36 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(ucan_file).unwrap()).unwrap();
         assert_eq!(content["ucan"].as_str().unwrap(), "eyJhbGci.test.token");
         assert_eq!(content["node"].as_str().unwrap(), server.url());
+    }
+
+    /// A supplied `--icaptcha-proof` must ride the register request as the
+    /// `x-icaptcha-proof` header so an enforce-mode node accepts it without a
+    /// fresh solve round-trip.
+    #[tokio::test]
+    async fn register_forwards_icaptcha_proof_header() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/api/register")
+            .match_header("x-icaptcha-proof", "test.supplied.proof")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"Welcome","ucan":"eyJhbGci.test.token","trust_score":0.5,"expires":"2026-12-31"}"#)
+            .create_async()
+            .await;
+
+        run(RegisterArgs {
+            node: server.url(),
+            capabilities: vec!["git:push".to_string()],
+            model: None,
+            dir: Some(dir.path().to_path_buf()),
+            icaptcha_proof: Some("test.supplied.proof".to_string()),
+        })
+        .await
+        .unwrap();
+        m.assert();
     }
 
     /// `gl register` READS the identity from the parent of `GITLAWB_KEY`, so it has
@@ -201,6 +237,7 @@ mod tests {
             capabilities: vec!["git:push".to_string()],
             model: None,
             dir: None,
+            icaptcha_proof: None,
         })
         .await
         .unwrap();
@@ -235,6 +272,7 @@ mod tests {
             capabilities: vec!["git:push".to_string()],
             model: None,
             dir: Some(dir.path().to_path_buf()),
+            icaptcha_proof: None,
         })
         .await;
 
@@ -256,6 +294,7 @@ mod tests {
             capabilities: vec![],
             model: None,
             dir: Some(dir.path().to_path_buf()),
+            icaptcha_proof: None,
         })
         .await;
 
