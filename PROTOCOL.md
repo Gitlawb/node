@@ -108,7 +108,9 @@ they are documented with the node's HTTP API, not here.
     mandatory**: an unsigned push is refused with `401`. Same pkt-line
     framing; the result content type is
     `application/x-git-receive-pack-result`.
-    Signed requests on this path follow §2, including TLS transport.
+    Signed requests on this path follow the RFC 9421 header rules in §2.
+    §2's transport note applies here too: the verifier has no scheme check,
+    so nothing at the signature layer requires this push to arrive over TLS.
 - **Fetch vs push auth split:** fetch-side requests against a withheld or
   private repo answer `404` (existence is not confirmed to unauthorized
   callers), while the push path answers `401` for missing/invalid
