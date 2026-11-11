@@ -263,6 +263,14 @@ fn ref_count_on_disk(repos_dir: &Path, owner_did: &str, name: &str) -> usize {
         return 1;
     };
     let path = path.into_path_buf();
+    // Match selection's fail-closed rule: a symlink at the repo path can point
+    // at an empty bare repo outside repos_dir, and following it would report
+    // zero refs for a path that was never a candidate. Treat as non-empty.
+    if path.is_symlink() {
+        warn!(path = %path.display(),
+            "purge-spam: repo path is a symlink — treating as non-empty (skipped)");
+        return 1;
+    }
     if !path.join("HEAD").is_file() || !path.join("objects").is_dir() {
         // Not a bare git repo at the exact expected path. Do NOT trust a ref
         // count that git discovery could have read from a parent repository.

@@ -434,16 +434,35 @@ pub async fn close_issue(
         }
     }
 
-    // Snapshot the issue ref's pre-close OID so a failed durable upload can roll
+    // Snapshot the issue's pre-close JSON so a failed durable upload can roll
     // the close back on local disk, mirroring create_issue. Best-effort: if the
     // snapshot read fails we proceed without a rollback closure (the close still
     // applies and a failed upload still surfaces as a 5xx below).
+    let prior_json = git_issues::get_issue(&disk_path, &issue_id).ok().flatten();
 
     let close_result = git_issues::close_issue(&disk_path, &issue_id);
 
     // Always release the advisory lock — even on error; upload to Tigris only on success.
-    // Same short-circuit as create_issue, and before the 200 body below.
-    guard.release(close_result.is_ok()).await.into_result()?;
+    // Same short-circuit as create_issue, and before the 200 body below. With a
+    // snapshot in hand, a failed upload rewrites the ref back to the pre-close
+    // content instead of leaving the local repo closed while the client saw 5xx.
+    let release_result = match (close_result.is_ok(), prior_json) {
+        (true, Some(json)) => {
+            let git_bin = state.git_bin.clone();
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+            let issue_id_for_comp = issue_id.clone();
+            let _ = (git_bin, deadline); // rollback is JSON-level, not git-cli
+            guard
+                .release_compensating(true, move |path| {
+                    git_issues::create_issue(path, &issue_id_for_comp, &json)
+                })
+                .await
+                .into_result()
+        }
+        _ => guard.release(close_result.is_ok()).await.into_result(),
+    };
+    release_result?;
 
     let updated = close_result
         .map_err(|e| AppError::Git(e.to_string()))?

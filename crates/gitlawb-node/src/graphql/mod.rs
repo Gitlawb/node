@@ -177,9 +177,10 @@ pub fn build_schema(
 }
 
 /// Build the subscriptions-only schema served over /graphql/ws. Carries the
-/// same broadcast senders the subscription resolvers consume; no query or
-/// mutation root exists on this type, so the transport cannot be used to
-/// execute either kind of operation.
+/// same broadcast senders the subscription resolvers consume. Mutations are
+/// disabled — the schema's mutation root is `EmptyMutation` — but queries still
+/// run via `QueryRoot` (they are reads and already ride the TaskReadBrake), so
+/// "subscriptions-only" refers to the write surface, not the operation set.
 pub fn build_ws_schema(
     db: Arc<Db>,
     ref_update_tx: tokio::sync::broadcast::Sender<RefUpdateBroadcast>,
