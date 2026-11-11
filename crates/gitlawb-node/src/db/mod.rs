@@ -10550,7 +10550,7 @@ mod migration_tests {
     /// Upgrade-path test for the nullable source timestamp. The worker must
     /// preserve it when it exists, while rows written before v18 remain valid.
     #[sqlx::test]
-    async fn migration_v18_adds_sync_queue_origin_timestamp(pool: sqlx::PgPool) {
+    async fn migration_v47_adds_sync_queue_origin_timestamp(pool: sqlx::PgPool) {
         let db = super::Db::for_testing(pool);
         db.migrate().await.unwrap();
 
@@ -10558,7 +10558,7 @@ mod migration_tests {
             .execute(&db.pool)
             .await
             .unwrap();
-        sqlx::query("DELETE FROM schema_migrations WHERE version = 18")
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 47")
             .execute(&db.pool)
             .await
             .unwrap();
@@ -14153,7 +14153,7 @@ mod ref_certificate_tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("DELETE FROM schema_migrations WHERE version = 18")
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 47")
             .execute(&pool)
             .await
             .unwrap();

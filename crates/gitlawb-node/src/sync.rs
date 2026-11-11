@@ -185,15 +185,22 @@ fn resolve_origin_url(peers: &[crate::db::PeerRecord], node_did: &str) -> Option
 /// Convert a sender-supplied RFC-3339 ref-update timestamp into an observable
 /// lag. Missing, malformed, and future timestamps are deliberately ignored:
 /// older peers and clock-skewed peers must not create fabricated observations.
+const MAX_SYNC_LAG_OBSERVATION: Duration = Duration::from_secs(86_400);
+
 fn sync_lag_from_origin_timestamp(
     origin_timestamp: Option<&str>,
     visible_at: DateTime<Utc>,
 ) -> Option<Duration> {
     let origin = DateTime::parse_from_rfc3339(origin_timestamp?).ok()?;
-    visible_at
+    let lag = visible_at
         .signed_duration_since(origin.with_timezone(&Utc))
         .to_std()
-        .ok()
+        .ok()?;
+    // The origin timestamp is unauthenticated input from a known-but-not-proofed
+    // peer: an absurd age (a 1970 date, a stale clock) would park a fabricated
+    // observation in the histogram's tail buckets, so past a day the value is
+    // ignored rather than sampled.
+    (lag <= MAX_SYNC_LAG_OBSERVATION).then_some(lag)
 }
 
 async fn process_batch(
@@ -422,6 +429,17 @@ async fn process_batch(
                     )
                     .await
                     .is_ok();
+                // The lag is push-to-visible: sample at registration, before
+                // the encrypted-blob tail and mark_sync_done. A quarantined
+                // mirror is admitted but withheld from readers, so it reports
+                // no visibility lag.
+                if mirror_visible && !quarantined {
+                    if let Some(lag) =
+                        sync_lag_from_origin_timestamp(item.origin_timestamp.as_deref(), Utc::now())
+                    {
+                        crate::metrics::observe_sync_lag(lag);
+                    }
+                }
                 // Option B2: carry the encrypted withheld-blob envelopes too, so an
                 // authorized reader can recover private content from this mirror if
                 // the origin dies. `item.repo` is the slug "{owner_short}/{name}",
@@ -436,15 +454,8 @@ async fn process_batch(
                     &config.ipfs_api,
                 )
                 .await;
-                let marked_done = db.mark_sync_done(&item.id).await;
+                let _ = db.mark_sync_done(&item.id).await;
                 crate::metrics::record_sync_processed("done");
-                if mirror_visible && marked_done.is_ok() {
-                    if let Some(lag) =
-                        sync_lag_from_origin_timestamp(item.origin_timestamp.as_deref(), Utc::now())
-                    {
-                        crate::metrics::observe_sync_lag(lag);
-                    }
-                }
 
                 // Tell the origin we now host a replica so its replica_count
                 // reflects reality. Best-effort: idempotent on the origin and
@@ -2853,6 +2864,7 @@ mod tests {
             cid: None,
             status: "pending".to_string(),
             enqueued_at: chrono::Utc::now().to_rfc3339(),
+            origin_timestamp: None,
         };
         async fn status_of(pool: &sqlx::PgPool, id: &str) -> String {
             let row: (String,) = sqlx::query_as("SELECT status FROM sync_queue WHERE id = $1")
