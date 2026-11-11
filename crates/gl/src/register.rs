@@ -22,6 +22,8 @@ pub struct RegisterArgs {
     )]
     pub node: String,
 
+    /// A pre-obtained iCaptcha proof token, forwarded on the register request
+    /// instead of making the client solve a fresh challenge.
     #[arg(long, env = "GITLAWB_ICAPTCHA_PROOF")]
     pub icaptcha_proof: Option<String>,
 
@@ -177,6 +179,36 @@ mod tests {
         assert_eq!(content["node"].as_str().unwrap(), server.url());
     }
 
+    /// A supplied `--icaptcha-proof` must ride the register request as the
+    /// `x-icaptcha-proof` header so an enforce-mode node accepts it without a
+    /// fresh solve round-trip.
+    #[tokio::test]
+    async fn register_forwards_icaptcha_proof_header() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/api/register")
+            .match_header("x-icaptcha-proof", "test.supplied.proof")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"Welcome","ucan":"eyJhbGci.test.token","trust_score":0.5,"expires":"2026-12-31"}"#)
+            .create_async()
+            .await;
+
+        run(RegisterArgs {
+            node: server.url(),
+            capabilities: vec!["git:push".to_string()],
+            model: None,
+            dir: Some(dir.path().to_path_buf()),
+            icaptcha_proof: Some("test.supplied.proof".to_string()),
+        })
+        .await
+        .unwrap();
+        m.assert();
+    }
+
     /// `gl register` READS the identity from the parent of `GITLAWB_KEY`, so it has
     /// to WRITE the bootstrap token there too. Sending it to `~/.gitlawb` instead is
     /// silent split-brain: registration prints success, and every command that later
@@ -205,6 +237,7 @@ mod tests {
             capabilities: vec!["git:push".to_string()],
             model: None,
             dir: None,
+            icaptcha_proof: None,
         })
         .await
         .unwrap();
