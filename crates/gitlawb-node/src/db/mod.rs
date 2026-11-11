@@ -2370,6 +2370,8 @@ const MIGRATIONS: &[Migration] = &[
         stmts: &[
             "ALTER TABLE webhook_deliveries ADD COLUMN IF NOT EXISTS sent_at TEXT",
             "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_pending ON webhook_deliveries (sent_at, created_at)",
+        ],
+    },
     Migration {
         version: 47,
         name: "sync_queue_origin_timestamp",
@@ -2378,9 +2380,6 @@ const MIGRATIONS: &[Migration] = &[
             // transport. It remains nullable for rows from older peers and
             // manually-triggered syncs, which must not report a fabricated lag.
             "ALTER TABLE sync_queue ADD COLUMN IF NOT EXISTS origin_timestamp TEXT",
-        ],
-    },
-
         ],
     },
 ];
