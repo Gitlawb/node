@@ -95,6 +95,36 @@ fn upload_pack(repo: &Path, advertise: bool, input: &[u8]) -> Vec<u8> {
     out.stdout
 }
 
+/// Run `git receive-pack --stateless-rpc [--advertise-refs] <repo>`, optionally
+/// feeding `input` on stdin. Returns raw stdout (the wire bytes). The receive
+/// half of `upload_pack`, used so the shim can serve a real push.
+fn receive_pack(repo: &Path, advertise: bool, input: &[u8]) -> Vec<u8> {
+    let mut cmd = Command::new("git");
+    cmd.arg("receive-pack").arg("--stateless-rpc");
+    if advertise {
+        cmd.arg("--advertise-refs");
+    }
+    cmd.arg(repo)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn git receive-pack");
+    let mut stdin = child.stdin.take().unwrap();
+    let input = input.to_vec();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&input);
+        // drop closes stdin
+    });
+    let out = child.wait_with_output().expect("wait receive-pack");
+    writer.join().ok();
+    assert!(
+        out.status.success(),
+        "git receive-pack failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
 #[derive(Clone, Copy)]
 enum ShimMode {
     /// Faithful v0 serving: pipe each POST to `git upload-pack --stateless-rpc`.
@@ -107,6 +137,11 @@ enum ShimMode {
 struct Shim {
     base_url: String,
     posts: Arc<AtomicUsize>,
+    /// Advertisement (GET /info/refs) count. One `git fetch` performs exactly
+    /// one advertisement, so tests assert this is EXACTLY one: any fetch-level
+    /// retry that comes back re-advertises and goes red on the spot, which the
+    /// lower-bound POST assertions alone cannot see (#275 round 6).
+    gets: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -136,15 +171,17 @@ fn start_shim(repo: PathBuf, mode: ShimMode) -> Shim {
     let addr = listener.local_addr().unwrap();
     let base_url = format!("http://{addr}");
     let posts = Arc::new(AtomicUsize::new(0));
+    let gets = Arc::new(AtomicUsize::new(0));
     let stop = Arc::new(AtomicBool::new(false));
 
     let posts_t = posts.clone();
+    let gets_t = gets.clone();
     let stop_t = stop.clone();
     let handle = std::thread::spawn(move || {
         while !stop_t.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    handle_conn(stream, &repo, mode, &posts_t);
+                    handle_conn(stream, &repo, mode, &posts_t, &gets_t);
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(5));
@@ -157,6 +194,7 @@ fn start_shim(repo: PathBuf, mode: ShimMode) -> Shim {
     Shim {
         base_url,
         posts,
+        gets,
         stop,
         handle: Some(handle),
     }
@@ -182,7 +220,13 @@ fn normalize_accepted_stream(stream: &TcpStream) {
     stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
 }
 
-fn handle_conn(stream: TcpStream, repo: &Path, mode: ShimMode, posts: &AtomicUsize) {
+fn handle_conn(
+    stream: TcpStream,
+    repo: &Path,
+    mode: ShimMode,
+    posts: &AtomicUsize,
+    gets: &AtomicUsize,
+) {
     normalize_accepted_stream(&stream);
     let mut reader = BufReader::new(stream);
 
@@ -218,7 +262,22 @@ fn handle_conn(stream: TcpStream, repo: &Path, mode: ShimMode, posts: &AtomicUsi
         reader.read_exact(&mut body).ok();
     }
 
-    let (content_type, payload) = if method == "GET" && target.contains("/info/refs") {
+    let (content_type, payload) = if method == "GET" && target.contains("service=git-receive-pack")
+    {
+        // Receive-pack advertisement, same wrapper shape as upload-pack.
+        let adv = receive_pack(repo, true, b"");
+        let mut wrapped = pkt(b"# service=git-receive-pack\n");
+        wrapped.extend_from_slice(b"0000");
+        wrapped.extend_from_slice(&adv);
+        ("application/x-git-receive-pack-advertisement", wrapped)
+    } else if method == "POST" && target.ends_with("/git-receive-pack") {
+        posts.fetch_add(1, Ordering::SeqCst);
+        (
+            "application/x-git-receive-pack-result",
+            receive_pack(repo, false, &body),
+        )
+    } else if method == "GET" && target.contains("/info/refs") {
+        gets.fetch_add(1, Ordering::SeqCst);
         // v0 advertisement, wrapped exactly as the node's info_refs does.
         let adv = upload_pack(repo, true, b"");
         let mut wrapped = pkt(b"# service=git-upload-pack\n");
@@ -290,6 +349,34 @@ fn fetch_with_helper(clone: &Path, node_url: &str) -> (bool, std::process::Outpu
         .env("LC_ALL", "C")
         .env("GITLAWB_NODE", node_url)
         .env("GITLAWB_KEY", "/nonexistent-key-for-anon-fetch");
+    run_bounded(cmd, Duration::from_secs(30))
+}
+
+/// Run `git push` in `local` through the helper, same wiring and hard timeout as
+/// [`fetch_with_helper`]. `args` carries the push spec, e.g.
+/// `["--delete", "doomed"]`.
+fn push_with_helper(local: &Path, node_url: &str, args: &[&str]) -> (bool, std::process::Output) {
+    let helper_bin = PathBuf::from(env!("CARGO_BIN_EXE_git-remote-gitlawb"));
+    let helper_dir = helper_bin.parent().unwrap().to_path_buf();
+    let path_env = match std::env::var_os("PATH") {
+        Some(p) => {
+            let mut dirs = vec![helper_dir.clone()];
+            dirs.extend(std::env::split_paths(&p));
+            std::env::join_paths(dirs).unwrap()
+        }
+        None => helper_dir.clone().into_os_string(),
+    };
+
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(local)
+        .arg("push")
+        .arg("origin")
+        .args(args)
+        .env("PATH", path_env)
+        .env("LC_ALL", "C")
+        .env("GITLAWB_NODE", node_url)
+        .env("GITLAWB_KEY", "/nonexistent-key-for-anon-push");
     run_bounded(cmd, Duration::from_secs(30))
 }
 
@@ -935,6 +1022,7 @@ fn shim_answers_a_connection_that_arrives_non_blocking() {
 
     let server = std::thread::spawn(move || {
         let posts = AtomicUsize::new(0);
+        let gets = AtomicUsize::new(0);
         let stream = loop {
             match listener.accept() {
                 Ok((s, _)) => break s,
@@ -949,7 +1037,7 @@ fn shim_answers_a_connection_that_arrives_non_blocking() {
         // the assertions below run on every platform.
         stream.set_nonblocking(true).unwrap();
         accepted_tx.send(()).unwrap();
-        handle_conn(stream, &repo, ShimMode::Normal, &posts);
+        handle_conn(stream, &repo, ShimMode::Normal, &posts, &gets);
     });
 
     let mut client = TcpStream::connect(addr).unwrap();
@@ -1012,6 +1100,17 @@ fn real_git_multi_round_fetch_completes() {
     assert!(
         posts >= 2,
         "fixture did not force multi-round negotiation (observed {posts} POST(s)); the bridging path was not exercised"
+    );
+    // Exactly one advertisement: the POST bound above is a floor, so a
+    // reintroduced fetch-level retry could satisfy it by running a second full
+    // fetch instead of multi-round negotiation. Re-advertising is what a
+    // second fetch cannot avoid, so this is the committed guard on the
+    // retry's absence.
+    let gets = shim.gets.load(Ordering::SeqCst);
+    assert_eq!(
+        gets, 1,
+        "expected exactly one advertisement GET per fetch; {gets} means a \
+         fetch-level retry is back"
     );
 
     // The fetched tip is present and the clone's object graph is intact.
@@ -1103,6 +1202,17 @@ fn real_git_withheld_shaped_first_post() {
     assert!(
         completed,
         "helper hung on a withheld-shaped response (should forward-and-terminate, not deadlock). stderr:\n{stderr}"
+    );
+
+    // Exactly one advertisement, pass or fail: the POST assertions below are
+    // floors, so a reintroduced fetch-level retry could mask the withheld
+    // shape behind a second full fetch. A retry cannot avoid re-advertising,
+    // so this is the committed guard on its absence.
+    let gets = shim.gets.load(Ordering::SeqCst);
+    assert_eq!(
+        gets, 1,
+        "expected exactly one advertisement GET per fetch; {gets} means a \
+         fetch-level retry is back"
     );
 
     if out.status.success() {
@@ -1240,5 +1350,79 @@ fn run_bounded_bounds_join_when_leader_exits_leaving_a_pipe_holder() {
          elapsed={elapsed:?} (expected <5s; the clean-exit path must close the \
          process group (unix) / terminate the job (windows) so the grandchild's \
          held pipes do not stall the joins)"
+    );
+}
+
+/// #369 end-to-end: a real `git push --delete` through the helper completes.
+/// The receive-pack request for a delete-only push is commands + flush with NO
+/// pack, and git holds its write pipe open for the report — so a helper that
+/// reads stdin to EOF deadlocks against it. The shim pipes the POST to a real
+/// `git receive-pack --stateless-rpc`, so the branch actually has to be deleted
+/// server-side for the assertions to pass.
+#[test]
+fn real_git_push_delete_completes() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = dir.path().join("server.git");
+    let local = dir.path().join("local");
+
+    // A bare repo holding the doomed branch, plus a live one.
+    git(
+        dir.path(),
+        &[
+            "init",
+            "--bare",
+            server.to_str().unwrap(),
+            "--initial-branch=main",
+        ],
+    );
+    let work = dir.path().join("work");
+    git(
+        dir.path(),
+        &["init", work.to_str().unwrap(), "--initial-branch=main"],
+    );
+    git(&work, &["config", "user.email", "t@t"]);
+    git(&work, &["config", "user.name", "t"]);
+    std::fs::write(work.join("f"), "x").unwrap();
+    git(&work, &["add", "f"]);
+    git(&work, &["commit", "-m", "c"]);
+    git(&work, &["branch", "doomed"]);
+    git(&work, &["push", server.to_str().unwrap(), "main", "doomed"]);
+
+    // The pusher: a local repo whose origin is the gitlawb remote pointing at
+    // the shim. Nothing needs to be fetched first; git takes the old-oid from
+    // the receive-pack advertisement.
+    git(
+        dir.path(),
+        &["init", local.to_str().unwrap(), "--initial-branch=main"],
+    );
+    git(
+        &local,
+        &["remote", "add", "origin", "gitlawb://did:key:z6MkTest/repo"],
+    );
+
+    let shim = start_shim(server.clone(), ShimMode::Normal);
+    let (completed, out) = push_with_helper(&local, &shim.base_url, &["--delete", "doomed"]);
+    let posts = shim.posts.load(Ordering::SeqCst);
+
+    assert!(
+        completed,
+        "git push --delete did not complete within the timeout (deadlock signature). stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "git push --delete failed. stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(posts, 1, "a delete-only push is exactly one POST");
+    let gone = Command::new("git")
+        .arg("-C")
+        .arg(&server)
+        .args(["rev-parse", "--verify", "--quiet", "refs/heads/doomed"])
+        .output()
+        .unwrap();
+    assert!(
+        !gone.status.success(),
+        "refs/heads/doomed must be deleted in the server repo"
     );
 }

@@ -19,7 +19,7 @@
 //! objects the reachable withheld set never classified, so subtracting that set
 //! is not enough — a dangling private blob would slip through (#99). The caller
 //! signals a full scan via [`PinCandidateSet::full_scan`] and must then apply
-//! the fail-closed blob filter (`visibility_pack::replicable_objects_fail_closed`)
+//! the fail-closed blob-and-tree filter (`visibility_pack::replicable_objects_fail_closed`)
 //! instead of the plain reachable-only subtraction.
 //!
 //! Because the pin candidate set needs only the OID *set* (never the per-path
@@ -185,10 +185,13 @@ fn rev_list_delta(
 /// List every object in the repository via
 /// `git cat-file --batch-all-objects --batch-check='%(objectname)'`.
 ///
-/// This is the whole-repo enumeration the push path falls back to and the
-/// reconciliation sweep relies on. It returns *all* objects (including
-/// unreachable/dangling ones), which is what the sweep needs to catch
-/// stragglers — do not swap it for a reachability walk.
+/// This is the whole-repo enumeration the push path falls back to. It
+/// returns *all* objects (including unreachable/dangling ones), which is
+/// what the push path needs to catch stragglers — do not swap it for a
+/// reachability walk. The reconciliation sweep no longer uses it: sweep
+/// candidates come from the windowed walk (window commits plus walked
+/// pairs), which are reachable by construction, so dangling objects are
+/// absent rather than filtered.
 pub fn list_all_objects(repo_path: &Path, git_bin: &str, deadline: Instant) -> Result<Vec<String>> {
     let out = crate::git::visibility_pack::run_bounded_git(
         git_bin,
@@ -211,8 +214,10 @@ pub fn list_all_objects(repo_path: &Path, git_bin: &str, deadline: Instant) -> R
 
 /// Like [`list_all_objects`] but pairs each OID with its object type, via
 /// `--batch-check='%(objectname) %(objecttype)'`. The pin path's fail-closed
-/// filter needs to tell blobs (content, withholdable) from commits/trees
-/// (structural, never withheld) without typing the candidate list itself.
+/// filter needs to tell blobs (content, withholdable) and trees (content,
+/// withholdable since #135/#173) from commits/tags (structural, never withheld)
+/// without typing the candidate list itself.
+#[allow(dead_code)] // used by tests and all_blob_oids
 pub fn list_all_objects_with_type(
     repo_path: &Path,
     git_bin: &str,
@@ -244,24 +249,49 @@ pub fn list_all_objects_with_type(
 /// Every blob OID in the repo, including unreachable/dangling ones. The
 /// fail-closed pin filter drops any candidate blob absent from the reachable,
 /// visibility-allowed set; a dangling private blob is in this set but not the
-/// allowed set, so it never replicates (#99).
+/// allowed set, so it never replicates (#99). Production uses
+/// [`all_blob_and_tree_oids`] (one typed pass); this wrapper stays for tests.
+#[cfg(test)]
 pub fn all_blob_oids(
     repo_path: &Path,
     git_bin: &str,
     deadline: Instant,
 ) -> Result<HashSet<String>> {
-    Ok(list_all_objects_with_type(repo_path, git_bin, deadline)?
-        .into_iter()
-        .filter(|(_, ty)| ty == "blob")
-        .map(|(oid, _)| oid)
-        .collect())
+    Ok(all_blob_and_tree_oids(repo_path, git_bin, deadline)?.0)
+}
+
+/// Every blob OID and every tree OID in the repo, including unreachable/dangling
+/// ones, from one typed enumeration. The fail-closed pin filter drops any
+/// candidate blob or tree absent from the matching reachable visibility-allowed
+/// set; a dangling or withheld object is in this universe but not the allowed
+/// set, so it never replicates (#99, #172).
+#[allow(dead_code)] // production went to the typed sweep path; tests still use it
+pub fn all_blob_and_tree_oids(
+    repo_path: &Path,
+    git_bin: &str,
+    deadline: Instant,
+) -> Result<(HashSet<String>, HashSet<String>)> {
+    let mut blobs = HashSet::new();
+    let mut trees = HashSet::new();
+    for (oid, ty) in list_all_objects_with_type(repo_path, git_bin, deadline)? {
+        match ty.as_str() {
+            "blob" => {
+                blobs.insert(oid);
+            }
+            "tree" => {
+                trees.insert(oid);
+            }
+            _ => {}
+        }
+    }
+    Ok((blobs, trees))
 }
 
 /// The pin candidate OIDs for a push plus whether they came from a full-repo
 /// scan. `full_scan` is true when the delta could not be used and the whole
 /// object DB (including dangling objects) was enumerated — the caller must then
-/// apply the fail-closed blob filter, because the reachable-only withheld set
-/// cannot classify dangling blobs (#99).
+/// apply the fail-closed blob-and-tree filter, because the reachable-only withheld set
+/// cannot classify dangling blobs or trees (#99, #172).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PinCandidateSet {
     pub candidates: Vec<String>,
@@ -278,10 +308,12 @@ pub struct PinCandidateSet {
 /// Every degraded path is **logged**, not silent: a full-scan fallback, a
 /// failed full scan, and a panicked blocking task each emit a warning. On a
 /// failed full scan or a task panic the candidate set is empty (pin nothing
-/// this push); that is a durability gap the reconciliation sweep backstops, and
-/// it can never leak because the withheld/fail-closed filter still runs on
-/// whatever set is returned. `full_scan` rides on the returned set so the caller
-/// knows when the dangling-inclusive filter is required.
+/// this push); that is a durability gap the reconciliation sweep backstops
+/// when it is enabled and a pin backend is configured (a node running with the
+/// sweep disabled or with no IPFS/Pinata backend has no backstop), and it can
+/// never leak because the withheld/fail-closed filter still runs on whatever
+/// set is returned. `full_scan` rides on the returned set so the caller knows
+/// when the dangling-inclusive filter is required.
 ///
 /// `scan_sem` is the post-receive scan admission pool (`git_encrypt_semaphore`,
 /// #174 F4): both git-spawning stages — the per-tip `cat-file` probe + delta

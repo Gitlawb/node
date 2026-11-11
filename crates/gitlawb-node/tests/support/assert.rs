@@ -60,9 +60,7 @@ pub fn check_denied_with_headers(
     expected: u16,
     withheld: &[&str],
 ) -> Result<(), String> {
-    if let Err(e) = check_denied(status, body, expected, withheld) {
-        return Err(e);
-    }
+    check_denied(status, body, expected, withheld)?;
     for token in withheld {
         if token.is_empty() {
             continue;

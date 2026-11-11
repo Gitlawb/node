@@ -1,0 +1,100 @@
+name: CodeQL
+
+# Advanced-setup replacement for CodeQL default setup. Default setup analyzes
+# every detected language on every PR, including Swift (macos-app/), which
+# autobuilds on a macOS runner for ~13 minutes per PR and has hung for 55 on
+# main; that single job was the longest check on most PRs. Here a PR analyzes
+# only the languages it touches (scripts/ci-surfaces.sh), while push to main
+# and the weekly schedule analyze every language, so main's code-scanning
+# baseline stays complete.
+#
+# Requires CodeQL default setup to be DISABLED (Settings -> Code security ->
+# Code scanning): GitHub rejects advanced-setup uploads while it is enabled.
+#
+# A PR that skips a language may show "configuration not found" on the CodeQL
+# check for that language; that is informational and expected.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    name: changed languages
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      codeql: ${{ steps.surfaces.outputs.codeql }}
+      matrix: ${{ steps.surfaces.outputs.codeql_matrix }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      - name: Map changed paths to languages
+        id: surfaces
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            # -z: literal paths; plain --name-only C-quotes unusual names.
+            git diff -z --name-only --no-renames HEAD^1 HEAD > changed-paths
+            tr '\0' '\n' < changed-paths >&2
+            scripts/ci-surfaces.sh < changed-paths > surfaces.out
+          else
+            scripts/ci-surfaces.sh --all > surfaces.out
+          fi
+          cat surfaces.out
+          grep -E '^(codeql|codeql_matrix)=' surfaces.out >> "$GITHUB_OUTPUT"
+
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    needs: changes
+    if: needs.changes.outputs.codeql == 'true'
+    runs-on: ${{ matrix.runner }}
+    # Normal runs take <=14 min (Swift autobuild is the longest); cap a hung
+    # autobuild instead of letting it hold a runner for an hour.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.matrix) }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      - name: Autobuild
+        if: matrix.build-mode == 'autobuild'
+        uses: github/codeql-action/autobuild@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          category: "/language:${{ matrix.language }}"

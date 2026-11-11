@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use gitlawb_core::identity::Keypair;
@@ -435,9 +436,10 @@ async fn process_batch(
                 .await;
             }
             Err(e) => {
-                warn!(repo = %item.repo, origin = %origin_url, err = %e, "repo sync failed");
-                let _ = db.mark_sync_failed(&item.id).await;
-                crate::metrics::record_sync_processed("failed");
+                // Prune vs terminal classification lives in
+                // `handle_sync_item_error` (defer = stays pending for the
+                // next tick; anything else = failed).
+                handle_sync_item_error(db, &item, &origin_url, e).await;
             }
         }
     }
@@ -576,7 +578,18 @@ async fn replicate_encrypted_blobs(
     let url = format!("{origin_url}/api/v1/repos/{owner}/{repo}/encrypted-blobs/replicate");
     let resp = match client.get(&url).send().await {
         Ok(r) if r.status().is_success() => r,
-        _ => return,
+        // A peer that predates the replicate route answers 404: expected and
+        // quiet. Anything else is the route existing and refusing or failing,
+        // which should be observable rather than read as route-absent.
+        Ok(r) if r.status().as_u16() == 404 => return,
+        Ok(r) => {
+            tracing::warn!(repo = %repo, status = %r.status(), "encrypted-blobs replicate refused; skipping");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(repo = %repo, error = %e, "encrypted-blobs replicate request failed; skipping");
+            return;
+        }
     };
     let parsed: ReplicateResponse = match resp.json().await {
         Ok(p) => p,
@@ -691,6 +704,284 @@ async fn existing_promisor_state(repo: &str) -> PromisorProbe {
     }
 }
 
+/// Byte-prefix check for the two node-managed blob namespaces exempt from
+/// the fail-closed commit walk (`visibility_pack.rs`): request markers
+/// (`refs/gitlawb/requests/`) and issue records (`refs/gitlawb/issues/`).
+/// Bytewise so non-UTF-8 refnames (which git accepts) are classified, not
+/// lossy-decoded into a false exempt match. Extracted so the predicate is
+/// unit-testable; [`prune_non_exempt_gitlawb_refs`] enforces it on import.
+fn gitlawb_ref_is_exempt(raw_refname: &[u8]) -> bool {
+    raw_refname.starts_with(b"refs/gitlawb/requests/")
+        || raw_refname.starts_with(b"refs/gitlawb/issues/")
+}
+
+/// Parse one `git show-ref` output line into its refname bytes: `<hex-sha>`
+/// (40-hex SHA-1 or 64-hex SHA-256, which a sha256 mirror inherits from its
+/// origin), one space, then the refname. Empty lines (trailing newline) yield
+/// `Ok(None)`; anything else-shaped is an anomaly the caller fails on rather
+/// than skips — silently passing an unclassifiable line could leave an evil
+/// ref imported. Extracted so malformed input is unit-testable without git.
+fn show_ref_refname(line: &[u8]) -> anyhow::Result<Option<&[u8]>> {
+    if line.is_empty() {
+        return Ok(None);
+    }
+    let Some(sp) = line.iter().position(|b| *b == b' ') else {
+        return Err(anyhow::anyhow!("git show-ref emitted an unparsable line"));
+    };
+    let (sha, raw) = (&line[..sp], &line[sp + 1..]);
+    let sha_ok = (sha.len() == 40 || sha.len() == 64) && sha.iter().all(|b| b.is_ascii_hexdigit());
+    if !sha_ok || raw.is_empty() {
+        return Err(anyhow::anyhow!("git show-ref emitted an unparsable line"));
+    }
+    Ok(Some(raw))
+}
+
+/// Delete imported `refs/gitlawb/*` refs outside the two exempt subtrees.
+///
+/// Mirrors import whatever the origin advertises (`+refs/*:refs/*`), and
+/// `transfer.hideRefs` is a serve-side knob: a repo's own `git fetch` never
+/// consults local hideRefs, and origins hide only `requests/` anyway. So a
+/// planted `refs/gitlawb/<other>` blob ref — creatable on any pre-gate node —
+/// lands on every mirror and then trips `assert_all_refs_are_commits` closed,
+/// wedging serving on each one. Prune at import instead: after clone/fetch,
+/// list `refs/gitlawb` and delete every ref outside the exempt subtrees
+/// (negative refspecs cannot re-include them, so post-import deletion is the
+/// mechanism that works).
+///
+/// Callers map a transient prune error to [`PruneFailed`] so the batch
+/// defers the row (stays `pending`, retried next tick) instead of failing
+/// it: a failed row would leave a possibly-wedged mirror unretried until
+/// the next peer announcement. Deterministic refusals (identity mismatch,
+/// malformed enumeration) map to [`PruneInvalid`], which fails terminally
+/// since no retry can clear them.
+///
+/// Enumeration is `git show-ref` (no pattern), parsed as raw bytes: refnames
+/// cannot contain newlines, so one line per ref is lossless even for
+/// non-UTF-8 names, which a lossy decode would miss. The `<sha> SP <refname>`
+/// structure (not `for-each-ref --format=%(refname)`, which carries no object
+/// id) is what lets the parser width-check 40-hex SHA-1 vs 64-hex SHA-256
+/// and reject anything else-shaped instead of skipping it.
+///
+/// Fail-closed throughout: the exit code is classified (only `1` with empty
+/// output means "no refs"; anything else non-zero, e.g. 128 on a missing
+/// repo, is fatal, since a silent skip would leave an imported evil ref in
+/// place while the sync reports success), and any line that is not
+/// `<hex-sha> SP <refname>` — 40-hex SHA-1 or 64-hex SHA-256, which a sha256
+/// mirror inherits from its origin — fails the sync rather than being
+/// skipped into an unpruned wedge.
+/// Bounded git spawn for the prune below: `kill_on_drop` plus a hard timeout
+/// so a wedged child cannot stall a mirror import or sweep forever. The
+/// refname delete runs on exact bytes, so args arrive as `OsStr`, not `str`.
+/// Non-PruneInvalid failures (including a timeout) wrap as PruneFailed and
+/// defer for retry, matching the transient classification below.
+async fn prune_git(
+    local_path: &Path,
+    args: &[&std::ffi::OsStr],
+    label: &str,
+) -> anyhow::Result<std::process::Output> {
+    let fut = async {
+        // allow-unbounded-git: bounded by the tokio::time::timeout wrapping
+        // this future below, plus kill_on_drop.
+        let mut cmd = tokio::process::Command::new("git");
+        cmd.kill_on_drop(true);
+        cmd.arg("-C").arg(local_path).args(args);
+        cmd.output().await
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(30), fut)
+        .await
+        .map_err(|_| anyhow::anyhow!("{label} timed out"))?
+        .map_err(|e| anyhow::anyhow!("{label} failed to spawn: {e}"))
+}
+
+async fn prune_non_exempt_gitlawb_refs(local_path: &Path) -> anyhow::Result<()> {
+    let local_str = local_path.to_str().unwrap_or(".");
+    // Prove the path is itself a repo before trusting the enumeration:
+    // `git -C` walks up to the nearest ancestor repo, so inside a non-repo
+    // child (a partially-created mirror) `show-ref` would exit 0 with the
+    // ANCESTOR's refs and `update-ref -d` would then run against that repo.
+    // Require `rev-parse --absolute-git-dir` to resolve to the path itself
+    // (mirrors are bare repos, where the git dir IS the path).
+    let git_dir_out = prune_git(
+        local_path,
+        &[
+            std::ffi::OsStr::new("rev-parse"),
+            std::ffi::OsStr::new("--absolute-git-dir"),
+        ],
+        "git rev-parse",
+    )
+    .await?;
+    if !git_dir_out.status.success() {
+        let stderr = String::from_utf8_lossy(&git_dir_out.stderr);
+        return Err(anyhow::anyhow!(PruneInvalid(format!(
+            "mirror path is not a git repo (rev-parse failed): {stderr}"
+        ))));
+    }
+    let actual_dir = PathBuf::from(
+        String::from_utf8_lossy(&git_dir_out.stdout)
+            .trim()
+            .to_string(),
+    );
+    let canonical_path = local_path
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!(PruneInvalid(format!("mirror path does not resolve: {e}"))))?;
+    let canonical_git_dir = actual_dir
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!(PruneInvalid(format!("git dir does not resolve: {e}"))))?;
+    if canonical_git_dir != canonical_path {
+        return Err(anyhow::anyhow!(PruneInvalid(format!(
+            "mirror path {local_str} is not itself a repo (git dir resolves elsewhere); refusing to enumerate"
+        ))));
+    }
+    let out = prune_git(
+        local_path,
+        &[std::ffi::OsStr::new("show-ref")],
+        "git show-ref",
+    )
+    .await?;
+    // Classify on the exit code (the `existing_promisor_state` precedent):
+    // 0 parses, 1 with empty output is an empty repo, anything else is a
+    // fatal enumeration failure that must not read as "nothing to prune".
+    match out.status.code() {
+        Some(0) => {}
+        Some(1) if out.stdout.is_empty() => return Ok(()),
+        _ => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(anyhow::anyhow!(
+                "git show-ref failed with code {:?}: {stderr}",
+                out.status.code()
+            ));
+        }
+    }
+    for line in out.stdout.split(|b| *b == b'\n') {
+        // Malformed lines are deterministic (same git, same output every
+        // tick): fail terminally via PruneInvalid, not transiently.
+        let Some(raw) =
+            show_ref_refname(line).map_err(|e| anyhow::anyhow!(PruneInvalid(e.to_string())))?
+        else {
+            continue;
+        };
+        if !(raw == b"refs/gitlawb" || raw.starts_with(b"refs/gitlawb/"))
+            || gitlawb_ref_is_exempt(raw)
+        {
+            continue;
+        }
+        // Delete by exact bytes (not the lossy display string below): a
+        // non-UTF-8 refname would otherwise survive the prune.
+        let refname_os = os_from_raw_refname(raw);
+        let shown = refname_os.to_string_lossy().into_owned();
+        let delete = prune_git(
+            local_path,
+            &[
+                std::ffi::OsStr::new("update-ref"),
+                std::ffi::OsStr::new("-d"),
+                refname_os.as_os_str(),
+                std::ffi::OsStr::new("--no-deref"),
+            ],
+            "git update-ref -d",
+        )
+        .await?;
+        if !delete.status.success() {
+            let stderr = String::from_utf8_lossy(&delete.stderr);
+            return Err(anyhow::anyhow!(
+                "git update-ref -d {shown} failed (mirror still carries a non-exempt refs/gitlawb ref): {stderr}"
+            ));
+        }
+        tracing::info!(
+            gitlawb_ref = %shown,
+            "mirror: pruned non-exempt refs/gitlawb ref on import"
+        );
+    }
+    Ok(())
+}
+
+/// Lossless bytes → OsString for `update-ref -d`: non-UTF-8 refnames must be
+/// deleted by exact bytes. Unix is the serving platform; elsewhere fall back
+/// to a lossy decode (best effort where exact bytes are unrepresentable).
+#[cfg(unix)]
+fn os_from_raw_refname(raw: &[u8]) -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStringExt;
+    std::ffi::OsString::from_vec(raw.to_vec())
+}
+
+#[cfg(not(unix))]
+fn os_from_raw_refname(raw: &[u8]) -> std::ffi::OsString {
+    String::from_utf8_lossy(raw).into_owned().into()
+}
+
+/// Marker for mirror-prune failures: the clone/fetch succeeded, so the
+/// mirror is on disk, but a non-exempt `refs/gitlawb/*` ref may still be
+/// imported. Local-git conditions are transient (a retry can succeed), while
+/// `mark_sync_failed` is terminal until the next peer announcement — and a
+/// failed row would leave a possibly-wedged mirror unretried in the
+/// meantime. The batch error arm downcasts to this and defers the row
+/// (stays `pending`, retried on the next 30s tick, where fetch+prune are
+/// idempotent) instead of failing it.
+#[derive(Debug)]
+struct PruneFailed(String);
+
+impl std::fmt::Display for PruneFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "mirror prune failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for PruneFailed {}
+
+/// Marker for deterministic mirror-prune refusals: the identity check (path
+/// is not itself a repo) and malformed `show-ref` output cannot clear on
+/// retry — re-running fetch+prune every tick would spin forever on a
+/// permanently bad path. Unlike [`PruneFailed`], these fail the row
+/// terminally so the condition surfaces instead of looping silently.
+#[derive(Debug)]
+struct PruneInvalid(String);
+
+/// Preserve a deterministic prune refusal through the clone/fetch call
+/// sites: `prune_non_exempt_gitlawb_refs` already returns `PruneInvalid`
+/// for identity mismatches and malformed enumeration, and re-wrapping
+/// every error as `PruneFailed` would stringify that type away before
+/// `handle_sync_item_error` downcasts it — leaving a permanently invalid
+/// mirror deferred (fetch+prune every tick) instead of failed. Transient
+/// failures keep the `PruneFailed` deferral.
+fn wrap_prune_error(e: anyhow::Error) -> anyhow::Error {
+    match e.downcast::<PruneInvalid>() {
+        Ok(invalid) => anyhow::Error::new(invalid),
+        Err(other) => anyhow::anyhow!(PruneFailed(other.to_string())),
+    }
+}
+
+impl std::fmt::Display for PruneInvalid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "mirror prune refused: {}", self.0)
+    }
+}
+
+impl std::error::Error for PruneInvalid {}
+
+/// Classify a mirror sync failure for one queue row. Transient prune
+/// failures ([`PruneFailed`]) defer: the mirror is on disk but may still
+/// carry a non-exempt refs/gitlawb ref, a transient local-git condition a
+/// retry can clear — failing the row would leave it unretried until the
+/// next peer announcement, wedging serving in the meantime. Deterministic
+/// refusals ([`PruneInvalid`]) and everything else fail the row terminally:
+/// retrying a permanently bad path every tick would spin forever instead of
+/// surfacing. Extracted so the deferral (not just the prune itself) is
+/// unit-testable.
+async fn handle_sync_item_error(
+    db: &Db,
+    item: &crate::db::SyncQueueItem,
+    origin_url: &str,
+    err: anyhow::Error,
+) {
+    if err.downcast_ref::<PruneFailed>().is_some() {
+        warn!(repo = %item.repo, origin = %origin_url, err = %err, "mirror prune failed; leaving sync row pending for retry");
+        crate::metrics::record_sync_processed("deferred");
+        return;
+    }
+    warn!(repo = %item.repo, origin = %origin_url, err = %err, "repo sync failed");
+    let _ = db.mark_sync_failed(&item.id).await;
+    crate::metrics::record_sync_processed("failed");
+}
+
 /// Mirror-clone a repo from a remote URL into a local bare repo.
 /// `Promisor` mode adds `--filter=blob:limit=10g`, which marks the repo a git
 /// promisor (so a pack with origin-omitted withheld blobs is accepted) while
@@ -701,6 +992,7 @@ async fn clone_repo(remote_url: &str, local_path: &Path, mode: MirrorMode) -> an
     if mode == MirrorMode::Promisor {
         args.push("--filter=blob:limit=10g");
     }
+    args.push("--");
     args.push(remote_url);
     args.push(local_str);
 
@@ -714,6 +1006,13 @@ async fn clone_repo(remote_url: &str, local_path: &Path, mode: MirrorMode) -> an
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(anyhow::anyhow!("git clone --mirror failed: {stderr}"));
     }
+    // A fresh mirror imports everything the origin advertises, including any
+    // planted non-exempt `refs/gitlawb/*` ref; prune before serving from it.
+    // Prune outcome flows through `wrap_prune_error`: transient failures
+    // defer (stays pending), deterministic refusals fail terminally.
+    prune_non_exempt_gitlawb_refs(local_path)
+        .await
+        .map_err(wrap_prune_error)?;
     Ok(())
 }
 
@@ -729,9 +1028,16 @@ async fn clone_repo(remote_url: &str, local_path: &Path, mode: MirrorMode) -> an
 async fn fetch_repo(local_path: &Path, remote_url: &str, mode: MirrorMode) -> anyhow::Result<()> {
     let local_str = local_path.to_str().unwrap_or(".");
 
-    git_run(&["-C", local_str, "remote", "set-url", "origin", remote_url]).await?;
+    git_run(&[
+        "-C", local_str, "remote", "set-url", "origin", "--", remote_url,
+    ])
+    .await?;
 
-    match mode {
+    // The fetch imports whatever the origin advertises via the stored
+    // `+refs/*:refs/*` refspec; prune non-exempt `refs/gitlawb/*` refs after
+    // every fetch so one planted origin ref cannot wedge serving on the
+    // mirror (see `prune_non_exempt_gitlawb_refs`).
+    let fetch_result = match mode {
         MirrorMode::Promisor => {
             git_run(&["-C", local_str, "config", "remote.origin.promisor", "true"]).await?;
             git_run(&[
@@ -771,7 +1077,13 @@ async fn fetch_repo(local_path: &Path, remote_url: &str, mode: MirrorMode) -> an
                 git_run(&["-C", local_str, "fetch", "--prune", "origin"]).await
             }
         }
-    }
+    };
+    fetch_result?;
+    // Prune after every fetch (see above); outcome flows through
+    // `wrap_prune_error` like the clone path.
+    prune_non_exempt_gitlawb_refs(local_path)
+        .await
+        .map_err(wrap_prune_error)
 }
 
 #[cfg(test)]
@@ -1004,6 +1316,82 @@ mod tests {
 
         let probe = existing_promisor_state(dest.to_str().unwrap()).await;
         assert_eq!(probe, PromisorProbe::NotPromisor);
+    }
+
+    /// #374: `clone_repo` interpolates the peer's origin URL into a `git
+    /// clone --mirror` argument list. Without a `--` delimiter git parses a
+    /// remote beginning with `-` as an option instead of a repository.
+    ///
+    /// The delimiter is what forces the same string to be a repository, and
+    /// git says so in its own words: it reports the whole argument as a
+    /// repository it cannot find. Undelimited, git consumes it as an option
+    /// and fails against the *destination* instead (`fatal: repository '<dest>' does not exist`),
+    /// never naming the injected string — which is why this assertion is RED
+    /// before the fix and GREEN after.
+    ///
+    /// The payload is deliberately free of `:` and spaces: a colon would make
+    /// git read the argument as an ssh-style `host:path` URL and report a
+    /// hostname rather than a repository, which is a different code path.
+    #[tokio::test]
+    async fn clone_never_parses_a_remote_as_a_git_option() {
+        let td = TempDir::new().unwrap();
+        let dest = td.path().join("mirror.git");
+        let injected = "--upload-pack=false";
+
+        let err = clone_repo(injected, &dest, MirrorMode::Plain)
+            .await
+            .expect_err("a remote that is not a repository must fail the clone")
+            .to_string();
+
+        assert!(
+            err.contains(injected),
+            "git must report the argument as a repository, not consume it as an option: {err}"
+        );
+    }
+
+    /// #374: `fetch_repo` interpolates the peer's origin URL into
+    /// `git remote set-url`, a second argv construction with the same contract as
+    /// the clone. It needs its own proof: the clone test cannot reach this path.
+    ///
+    /// The assertion is on stored state rather than on the error string, and that
+    /// is deliberate. `git_run` formats its failure as `git {args:?} failed:
+    /// {stderr}`, so the injected value is in the message via the debug-printed
+    /// argv whether or not the delimiter is present — asserting on containment
+    /// would pass with `--` deleted. Delimited, `set-url` succeeds and stores the
+    /// value verbatim; undelimited, git exits 129 with `unknown option` and leaves
+    /// the previous URL in place, so this goes red without the fix.
+    ///
+    /// The fetch that follows the rewrite fails, because the stored URL is not a
+    /// repository. That is expected and ignored: the property under test is what
+    /// `set-url` wrote, not whether the subsequent fetch could succeed.
+    #[tokio::test]
+    async fn fetch_never_parses_a_remote_as_a_git_option() {
+        let td = TempDir::new().unwrap();
+        let local = td.path().join("mirror.git");
+        let local_str = local.to_str().unwrap();
+        let placeholder = "http://example.invalid/x.git";
+
+        assert!(Command::new("git")
+            .args(["init", "-q", "--bare", local_str])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["-C", local_str, "remote", "add", "origin", placeholder])
+            .status()
+            .unwrap()
+            .success());
+
+        let injected = "--upload-pack=false";
+        let _ = fetch_repo(&local, injected, MirrorMode::Plain).await;
+
+        assert_eq!(
+            git_config_get(local_str, "remote.origin.url")
+                .await
+                .as_deref(),
+            Some(injected),
+            "set-url must store an option-shaped remote verbatim, not reject it as an option"
+        );
     }
 
     #[tokio::test]
@@ -1250,6 +1638,18 @@ mod tests {
         .await;
     }
 
+    /// Use a rooted path without a Windows drive prefix in the remote fixture.
+    /// The destination still resolves on the temp directory's current drive,
+    /// while the remote's relative path contains no illegal colon component.
+    fn absolute_slug_path(path: &Path) -> String {
+        assert!(path.is_absolute());
+        path.components()
+            .filter(|part| !matches!(part, std::path::Component::Prefix(_)))
+            .collect::<std::path::PathBuf>()
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
     #[sqlx::test]
     async fn process_batch_rejects_slug_escaping_repos_dir(pool: PgPool) {
         // The verified escape from #272: `PathBuf::join` discards everything
@@ -1265,12 +1665,13 @@ mod tests {
         // fails on but leaves the parent it created, so assert on both.
         let outside = TempDir::new().unwrap();
         let escape_dir = outside.path().join("nest");
-        let slug = format!("a/{}/escape", escape_dir.display());
+        let escape_path = absolute_slug_path(&escape_dir);
+        let slug = format!("a/{escape_path}/escape");
         let escape_target = escape_dir.join("escape.git");
 
         // Serve the composed URL for real, so a run without the guard genuinely
         // clones outside the root rather than merely failing at git.
-        let rel = format!("a{}/escape", escape_dir.display());
+        let rel = format!("a{escape_path}/escape");
         let (_remote, peer_url) = rooted_remote(&[&rel]);
 
         let did = "did:key:z6MkAttacker";
@@ -1390,6 +1791,7 @@ mod tests {
     // ── canonical containment before the git call (issue #272) ───────────────
 
     /// Every ref in `repo`, as one string, for a before/after comparison.
+    #[cfg(unix)]
     fn refs_of(repo: &Path) -> String {
         let out = Command::new("git")
             .args(["-C", repo.to_str().unwrap(), "for-each-ref"])
@@ -1722,6 +2124,7 @@ mod tests {
     /// starvation tests is fixed rather than dependent on how fast the loop
     /// runs. Two rows enqueued in the same microsecond would otherwise order
     /// arbitrarily.
+    #[cfg(unix)]
     async fn enqueue_at(db: &Db, pool: &PgPool, repo: &str, did: &str, enqueued_at: &str) {
         enqueue(db, repo, did).await;
         sqlx::query("UPDATE sync_queue SET enqueued_at = $1 WHERE repo = $2")
@@ -1915,7 +2318,8 @@ mod tests {
 
         let outside = TempDir::new().unwrap();
         let escape_dir = outside.path().join("nest");
-        let slug = format!("a/{}/gitlawb-probe", escape_dir.display());
+        let escape_path = absolute_slug_path(&escape_dir);
+        let slug = format!("a/{escape_path}/gitlawb-probe");
         let escape_target = escape_dir.join("gitlawb-probe.git");
 
         // Two things this fixture must get right or the test is green for the
@@ -1926,7 +2330,7 @@ mod tests {
         // run without the guard genuinely clones outside the root instead of
         // just failing at git. Db::upsert_peer cannot seed this row: it gates on
         // is_public_http_url, which rejects file://.
-        let rel = format!("a{}/gitlawb-probe", escape_dir.display());
+        let rel = format!("a{escape_path}/gitlawb-probe");
         let (_remote, peer_url) = rooted_remote(&[&rel]);
         let did = "did:key:z6MkAttacker";
         seed_local_peer(&pool, did, &peer_url).await;
@@ -2011,5 +2415,464 @@ mod tests {
         assert!(mirror.is_dir(), "mirror missing at {}", mirror.display());
         assert!(object_count(&mirror) > 0, "mirror has no objects");
         assert_eq!(sync_status(&pool, "z6Mkfoo/hello").await, "done");
+    }
+
+    /// The import-exemption predicate is bytewise over both node-managed
+    /// namespaces and nothing else. Non-UTF-8 bytes never match (git accepts
+    /// them, so a lossy decode could false-exempt). Narrowing either prefix
+    /// turns these red.
+    #[test]
+    fn gitlawb_import_exemption_covers_both_namespaces_by_bytes() {
+        for exempt in [
+            &b"refs/gitlawb/requests/550e8400-e29b-41d4-a716-446655440000"[..],
+            &b"refs/gitlawb/issues/abc123"[..],
+        ] {
+            assert!(
+                gitlawb_ref_is_exempt(exempt),
+                "import must keep {}",
+                String::from_utf8_lossy(exempt)
+            );
+        }
+        for pruned in [
+            &b"refs/gitlawb/evil"[..],
+            &b"refs/gitlawb"[..],
+            &b"refs/gitlawbfoo"[..],
+            &b"refs/heads/main"[..],
+            &b""[..],
+            // Raw 0xFF byte: never an exempt prefix, always pruned.
+            &b"refs/gitlawb/\xffvil"[..],
+        ] {
+            assert!(
+                !gitlawb_ref_is_exempt(pruned),
+                "import must prune {}",
+                String::from_utf8_lossy(pruned)
+            );
+        }
+    }
+
+    /// End-to-end prune on a scratch bare repo: a planted non-exempt
+    /// `refs/gitlawb/*` blob ref is deleted, exempt `requests/`/`issues/`
+    /// blob refs and content refs survive. Removing the prune call from
+    /// `clone_repo`/`fetch_repo` leaves the evil ref in place, which is what
+    /// wedges serving on mirrors — this test plants exactly that state and
+    /// proves the prune removes it.
+    #[test]
+    fn prune_removes_non_exempt_gitlawb_refs_and_keeps_exempt() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        rt.block_on(async {
+            let td = TempDir::new().unwrap();
+            let work = td.path().join("work");
+            let bare = td.path().join("m.git");
+            std::fs::create_dir_all(&work).unwrap();
+            // A real commit for the content branch (branch refs must point
+            // at commits; the evil/exempt refs below point at blobs).
+            std::fs::write(work.join("f.txt"), b"x\n").unwrap();
+            let run_work = |args: &[&str]| {
+                assert!(
+                    Command::new("git")
+                        .args(args)
+                        .current_dir(&work)
+                        .status()
+                        .unwrap()
+                        .success(),
+                    "git {args:?} failed"
+                );
+            };
+            run_work(&["init", "-q"]);
+            run_work(&["config", "user.email", "t@t"]);
+            run_work(&["config", "user.name", "t"]);
+            run_work(&["add", "f.txt"]);
+            run_work(&["commit", "-qm", "init"]);
+            assert!(
+                Command::new("git")
+                    .args([
+                        "clone",
+                        "-q",
+                        "--bare",
+                        work.to_str().unwrap(),
+                        bare.to_str().unwrap()
+                    ])
+                    .current_dir(td.path())
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git clone --bare failed"
+            );
+            let run = |args: &[&str]| {
+                assert!(
+                    Command::new("git")
+                        .args(args)
+                        .current_dir(&bare)
+                        .status()
+                        .unwrap()
+                        .success(),
+                    "git {args:?} failed"
+                );
+            };
+            let run_out = |args: &[&str]| {
+                let out = Command::new("git")
+                    .args(args)
+                    .current_dir(&bare)
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "git {args:?} failed");
+                out.stdout
+            };
+            run(&["init", "-q", "--bare", "."]);
+            std::fs::write(bare.join("blob-body"), b"marker\n").unwrap();
+            let blob = String::from_utf8_lossy(&run_out(&["hash-object", "-w", "blob-body"]))
+                .trim()
+                .to_string();
+            // The clone carries the content branch; plant the evil ref and
+            // both exempt refs (all blob-pointing, like node metadata).
+            run(&["update-ref", "refs/gitlawb/evil", &blob]);
+            run(&["update-ref", "refs/gitlawb/requests/r1", &blob]);
+            run(&["update-ref", "refs/gitlawb/issues/i1", &blob]);
+
+            prune_non_exempt_gitlawb_refs(&bare)
+                .await
+                .expect("prune succeeds");
+
+            let raw_refs = run_out(&["for-each-ref", "--format=%(refname)"]);
+            let refs = String::from_utf8_lossy(&raw_refs);
+            let set: std::collections::HashSet<&str> = refs
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect();
+            assert!(
+                !set.contains("refs/gitlawb/evil"),
+                "non-exempt blob ref must be pruned, still present: {set:?}"
+            );
+            for keep in ["refs/gitlawb/requests/r1", "refs/gitlawb/issues/i1"] {
+                assert!(set.contains(keep), "{keep} must survive the prune: {set:?}");
+            }
+            assert!(
+                set.iter().any(|r| r.starts_with("refs/heads/")),
+                "content branch ref must survive the prune: {set:?}"
+            );
+        });
+    }
+
+    /// `show-ref` line parser: 40-hex SHA-1 and 64-hex SHA-256 lines yield
+    /// the refname, empty lines yield None, and anything else-shaped errors
+    /// (the caller fails the sync rather than skipping into an unpruned
+    /// wedge). Reverting to a 40-only width check turns the sha256 case red.
+    #[test]
+    fn show_ref_line_parser_accepts_both_hash_widths_and_rejects_junk() {
+        // 40-hex SHA-1 line.
+        let sha1_line = format!("{} refs/gitlawb/evil", "a".repeat(40));
+        assert_eq!(
+            show_ref_refname(sha1_line.as_bytes()).unwrap(),
+            Some(b"refs/gitlawb/evil".as_slice())
+        );
+        // 64-hex SHA-256 line (a sha256 mirror inherits the width).
+        let sha256_line = format!("{} refs/gitlawb/evil", "b".repeat(64));
+        assert_eq!(
+            show_ref_refname(sha256_line.as_bytes()).unwrap(),
+            Some(b"refs/gitlawb/evil".as_slice())
+        );
+        // Non-UTF-8 refname passes through as exact bytes.
+        let mut raw = vec![b'c'; 40];
+        raw.extend_from_slice(b" refs/gitlawb/\xffvil");
+        assert_eq!(
+            show_ref_refname(&raw).unwrap(),
+            Some(b"refs/gitlawb/\xffvil".as_slice())
+        );
+        // Trailing newline residue.
+        assert_eq!(show_ref_refname(b"").unwrap(), None);
+        // No space, short sha, non-hex sha, empty refname: all errors.
+        let bads: Vec<Vec<u8>> = vec![
+            b"nospaceshere".to_vec(),
+            format!("{}refs/x", "a".repeat(40)).into_bytes(),
+            [b'z'; 40]
+                .iter()
+                .chain(b" refs/x".iter())
+                .copied()
+                .collect(),
+            format!("{} ", "a".repeat(40)).into_bytes(),
+            format!("{} refs/x", "a".repeat(41)).into_bytes(),
+        ];
+        for bad in &bads {
+            assert!(
+                show_ref_refname(bad).is_err(),
+                "malformed show-ref line must error, not skip"
+            );
+        }
+    }
+
+    /// Pruning a path that is not a repo errors. Two shapes: a missing path
+    /// fails `rev-parse` outright (exit 128), while a plain subdirectory of
+    /// a repo would otherwise enumerate the ancestor's refs — covered by the
+    /// identity test below. Either way the prune refuses instead of pruning
+    /// the wrong repo or silently skipping an evil ref.
+    #[test]
+    fn prune_on_non_repo_path_errors() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        rt.block_on(async {
+            let err =
+                prune_non_exempt_gitlawb_refs(Path::new("/tmp/gitlawb-definitely-not-a-repo-xyz"))
+                    .await
+                    .expect_err("non-repo path must fail the prune, not skip it");
+            assert!(
+                err.to_string().contains("not a git repo")
+                    || err.to_string().contains("does not resolve"),
+                "unexpected error shape: {err:#}"
+            );
+        });
+    }
+
+    /// Identity check: pruning a plain subdirectory of a repo refuses instead
+    /// of enumerating the ancestor. `git -C` on the child exits 0 from
+    /// `show-ref` with the ANCESTOR's refs, so without the
+    /// `rev-parse --absolute-git-dir` identity check the delete loop would
+    /// enumerate and delete the wrong repository's refs. Deleting the check
+    /// makes the prune succeed and removes the ancestor's evil ref — both
+    /// assertions go red.
+    #[test]
+    fn prune_on_non_repo_child_of_repo_refuses_and_touches_nothing() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        rt.block_on(async {
+            let td = TempDir::new().unwrap();
+            let ancestor = td.path().join("ancestor.git");
+            std::fs::create_dir_all(&ancestor).unwrap();
+            let run_ancestor = |args: &[&str]| {
+                assert!(
+                    Command::new("git")
+                        .args(args)
+                        .current_dir(&ancestor)
+                        .status()
+                        .unwrap()
+                        .success(),
+                    "git {args:?} failed"
+                );
+            };
+            run_ancestor(&["init", "-q", "--bare", "."]);
+            // Blob target for the planted ref (mirrors the node-metadata shape).
+            std::fs::write(ancestor.join("blob-body"), b"marker\n").unwrap();
+            let out = Command::new("git")
+                .args(["hash-object", "-w", "blob-body"])
+                .current_dir(&ancestor)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git hash-object failed");
+            let blob = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            run_ancestor(&["update-ref", "refs/gitlawb/evil", &blob]);
+
+            // A plain child directory: not itself a repo.
+            let child = ancestor.join("not-a-repo");
+            std::fs::create_dir_all(&child).unwrap();
+
+            let err = prune_non_exempt_gitlawb_refs(&child)
+                .await
+                .expect_err("pruning a non-repo child must refuse, not enumerate the ancestor");
+            assert!(
+                err.to_string().contains("not itself a repo"),
+                "refusal must name the identity mismatch, got: {err:#}"
+            );
+
+            // The ancestor's evil ref is untouched.
+            let refs_out = Command::new("git")
+                .args(["for-each-ref", "--format=%(refname)"])
+                .current_dir(&ancestor)
+                .output()
+                .unwrap();
+            let refs = String::from_utf8_lossy(&refs_out.stdout);
+            assert!(
+                refs.lines().any(|l| l.trim() == "refs/gitlawb/evil"),
+                "ancestor evil ref must survive the refused prune"
+            );
+        });
+    }
+
+    /// sha256 mirror: a 64-hex `show-ref` line parses and the planted ref is
+    /// pruned. A 40-only parser skips every line and leaves the evil ref.
+    #[test]
+    fn prune_parses_sha256_show_ref_and_prunes() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        rt.block_on(async {
+            let td = TempDir::new().unwrap();
+            let bare = td.path().join("m256.git");
+            std::fs::create_dir_all(&bare).unwrap();
+            let run = |args: &[&str]| {
+                assert!(
+                    Command::new("git")
+                        .args(args)
+                        .current_dir(&bare)
+                        .status()
+                        .unwrap()
+                        .success(),
+                    "git {args:?} failed"
+                );
+            };
+            let run_out = |args: &[&str]| {
+                let out = Command::new("git")
+                    .args(args)
+                    .current_dir(&bare)
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "git {args:?} failed");
+                out.stdout
+            };
+            run(&["init", "-q", "--bare", "--object-format=sha256", "."]);
+            std::fs::write(bare.join("blob-body"), b"marker\n").unwrap();
+            let blob = String::from_utf8_lossy(&run_out(&["hash-object", "-w", "blob-body"]))
+                .trim()
+                .to_string();
+            assert_eq!(
+                blob.len(),
+                64,
+                "sanity: sha256 repo must mint 64-hex objects"
+            );
+            run(&["update-ref", "refs/gitlawb/evil", &blob]);
+            run(&["update-ref", "refs/gitlawb/issues/i1", &blob]);
+
+            prune_non_exempt_gitlawb_refs(&bare)
+                .await
+                .expect("prune succeeds on a sha256 repo");
+
+            let raw_refs = run_out(&["for-each-ref", "--format=%(refname)"]);
+            let refs = String::from_utf8_lossy(&raw_refs);
+            let set: std::collections::HashSet<&str> = refs
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect();
+            assert!(
+                !set.contains("refs/gitlawb/evil"),
+                "evil ref must be pruned from sha256 mirror: {set:?}"
+            );
+            assert!(
+                set.contains("refs/gitlawb/issues/i1"),
+                "exempt ref must survive: {set:?}"
+            );
+        });
+    }
+
+    /// Prune failures defer the queue row (stays `pending` for the next
+    /// tick); deterministic prune refusals and any other sync error fail it
+    /// terminally. Deleting the `downcast_ref::<PruneFailed>` arm restores
+    /// terminal failure and turns the first assertion red.
+    /// Prune failures defer the queue row (stays `pending` for the next
+    /// tick); deterministic prune refusals and any other sync error fail it
+    /// terminally. Deleting the `downcast_ref::<PruneFailed>` arm restores
+    /// terminal failure and turns the first assertion red.
+    ///
+    /// The wrapper below is what the clone/fetch call sites run through:
+    /// a `PruneInvalid` from the helper must still downcast as
+    /// `PruneInvalid` afterwards (not stringified into `PruneFailed`),
+    /// and anything else must arrive as `PruneFailed`.
+    #[test]
+    fn wrap_prune_error_preserves_deterministic_type() {
+        let invalid = wrap_prune_error(anyhow::anyhow!(PruneInvalid("x".to_string())));
+        assert!(
+            invalid.downcast_ref::<PruneInvalid>().is_some(),
+            "deterministic refusal must survive the call-site wrap"
+        );
+        assert!(
+            invalid.downcast_ref::<PruneFailed>().is_none(),
+            "deterministic refusal must not also read as transient"
+        );
+        let transient = wrap_prune_error(anyhow::anyhow!("boom"));
+        assert!(
+            transient.downcast_ref::<PruneFailed>().is_some(),
+            "generic failure must arrive as transient"
+        );
+        assert!(
+            transient.downcast_ref::<PruneInvalid>().is_none(),
+            "generic failure must not read as deterministic"
+        );
+    }
+
+    #[sqlx::test]
+    async fn prune_failure_defers_row_other_failures_fail_it(pool: PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let item = |id: &str| crate::db::SyncQueueItem {
+            id: id.to_string(),
+            repo: "z6Mkfoo/hello".to_string(),
+            node_did: "did:key:z6MkOrigin".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            new_sha: "0".repeat(40),
+            cid: None,
+            status: "pending".to_string(),
+            enqueued_at: chrono::Utc::now().to_rfc3339(),
+        };
+        async fn status_of(pool: &sqlx::PgPool, id: &str) -> String {
+            let row: (String,) = sqlx::query_as("SELECT status FROM sync_queue WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            row.0
+        }
+        // Seed three pending rows directly (enqueue_sync mints random ids).
+        for id in ["sync-prune-defer", "sync-prune-invalid", "sync-other-fail"] {
+            sqlx::query(
+                "INSERT INTO sync_queue (id, repo, node_did, ref_name, new_sha, cid, status, enqueued_at)
+                 VALUES ($1, $2, $3, $4, $5, NULL, 'pending', $6)",
+            )
+            .bind(id)
+            .bind("z6Mkfoo/hello")
+            .bind("did:key:z6MkOrigin")
+            .bind("refs/heads/main")
+            .bind("0".repeat(40))
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        }
+
+        handle_sync_item_error(
+            &state.db,
+            &item("sync-prune-defer"),
+            "http://origin.example",
+            anyhow::anyhow!(PruneFailed("boom".to_string())),
+        )
+        .await;
+        assert_eq!(
+            status_of(state.db.pool(), "sync-prune-defer").await,
+            "pending",
+            "prune failure must leave the row pending for retry"
+        );
+
+        handle_sync_item_error(
+            &state.db,
+            &item("sync-other-fail"),
+            "http://origin.example",
+            anyhow::anyhow!("boom"),
+        )
+        .await;
+        assert_eq!(
+            status_of(state.db.pool(), "sync-other-fail").await,
+            "failed",
+            "non-prune failure must fail the row"
+        );
+
+        // Deterministic refusal: no retry can clear it, so it fails
+        // terminally instead of spinning every tick forever.
+        handle_sync_item_error(
+            &state.db,
+            &item("sync-prune-invalid"),
+            "http://origin.example",
+            anyhow::anyhow!(PruneInvalid("not itself a repo".to_string())),
+        )
+        .await;
+        assert_eq!(
+            status_of(state.db.pool(), "sync-prune-invalid").await,
+            "failed",
+            "deterministic prune refusal must fail the row, not defer forever"
+        );
     }
 }

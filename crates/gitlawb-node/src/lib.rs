@@ -3,13 +3,16 @@
 // migrations) so the out-of-crate deny-harness integration crate can spawn a
 // real node; `src/main.rs` is a thin shim over `run()`. Modules the harness
 // reaches are `pub`; the rest stay crate-private.
+mod ans104;
 pub mod api;
 mod arweave;
+mod arweave_v2;
 pub mod auth;
 mod bootstrap;
 mod cert;
 pub mod config;
 pub mod db;
+mod durable_outbox;
 mod encrypted_pin;
 pub mod error;
 pub mod git;
@@ -21,15 +24,17 @@ mod operator;
 mod p2p;
 mod pinata;
 mod rate_limit;
+mod reconciliation;
 pub mod server;
 pub mod state;
 mod sync;
 #[cfg(feature = "test-harness")]
-#[doc(hidden)]
 pub mod test_harness;
-#[cfg(test)]
-mod test_support;
+#[cfg(any(test, feature = "test-harness"))]
+pub mod test_support;
+mod upstream_mirror;
 mod visibility;
+mod webhook_secret;
 mod webhooks;
 
 use anyhow::{anyhow, Context, Result};
@@ -44,19 +49,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use gitlawb_core::http_sig::sign_request;
 use gitlawb_core::identity::Keypair;
 
-pub use config::Config;
+use config::Config;
 use db::Db;
-pub use state::AppState;
+use state::AppState;
 
 #[derive(Clone)]
 struct DegradedState {
     node_did: String,
     db_startup: Arc<DbStartupStatus>,
+    web_url: Option<String>,
 }
 
 /// Two independent counters with no cross-field invariant — atomics, not a
@@ -67,35 +73,6 @@ struct DbStartupStatus {
     next_retry_secs: AtomicU64,
 }
 
-/// Hard ceiling on the advisory-lock pool's `max_connections`.
-///
-/// `max_concurrent_git_pushes` is validated all the way up to 1_048_576, and the lock
-/// pool used to derive its size straight from that knob, so raising the push cap
-/// silently raised the node's Postgres connection ceiling with no CLI error and no
-/// relation to the server's own `max_connections` (#173 F4). The node's total budget is
-/// now bounded: `db_max_connections` (default 48) + at most this.
-const LOCK_POOL_MAX_CONNECTIONS: u32 = 64;
-
-/// Connections the lock pool keeps above the push cap. Covers the three non-push
-/// `acquire_write` callers (`api/issues.rs` x2, `api/pulls.rs`), which hold no
-/// concurrency permit, so a push never queues here for a connection where it did not
-/// before.
-const LOCK_POOL_PUSH_HEADROOM: u8 = 8;
-
-/// Size the advisory-lock pool for a given push cap: the cap plus
-/// [`LOCK_POOL_PUSH_HEADROOM`], clamped to [`LOCK_POOL_MAX_CONNECTIONS`]. Past the
-/// clamp a push may wait for a lock-pool connection, which is a bounded wait that sheds
-/// a clean 503 (see `LockPoolBusy`), not an unbounded hang.
-fn lock_pool_size(max_concurrent_git_pushes: usize) -> u32 {
-    u32::try_from(max_concurrent_git_pushes)
-        .unwrap_or(u32::MAX)
-        .saturating_add(u32::from(LOCK_POOL_PUSH_HEADROOM))
-        .min(LOCK_POOL_MAX_CONNECTIONS)
-}
-
-/// Boot and run the node to completion. The `gitlawb-node` binary is a thin
-/// `#[tokio::main]` shim over this; keeping the body here (not in `main.rs`)
-/// lets the library own the full module tree so integration tests can link it.
 pub async fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -120,20 +97,16 @@ pub async fn run() -> Result<()> {
 
     if !config.public_read {
         warn!(
-            "GITLAWB_PUBLIC_READ=false is reserved; per-repository private-read enforcement is not wired in alpha"
+            "GITLAWB_PUBLIC_READ=false has no effect; reads are gated per repository by is_public and path-scoped visibility rules, not this flag"
         );
     }
 
     // Load or generate the node's identity keypair
-    let keypair = load_or_create_keypair(&config)?;
-    // The boot sweep spares young `.recovering.` claims (they may gate a
-    // live round); this one delayed re-sweep clears any spared orphan once
-    // it has aged past the liveness floor, ~12s into uptime, so aged claim
-    // residue cannot linger beside a healthy final (F2). Fire-and-forget.
-    spawn_delayed_claim_resweep(config.resolved_key_path());
+    let keypair = Arc::new(load_or_create_keypair(&config)?);
     // Sealing key for the legacy-scan continuation tokens, DERIVED from the identity
     // just loaded so it is the same key after a restart (see `derive_scan_token_key`).
     let scan_token_key = AppState::derive_scan_token_key(&keypair);
+    let webhook_secret_key = AppState::derive_webhook_secret_key(&keypair);
     let node_did = keypair.did();
 
     // One-time metrics init. Must run before any handler that calls into
@@ -144,7 +117,7 @@ pub async fn run() -> Result<()> {
 
     info!("╔══════════════════════════════════════════╗");
     info!(
-        "║         gitlawb node v{}             ║",
+        "║         Twigpine node v{}            ║",
         env!("CARGO_PKG_VERSION")
     );
     info!("╚══════════════════════════════════════════╝");
@@ -198,9 +171,47 @@ pub async fn run() -> Result<()> {
         degraded_listener,
         node_did.to_string(),
         Arc::clone(&db_startup),
+        config.web_url.clone(),
         db_ready_rx,
         shutdown_tx.subscribe(),
     ));
+
+    // Resolve the p2p identity BEFORE the database connect, both arms of the
+    // port gate together.
+    //
+    // The key load is pure filesystem work with no database dependency, and
+    // its failure is deliberately non-fatal. Leaving it behind the DB connect
+    // meant the "HTTP up, p2p off" outcome and the port-zero no-IO guarantee
+    // were both unobservable whenever the database was unreachable, because
+    // `connect_db_with_retry` retries indefinitely and never falls through.
+    // Moving only the load would have left the disabled arm stranded, so the
+    // whole gate moves and just `p2p::start` stays behind the database.
+    let p2p_local_key = if config.p2p_port > 0 {
+        match p2p::load_or_create_p2p_keypair(&config.resolved_p2p_key_path()) {
+            Ok(local_key) => {
+                metrics::set_p2p_key_load_failed(false);
+                Some(local_key)
+            }
+            // Non-fatal by policy, and the cost is named rather than hidden:
+            // the node keeps serving HTTP with a green /health while it is off
+            // the p2p network entirely. Logged at error with a stable event
+            // name and mirrored into a metric, so the outage is alertable
+            // without reading startup logs by hand.
+            Err(e) => {
+                error!(
+                    err = %format!("{e:#}"),
+                    event = "p2p_identity_key_load_failed",
+                    "failed to load p2p identity key, continuing without p2p"
+                );
+                metrics::set_p2p_key_load_failed(true);
+                None
+            }
+        }
+    } else {
+        info!("p2p disabled (p2p_port = 0)");
+        metrics::set_p2p_key_load_failed(false);
+        None
+    };
 
     // Connect to PostgreSQL database. A transient outage or bad secret should
     // not crash-loop the process and hammer the database provider; permanent
@@ -265,36 +276,39 @@ pub async fn run() -> Result<()> {
     // Ensure repos directory exists
     std::fs::create_dir_all(&config.repos_dir).context("failed to create repos directory")?;
 
-    // Start libp2p swarm (if p2p_port > 0)
-    let p2p_handle = if config.p2p_port > 0 {
-        let bootstrap_addrs = config
-            .p2p_bootstrap
-            .iter()
-            .filter_map(|s| s.parse().ok())
-            .collect();
-        let shutdown_rx = shutdown_tx.subscribe();
-        match p2p::start(
-            &node_did.to_string(),
-            config.p2p_port,
-            bootstrap_addrs,
-            Arc::clone(&db),
-            config.auto_sync,
-            shutdown_rx,
-        )
-        .await
-        {
-            Ok(handle) => {
-                info!(port = config.p2p_port, peer_id = %handle.local_peer_id, "libp2p swarm started");
-                Some(Arc::new(handle))
-            }
-            Err(e) => {
-                tracing::warn!(err = %e, "failed to start libp2p swarm — continuing without p2p");
-                None
+    // The identity was resolved before the database connect; this is only the
+    // swarm start, which genuinely needs the database handle.
+    let p2p_handle = match p2p_local_key {
+        Some(local_key) => {
+            let bootstrap_addrs = config
+                .p2p_bootstrap
+                .iter()
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            let shutdown_rx = shutdown_tx.subscribe();
+            match p2p::start(
+                local_key,
+                config.p2p_port,
+                bootstrap_addrs,
+                Arc::clone(&db),
+                config.auto_sync,
+                shutdown_rx,
+                Arc::clone(&keypair),
+                config.require_signed_peer_writes,
+            )
+            .await
+            {
+                Ok(handle) => {
+                    info!(port = config.p2p_port, peer_id = %handle.local_peer_id, "libp2p swarm started");
+                    Some(Arc::new(handle))
+                }
+                Err(e) => {
+                    tracing::warn!(err = %e, "failed to start libp2p swarm — continuing without p2p");
+                    None
+                }
             }
         }
-    } else {
-        info!("p2p disabled (p2p_port = 0)");
-        None
+        None => None,
     };
 
     // Shared no-redirect HTTP client. See build_http_client for the SSRF rationale.
@@ -303,10 +317,15 @@ pub async fn run() -> Result<()> {
     let (ref_update_tx, _) = tokio::sync::broadcast::channel::<state::RefUpdateBroadcast>(256);
     let (task_event_tx, _) = tokio::sync::broadcast::channel::<state::TaskEventBroadcast>(256);
 
+    // Node-keyed, so continuation tokens this node mints are only accepted by
+    // this node and survive its restarts without any configured secret.
+    let task_cursor_key = api::task_cursor::TaskCursorKey::derive(&keypair.to_seed());
+
     let graphql_schema = Arc::new(graphql::build_schema(
         Arc::clone(&db),
         ref_update_tx.clone(),
         task_event_tx.clone(),
+        task_cursor_key.clone(),
     ));
 
     let machine_id = std::env::var("FLY_MACHINE_ID").ok();
@@ -331,25 +350,30 @@ pub async fn run() -> Result<()> {
         None
     };
 
-    // Repo write locks run on their own pool, never the main query pool: each push
-    // holds its connection for the whole receive-pack, so a burst of concurrent
-    // pushes drawing from the main pool would park that many connections for the
-    // duration of their receive-packs and starve every other query. That holds
-    // whatever the two pools are sized at, which is why the separation is
-    // structural rather than a consequence of the defaults; config validate()
-    // separately requires db_max_connections >= max_concurrent_git_pushes + 8. See
-    // build_lock_pool for the cancellation semantics (#173).
-    let lock_pool = git::repo_store::build_lock_pool(
-        db.pool(),
-        lock_pool_size(config.max_concurrent_git_pushes),
+    // Advisory-lock connections come from their own pool: a write guard pins one
+    // for its whole lifetime, and sharing the application pool would let a push
+    // burst starve ordinary request handlers.
+    let lock_pool = db::Db::lock_pool(
+        &config.database_url,
+        config.db_lock_pool_max_connections,
         std::time::Duration::from_secs(config.db_acquire_timeout_secs),
+    )?;
+    let repo_store = git::repo_store::RepoStore::new(
+        config.repos_dir.clone(),
+        tigris,
+        lock_pool,
+        std::time::Duration::from_secs(config.lock_held_transfer_timeout_secs),
     );
-    let repo_store = git::repo_store::RepoStore::new(config.repos_dir.clone(), tigris, lock_pool);
 
     // Per-DID limiter for the creation endpoints. Keyed on the authenticated
-    // DID (attacker-varied), so bound its key set to cap memory.
-    let rate_limiter =
-        rate_limit::RateLimiter::new_bounded(10, std::time::Duration::from_secs(3600), 200_000);
+    // DID (attacker-varied), so bound its key set to cap memory. Max and window
+    // are operator-configurable via GITLAWB_RATE_LIMIT_MAX /
+    // GITLAWB_RATE_LIMIT_WINDOW_SECS; both reject 0 at parse time.
+    let rate_limiter = rate_limit::RateLimiter::new_bounded(
+        config.rate_limit_max_requests as usize,
+        std::time::Duration::from_secs(config.rate_limit_window_secs),
+        200_000,
+    );
 
     // Per-client-IP flood brake for the creation endpoints. The per-DID limiter
     // above is bypassed by a DID farm (one throwaway did:key per repo), which is
@@ -389,6 +413,23 @@ pub async fn run() -> Result<()> {
         tracing::warn!("GITLAWB_PUSH_RATE_LIMIT=0 — per-IP push rate limiting disabled");
     }
 
+    // close_issue drives a full archive download for non-owner author pre-checks.
+    // Keep it on its own bucket so it cannot drain the receive-pack limit.
+    let close_issue_limit = std::env::var("GITLAWB_CLOSE_ISSUE_RATE_LIMIT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(120);
+    let close_issue_rate_limiter = rate_limit::RateLimiter::new_bounded(
+        close_issue_limit,
+        std::time::Duration::from_secs(3600),
+        200_000,
+    );
+    if close_issue_limit == 0 {
+        tracing::warn!(
+            "GITLAWB_CLOSE_ISSUE_RATE_LIMIT=0 — per-IP close_issue rate limiting disabled"
+        );
+    }
+
     // Which forwarded header the edge is trusted to set. Default None (trust
     // nothing, key on the socket peer). Fly nodes set GITLAWB_TRUSTED_PROXY=fly;
     // a node behind Caddy/NGINX sets it to x-forwarded-for.
@@ -411,6 +452,8 @@ pub async fn run() -> Result<()> {
         std::time::Duration::from_secs(3600),
         200_000,
     );
+    let federated_rate_limiter =
+        rate_limit::RateLimiter::new_bounded(12, std::time::Duration::from_secs(60), 10_000);
     if config.sync_trigger_rate_limit == 0 {
         tracing::warn!(
             "GITLAWB_SYNC_TRIGGER_RATE_LIMIT=0 — /sync/trigger IP rate limiting disabled"
@@ -427,7 +470,8 @@ pub async fn run() -> Result<()> {
         config: Arc::new(config.clone()),
         db,
         node_did: node_did.clone(),
-        node_keypair: Arc::new(keypair),
+        node_keypair: keypair,
+        task_cursor_key,
         p2p: p2p_handle,
         http_client,
         ref_update_tx,
@@ -438,39 +482,79 @@ pub async fn run() -> Result<()> {
         rate_limiter,
         create_ip_rate_limiter,
         push_rate_limiter,
+        close_issue_rate_limiter,
         ipfs_max_history_walks: crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST,
         ipfs_max_legacy_probes: AppState::ipfs_legacy_probe_budget(&config),
         ipfs_legacy_scan_page_rows: crate::api::ipfs::LEGACY_SCAN_PAGE_ROWS,
         ipfs_max_legacy_scan_rows: AppState::ipfs_legacy_scan_row_budget(&config),
         ipfs_max_legacy_scan_rule_bytes: crate::api::ipfs::MAX_LEGACY_SCAN_RULE_BYTES_PER_REQUEST,
         ipfs_scan_token_key: Arc::new(scan_token_key),
+        webhook_secret_key: Arc::new(webhook_secret_key),
         ipfs_max_served_object_bytes: crate::api::ipfs::MAX_SERVED_OBJECT_BYTES,
         push_limiter_trust,
         sync_trigger_rate_limiter,
         peer_write_rate_limiter,
+        federated_rate_limiter,
         shutdown_tx: shutdown_tx.clone(),
         git_read_semaphore: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_git_ops)),
         git_write_semaphore: Arc::new(tokio::sync::Semaphore::new(
             config.max_concurrent_git_pushes,
         )),
+        // Anon receive-pack advertisements get their OWN pool, same size as the
+        // write pool but disjoint, so filling it (which takes many source IPs, each
+        // capped by git_push_advert_per_caller) never occupies a permit the
+        // authenticated POST needs (#174).
         git_push_advert_semaphore: Arc::new(tokio::sync::Semaphore::new(
             config.max_concurrent_git_pushes,
         )),
+        // Bounds concurrent detached post-push encryption walks, sized from the push
+        // pool (no separate knob — Q1): completed pushes cannot outnumber active
+        // encryption walks past this (#174 P1-e).
         git_encrypt_semaphore: Arc::new(tokio::sync::Semaphore::new(
             config.max_concurrent_git_pushes,
         )),
+        // Bounds how many post-push pin loops run concurrently across all repos (#174 F6),
+        // independent of the per-repo encrypt-task coalescing below. Not a bound on the
+        // MB-scale object-id lists themselves: parked tasks still hold theirs (see the
+        // field doc on AppState::pin_semaphore).
         pin_semaphore: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_pin_tasks)),
+        // Coalesces the DETACHED post-push encryption tasks per repo so a rapid pusher
+        // cannot grow the outstanding parked-waiter set past one task per repo (#174
+        // P2-2). No knob: it is a natural cap (one entry per distinct repo), not a
+        // sized pool.
         encrypt_inflight: crate::state::EncryptInflight::new(),
+        // Per-repo in-process write-lease serializer (#174 U2/F3): supplements the pg
+        // advisory lock so a disconnected push's still-reaping git group can't be raced
+        // by a second same-node push. The map is naturally capped (one entry per contended
+        // repo, freed when unreferenced); the sized knob is how many pushes may PARK on
+        // one repo, since each parked push holds a fully buffered pack.
         repo_write_leases: crate::state::RepoWriteLeases::new(config.repo_lease_max_waiters),
         git_read_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
             config.max_concurrent_reads_per_caller,
         ),
+        // Per-source cap on the receive-pack advertisement, sized to an eighth of the
+        // write pool (min 1): one resolved client key (rate_limit::client_key) can hold
+        // at most this many slots in the DEDICATED advert pool (git_push_advert_semaphore,
+        // disjoint from the write pool), so saturating that pool takes ~8 distinct keys
+        // (#174). That bounds an IPv4 or single-address caller; a caller controlling many
+        // addresses (an IPv6 /64 is 2^64 keys) still gets one cap per address, since
+        // client_key uses the full IP with no prefix folding. Narrowing the keying is a
+        // deferred design call, not something these caps claim to solve. Sized off the
+        // write pool only because the advert pool is created at the same size; an advert
+        // flood cannot touch a write permit.
         git_push_advert_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
             rate_limit::per_source_push_cap(config.max_concurrent_git_pushes),
         ),
+        // Per-source cap on the authenticated receive-pack POST, sized like the advert
+        // cap: one resolved client key can hold at most this many write-pool slots, so
+        // monopolizing the pool takes ~8 distinct keys (#174 P1-d). Same residual as
+        // above: keys are full IPs, so a caller with many addresses has many caps.
         git_write_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
             rate_limit::per_source_push_cap(config.max_concurrent_git_pushes),
         ),
+        // Bounds concurrent /ipfs visibility walks — a distinct public cost center, so
+        // its own pool + per-source sub-cap + per-IP rate limiter, never a git pool
+        // (#174 P1-3). The per-source map is bounded (reject-before-insert, INV-15).
         git_ipfs_walk_semaphore: Arc::new(tokio::sync::Semaphore::new(
             config.max_concurrent_ipfs_walks,
         )),
@@ -487,10 +571,35 @@ pub async fn run() -> Result<()> {
             std::time::Duration::from_secs(3600),
             200_000,
         ),
+        task_read_rate_limiter: rate_limit::RateLimiter::new_bounded(
+            config.task_read_rate_limit,
+            std::time::Duration::from_secs(3600),
+            200_000,
+        ),
         git_bin: "git".to_string(),
     };
+
+    // One-time re-encryption of any webhook HMAC secrets still resting as
+    // plaintext (written before at-rest encryption shipped). A SQL migration
+    // cannot do it — Postgres never sees the node-held key — so it runs here.
+    match state
+        .db
+        .reencrypt_legacy_webhook_secrets(state.webhook_secret_key.as_ref())
+        .await
+    {
+        Ok(0) => {}
+        Ok(n) => info!(
+            count = n,
+            "re-encrypted legacy webhook HMAC secrets at rest"
+        ),
+        Err(e) => warn!(err = %e, "failed to re-encrypt legacy webhook secrets"),
+    }
+
     if config.ipfs_rate_limit == 0 {
         tracing::warn!("GITLAWB_IPFS_RATE_LIMIT=0 — per-IP /ipfs rate limiting disabled");
+    }
+    if config.task_read_rate_limit == 0 {
+        tracing::warn!("GITLAWB_TASK_READ_RATE_LIMIT=0 — per-IP task read rate limiting disabled");
     }
 
     // Periodic peer-count poll for the metrics gauge. If p2p is disabled
@@ -521,14 +630,14 @@ pub async fn run() -> Result<()> {
 
     // Periodic cleanup of expired rate limit entries + consumed-proof ledger
     {
-        let cleanup_state = state.clone();
+        let sweep_state = state.clone();
         let db = state.db.clone();
         let mut shutdown_rx = state.subscribe_shutdown();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
-                        cleanup_state.sweep_rate_limiters().await;
+                        sweep_state.sweep_rate_limiters().await;
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs() as i64)
@@ -548,6 +657,13 @@ pub async fn run() -> Result<()> {
     }
 
     let _legacy_cid_sweep = spawn_legacy_cid_sweep(&state, &config);
+    let _queue_lifecycle_sweep = spawn_queue_lifecycle_sweep(&state, &config);
+    // NOTE: the due-request worker is spawned AFTER the one-shot startup
+    // reconcile/drain below, not here: its 5s interval would otherwise tick
+    // during operator/PoS setup and interleave with boot recovery on backlog
+    // rows (state gates prevent data loss, but the interleave costs recovery
+    // latency and widens the reconcile/drain race window).
+    let _marker_cleanup_worker = spawn_marker_cleanup_worker(&state);
 
     let router = server::build_router(state.clone());
     // Re-register the socket bound at startup — same fd, so there was never a
@@ -585,14 +701,14 @@ pub async fn run() -> Result<()> {
     }
 
     // Spawn background gossip: announce to bootstrap peers, then ping known peers periodically
-    let gossip_handle = {
+    {
         let gossip_state = state.clone();
         let bootstrap_peers = config.bootstrap_peers.clone();
         let shutdown_rx = state.subscribe_shutdown();
         tokio::spawn(async move {
             gossip_task(gossip_state, bootstrap_peers, shutdown_rx).await;
-        })
-    };
+        });
+    }
 
     // Start multi-node sync worker if auto_sync is enabled
     if config.auto_sync {
@@ -603,6 +719,46 @@ pub async fn run() -> Result<()> {
             state.subscribe_shutdown(),
         );
         info!("auto-sync worker started");
+    }
+
+    // External-forge mirroring is a separate, default-off worker. Startup
+    // validation already requires owner-only pushes when it is enabled; the
+    // worker additionally verifies the Git runtime can pin DNS answers before
+    // any URL reaches `git fetch`.
+    if config.upstream_mirror_enabled {
+        upstream_mirror::start(
+            Arc::clone(&state.db),
+            Arc::clone(&state.config),
+            state.repo_store.clone(),
+            state.repo_write_leases.clone(),
+            Arc::clone(&state.git_write_semaphore),
+            state.subscribe_shutdown(),
+        )
+        .context("starting upstream mirror worker")?;
+    }
+
+    // Periodic reconciliation sweep: re-derives pin/seal sets and fills gaps
+    // so a dropped replication job never means data loss.
+    {
+        let db = state.db.clone();
+        let config = Arc::clone(&state.config);
+        let http_client = Arc::clone(&state.http_client);
+        let node_keypair = Arc::clone(&state.node_keypair);
+        let node_did = state.node_did.clone();
+        let pin_sem = Arc::clone(&state.pin_semaphore);
+        let shutdown_rx = state.subscribe_shutdown();
+        if reconciliation::spawn(
+            db,
+            config,
+            http_client,
+            node_keypair,
+            node_did,
+            pin_sem,
+            shutdown_rx,
+            Some(state.repo_store.clone()),
+        ) {
+            info!("reconciliation sweep worker started");
+        }
     }
 
     // On-chain operator setup: verify stake + spawn heartbeat loop
@@ -633,22 +789,73 @@ pub async fn run() -> Result<()> {
         info!("on-chain PoS disabled (GITLAWB_CONTRACT_NODE_STAKING or GITLAWB_OPERATOR_PRIVATE_KEY unset)");
     }
 
-    // axum's `with_graceful_shutdown` begins draining in-flight requests once
-    // the shutdown watch flips. That drain is otherwise unbounded, so we bound
-    // it by `grace`: the closure fires `armed_tx` the instant it observes the
-    // signal, and `drive_serve_with_grace` abandons the drain if it has not
-    // finished `grace` after that moment. The clock starts at the signal, not at
-    // server start, so total uptime is never bounded.
+    // axum's `with_graceful_shutdown` waits for in-flight requests to
+    // complete (up to the configured grace) once the future resolves.
     let shutdown_signal_for_axum = state.subscribe_shutdown();
     let grace = std::time::Duration::from_secs(config.shutdown_grace_secs);
     info!(grace_secs = config.shutdown_grace_secs, "axum server ready");
 
-    let (armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
+    // #26 Split PR 1: drain any `applied` rows left by a previous
+    // process that crashed after Git applied a ref but before the
+    // bookkeeping landed. Runs once, BEFORE the server accepts new
+    // pushes, so a recovery re-derivation does not race a fresh push.
+    // Non-fatal: a transient drain failure is logged and the rows
+    // remain `applied` for the next startup to pick up.
+    //
+    // P1-A: the reconcile step runs FIRST and promotes any `prepared`
+    // or `uncertain` row whose target SHA actually landed on disk.
+    // This is the path that recovers a ref when the post-receive
+    // `mark_pending_ref_transitions_applied` call errored or was
+    // interrupted after `receive_pack` returned Ok, or when
+    // receive-pack returned Err but some refs may have landed
+    // (the `uncertain` state). Without this step, the drain (gated
+    // on `state = 'applied'`) would never see those rows.
+    //
+    // P2 (reviewer-1/2 round 3): use the multi-pass reconcile so
+    // prepared/uncertain rows beyond the first 1000-row page are
+    // processed in the same startup, rather than waiting for the
+    // next restart (where they might age out of MAX_RECONCILE_AGE).
+    match durable_outbox::reconcile_prepared_from_disk_all(
+        state.clone(),
+        durable_outbox::DRAIN_PER_PASS_LIMIT,
+        durable_outbox::DRAIN_MAX_PASSES,
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(n) => info!(
+            n,
+            "reconciled prepared/uncertain -> applied via on-disk ref match"
+        ),
+        Err(e) => warn!(
+            err = %e,
+            "pending ref transition reconcile failed at startup (non-fatal; will retry on next start)"
+        ),
+    }
+    match durable_outbox::drain_receive_pack_requests_all(
+        state.clone(),
+        durable_outbox::DRAIN_PER_PASS_LIMIT,
+        durable_outbox::DRAIN_MAX_PASSES,
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(n) => info!(n, "drained pending ref transitions from prior run"),
+        Err(e) => warn!(
+            err = %e,
+            "pending ref transition drain failed at startup (non-fatal; will retry on next start)"
+        ),
+    }
+
+    // Start the due-request worker only now that boot recovery is done (see
+    // the note at the other spawns above): its first tick must not interleave
+    // with the one-shot reconcile/drain on backlog rows.
+    let _due_request_worker = spawn_due_request_worker(&state);
 
     // `into_make_service_with_connect_info` exposes the socket peer address as
     // `ConnectInfo<SocketAddr>` so the push limiter can key on the real client
     // when no trusted proxy header applies (see `rate_limit::client_key`).
-    let serve = axum::serve(
+    let serve_result = axum::serve(
         listener,
         router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
@@ -662,59 +869,38 @@ pub async fn run() -> Result<()> {
                 break;
             }
         }
-        // Start the grace clock at the signal, right before axum drains.
-        let _ = armed_tx.send(());
-    });
-
-    // Race the drain against the grace deadline (see `drive_serve_with_grace`):
-    // the clock starts when the closure above arms `armed_rx`, i.e. at the
-    // signal, and the drain is abandoned if it outlasts `grace`.
-    let (serve_result, grace_expired) = drive_serve_with_grace(serve, armed_rx, grace).await;
-
-    if grace_expired {
-        warn!(
-            grace_secs = config.shutdown_grace_secs,
-            "shutdown grace expired; abandoning in-flight requests"
-        );
-    }
+    })
+    .await;
 
     // Server has stopped accepting new connections and drained in-flight
-    // requests (or the grace deadline fired). Tear the rest of the system down.
+    // requests. Tear the rest of the system down.
     info!("HTTP server stopped, beginning process shutdown");
     if let Some(h) = metrics_handle {
         h.abort();
     }
-    gossip_handle.abort();
+    let _ = grace; // recorded for operators in the log above; not enforced
     serve_result?;
     info!("clean exit");
     Ok(())
 }
 
-/// Drive the HTTP `serve` future to completion, bounding the post-signal drain
-/// by `grace`. `armed` resolves the instant the shutdown signal fires (the serve
-/// future's graceful-shutdown closure sends on it), so the grace clock starts at
-/// the signal, not at server start — total uptime is never bounded. Returns the
-/// serve result plus whether the deadline fired (which abandons in-flight
-/// requests so teardown can proceed).
-async fn drive_serve_with_grace<F>(
-    serve: F,
-    armed: tokio::sync::oneshot::Receiver<()>,
-    grace: std::time::Duration,
-) -> (std::io::Result<()>, bool)
-where
-    F: std::future::IntoFuture<Output = std::io::Result<()>>,
-{
-    let serve = serve.into_future();
-    tokio::select! {
-        result = serve => (result, false),
-        _ = async {
-            // Park until the signal arms the clock, then bound the drain.
-            let _ = armed.await;
-            tokio::time::sleep(grace).await;
-        } => (Ok(()), true),
-    }
-}
-
+/// U4 (#173): spawn the periodic legacy provider-CID repair sweep. Releases before this
+/// version stored the PROVIDER CID (Kubo dag-pb / Pinata CIDv0) in `pinned_cids.cid`,
+/// and this version's `/ipfs/{cid}` resolver withholds any row whose stored key is not
+/// the raw-content CID. The opportunistic repair on the pin path only fires when a push
+/// re-carries the object, which normal git negotiation makes it not do, so those rows
+/// need a walk. DETACHED, never on the boot path: the caller keeps serving while this
+/// runs, and the sweep's own batch bound plus inter-batch delay keep it off the DB's
+/// critical path. Its cursor is durable, so a restart mid-walk resumes instead of
+/// rewinding. It re-arms after every run, including a failed one, so it never returns
+/// and there is no awaited value to log here; the shutdown watcher below is what ends
+/// it.
+///
+/// A named function rather than an inline block in `main` so the WIRING has a seam a
+/// test can call: that the task is spawned at all, that it reads its batch and delay
+/// from the config knobs rather than some other field, that the caller is not blocked
+/// on it, and that the shutdown watcher actually ends it mid-walk. The sweep's own
+/// behavior is covered elsewhere; this is the boot-path half.
 fn spawn_legacy_cid_sweep(state: &AppState, config: &Config) -> tokio::task::JoinHandle<()> {
     let db = state.db.clone();
     let repos_dir = config.repos_dir.clone();
@@ -729,7 +915,123 @@ fn spawn_legacy_cid_sweep(state: &AppState, config: &Config) -> tokio::task::Joi
                 &repos_dir, &git_bin, git_timeout, batch, delay,
                 ipfs_pin::SWEEP_REARM_DELAY, &db,
             ) => {}
+            // Shutdown mid-walk simply drops the run; the persisted cursor means the
+            // next boot picks up where this one stopped.
             _ = shutdown_rx.changed() => {}
+        }
+    })
+}
+
+/// #26 Split PR 1 step 4 — periodic queue-lifecycle purge. Runs on
+/// the same detached task pattern as `spawn_legacy_cid_sweep`:
+/// tokio::spawn with a shutdown watcher, never on the boot path. The
+/// interval is fixed at 24 hours (the spec calls for "one per
+/// cluster per day"); the inter-batch delay is implicit in the
+/// batch size plus the wall-clock cost of each pass. The drain
+/// (`drain_receive_pack_requests_all`) and the purge
+/// (`purge_request_queue`) share the same `DRAIN_PER_PASS_LIMIT`
+/// budget so a 1000-row purge pass takes roughly the same time as
+/// a 1000-row drain pass.
+fn spawn_queue_lifecycle_sweep(state: &AppState, config: &Config) -> tokio::task::JoinHandle<()> {
+    let app_state = state.clone();
+    let retention_days = config.queue_retention_days;
+    let batch = config.queue_purge_batch;
+    let git_timeout = std::time::Duration::from_secs(config.git_service_timeout_secs.min(30));
+    let mut shutdown_rx = state.subscribe_shutdown();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Consume the immediate first tick: Tokio intervals fire
+        // immediately on creation, which would run the purge
+        // concurrently with startup reconcile/drain. The child purge
+        // is terminal-parent-gated in SQL, but delaying the first
+        // sweep a full period removes the race entirely.
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(e) = durable_outbox::purge_request_queue(
+                        &app_state.db,
+                        retention_days,
+                        batch,
+                    ).await {
+                        tracing::warn!(err = %e, "queue lifecycle purge failed; will retry on next tick");
+                    }
+                    // Drain marker tombstones with the bounded deleter;
+                    // failures retain the tombstone for the next tick.
+                    if let Err(e) = durable_outbox::drain_marker_cleanup_queue(
+                        &app_state,
+                        batch,
+                        git_timeout,
+                    ).await {
+                        tracing::warn!(err = %e, "marker cleanup drain failed");
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    break;
+                }
+            }
+        }
+    })
+}
+
+/// Shutdown-aware background due-request loop. The startup drain runs
+/// once; without this, `effects_pending` rows with a future
+/// `next_attempt_at` would wait until the next process restart.
+/// Polls the indexed due query with bounded batches and failure
+/// isolation (one request's error never aborts the batch).
+fn spawn_due_request_worker(state: &AppState) -> tokio::task::JoinHandle<()> {
+    let app_state = state.clone();
+    let mut shutdown_rx = state.subscribe_shutdown();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    match durable_outbox::drain_receive_pack_requests(
+                        app_state.clone(),
+                        durable_outbox::DRAIN_PER_PASS_LIMIT,
+                    )
+                    .await
+                    {
+                        Ok((0, _)) => {}
+                        Ok((n, _)) => tracing::info!(n, "due request worker drained"),
+                        Err(e) => tracing::warn!(err = %e, "due request worker drain failed"),
+                    }
+                }
+                _ = shutdown_rx.changed() => break,
+            }
+        }
+    })
+}
+
+/// Dedicated marker-tombstone worker at a shorter cadence than the
+/// daily purge, so external Git refs do not linger a full period
+/// after their SQL owner is gone.
+fn spawn_marker_cleanup_worker(state: &AppState) -> tokio::task::JoinHandle<()> {
+    let app_state = state.clone();
+    let git_timeout =
+        std::time::Duration::from_secs(app_state.config.git_service_timeout_secs.min(30));
+    let mut shutdown_rx = state.subscribe_shutdown();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(e) = durable_outbox::drain_marker_cleanup_queue(
+                        &app_state,
+                        durable_outbox::DRAIN_PER_PASS_LIMIT,
+                        git_timeout,
+                    )
+                    .await
+                    {
+                        tracing::warn!(err = %e, "marker cleanup worker failed");
+                    }
+                }
+                _ = shutdown_rx.changed() => break,
+            }
         }
     })
 }
@@ -876,11 +1178,12 @@ async fn run_degraded_server(
     listener: TcpListener,
     node_did: String,
     db_startup: Arc<DbStartupStatus>,
+    web_url: Option<String>,
     mut db_ready_rx: watch::Receiver<bool>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let addr = listener.local_addr().ok();
-    let router = build_degraded_router(node_did, db_startup);
+    let router = build_degraded_router(node_did, db_startup, web_url);
     info!(?addr, "degraded HTTP server ready");
 
     axum::serve(listener, router)
@@ -897,14 +1200,19 @@ async fn run_degraded_server(
     Ok(())
 }
 
-fn build_degraded_router(node_did: String, db_startup: Arc<DbStartupStatus>) -> Router {
+fn build_degraded_router(
+    node_did: String,
+    db_startup: Arc<DbStartupStatus>,
+    web_url: Option<String>,
+) -> Router {
     let state = DegradedState {
         node_did,
         db_startup,
+        web_url,
     };
     // Everything answers 503 with the same body — including /health and
-    // /ready, so peer pings (which treat any 2xx /health as alive) and
-    // uptime monitors correctly see a node that cannot serve traffic.
+    // /ready, so peer readiness probes and uptime monitors correctly see a
+    // node that cannot serve traffic.
     // `/` additionally carries the node identity for probing peers.
     Router::new()
         .route("/", get(degraded_node_info))
@@ -932,6 +1240,9 @@ async fn degraded_node_info(State(state): State<DegradedState>) -> impl IntoResp
         obj.insert("name".into(), "gitlawb-node".into());
         obj.insert("version".into(), env!("CARGO_PKG_VERSION").into());
         obj.insert("did".into(), state.node_did.clone().into());
+        if let Some(web_url) = &state.web_url {
+            obj.insert("web_url".into(), web_url.clone().into());
+        }
     }
     (StatusCode::SERVICE_UNAVAILABLE, Json(body))
 }
@@ -1036,7 +1347,7 @@ async fn gossip_task(
     }
 
     // Reuse the shared no-redirect client for every gossip outbound call (the
-    // bootstrap announce POST and the periodic peer /health ping). Peer URLs are
+    // bootstrap announce POST and the periodic peer /ready ping). Peer URLs are
     // attacker-influenceable, so a 3xx to a private address must not be followed.
     // Do NOT fall back to reqwest::Client::new(): its default follows redirects
     // and would reintroduce the SSRF closed here (#93).
@@ -1091,6 +1402,17 @@ async fn gossip_task(
                             json.get("node_url").and_then(|v| v.as_str()),
                         ) {
                             if !their_url.is_empty() {
+                                // Unproven, unconditionally: their_did and
+                                // their_url come straight out of the contacted
+                                // peer's JSON response body, with no signature
+                                // and no proof the claimed DID belongs to the
+                                // peer we reached. This path therefore seeds
+                                // new peers and can never repoint an existing
+                                // row. The upsert's result is matched rather
+                                // than discarded, because "bootstrap peer
+                                // added" printed over a refused write is a
+                                // denial rendering as success. Non-fatal to the
+                                // loop either way.
                                 match state
                                     .db
                                     .upsert_peer(
@@ -1128,15 +1450,11 @@ async fn gossip_task(
             _ = interval.tick() => {
                 let peers = match state.db.list_peers().await {
                     Ok(p) => p,
-                    Err(e) => {
-                        warn!(err = %e, "gossip: list_peers failed; skipping ping round");
-                        continue;
-                    }
+                    Err(_) => continue,
                 };
                 gossip_ping_round(
                     state.db.as_ref(),
                     client.as_ref(),
-                    &mut shutdown_rx,
                     &mut failed_once,
                     peers,
                 )
@@ -1152,44 +1470,59 @@ async fn gossip_task(
     }
 }
 
-async fn gossip_ping_round(
-    db: &Db,
-    client: &reqwest::Client,
-    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
-    failed_once: &mut HashSet<String>,
-    peers: Vec<db::PeerRecord>,
-) {
-    {
-        let current_dids: HashSet<&str> = peers.iter().map(|peer| peer.did.as_str()).collect();
-        failed_once.retain(|did| current_dids.contains(did.as_str()));
-    }
-    for peer in peers {
-        if *shutdown_rx.borrow() {
-            return;
-        }
-        let ok = tokio::select! {
-            biased;
-            _ = shutdown_rx.changed() => return,
-            ready = ping_peer_readiness(client, &peer.http_url) => ready,
+#[cfg(test)]
+mod rate_limiter_sweep_tests {
+    use crate::rate_limit::RateLimiter;
+    use std::time::Duration;
+
+    // Every per-key limiter the router mounts must be swept by the periodic
+    // task, the `/ipfs` one included: a limiter left out keeps expired keys
+    // until its map fills and the inline capacity sweep fires. Fails on the
+    // pre-fix sweeper, which skipped `ipfs_rate_limiter`.
+    #[tokio::test]
+    async fn sweep_evicts_expired_keys_from_every_limiter() {
+        let window = Duration::from_millis(30);
+        let mut state = crate::test_support::test_state_lazy();
+        state.rate_limiter = RateLimiter::new(10, window);
+        state.create_ip_rate_limiter = RateLimiter::new(10, window);
+        state.push_rate_limiter = RateLimiter::new(10, window);
+        state.close_issue_rate_limiter = RateLimiter::new(10, window);
+        state.sync_trigger_rate_limiter = RateLimiter::new(10, window);
+        state.peer_write_rate_limiter = RateLimiter::new(10, window);
+        state.federated_rate_limiter = RateLimiter::new(10, window);
+        state.ipfs_rate_limiter = RateLimiter::new(10, window);
+        state.ipfs_work_rate_limiter = RateLimiter::new(10, window);
+        state.task_read_rate_limiter = RateLimiter::new(10, window);
+
+        let limiters = |s: &crate::state::AppState| {
+            [
+                s.rate_limiter.clone(),
+                s.create_ip_rate_limiter.clone(),
+                s.push_rate_limiter.clone(),
+                s.close_issue_rate_limiter.clone(),
+                s.sync_trigger_rate_limiter.clone(),
+                s.peer_write_rate_limiter.clone(),
+                s.federated_rate_limiter.clone(),
+                s.ipfs_rate_limiter.clone(),
+                s.ipfs_work_rate_limiter.clone(),
+                s.task_read_rate_limiter.clone(),
+            ]
         };
-        match peer_ping_db_update(failed_once, &peer.did, ok) {
-            Some(reachable) => {
-                if let Err(error) = db.mark_peer_ping(&peer.did, reachable).await {
-                    warn!(did = %peer.did, err = %error, "failed to persist peer readiness");
-                }
-            }
-            None => warn!(
-                did = %peer.did,
-                "peer readiness probe failed once; preserving previous federation status"
-            ),
+        for l in limiters(&state) {
+            assert!(l.check("1.2.3.4").await);
+            assert_eq!(l.tracked_keys().await, 1);
+        }
+
+        tokio::time::sleep(window * 3).await;
+        state.sweep_rate_limiters().await;
+
+        for (i, l) in limiters(&state).into_iter().enumerate() {
+            assert_eq!(l.tracked_keys().await, 0, "limiter {i} was not swept");
         }
     }
 }
 
-/// Decide whether one readiness sample should update the persisted federation
-/// gate. A success is authoritative immediately. A failure must repeat on the
-/// next gossip tick before it can mark a peer unreachable, so one transient
-/// database hiccup does not hide the peer's repositories for five minutes.
+/// it.
 fn peer_ping_db_update(failed_once: &mut HashSet<String>, did: &str, ready: bool) -> Option<bool> {
     if ready {
         failed_once.remove(did);
@@ -1211,12 +1544,25 @@ fn peer_ping_db_update(failed_once: &mut HashSet<String>, did: &str, ready: bool
 /// runs, not a hand-rolled equivalent.
 fn build_http_client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(OUTBOUND_HTTP_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .build()
 }
 
+const OUTBOUND_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Ping a peer's DB-aware `/ready` endpoint and report whether it answered 2xx.
+///
+/// A 404 falls back to `/health` for compatibility with nodes released before
+/// `/ready` existed. Other readiness failures, including 503 during a database
+/// outage, fail closed and must not use the liveness-only endpoint. The complete
+/// `/ready`-then-`/health` probe shares one timeout budget.
+///
+/// Takes the client by reference so callers supply the shared, no-redirect
+/// `state.http_client`. Peer URLs are attacker-influenceable, so a `3xx` to a
+/// private address must not be followed. Do NOT call this with a bare
+/// `reqwest::Client::new()`: its default follows redirects and would
+/// reintroduce the SSRF this guards against (#93).
 pub(crate) async fn ping_peer_readiness(client: &reqwest::Client, http_url: &str) -> bool {
     ping_peer_readiness_with_timeout(client, http_url, OUTBOUND_HTTP_TIMEOUT).await
 }
@@ -1290,2350 +1636,92 @@ async fn ping_peer_readiness_with_timeout(
     }
 }
 
-const OUTBOUND_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Persist a just-created identity key, removing the file if the write failed
-/// (#194, F1). `create_new` makes the inode appear before the PEM is flushed, so a
-/// failed `write_all` (ENOSPC/EIO/quota) leaves an empty or partial PEM behind;
-/// every later start would then take the `exists()` branch and re-parse that
-/// corrupt file forever, exiting `invalid PEM key` instead of regenerating. Remove
-/// it on failure so the next start starts clean.
-///
-/// `before_remove` is the observation seam, run immediately before the
-/// removal (a no-op in production, per the `PublishFaults` precedent); the
-/// ordering test uses it to assert the caller has already closed its handle.
-fn write_key_or_cleanup(
-    path: &std::path::Path,
-    write_result: std::io::Result<()>,
-    before_remove: fn(),
-) -> Result<()> {
-    write_result.map_err(|e| {
-        before_remove();
-        // The original write error stays the one surfaced: it is the actionable
-        // failure. But a removal that itself fails is exactly the state that
-        // later exhausts the KEY_TEMP_ATTEMPTS deterministic temp names and
-        // blocks recovery, so it must be visible in the operator's log at the
-        // moment it happens rather than discarded. NotFound means the job is
-        // already done.
-        if let Err(rm) = std::fs::remove_file(path) {
-            if rm.kind() != std::io::ErrorKind::NotFound {
-                warn!(
-                    path = %path.display(),
-                    err = %rm,
-                    "could not remove the temp key file after a failed write; it will \
-                     occupy one of the bounded temp names until it is cleared"
-                );
-            }
-        }
-        anyhow::Error::new(e).context(format!("failed to write key to {}", path.display()))
-    })
+fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
+    load_or_create_keypair_at(&config.resolved_key_path())
 }
 
-/// Verify an identity key file is not world/group-readable (#194, F2). A `chmod`
-/// that failed or silently no-op'd (read-only mount, ACL mismatch) must not leave
-/// a readable private key in use, so this is checked after any tightening attempt
-/// and fails closed rather than logging a normal "loaded identity" path.
-#[cfg(unix)]
-fn ensure_key_mode_0600(path: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = std::fs::metadata(path)
-        .with_context(|| format!("stat identity key {}", path.display()))?
-        .permissions()
-        .mode();
-    check_mode_0600(mode, path)
-}
-
-/// The mode comparison behind `ensure_key_mode_0600`, taking a mode already
-/// read by the caller. `load_existing_key` holds an open descriptor on the key
-/// and reads the mode through it, so it must not stat the PATH a second time:
-/// the second stat is a different lookup and can resolve to a different inode.
-/// The message text is unchanged and is pinned by `loose_key_mode_is_rejected_not_used`.
-#[cfg(unix)]
-fn check_mode_0600(mode: u32, path: &std::path::Path) -> Result<()> {
-    let mode = mode & 0o777;
-    if mode != 0o600 {
+/// The node identity key's load-or-create, taken by path so the storage
+/// contract can be tested without building a whole `Config`.
+fn load_or_create_keypair_at(key_path: &std::path::Path) -> Result<Keypair> {
+    if p2p::path_denotes_a_directory(key_path, None)
+        || key_path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
         anyhow::bail!(
-            "identity key {} has mode {mode:o}, expected 0600 — refusing to use a \
-             world/group-readable private key",
-            path.display()
+            "GITLAWB_KEY ({}) must name a key file, not a directory; a trailing separator, \
+             a final `.` or `..` component, and `..` traversal are refused so the path \
+             cannot retarget a parent",
+            key_path.display()
         );
     }
-    Ok(())
-}
 
-/// Create the identity key parent directory if missing and ensure it is
-/// owner-only (0700). A group/world-writable parent lets a local co-tenant
-/// unlink or replace the 0600 key file even when the file itself is secure
-/// (#194, INV-23(a)).
-#[cfg(unix)]
-fn ensure_key_parent_dir_private(parent: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("create identity key directory {}", parent.display()))?;
-    let mode = std::fs::metadata(parent)
-        .with_context(|| format!("stat identity key directory {}", parent.display()))?
-        .permissions()
-        .mode()
-        & 0o777;
-    if mode & 0o077 != 0 {
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).with_context(
-            || {
-                format!(
-                    "tighten identity key directory {} to 0700 (was {mode:o})",
-                    parent.display()
-                )
-            },
-        )?;
-        let after = std::fs::metadata(parent)
-            .with_context(|| format!("re-stat identity key directory {}", parent.display()))?
-            .permissions()
-            .mode()
-            & 0o777;
-        if after & 0o077 != 0 {
-            anyhow::bail!(
-                "identity key directory {} has mode {after:o}, expected 0700 — refusing to \
-                 use a world/group-writable private key directory",
-                parent.display()
-            );
-        }
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn ensure_key_parent_dir_private(parent: &std::path::Path) -> Result<()> {
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("create identity key directory {}", parent.display()))?;
-    Ok(())
-}
-
-/// Secure a just-created, still-EMPTY key file before any PEM byte is written
-/// (#194, U2): tighten to 0600, then verify with `ensure_key_mode_0600`. The
-/// pair matters: `create_new`'s requested 0600 is narrowed by the process
-/// umask (0277 lands 0400), so the tighten repairs that first; the verify
-/// alone would falsely fail closed. On a mode-ignoring mount (vfat: chmod
-/// silently no-ops returning Ok) the tighten changes nothing and the verify
-/// fails CLOSED, so the private key never hits a group/other-readable file.
-/// On failure the empty file is removed so a retry is not wedged on
-/// `AlreadyExists`; removal is safe precisely because nothing has been
-/// written yet (the split-phase rule protects only files holding PEM bytes).
-/// `verify_fault` is the fault-injection hook (`Ok` in production).
-#[cfg(unix)]
-fn tighten_and_verify_created(
-    path: &std::path::Path,
-    verify_fault: fn() -> std::io::Result<()>,
-) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .map_err(anyhow::Error::new)
-        .and_then(|()| verify_fault().map_err(anyhow::Error::new))
-        .and_then(|()| ensure_key_mode_0600(path))
-        .map_err(|e| {
-            let _ = std::fs::remove_file(path);
-            e.context(format!(
-                "could not secure just-created identity key {} to 0600",
-                path.display()
-            ))
-        })
-}
-
-/// Fsync the parent directory of `final_path` so the namespace change (a link
-/// or a create into it) is durable before success is reported (#194). Unix-only:
-/// opening a directory as a file is not portable. An empty or missing parent
-/// resolves to `"."`.
-#[cfg(unix)]
-fn fsync_parent_dir(final_path: &std::path::Path) -> anyhow::Result<()> {
-    let dir = final_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    std::fs::File::open(dir)
-        .with_context(|| format!("open key directory {} to fsync", dir.display()))?
-        .sync_all()
-        .with_context(|| format!("fsync key directory {}", dir.display()))?;
-    Ok(())
-}
-
-/// Outcome of an atomic key publish.
-enum KeyPublish {
-    /// We created the key file; it now holds the complete PEM.
-    Won,
-    /// Another concurrent start already created it; ours was discarded.
-    Lost,
-}
-
-/// Wall-clock budget for reading a key another start may still be publishing.
-/// On the atomic hard-link path (`publish_key_atomically`) a *present* key file
-/// is always complete, so a read there succeeds on the first try. On the
-/// hard-link fallback (`publish_key_fallback`) the final NAME becomes visible
-/// while the PEM is still being written, so a losing/concurrent reader can
-/// observe an empty/partial final; this deadline is the window it rides out
-/// until the winner's write completes. Cross-host cache lag is a secondary
-/// reason a present key may not read on the first attempt. It is a wall-clock
-/// budget, NOT a fixed retry count, so a slow/stalled filesystem cannot starve a
-/// losing start after an arbitrarily short (~100ms) window (#194).
-const KEY_RACE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Minimum age (metadata mtime) before a `.recovering.` claim is sweepable
-/// by a healthy boot (#194, G1). LIVENESS CONTRACT: a live recovery
-/// HEARTBEATS every claim it holds (`spawn_claim_heartbeat`), refreshing
-/// each mtime every quarter of this floor until release, so a live round's
-/// claims NEVER age out, however long the round runs on a slow shared
-/// volume. An AGED claim therefore means its recoverer stopped heartbeating
-/// (crashed or killed): orphaned residue, claimable and sweepable (the
-/// demotion waiter, by contrast, keys on claim-file ABSENCE, not age; see
-/// `wait_for_recovery_claims`). A YOUNG
-/// claim means live or recently dead, an ambiguity bounded by one floor
-/// (the price of never stealing a live round). The 2x margin over
-/// `KEY_RACE_DEADLINE` absorbs clock skew between writers on network
-/// mounts. The gate matters because live claims are load-bearing: a
-/// demoted publisher's `wait_for_recovery_claims` waits on them, and a third
-/// start sweeping a live claim would cancel that wait mid-recovery, letting
-/// the publisher re-load the pre-quarantine key while the recoverer
-/// quarantines and republishes: two-sided divergence. An unreadable mtime is
-/// treated as YOUNG (skip removal; fail safe).
-///
-/// The same floor also gates which `.recovering.` claims are CLAIMABLE
-/// (`list_recovery_claimables`), so a claim-crash state (a content-bad
-/// final whose only claimable is a claim) becomes recoverable only after
-/// this floor passes. That delay is bounded (~2x the deadline) and is the
-/// price of never stealing a live recovery round.
-const CLAIM_SWEEP_MIN_AGE: std::time::Duration = KEY_RACE_DEADLINE.saturating_mul(2);
-
-/// Retention window for forensic residue beside a healthy final: both
-/// `.{stem}.superseded.` files and plain `.{stem}.quarantined.` files. A
-/// superseded quarantine is kept for operator inspection after a lost
-/// round, and a plain quarantine lingers as crash forensics (unparseable
-/// bytes) or as aged history (a parseable key already past the adoption
-/// floor, never resurrected); with no expiry either class accumulates
-/// forever (every lost round or crash adds one file beside the final). 24
-/// hours is a generous post-mortem window while keeping growth bounded:
-/// once a file in either class is older than this, the healthy-boot sweep
-/// removes it (behind the same durability gate as every other removal in
-/// `sweep_stale_markers`). The window is orders of magnitude above the
-/// adoption floor (`CLAIM_SWEEP_MIN_AGE`), so no quarantine this sweep can
-/// touch was still adoptable. An unreadable mtime reads as young (kept;
-/// fail safe).
-const SUPERSEDED_RETENTION: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
-
-/// How long the crash signature (a content-bad final beside a claimable)
-/// must persist across consecutive observations before boot classifies a
-/// crash (#194, G3). A single ~2ms poll sits well inside a LIVE fallback
-/// publisher's mid-write window once chmod/stat/scheduling latency on shared
-/// volumes is real, so a shorter grace lets a concurrent starter classify a
-/// live publish as a crash and churn quarantines and identities. 250ms is
-/// far above that latency yet far under the <2s recovery budget the tests
-/// pin (250ms of persistence plus claim, quarantine, and regenerate stays
-/// well under 2s). Any successful load or signature-free observation resets
-/// the clock.
-///
-/// Honest trade-off: on mounts where a live first publish's pre-write window
-/// (the fallback's `create_new` through `write_all`) can itself exceed this
-/// floor, a concurrent starter can still classify that live publish as
-/// crashed. Every such path converges (the demotion commit check, the
-/// post-claim re-parse, the no-clobber restore, the quarantine adoption), so
-/// the cost is churn, not divergence; raising the floor trades that
-/// probability against recovery latency after a real crash.
-const CRASH_SIGNATURE_MIN_PERSIST: std::time::Duration = std::time::Duration::from_millis(250);
-
-/// Bounded number of temp-file names a publish will try before giving up.
-/// Attempt 0 is the deterministic `.{stem}.tmp.{pid}.0`, so a stale temp left
-/// by a crashed prior start with the same PID (a restarted container is
-/// commonly PID 1 again) is skipped rather than wedging the restart (#194).
-/// 64 names is far more than any plausible pile-up of stale temps plus live
-/// concurrent publishers. Also bounds the fallback publish-marker names,
-/// which follow the same stale-name discipline (#194, U1).
-const KEY_TEMP_ATTEMPTS: u32 = 64;
-
-/// A key-load failure caused by the file's CONTENT (an empty or unparseable
-/// PEM) rather than IO or permissions (#194, U2). Used as the anyhow error's
-/// root so the boot loop can classify a failure as crash-recoverable via
-/// `is_key_content_error` WITHOUT changing the message text operators and
-/// tests rely on ("invalid PEM key"). Every other load failure (stat,
-/// tighten, mode verification, read IO) stays a plain anyhow error and is
-/// never recovered from.
-#[derive(Debug)]
-struct KeyContentError(String);
-
-impl std::fmt::Display for KeyContentError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for KeyContentError {}
-
-/// True when `err` is a content-class load failure (see `KeyContentError`).
-fn is_key_content_error(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<KeyContentError>().is_some()
-}
-
-/// Load an already-provisioned identity key. On Unix, defensively tighten looser
-/// permissions to 0600 (do NOT reject a loose key — that would break existing
-/// deployments; just narrow them), then verify the mode is actually 0600.
-///
-/// MUST NOT BREAK: a loose-permission REGULAR key file is NARROWED to 0600 and
-/// loaded, never rejected. Operators have such keys on disk today and rejecting
-/// them would fail their next start. The refusals added below apply only to a
-/// SYMLINK or a non-regular file, neither of which any working deployment has
-/// at its key path.
-///
-/// On Unix every step runs through one descriptor opened with `O_NOFOLLOW`
-/// (#194, P2). `GITLAWB_KEY` only names a path, so an attacker able to plant a
-/// symlink there would otherwise redirect the defensive chmod above onto any
-/// file the node can reach, turning a privileged start into a filesystem
-/// integrity attack, and would leave the mode check and the read resolving the
-/// path twice with a window in between. `O_NOFOLLOW` makes the open of a
-/// symlink fail (`ELOOP`), and fchmod, fstat, and the read through the
-/// descriptor cannot be re-pointed afterwards. Non-Unix keeps the plain
-/// read-by-path: `custom_flags` does not exist there and the chmod this
-/// protects is itself Unix-only.
-fn load_existing_key(path: &std::path::Path) -> Result<Keypair> {
     #[cfg(unix)]
-    let pem = {
-        use std::io::Read;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut f = std::fs::OpenOptions::new()
-            .read(true)
-            // O_NONBLOCK as well as O_NOFOLLOW, because the is_file refusal
-            // below is only reachable if the open itself returns. Opening a
-            // FIFO read-only BLOCKS until a writer connects, so a planted named
-            // pipe at the key path would hang startup forever instead of being
-            // refused, with the same reachability as the symlink case. On a
-            // regular file O_NONBLOCK has no effect, and a non-regular fd never
-            // survives the check below, so nothing else needs to clear it.
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)
-            .map_err(|e| {
-                // ELOOP is what O_NOFOLLOW returns when the final component is
-                // a symlink. Matched on the raw errno, not on
-                // `ErrorKind::FilesystemLoop`, which is still unstable
-                // (io_error_more) on the 1.95 toolchain, let alone the 1.91
-                // MSRV.
-                let why = if e.raw_os_error() == Some(libc::ELOOP) {
-                    "refusing to load identity key through a symlink"
-                } else {
-                    "failed to open identity key"
-                };
-                // Keep the io::Error as the root so the recovery re-parse can
-                // still downcast it for its NotFound arm.
-                anyhow::Error::new(e).context(format!("{why}: {}", path.display()))
-            })?;
-        let meta = f
-            .metadata()
-            .with_context(|| format!("stat identity key {}", path.display()))?;
-        if !meta.is_file() {
-            // A plain anyhow error, never KeyContentError: recovery quarantines
-            // (destroys) only content-class failures, and this one says nothing
-            // about any key's content.
-            anyhow::bail!(
-                "identity key {} is not a regular file; refusing to load it",
-                path.display()
-            );
-        }
-        if meta.permissions().mode() & 0o777 != 0o600 {
-            // Do NOT silently ignore a failed tighten (#194, F2): surface it
-            // so a key we cannot secure is not read and used exposed.
-            f.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .with_context(|| {
-                    format!("could not tighten identity key {} to 0600", path.display())
-                })?;
-        }
-        // Verify the key is actually 0600 before using it — a chmod that
-        // succeeded-but-no-op'd (some mounts) still leaves it exposed.
-        let mode = f
-            .metadata()
-            .with_context(|| format!("stat identity key {}", path.display()))?
-            .permissions()
-            .mode();
-        check_mode_0600(mode, path)?;
-        let mut pem = String::new();
-        f.read_to_string(&mut pem)
-            .with_context(|| format!("failed to read key from {}", path.display()))?;
-        pem
-    };
+    if let Some(pem) = p2p::load_identity_pem_if_present(key_path)? {
+        let kp = Keypair::from_pem(&pem).map_err(|e| anyhow::anyhow!("invalid PEM key: {e}"))?;
+        info!(path = %key_path.display(), "loaded existing identity");
+        return Ok(kp);
+    }
+
     #[cfg(not(unix))]
-    let pem = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read key from {}", path.display()))?;
-    // Content-class failure (#194, U2): an empty file reads Ok("") and is
-    // rejected here too, so this one arm classifies both the zero-length and
-    // the unparseable case. The message text is unchanged.
-    let kp = Keypair::from_pem(&pem)
-        .map_err(|e| anyhow::Error::new(KeyContentError(format!("invalid PEM key: {e}"))))?;
-    info!(path = %path.display(), "loaded existing identity");
+    if key_path.exists() {
+        let pem = std::fs::read_to_string(key_path)
+            .with_context(|| format!("failed to read key from {}", key_path.display()))?;
+        let kp = Keypair::from_pem(&pem).map_err(|e| anyhow::anyhow!("invalid PEM key: {e}"))?;
+        info!(path = %key_path.display(), "loaded existing identity");
+        return Ok(kp);
+    }
+
+    let kp = Keypair::generate();
+    let pem = kp
+        .to_pem()
+        .map_err(|e| anyhow::anyhow!("failed to serialize key: {e}"))?;
+
+    // The directory is created pinned to 0700 and the PEM is published
+    // through the same scratch-then-link path the p2p key uses, at a
+    // verified 0600. The previous flow (create_dir_all with no mode, then
+    // write, then set_permissions) is the sequence INV-23 prohibits: it
+    // left the directory world-writable under a permissive umask, and
+    // under a restrictive one it could not be opened at all, which failed
+    // the whole node here, before the listener binds.
+    #[cfg(unix)]
+    p2p::create_pinned_dir_and_publish(key_path, pem.as_bytes())?;
+
+    #[cfg(not(unix))]
+    {
+        if let Some(parent) = key_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(key_path, pem.as_bytes())?;
+    }
+
+    info!(path = %key_path.display(), did = %kp.did(), "generated new node identity");
     Ok(kp)
 }
 
-/// `".{stem}.publishing."`: the single source of truth for the publish
-/// marker name class (#194, U1). Every production site that constructs a
-/// marker name or prefix goes through here; the test module keeps raw
-/// literals on purpose, as a guard against prefix drift.
-fn publishing_prefix(stem: &str) -> String {
-    format!(".{stem}.publishing.")
-}
-
-/// `".{stem}.recovering."`: the single source of truth for the recovery
-/// claim name class (#194, F3). Same policy as `publishing_prefix`.
-fn recovering_prefix(stem: &str) -> String {
-    format!(".{stem}.recovering.")
-}
-
-/// `".{stem}.quarantined."`: the single source of truth for the quarantine
-/// name class. Same policy as `publishing_prefix`. Class distinction (N2/N4):
-/// a `.quarantined.` file is possibly-current residue, the crashed round's
-/// own key, adoptable while young; a `.superseded.` file
-/// (`superseded_prefix`) is provably outcompeted and forensics only.
-fn quarantined_prefix(stem: &str) -> String {
-    format!(".{stem}.quarantined.")
-}
-
-/// `".{stem}.superseded."`: the single source of truth for the SUPERSEDED
-/// quarantine class (N2/N4). A quarantine moves into this class when its key
-/// provably LOST its round: a restore republish returned Lost (a concurrent
-/// winner durably published meanwhile), or a sibling quarantine won the
-/// adoption. Superseded files are forensics only: never adoptable
-/// (`find_adoptable_quarantine` scans `.quarantined.` alone), never part of
-/// the boot crash signature, and swept only once older than
-/// `SUPERSEDED_RETENTION` (bounded forensics); every consumer matches its
-/// own prefix class, so this class is inert by construction.
-fn superseded_prefix(stem: &str) -> String {
-    format!(".{stem}.superseded.")
-}
-
-/// Rename `quarantine` into the superseded class
-/// (`.{stem}.superseded.{pid}.{n}`), probing bounded fresh names per the
-/// KEY_TEMP_ATTEMPTS discipline (skip an existing name, never clobber it).
-/// A NotFound source means the quarantine resolved concurrently and there is
-/// nothing left to reclassify. Best-effort: if every attempt fails the file
-/// stays a plain quarantine, still adoptable while young, and a warn names
-/// that hazard.
-fn supersede_quarantine(final_path: &std::path::Path, quarantine: &std::path::Path) {
-    let dir = final_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let stem = final_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("identity.pem");
-    let prefix = superseded_prefix(stem);
-    for n in 0..KEY_TEMP_ATTEMPTS {
-        let dest = dir.join(format!("{prefix}{}.{n}", std::process::id()));
-        if dest.exists() {
-            continue;
-        }
-        match std::fs::rename(quarantine, &dest) {
-            Ok(()) => return,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-            Err(_) => continue,
-        }
-    }
-    warn!(
-        quarantine = %quarantine.display(),
-        "could not rename an outcompeted quarantine into the superseded class; \
-         it remains adoptable while young"
-    );
-}
-
-/// Rename every YOUNG parseable `.{stem}.quarantined.*` sibling other than
-/// `adopted` into the superseded class (N4). The adoption decided this round
-/// in favor of the adopted key, so any other young parseable quarantine is
-/// provably outcompeted; left adoptable, it would resurrect a different
-/// historical DID the next time the final goes missing. Unparseable entries
-/// stay plain quarantines (crash forensics, never adoptable anyway), and so
-/// do AGED parseable ones (already outside the adoption bound; unreadable
-/// mtime reads as aged, matching `find_adoptable_quarantine`). Best-effort
-/// throughout.
-fn supersede_sibling_quarantines(final_path: &std::path::Path, adopted: &std::path::Path) {
-    let dir = final_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let stem = final_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("identity.pem");
-    let prefix = quarantined_prefix(stem);
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let now = std::time::SystemTime::now();
-    for entry in entries.filter_map(|e| e.ok()) {
-        if !entry
-            .file_name()
-            .to_str()
-            .is_some_and(|n| n.starts_with(&prefix))
-        {
-            continue;
-        }
-        let path = entry.path();
-        if path == *adopted {
-            continue;
-        }
-        let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
-            continue;
-        };
-        let age = now.duration_since(mtime).unwrap_or_default();
-        if age >= CLAIM_SWEEP_MIN_AGE {
-            continue;
-        }
-        let parseable =
-            std::fs::read_to_string(&path).is_ok_and(|pem| Keypair::from_pem(&pem).is_ok());
-        if parseable {
-            supersede_quarantine(final_path, &path);
-        }
-    }
-}
-
-/// The newest `.{stem}.quarantined.*` entry beside `final_path` YOUNGER than
-/// `CLAIM_SWEEP_MIN_AGE` whose bytes parse as a keypair, with those bytes: a
-/// COMPLETED key the CURRENT round's crashed or failed recovery left
-/// stranded, adoptable by the generate arm of `load_or_create_keypair_with`
-/// (F1). The age bound is the point: a stranded current round's quarantine
-/// is seconds old, so continuity across a just-crashed restore is preserved,
-/// while a HISTORICAL parseable quarantine (forensics kept after a Lost
-/// restore, or any prior round) is never resurrected; without the bound, a
-/// final that goes missing later silently revives an old identity, and the
-/// operator procedure "delete identity.pem for a fresh DID" is defeated by
-/// whatever quarantine still sits beside it. Once the floor passes, that
-/// procedure mints a genuinely fresh identity. An unreadable mtime reads as
-/// too old (skip; fail safe against resurrection). Candidates are tried
-/// newest mtime first (the most recent quarantine is the most recently live
-/// identity); unparseable entries are skipped, staying on disk as forensics.
-/// Directory-read and non-UTF-8 policy match `list_publish_markers`.
-fn find_adoptable_quarantine(
-    final_path: &std::path::Path,
-) -> Option<(std::path::PathBuf, String, Keypair)> {
-    let dir = final_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let stem = final_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("identity.pem");
-    let prefix = quarantined_prefix(stem);
-    let entries = std::fs::read_dir(dir).ok()?;
-    let now = std::time::SystemTime::now();
-    let mut quarantines: Vec<(std::path::PathBuf, std::time::SystemTime)> = entries
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| n.starts_with(&prefix))
-        })
-        .filter_map(|e| {
-            // The adoption age bound (see the doc comment): an unreadable
-            // mtime is skipped outright, and a future mtime (clock skew)
-            // reads as age zero, matching the sweep's young side.
-            let mtime = e.metadata().and_then(|m| m.modified()).ok()?;
-            let age = now.duration_since(mtime).unwrap_or_default();
-            (age < CLAIM_SWEEP_MIN_AGE).then_some((e.path(), mtime))
-        })
-        .collect();
-    // Newest first.
-    quarantines.sort_by_key(|q| std::cmp::Reverse(q.1));
-    for (path, _) in quarantines {
-        let Ok(pem) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        if let Ok(kp) = Keypair::from_pem(&pem) {
-            return Some((path, pem, kp));
-        }
-    }
-    None
-}
-
-/// The publish markers (`.{stem}.publishing.*`) beside `final_path`, sorted:
-/// U1's crash signature for a fallback publish interrupted mid-window (#194,
-/// U2). An unreadable directory reads as no markers, so recovery stays off
-/// and the load error surfaces unchanged (the loud-fail default); entries
-/// with non-UTF-8 names cannot be our markers and are skipped.
-fn list_publish_markers(final_path: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let dir = final_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let stem = final_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("identity.pem");
-    let prefix = publishing_prefix(stem);
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut markers: Vec<_> = entries
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| n.starts_with(&prefix))
-        })
-        .map(|e| e.path())
-        .collect();
-    markers.sort();
-    markers
-}
-
-/// The publish markers AND recovery claims (`.{stem}.publishing.*` plus
-/// `.{stem}.recovering.*`) beside `final_path`, sorted: the full claimable
-/// set for crash recovery (#194, F3). Claims count because a recoverer's
-/// claim IS a renamed marker: a recoverer that crashes between its claim
-/// rename and the quarantine leaves a content-bad final with a claim and
-/// ZERO markers, and a signature keyed on markers alone would leave that
-/// state unrecoverable forever. Directory-read and non-UTF-8 policy match
-/// `list_publish_markers`.
-///
-/// A `.recovering.` claim counts only once older than `CLAIM_SWEEP_MIN_AGE`
-/// (same age gate and rationale as the G1 sweep): a fresh claim may gate a
-/// LIVE recovery round, and a second starter that claims it mid-round steals
-/// the round from the recoverer that owns it. Because both the crash
-/// signature (`boot_load_key`) and the claim loop
-/// (`recover_crashed_publish`) read this one list, the gate holds at a
-/// single point. An unreadable claim mtime reads as young, so the claim is
-/// skipped (fail safe, matching the sweep). `.publishing.` markers stay
-/// unconditionally claimable: claiming a live publisher's marker only fails
-/// its commit check, a safe demotion.
-fn list_recovery_claimables(final_path: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let dir = final_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let stem = final_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("identity.pem");
-    let publishing = publishing_prefix(stem);
-    let recovering = recovering_prefix(stem);
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut claimables: Vec<_> = entries
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            let name = e.file_name();
-            let Some(name) = name.to_str() else {
-                return false;
-            };
-            if name.starts_with(&publishing) {
-                return true;
-            }
-            if !name.starts_with(&recovering) {
-                return false;
-            }
-            // F2 age gate (see the doc comment): only an ORPHANED claim is
-            // claimable; a fresh one may gate a live round.
-            e.metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|mtime| std::time::SystemTime::now().duration_since(mtime).ok())
-                .is_some_and(|age| age >= CLAIM_SWEEP_MIN_AGE)
-        })
-        .map(|e| e.path())
-        .collect();
-    claimables.sort();
-    claimables
-}
-
-/// Load a key another concurrent start may still be publishing, polling until it
-/// parses or `KEY_RACE_DEADLINE` elapses. An already-provisioned key parses on
-/// the first attempt with no sleep.
-fn load_racing_key(path: &std::path::Path) -> Result<Keypair> {
-    match boot_load_key(path, false, || Ok(())) {
-        BootLoad::Loaded(kp) => Ok(*kp),
-        BootLoad::CrashSignature(e) | BootLoad::Failed(e) => Err(e),
-    }
-}
-
-/// Outcome of `boot_load_key` (#194, U2). The tri-state exists so the boot
-/// loop can tell "content failure WITH the crash signature observed" (a
-/// recovery candidate) from every other failure; folding both into one error
-/// would let a concurrent recoverer's marker sweep turn a recoverable boot
-/// into a loud failure.
-enum BootLoad {
-    /// Boxed to keep the variants' sizes comparable (clippy:
-    /// large_enum_variant); the enum lives only across a boot-time match.
-    Loaded(Box<Keypair>),
-    /// Content-class failure observed while a `.publishing.` marker or a
-    /// `.recovering.` claim was present, continuously for
-    /// `CRASH_SIGNATURE_MIN_PERSIST`; returned without riding the rest of
-    /// the deadline.
-    CrashSignature(anyhow::Error),
-    /// Any other failure, after the full deadline.
-    Failed(anyhow::Error),
-}
-
-/// `load_racing_key` for the boot loop (#194, U2). With `crash_exit` set, a
-/// content-class failure (`KeyContentError`) observed while a `.publishing.`
-/// marker or a `.recovering.` claim is present, continuously for
-/// `CRASH_SIGNATURE_MIN_PERSIST` of consecutive observations, returns
-/// `CrashSignature` instead of riding the deadline: claimable plus
-/// unreadable content is the crash signature recovery exists for, and the
-/// caller's atomic claim renames arbitrate the (rare) race against a live
-/// fallback publisher still inside its window. Claims count toward the
-/// signature for F3 (see `list_recovery_claimables`). The persistence window
-/// (#194, G3) exists so a reader that catches a live publisher's mid-write
-/// window is not classified as a crash: chmod/stat/scheduling latency on
-/// shared volumes routinely stretches that window past any small fixed poll
-/// count, while a real crash state persists across every poll, so the
-/// signature clock starts at its first observation and any successful load
-/// or signature-free observation resets it. Every other failure keeps the
-/// full wall-clock deadline. `load_fault` is the injection hook (a no-op
-/// `Ok` in production); an injected `Err` is taken as that attempt's result
-/// and is NOT content-class.
-fn boot_load_key(
-    path: &std::path::Path,
-    crash_exit: bool,
-    load_fault: fn() -> std::io::Result<()>,
-) -> BootLoad {
-    let deadline = std::time::Instant::now() + KEY_RACE_DEADLINE;
-    let mut last_err;
-    let mut signature_since: Option<std::time::Instant> = None;
-    loop {
-        match load_fault()
-            .map_err(anyhow::Error::new)
-            .and_then(|()| load_existing_key(path))
-        {
-            Ok(kp) => return BootLoad::Loaded(Box::new(kp)),
-            Err(e) => last_err = e,
-        }
-        let signature = crash_exit
-            && is_key_content_error(&last_err)
-            && !list_recovery_claimables(path).is_empty();
-        if signature {
-            let since = *signature_since.get_or_insert_with(std::time::Instant::now);
-            if since.elapsed() >= CRASH_SIGNATURE_MIN_PERSIST {
-                return BootLoad::CrashSignature(last_err);
-            }
-        } else {
-            signature_since = None;
-        }
-        if std::time::Instant::now() >= deadline {
-            return BootLoad::Failed(last_err);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
-}
-
-/// Wait until NO `.{stem}.recovering.*` claim FILE remains beside
-/// `final_path`, polling on `load_racing_key`'s cadence (~2ms), bounded by
-/// `CLAIM_SWEEP_MIN_AGE` plus a one-second margin (#194, U3; F3; N3). Why
-/// the wait exists: a fallback winner that failed its commit check was
-/// demoted by a recovering peer, and that peer is mid-round — it
-/// quarantines the (old) final, republishes a fresh key, and only then
-/// clears its claim. A demoted winner that re-loaded before the claim
-/// cleared could observe the pre-quarantine key and diverge from what the
-/// peer ends up publishing; waiting for claim clearance makes the follow-up
-/// load observe the settled state.
-///
-/// The waiter keys purely on ABSENCE, never on age. Age stays the liveness
-/// rule for the SWEEP (`sweep_stale_markers`) and CLAIMABILITY
-/// (`list_recovery_claimables`), but an aged claim is not proof its
-/// recoverer is gone: with the heartbeat spawn failed AND both mtime stamp
-/// rungs failing on a hostile volume, a LIVE recoverer's claim can sit
-/// mtime-frozen while the round is still settling disk, and a waiter that
-/// read it as orphaned residue would let the demoted publisher load a
-/// pre-settlement key while that recoverer settles disk differently:
-/// two-sided divergence under compounded failure. A file that is GONE is
-/// unambiguous: the round settled (release) or a sweep decided the claim
-/// was orphaned; either way the follow-up load observes a settled state.
-///
-/// So: `Ok` only when the claim files are gone. Bound expiry with ANY claim
-/// file still present (young or aged) returns an `Err` naming the file(s):
-/// the round cannot be proven settled, and the caller must fail closed
-/// instead of loading. Consequence: an aged ORPHAN claim (its recoverer
-/// long dead) now fails a concurrently-demoted publisher loudly until a
-/// healthy boot's sweep or the delayed re-sweep
-/// (`spawn_delayed_claim_resweep`) clears it — a bounded,
-/// operator-visible degradation, priced against the silent divergence the
-/// age rule risked. An unreadable directory reads as no claims, matching
-/// `list_publish_markers`' policy.
-fn wait_for_recovery_claims(final_path: &std::path::Path) -> Result<()> {
-    let dir = final_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let stem = final_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("identity.pem");
-    let prefix = recovering_prefix(stem);
-    let bound = CLAIM_SWEEP_MIN_AGE + std::time::Duration::from_secs(1);
-    let deadline = std::time::Instant::now() + bound;
-    loop {
-        let present: Vec<String> = std::fs::read_dir(dir)
-            .map(|entries| {
-                entries
-                    .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.file_name()
-                            .to_str()
-                            .is_some_and(|n| n.starts_with(&prefix))
-                    })
-                    .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .collect()
-            })
-            .unwrap_or_default();
-        if present.is_empty() {
-            return Ok(());
-        }
-        if std::time::Instant::now() >= deadline {
-            anyhow::bail!(
-                "recovery round did not settle within the {bound:?} wait bound: \
-                 recovery claim(s) {present:?} still present beside {}",
-                final_path.display()
-            );
-        }
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
-}
-
-/// Best-effort sweep of stale `.{stem}.publishing.*` markers,
-/// `.{stem}.recovering.*` claims, and expired `.{stem}.superseded.*` /
-/// `.{stem}.quarantined.*` forensics beside a healthy final, run on both
-/// healthy-boot arms of `load_or_create_keypair_with` (#194, U4). Without it
-/// a marker orphaned by a crash between its durability fsync and the final's
-/// `create_new`, or a claim left by a crashed recovery, outlives every
-/// healthy boot and later misclassifies a real corruption of a good key as
-/// an interrupted first write (quarantine-and-regenerate instead of the loud
-/// error a corrupted good key deserves).
-///
-/// DURABILITY PRECONDITION (critical, the reason this is not a bare unlink
-/// loop): a loadable final is not necessarily durable — a racing fallback
-/// winner's `write_all` is visible via the page cache before its `sync_all`,
-/// so sweeping on loadability alone could remove a marker ahead of the
-/// content it vouches for and let a power loss recreate exactly the
-/// marker-less partial final the bracket exists to prevent. The sweeper
-/// therefore makes the content durable ITSELF before touching any marker:
-/// open the final read-only, `sync_all` it, then `fsync_parent_dir` (Unix).
-/// If either step fails the sweep is skipped entirely — every marker stays
-/// in place, at most a warn. Only after both succeed is every matching entry
-/// removed (each best-effort), followed by a best-effort dir fsync. On
-/// non-Unix the dir-fsync halves are skipped like every other dir fsync here
-/// (reasoned, not run: no non-Unix target is exercised by these tests).
-///
-/// Sweeping a FOREIGN marker is safe once durability holds: the swept
-/// publisher's own disposal tolerates NotFound on every arm; a live
-/// publisher still before its final `create_new` hits AlreadyExists and
-/// routes to Lost regardless of its marker; and the content the marker
-/// vouched for is durable by the sweeper's own hand. `sweep_sync` is the
-/// `RecoverySeam` test hook, run before the final's `sync_all` with an `Err`
-/// taken as that sync's result; production passes a no-op `Ok`.
-///
-/// SWEEP ASYMMETRY (#194, G1): `.publishing.` markers are removed
-/// unconditionally, but `.recovering.` claims only once older than
-/// `CLAIM_SWEEP_MIN_AGE`. Sweeping a LIVE publisher's marker is safe (it
-/// only fails that publisher's commit check, forcing a safe
-/// demotion-and-reload), while sweeping a LIVE recoverer's claim is not: a
-/// demoted publisher's `wait_for_recovery_claims` waits on that claim until
-/// the recovery resolves, and removing it early lets the publisher re-load
-/// the pre-quarantine key while the recoverer quarantines and republishes:
-/// two-sided divergence. An unreadable claim mtime reads as young, so the
-/// claim is kept (fail safe; the next boot past the age floor sweeps it).
-fn sweep_stale_markers(final_path: &std::path::Path, sweep_sync: fn() -> std::io::Result<()>) {
-    let durable = std::fs::File::open(final_path)
-        .and_then(|f| sweep_sync().and_then(|()| f.sync_all()))
-        .map_err(anyhow::Error::new);
-    #[cfg(unix)]
-    let durable = durable.and_then(|()| fsync_parent_dir(final_path));
-    if let Err(e) = durable {
-        warn!(
-            path = %final_path.display(),
-            err = %e,
-            "skipping stale publish-marker sweep: could not make the final key durable"
-        );
-        return;
-    }
-    let dir = final_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let stem = final_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("identity.pem");
-    let publishing = publishing_prefix(stem);
-    let recovering = recovering_prefix(stem);
-    let superseded = superseded_prefix(stem);
-    let quarantined = quarantined_prefix(stem);
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.filter_map(|e| e.ok()) {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if name.starts_with(&publishing) {
-            let _ = std::fs::remove_file(entry.path());
-        } else if name.starts_with(&recovering) {
-            // G1 age gate: only an orphaned claim (older than
-            // CLAIM_SWEEP_MIN_AGE) is sweepable; see the doc comment.
-            let orphaned = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|mtime| std::time::SystemTime::now().duration_since(mtime).ok())
-                .is_some_and(|age| age >= CLAIM_SWEEP_MIN_AGE);
-            if orphaned {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        } else if name.starts_with(&superseded) || name.starts_with(&quarantined) {
-            // Forensic residue expires after SUPERSEDED_RETENTION (the
-            // operator's inspection window); without an expiry every lost
-            // round's superseded file, and every crash's plain quarantine
-            // (unparseable forensics, or parseable history already far past
-            // the adoption floor), accumulates forever. Unreadable mtime
-            // reads as young (kept; fail safe), matching the claim gate
-            // above.
-            let expired = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|mtime| std::time::SystemTime::now().duration_since(mtime).ok())
-                .is_some_and(|age| age >= SUPERSEDED_RETENTION);
-            if expired {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
-    #[cfg(unix)]
+async fn gossip_ping_round(
+    db: &Db,
+    client: &reqwest::Client,
+    failed_once: &mut HashSet<String>,
+    peers: Vec<db::PeerRecord>,
+) {
     {
-        let _ = fsync_parent_dir(final_path);
+        let current_dids: HashSet<&str> = peers.iter().map(|peer| peer.did.as_str()).collect();
+        failed_once.retain(|did| current_dids.contains(did.as_str()));
     }
-}
-
-/// Fire-and-forget companion to the boot sweep's young-claim sparing (F2):
-/// one delayed re-sweep of `key_path`, `CLAIM_SWEEP_MIN_AGE` plus a
-/// two-second margin into uptime. The boot-time sweep must SPARE a young
-/// `.recovering.` claim (it may gate a live round), but a spared orphan is
-/// never re-examined in-process, and once it ages on disk a LATER content
-/// failure of the good final would match the crash signature (content-bad
-/// beside an aged claimable) and silently regenerate where marker-less
-/// corruption must fail loudly. By the time this fires, any claim the boot
-/// sweep spared has aged past the liveness floor, so `sweep_stale_markers`
-/// clears it and aged residue cannot coexist with a long-healthy final. The
-/// node never waits on this task; failures stay at warn (the sweep itself
-/// warns internally when it skips).
-fn spawn_delayed_claim_resweep(key_path: std::path::PathBuf) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        tokio::time::sleep(CLAIM_SWEEP_MIN_AGE + std::time::Duration::from_secs(2)).await;
-        let sweep_path = key_path.clone();
-        if let Err(e) =
-            tokio::task::spawn_blocking(move || sweep_stale_markers(&sweep_path, || Ok(()))).await
-        {
-            warn!(
-                path = %key_path.display(),
-                err = %e,
-                "delayed identity-claim re-sweep task failed"
-            );
-        }
-    })
-}
-
-/// Compile-time fault-injection seam for `publish_key_atomically`, extending
-/// the `before_link` closure precedent: every hook is a no-op `Ok` in
-/// production (`PublishFaults::NONE`); tests swap in a hook returning `Err` to
-/// force that step to fail deterministically. Plain `fn` pointers, not a
-/// runtime/env knob: production code only ever passes `NONE`.
-#[derive(Clone, Copy)]
-struct PublishFaults {
-    /// Runs before the `hard_link`; an `Err` is taken as the link result and
-    /// the real link is never attempted.
-    link: fn() -> std::io::Result<()>,
-    /// Runs before the fallback's `create_new` open of the FINAL path; an `Err`
-    /// is taken as the open result (a non-`AlreadyExists` open error), so the
-    /// publish surfaces it chained with `link_err`.
-    fallback_create: fn() -> std::io::Result<()>,
-    /// Runs before the fallback's publish-marker `create_new` (each name
-    /// attempt); an `Err` is taken as the create result (a non-`AlreadyExists`
-    /// open error), so the publish surfaces it chained with `link_err` (#194,
-    /// U1).
-    marker_create: fn() -> std::io::Result<()>,
-    /// Runs before the fsync of the marker's parent directory; an `Err` is
-    /// taken as that fsync's result. This fsync is warn-and-continue, so an
-    /// injected `Err` must NOT fail the publish (#194, U1).
-    #[cfg(unix)]
-    marker_fsync: fn() -> std::io::Result<()>,
-    /// Runs before the PRIMARY temp file's `write_all`; an `Err` is taken as
-    /// the write result, so the publish takes `write_key_or_cleanup`'s error
-    /// path. There is no other way to fail that write on a healthy
-    /// filesystem, and the error path is where the handle-close ordering is
-    /// observable (#194, P2).
-    temp_write: fn() -> std::io::Result<()>,
-    /// Observation seam, NOT a fault: runs immediately before
-    /// `write_key_or_cleanup` removes the primary temp file. Production
-    /// passes a no-op; the ordering test uses it to sample /proc/self/fd and
-    /// prove the temp handle is already closed at removal time.
-    before_temp_remove: fn(),
-    /// Runs before the fallback's `write_all`; an `Err` is taken as the write
-    /// result.
-    fallback_write: fn() -> std::io::Result<()>,
-    /// Runs before the fallback's file `sync_all`; an `Err` is taken as the
-    /// fsync result.
-    fallback_fsync: fn() -> std::io::Result<()>,
-    /// Runs between the tighten and the 0600 verification of the just-created
-    /// TEMP file; an `Err` is taken as the verification result. Simulates a
-    /// mode-ignoring mount (vfat: chmod no-ops returning Ok), which cannot be
-    /// reproduced on ext4.
-    #[cfg(unix)]
-    temp_mode_verify: fn() -> std::io::Result<()>,
-    /// Same, for the FINAL file created on the hard-link fallback path.
-    #[cfg(unix)]
-    fallback_mode_verify: fn() -> std::io::Result<()>,
-}
-
-impl PublishFaults {
-    /// The production value: no fault injected at any step.
-    const NONE: Self = Self {
-        link: || Ok(()),
-        fallback_create: || Ok(()),
-        marker_create: || Ok(()),
-        #[cfg(unix)]
-        marker_fsync: || Ok(()),
-        temp_write: || Ok(()),
-        before_temp_remove: || {},
-        fallback_write: || Ok(()),
-        fallback_fsync: || Ok(()),
-        #[cfg(unix)]
-        temp_mode_verify: || Ok(()),
-        #[cfg(unix)]
-        fallback_mode_verify: || Ok(()),
-    };
-}
-
-/// Publish `pem` to `final_path` atomically: write the full bytes to a sibling
-/// temp file, then `hard_link` the temp into place. `hard_link` is atomic and
-/// fails if `final_path` already exists, which on the hard-link path gives
-/// these guarantees at once:
-///   (a) the final path only ever appears with COMPLETE content — a concurrent
-///       reader never observes an empty/half-written key, unlike a
-///       `create_new`+`write_all` that exposes an empty inode before the PEM is
-///       flushed (#194);
-///   (b) a lost race never clobbers the winner — exactly one publisher links;
-///   (c) a crashed publisher leaves only the temp, never a partial final that
-///       would wedge every later start on `invalid PEM key`;
-///   (d) durability: the PEM bytes are fsynced before the name appears and the
-///       namespace change is fsynced (on Unix) before success is reported, so a
-///       power crash cannot leave a durable-but-truncated final key (#194).
-///
-/// If the link fails for any reason other than `AlreadyExists` (a filesystem
-/// without hard-link support, or a transient link error), the publish falls
-/// back to `create_new(0o600)` directly on the final path
-/// (`publish_key_fallback`). The fallback keeps (b): `create_new` still admits
-/// exactly one winner and a lost race loads the existing key. It weakens (a)
-/// and (d): the final name is visible while the PEM is being written, a
-/// window concurrent readers ride out via `load_racing_key`'s wall-clock
-/// deadline; and the final name can become durable before the PEM bytes are
-/// fsynced, so a power loss can additionally leave a durable empty/truncated
-/// final. Guarantee (c) now holds on the fallback too, via the marker
-/// protocol (#194, U2/U4): a crash inside the non-atomic window leaves
-/// marker+final together, and the next boot claims the marker, quarantines
-/// the partial final, and regenerates instead of wedging. On
-/// dir-fsync-hostile mounts the marker dir fsync is warn-and-continue (see
-/// `publish_key_fallback`), so there the recovery guarantee narrows to
-/// non-power-loss (SIGKILL-class) crashes: a power loss can drop the
-/// undurable marker name and leave the partial final to the loud
-/// invalid-PEM error instead. Honest residual on
-/// top of the U3 list below: that recovery runs at the next boot, not at
-/// crash time, so the partial final persists until then. In every unrecovered
-/// case the failure mode is the same LOUD invalid-PEM (or mode) error at the
-/// next start, never a silently used key.
-///
-/// Against the boot-time crash RECOVERY race (#194, U3) the fallback's marker
-/// protocol restores (b)-style convergence: removing the publish marker is
-/// the winner's commit check, and recovery claims a round by renaming EVERY
-/// marker and stale claim beside the final (a live winner's own marker is
-/// necessarily among them), so exactly one side takes the round. A winner
-/// that loses its marker demotes itself, waits for every `.recovering.`
-/// claim FILE to clear (bounded by `CLAIM_SWEEP_MIN_AGE` plus a margin; see
-/// `wait_for_recovery_claims`), and re-loads the settled key as Lost; if
-/// any claim file survives the bound the publish fails closed with a loud
-/// error instead of loading. A recovery that finds the final completed
-/// after claiming re-loads it instead of quarantining. Honest residuals: a
-/// winner stalled past `KEY_RACE_DEADLINE` that loads in the sub-ms window
-/// before a recoverer's claim exists degrades to a re-load, and a
-/// crash-interrupted recovery whose orphaned claim outlives the bounded
-/// wait fails the demoted publish loudly until a sweep clears the claim:
-/// loud error or re-load, never silent two-sided divergence.
-///
-/// `before_link` is a no-op in production; tests use it to widen the
-/// post-write / pre-link window deterministically. `before_commit` runs
-/// between the fallback final's dir fsync and the marker-removal commit
-/// check — a no-op in production; tests use it to interleave a concurrent
-/// recovery into that window (#194, U3). `faults` is the compile-time
-/// fault-injection seam (`PublishFaults::NONE` in production).
-fn publish_key_atomically(
-    final_path: &std::path::Path,
-    pem: &[u8],
-    before_link: &dyn Fn(),
-    before_commit: &dyn Fn(),
-    faults: PublishFaults,
-) -> Result<KeyPublish> {
-    use std::io::Write;
-    let dir = final_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let stem = final_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("identity.pem");
-
-    // Pick the temp name with a bounded per-call retry, not a process-global
-    // counter: a counter is only unique within one process (two containers
-    // sharing a volume can both run as PID 1), and a crash between the temp
-    // write and its cleanup leaves the old name behind, so a single
-    // deterministic name would fail `create_new` on every restart until an
-    // operator deleted it (#194). `AlreadyExists` means either such a stale
-    // temp or a live concurrent publisher's temp; the two are indistinguishable,
-    // so never delete a temp this call did not create (unlinking a live one
-    // between its write and its hard_link would fail that healthy start), just
-    // skip to the next name. Consequence: a crashed start leaks at most one
-    // 0600 temp file, which later starts skip.
-    let mut opened = None;
-    for attempt in 0..KEY_TEMP_ATTEMPTS {
-        let tmp = dir.join(format!(".{stem}.tmp.{}.{attempt}", std::process::id()));
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        match opts.open(&tmp) {
-            Ok(f) => {
-                opened = Some((tmp, f));
-                break;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e).with_context(|| format!("create temp key {}", tmp.display())),
-        }
-    }
-    let Some((tmp, mut f)) = opened else {
-        anyhow::bail!(
-            "all {KEY_TEMP_ATTEMPTS} temp key names .{stem}.tmp.{}.* in {} are taken; \
-             remove the stale temp files and restart",
-            std::process::id(),
-            dir.display()
-        );
-    };
-    // Secure the empty temp BEFORE the PEM bytes hit it: on a mode-ignoring
-    // mount this fails closed with nothing sensitive on disk, and the
-    // hard_link later carries the verified 0600 inode to the final name
-    // (#194, U2).
-    #[cfg(unix)]
-    tighten_and_verify_created(&tmp, faults.temp_mode_verify)?;
-    // On a failed write OR fsync, remove the temp so nothing partial is ever
-    // linked (#194). The fsync makes the PEM bytes durable BEFORE the name can
-    // appear: without it a power crash after the link could leave a durable
-    // final name over truncated bytes, wedging every later start.
-    // `sync_all` needs the live handle, so the write-and-fsync result is
-    // computed first; the handle is then closed BEFORE write_key_or_cleanup
-    // runs its error-path removal (#194, P2). Windows cannot remove an open
-    // file, so with the removal ahead of the close a failed write leaks
-    // .{stem}.tmp.{pid}.{n}, and those names are deterministic per pid and
-    // bounded by KEY_TEMP_ATTEMPTS: restarts under a reused container pid
-    // exhaust them and block recovery after storage becomes healthy.
-    let write_result = (faults.temp_write)()
-        .and_then(|()| f.write_all(pem))
-        .and_then(|()| f.sync_all());
-    drop(f);
-    write_key_or_cleanup(&tmp, write_result, faults.before_temp_remove)?;
-
-    before_link();
-
-    let linked = (faults.link)().and_then(|()| std::fs::hard_link(&tmp, final_path));
-    let _ = std::fs::remove_file(&tmp);
-    match linked {
-        Ok(()) => {
-            // Fsync the parent directory so the link (and the temp unlink) are
-            // durable before success is reported (#194). Skipped on non-Unix,
-            // where opening a directory fails. On fsync failure do NOT remove
-            // the final file: it is complete and data-synced, a concurrent
-            // loser may already have loaded it, and a later start loads it via
-            // the exists() path.
-            #[cfg(unix)]
-            fsync_parent_dir(final_path)?;
-            Ok(KeyPublish::Won)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(KeyPublish::Lost),
-        Err(e) => publish_key_fallback(final_path, pem, e, before_commit, faults),
-    }
-}
-
-/// Fallback publish for a key directory whose filesystem cannot hard-link
-/// (Unsupported/EPERM on some network and overlay mounts, or a transient link
-/// error): create the FINAL path directly with `create_new(true).mode(0o600)`
-/// (the INV-23 creation pattern) and write the PEM into it. `AlreadyExists`
-/// still routes to the lost-race path, so no-clobber holds. Error handling
-/// splits at the first PEM byte. PRE-write failures (marker create, final
-/// create, tighten/mode-verify) remove the just-created EMPTY final and
-/// dispose the marker: nothing recoverable exists yet, and those arms
-/// complete within `CRASH_SIGNATURE_MIN_PERSIST` of the final's creation,
-/// so no recovery can have claimed the round. POST-write failures
-/// (`write_all` or the file `sync_all`) remove NOTHING: the partial final
-/// and its marker are left in place together and the error surfaces naming
-/// the handoff. That pair is exactly the crash state boot-time recovery
-/// handles (claim, quarantine, regenerate), while an unlink here is a
-/// stat-then-unlink race against a recovery that already claimed this round
-/// and republished a live key at the name, and a marker disposed beside a
-/// kept partial final recreates the marker-less wedge the bracket below
-/// exists to prevent. The complete-but-unsynced `sync_all`-failure state is
-/// safe too: a later healthy load fsyncs the final ITSELF before sweeping
-/// the marker (`sweep_stale_markers`' durability gate), and a crash before
-/// then re-enters recovery via the surviving marker. A failed parent-DIR
-/// fsync also keeps the final but DOES dispose the marker (the content is
-/// complete and data-synced, and a lost directory entry just disappears ->
-/// clean regen, no wedge). Every error context chains `link_err` so a
-/// two-step failure is diagnosable.
-///
-/// The whole non-atomic window is bracketed by a durable publish marker
-/// (`.{stem}.publishing.{pid}.{attempt}`, empty, same dir as the final): the
-/// marker is created and its NAME fsynced BEFORE the final can exist, and it
-/// is removed only once the final is complete-and-durable (success) or the
-/// exit leaves nothing needing vouching (pre-write error / lost race /
-/// dir-fsync failure); on a post-write error the marker intentionally
-/// OUTLIVES the attempt to vouch for the partial final beside it. On success
-/// the removal doubles as the COMMIT CHECK (#194, U3): a removal that fails
-/// means a recovering peer claimed this round, and the publish demotes
-/// itself to Lost (see the success arm). A crash inside the window therefore
-/// leaves marker+final together, so a later boot can tell "partial final from
-/// a crashed fallback publish" from a key an operator corrupted (#194, U1).
-/// Two constraints:
-///   - Disposal ORDER on the pre-write arms is pinned: the empty final's
-///     removal is ISSUED BEFORE the marker's. Cleanup is deliberately NOT a
-///     Drop guard: a drop guard can run ahead of the final's disposal on an
-///     early exit, and it would also fire on the post-write error exits,
-///     whose whole point is that the marker survives.
-///   - The marker dir fsync is warn-and-continue, not a hard gate: on
-///     dir-fsync-hostile mounts a hard failure would turn "wedge once, then
-///     recover" into "never provisions". Without that durability the marker
-///     still survives SIGKILL-class crashes (the fs state persists); only the
-///     power-loss protection narrows.
-fn publish_key_fallback(
-    final_path: &std::path::Path,
-    pem: &[u8],
-    link_err: std::io::Error,
-    before_commit: &dyn Fn(),
-    faults: PublishFaults,
-) -> Result<KeyPublish> {
-    use std::io::Write;
-    warn!(
-        path = %final_path.display(),
-        err = %link_err,
-        "hard_link failed; publishing identity key via direct create_new fallback"
-    );
-    let dir = final_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let stem = final_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("identity.pem");
-
-    // Create the publish marker BEFORE the final name can exist, probing
-    // bounded per-call names exactly like the temp-name loop and for the same
-    // reasons: a stale marker left by a crashed same-PID start must not wedge
-    // the restart, and a stale marker is indistinguishable from a live
-    // concurrent publisher's, so never delete a name this call did not
-    // create; just skip to the next one (#194, U1).
-    let marker_prefix = publishing_prefix(stem);
-    let mut marker = None;
-    for attempt in 0..KEY_TEMP_ATTEMPTS {
-        let candidate = dir.join(format!("{marker_prefix}{}.{attempt}", std::process::id()));
-        match (faults.marker_create)().and_then(|()| {
-            let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
-            }
-            opts.open(&candidate)
-        }) {
-            Ok(f) => {
-                drop(f);
-                marker = Some(candidate);
-                break;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => {
-                return Err(e).with_context(|| {
-                    format!(
-                        "create publish marker {} in hard_link fallback (link failed: {link_err})",
-                        candidate.display()
-                    )
-                })
-            }
-        }
-    }
-    let Some(marker) = marker else {
-        anyhow::bail!(
-            "all {KEY_TEMP_ATTEMPTS} publish marker names {marker_prefix}{}.* in {} are \
-             taken; remove the stale marker files and restart (link failed: {link_err})",
-            std::process::id(),
-            dir.display()
-        );
-    };
-    // Marker disposal is explicit at every disposing exit, never a Drop
-    // guard; see the order constraint in the doc comment (the post-write
-    // error exits deliberately keep the marker).
-    let dispose_marker = || {
-        let _ = std::fs::remove_file(&marker);
-    };
-    // Make the marker NAME durable before the final can exist, so no crash
-    // can leave a partial final without its marker. Warn-and-continue on
-    // failure per the doc comment's degradation constraint.
-    #[cfg(unix)]
-    {
-        if let Err(e) = (faults.marker_fsync)()
-            .map_err(anyhow::Error::new)
-            .and_then(|()| fsync_parent_dir(final_path))
-        {
-            warn!(
-                marker = %marker.display(),
-                err = %e,
-                "publish marker dir fsync failed; continuing with reduced power-loss protection"
-            );
-        }
-    }
-
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = match (faults.fallback_create)().and_then(|()| opts.open(final_path)) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Lost race: the existing final is the winner's complete key, not
-            // ours to bracket; drop our marker and defer to it.
-            dispose_marker();
-            return Ok(KeyPublish::Lost);
-        }
-        Err(e) => {
-            // The final was never created here, so there is no final removal
-            // to order ahead of the marker's.
-            dispose_marker();
-            return Err(e).with_context(|| {
-                format!(
-                    "create identity key {} in hard_link fallback (link failed: {link_err})",
-                    final_path.display()
-                )
-            });
-        }
-    };
-    // Secure the empty final BEFORE the PEM bytes hit it (#194, U2). The
-    // helper's fail-closed removal is what keeps a retry from wedging on
-    // AlreadyExists, and is safe here for the same reason as on every
-    // pre-write arm: the file is still empty, so the post-write
-    // keep-everything rule below does not apply yet. The helper removes the
-    // final before returning Err, so the pinned final-before-marker disposal
-    // order holds. By-name removal stays right on this and the other
-    // pre-write arms (create/mode-verify): they run within
-    // CRASH_SIGNATURE_MIN_PERSIST of the final's creation, so no recovery
-    // can have claimed this round yet.
-    #[cfg(unix)]
-    {
-        if let Err(e) = tighten_and_verify_created(final_path, faults.fallback_mode_verify)
-            .with_context(|| {
-                format!("secure identity key in hard_link fallback (link failed: {link_err})")
-            })
-        {
-            dispose_marker();
-            return Err(e);
-        }
-    }
-    // A failed write LEAVES the partial final and its marker in place and
-    // only surfaces the error: marker+final together is exactly the crash
-    // state the next boot recovers from (claim, quarantine, regenerate).
-    // Any removal here would be a stat-then-unlink race against a recovery
-    // that already claimed this round and republished a live key at the
-    // name, and disposing the marker while the partial final stays would
-    // recreate the marker-less wedge the bracket exists to prevent, so this
-    // exit removes nothing and disposes nothing. Not write_key_or_cleanup,
-    // whose by-name removal stays right for the primary path's TEMP file
-    // (a private name no recovery can race).
-    if let Err(e) = (faults.fallback_write)().and_then(|()| f.write_all(pem)) {
-        return Err(anyhow::Error::new(e)
-            .context(format!(
-                "failed to write key to {}; the partial final and its publish marker \
-                 are left in place for boot-time crash recovery",
-                final_path.display()
-            ))
-            .context(format!(
-                "hard_link fallback publish to {} (link failed: {link_err})",
-                final_path.display()
-            )));
-    }
-    // A failed file fsync takes the same keep-everything exit as the failed
-    // write: the bytes were accepted but may not be durable, and marker+
-    // final left together is the recoverable crash state (the next boot's
-    // load either parses the complete content, after which the sweep's
-    // durability gate fsyncs the final BEFORE removing the marker, or
-    // content-fails beside the marker and recovers). A DISTINCT context is
-    // kept so an operator debugging ENOSPC/EIO can tell "durability failed"
-    // (bytes accepted, not synced) from the write-rejected case above. Only
-    // the parent-DIR fsync below keeps the final while disposing the marker
-    // (a lost directory entry just disappears -> clean regen).
-    if let Err(e) = (faults.fallback_fsync)().and_then(|()| f.sync_all()) {
-        return Err(anyhow::Error::new(e).context(format!(
-            "fsync identity key {} in hard_link fallback (durability failed; the \
-             final and its publish marker are left in place for boot-time crash \
-             recovery; link failed: {link_err})",
-            final_path.display()
-        )));
-    }
-    drop(f);
-    // Fsync the parent directory so the new name is durable before success is
-    // reported, as on the hard-link path. Same policy on failure: the final is
-    // complete and data-synced, so it is NOT removed; the marker is still
-    // disposed of best-effort.
-    #[cfg(unix)]
-    {
-        if let Err(e) = fsync_parent_dir(final_path) {
-            dispose_marker();
-            return Err(e);
-        }
-    }
-    // Success: the final is complete and durable. Removing our OWN marker is
-    // the COMMIT CHECK (#194, U3): recovery claims a round by renaming EVERY
-    // marker beside the final, so our marker is necessarily among any
-    // claimed round and a successful removal proves no recovery can ever
-    // claim it, linearizing this winner ahead of any recoverer. Any failure
-    // (NotFound after a peer's claim rename, or any other error) means
-    // ownership of the round cannot be proven: a recovering peer may have
-    // quarantined our final and republished, so returning Won could report
-    // key A while disk holds key B. Demote to Lost instead. Demotion is safe
-    // ONLY for a SETTLED round (N3): the caller's Lost arm re-loads the
-    // final, and that load observes the recoverer's outcome only once the
-    // recoverer's claims have cleared, so the demoted publish first waits
-    // them out. An UNSETTLED round past the wait bound (any claim file
-    // still present) fails the publish closed with a loud error instead:
-    // loading there could return a pre-settlement key while the still-live
-    // recoverer settles disk on a different identity.
-    before_commit();
-    match std::fs::remove_file(&marker) {
-        Ok(()) => {
-            // Best-effort fsync so the marker's removal tends to be durable.
-            #[cfg(unix)]
-            {
-                let _ = fsync_parent_dir(final_path);
-            }
-            Ok(KeyPublish::Won)
-        }
-        Err(e) => {
-            warn!(
-                marker = %marker.display(),
-                err = %e,
-                "fallback publish lost its marker before commit; a recovering peer owns \
-                 this round, demoting the publish to lost"
-            );
-            wait_for_recovery_claims(final_path).with_context(|| {
-                format!(
-                    "fallback publish of {} was demoted by a recovering peer, and the \
-                     recovery round did not settle within the wait bound; failing the \
-                     publish closed instead of loading a possibly pre-settlement key \
-                     (marker removal failed: {e})",
-                    final_path.display()
-                )
-            })?;
-            Ok(KeyPublish::Lost)
-        }
-    }
-}
-
-/// Compile-time test seam for the load-side crash recovery in
-/// `load_or_create_keypair_with` (#194, U2), following the `PublishFaults`
-/// precedent: production passes `RecoverySeam::NONE` (every hook a no-op).
-#[derive(Clone, Copy)]
-struct RecoverySeam<'a> {
-    /// Runs before every load attempt of the boot loader; an `Err` is taken as
-    /// that attempt's result. The injected failure is NOT content-class, so it
-    /// deterministically exercises the transient-failure (never-recover) policy.
-    load_fault: fn() -> std::io::Result<()>,
-    /// Runs at the top of each generate+publish pass, so a test can mutate
-    /// on-disk state between a completed recovery and the retry publish.
-    before_publish: &'a dyn Fn(),
-    /// Runs inside `sweep_stale_markers` before the final's `sync_all`; an
-    /// `Err` is taken as that sync's result, so a test can fail the sweep's
-    /// durability gate deterministically (#194, U4).
-    sweep_sync: fn() -> std::io::Result<()>,
-    /// Runs inside `recover_crashed_publish` between the claim renames and
-    /// the post-claim re-parse of the final, so a test can interleave a
-    /// concurrent publisher's resolution into exactly that window (#194, F2).
-    before_reparse: &'a dyn Fn(),
-    /// Runs immediately before the post-claim RE-parse load inside
-    /// `recover_crashed_publish`; an `Err` is taken as that load's result.
-    /// The injected failure is NOT content-class, so it deterministically
-    /// exercises the transient-reparse (release-and-fail-loudly) policy
-    /// (#194, G2a). Narrower than `load_fault`, which only reaches
-    /// `boot_load_key`'s attempts, never this re-parse.
-    reparse_fault: fn() -> std::io::Result<()>,
-    /// Runs inside `recover_crashed_publish` between the quarantine's
-    /// completed-parse and the restore of the completed key to the final
-    /// name, so a test can interleave a concurrent starter's publish into
-    /// exactly the quarantine-to-restore window (#194, G2b follow-up).
-    before_restore: &'a dyn Fn(),
-    /// Faults threaded into the restore's republish of a completed
-    /// quarantined key, so a test can force the restore onto its link-hostile
-    /// degradation tier (production: `PublishFaults::NONE`).
-    restore_faults: PublishFaults,
-    /// Runs inside `recover_crashed_publish` between the post-claim re-parse
-    /// and the quarantine rename, so a test can land a publisher's completed
-    /// write in exactly the re-parse-to-rename window (#194, G2b).
-    before_quarantine: &'a dyn Fn(),
-}
-
-impl RecoverySeam<'_> {
-    /// The production value: no fault, no hook.
-    const NONE: RecoverySeam<'static> = RecoverySeam {
-        load_fault: || Ok(()),
-        before_publish: &|| {},
-        sweep_sync: || Ok(()),
-        before_reparse: &|| {},
-        reparse_fault: || Ok(()),
-        before_restore: &|| {},
-        restore_faults: PublishFaults::NONE,
-        before_quarantine: &|| {},
-    };
-}
-
-fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
-    load_or_create_keypair_with(
-        &config.resolved_key_path(),
-        &|| {},
-        &|| {},
-        PublishFaults::NONE,
-        RecoverySeam::NONE,
-    )
-}
-
-/// Outcome of `recover_crashed_publish` (#194, U2).
-enum Recovery {
-    /// The round was claimed and the corrupt final quarantined (or removed);
-    /// the caller regenerates. Holds every claim file this recovery created
-    /// plus their heartbeat (`ClaimSet`), released once the follow-up
-    /// publish resolves (or on any error exit).
-    Claimed(ClaimSet),
-    /// The marker vanished before it could be claimed (the publisher — or a
-    /// competing recoverer — resolved the window concurrently): the single
-    /// follow-up load's result is final, success or error, no recovery.
-    /// Boxed to keep the variants' sizes comparable (clippy:
-    /// large_enum_variant); the enum lives only across a boot-time match.
-    Reloaded(Box<Result<Keypair>>),
-}
-
-/// The per-process nonce embedded in recovery-claim names
-/// (`.{stem}.recovering.{pid}.{nonce}.{n}`). The pid alone is NOT unique
-/// across recoverers on a shared volume: two containers each running as
-/// PID 1 (the same restart topology `KEY_TEMP_ATTEMPTS`' stale-name
-/// discipline already handles) can recover the same directory concurrently
-/// and derive identical destination names, and `rename` REPLACES an
-/// existing destination, so the second recoverer's claim rename would
-/// clobber the first's LIVE claim inode (the claim loop's `exists()` probe
-/// is check-then-act, not an arbiter). Both would then track the same
-/// path, and the first release would unlink the other's live claim,
-/// early-waking the demoted publisher that claim gates. The nonce makes
-/// the two name sequences disjoint. Std-only seeding: boot-time nanos
-/// XORed with this static's address (ASLR-shifted per process), folded to
-/// 32 bits; uniqueness is probabilistic-by-construction, which suffices
-/// because a collision needs the same pid AND the same nonce against the
-/// same directory at the same time. Threads within one process share the
-/// nonce; intra-process claim arbitration remains the per-source rename
-/// (production calls this once, at boot).
-fn claim_nonce() -> u32 {
-    static NONCE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *NONCE.get_or_init(|| {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        let mixed = nanos ^ (&NONCE as *const _ as u64);
-        (mixed ^ (mixed >> 32)) as u32
-    })
-}
-
-/// Production primary stamp for `refresh_claim_mtime`: set the file's mtime
-/// to now via `set_modified`.
-fn set_mtime_now(path: &std::path::Path) -> std::io::Result<()> {
-    std::fs::File::options()
-        .write(true)
-        .open(path)?
-        .set_modified(std::time::SystemTime::now())
-}
-
-/// Stamp `claim`'s mtime fresh, for the G1 age gate (see the call site in
-/// `recover_crashed_publish`). `primary_stamp` is `set_mtime_now` in
-/// production (injectable, the file's fn-pointer seam style; some
-/// filesystems reject explicit timestamps while honoring write-driven
-/// updates). If the primary fails, fall back to appending one byte, which
-/// updates the mtime on effectively every filesystem, plus a best-effort
-/// data sync. The claim is then no longer empty, which is safe: claims
-/// vouch for no content and every consumer matches them by NAME only
-/// (`list_recovery_claimables`, `sweep_stale_markers`,
-/// `wait_for_recovery_claims`); nothing reads a claim's bytes. Errs only
-/// when BOTH rungs fail, carrying both failures in the message.
-fn refresh_claim_mtime(
-    claim: &std::path::Path,
-    primary_stamp: fn(&std::path::Path) -> std::io::Result<()>,
-) -> std::io::Result<()> {
-    let primary_err = match primary_stamp(claim) {
-        Ok(()) => return Ok(()),
-        Err(e) => e,
-    };
-    std::fs::File::options()
-        .append(true)
-        .open(claim)
-        .and_then(|mut f| {
-            use std::io::Write;
-            f.write_all(b".")?;
-            let _ = f.sync_data();
-            Ok(())
-        })
-        .map_err(|fallback_err| {
-            std::io::Error::new(
-                fallback_err.kind(),
-                format!(
-                    "set_modified failed ({primary_err}) and the write fallback \
-                     failed ({fallback_err})"
-                ),
-            )
-        })
-}
-
-/// Handle to a live recovery's claim-heartbeat thread. Dropping it stops
-/// the beat and joins the thread, so every exit path (release, error, or
-/// unwind) reclaims it; the join is bounded because the thread checks the
-/// stop flag at least every ~250ms (the sleep granule in
-/// `spawn_claim_heartbeat`).
-#[derive(Debug)]
-struct ClaimHeartbeat {
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    handle: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Drop for ClaimHeartbeat {
-    fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-/// Spawn the claim heartbeat: a thread refreshing every claim's mtime every
-/// `CLAIM_SWEEP_MIN_AGE / 4` until stopped, sleeping in ~250ms granules so
-/// the joining release is prompt. This is what makes the G1 age-as-orphan
-/// rule sound (see `CLAIM_SWEEP_MIN_AGE`'s liveness contract): without it a
-/// recoverer stalled longer than the floor between claim and settlement
-/// reads as an orphan to the sweep and to claimability, so a healthy boot
-/// can remove the still-live claim (early-releasing the demoted waiter to
-/// a pre-settlement load) or a competing recoverer can steal the round:
-/// divergence returns on slow shared volumes. The demotion waiter itself is
-/// age-blind (it keys on claim-file absence; see
-/// `wait_for_recovery_claims`), so a frozen mtime alone fails a demoted
-/// publisher closed rather than releasing it early. Best-effort:
-/// a failed spawn warns and degrades to the single claim-time stamp (the
-/// pre-heartbeat exposure, churn not divergence); a failed refresh warns and
-/// retries at the next beat.
-fn spawn_claim_heartbeat(files: Vec<std::path::PathBuf>) -> Option<ClaimHeartbeat> {
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let thread_stop = std::sync::Arc::clone(&stop);
-    let spawned = std::thread::Builder::new()
-        .name("identity-claim-heartbeat".into())
-        .spawn(move || {
-            let beat = CLAIM_SWEEP_MIN_AGE / 4;
-            let granule = std::time::Duration::from_millis(250);
-            'beat: loop {
-                let mut slept = std::time::Duration::ZERO;
-                while slept < beat {
-                    if thread_stop.load(std::sync::atomic::Ordering::SeqCst) {
-                        break 'beat;
-                    }
-                    std::thread::sleep(granule);
-                    slept += granule;
-                }
-                for claim in &files {
-                    if thread_stop.load(std::sync::atomic::Ordering::SeqCst) {
-                        break 'beat;
-                    }
-                    if let Err(e) = refresh_claim_mtime(claim, set_mtime_now) {
-                        warn!(
-                            claim = %claim.display(),
-                            err = %e,
-                            "claim heartbeat could not refresh a live claim's mtime; if \
-                             this persists past the liveness floor the claim reads as \
-                             orphaned (bounded to churn, not divergence)"
-                        );
-                    }
+    for peer in peers {
+        let ok = ping_peer_readiness(client, &peer.http_url).await;
+        match peer_ping_db_update(failed_once, &peer.did, ok) {
+            Some(reachable) => {
+                if let Err(error) = db.mark_peer_ping(&peer.did, reachable).await {
+                    warn!(did = %peer.did, err = %error, "failed to persist peer readiness");
                 }
             }
-        });
-    match spawned {
-        Ok(handle) => Some(ClaimHeartbeat {
-            stop,
-            handle: Some(handle),
-        }),
-        Err(e) => {
-            warn!(
-                err = %e,
-                "could not spawn the claim heartbeat; falling back to the single \
-                 claim-time stamp: a recovery stalled past the liveness floor may \
-                 read as orphaned (bounded to churn, not divergence)"
-            );
-            None
+            None => warn!(
+                did = %peer.did,
+                "peer readiness probe failed once; preserving previous federation status"
+            ),
         }
-    }
-}
-
-/// The claim files a recovery holds, plus the heartbeat keeping them young
-/// (see `spawn_claim_heartbeat`). Carried through `Recovery::Claimed` so the
-/// boot loop's follow-up publish keeps the round visibly live until
-/// `release_recovery_claims`; dropping the set (any path) stops and joins
-/// the heartbeat via `ClaimHeartbeat`'s `Drop`.
-#[derive(Debug)]
-struct ClaimSet {
-    files: Vec<std::path::PathBuf>,
-    heartbeat: Option<ClaimHeartbeat>,
-}
-
-impl ClaimSet {
-    /// No claims, no heartbeat: the boot loop's initial state.
-    fn empty() -> Self {
-        ClaimSet {
-            files: Vec::new(),
-            heartbeat: None,
-        }
-    }
-
-    /// Wrap freshly created claim files and start their heartbeat
-    /// (best-effort; `None` on spawn failure).
-    fn with_heartbeat(files: Vec<std::path::PathBuf>) -> Self {
-        let heartbeat = spawn_claim_heartbeat(files.clone());
-        ClaimSet { files, heartbeat }
-    }
-}
-
-/// Best-effort removal of the claim files a recovery created, plus a
-/// best-effort dir fsync. Stops and joins the claim heartbeat FIRST (via
-/// `ClaimHeartbeat`'s `Drop`; bounded by its ~250ms flag granule), so no
-/// beat can restamp a claim after its removal. Claims vouch for NO on-disk
-/// content (unlike
-/// publish markers, whose disposal order against the final is pinned): they
-/// only gate a demoted publisher's bounded wait and recovery arbitration.
-/// Release therefore needs no ordering against the final, the markers, or
-/// anything else: any exit may drop the claims at any point once their owner
-/// stops recovering, and the worst a lost claim can cause is a waiter
-/// re-loading early, which the load path copes with (#194, F1/F3).
-fn release_recovery_claims(final_path: &std::path::Path, claims: &mut ClaimSet) {
-    drop(claims.heartbeat.take());
-    for claim in &claims.files {
-        let _ = std::fs::remove_file(claim);
-    }
-    claims.files.clear();
-    #[cfg(unix)]
-    {
-        let _ = fsync_parent_dir(final_path);
-    }
-}
-
-/// Claim-and-quarantine for a boot whose load returned `CrashSignature`: a
-/// content-class failure beside a `.publishing.` marker or `.recovering.`
-/// claim, the signature of a fallback publish (or a recovery) crashed
-/// inside its window (#194, U2/F2/F3). Claims the WHOLE round: every marker
-/// and every pre-existing claim is renamed to a fresh claim of our own
-/// (`.{stem}.recovering.{pid}.{n}`, bounded fresh-name probing per item, the
-/// KEY_TEMP_ATTEMPTS discipline; a NotFound on an individual rename means
-/// that item resolved concurrently and is skipped). Claiming everything is
-/// what makes the publisher's commit check sound: a live fallback publisher
-/// still inside its window necessarily has its own marker among the
-/// claimables, so its marker removal fails and it demotes (F2); claiming
-/// only one marker would let a stale marker's claim steal a live round.
-///
-/// If NO rename lands, the round resolved concurrently: one immediate
-/// re-load decides, with no recovery. If at least one lands, this recovery
-/// owns the round, and it RE-PARSES the final once before touching it: a
-/// publisher that completed inside the claim window has already resolved the
-/// round, so a parseable final is returned as `Reloaded` and the claims are
-/// released, never quarantining a good key. A TRANSIENT (non-content)
-/// re-parse failure releases the claims and surfaces the error loudly with
-/// nothing destroyed (#194, G2a). Only if the final still content-fails does
-/// the recovery quarantine it by rename (preserving bytes and mode for
-/// post-mortem; falling back to removal only if every quarantine name
-/// fails); a quarantine whose bytes then PARSE is a publisher that completed
-/// in the re-parse-to-rename window and is restored to the final name
-/// (#194, G2b; see the inline comment). Otherwise recovery consumes any
-/// remaining markers best-effort and hands control back to regenerate.
-/// Every error exit after claiming releases
-/// the claims first (see `release_recovery_claims`; a leaked claim would
-/// ride later demoted publishers through the full wait bound and fail
-/// their publish closed until a sweep cleared it, F1). `seam` carries
-/// the test hooks for the claim-to-re-parse and re-parse-to-quarantine
-/// windows (`before_reparse`, `reparse_fault`, `before_quarantine`; all
-/// no-ops in production).
-fn recover_crashed_publish(
-    final_path: &std::path::Path,
-    load_err: anyhow::Error,
-    seam: RecoverySeam<'_>,
-) -> Result<Recovery> {
-    let dir = final_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let stem = final_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("identity.pem");
-    let claimables = list_recovery_claimables(final_path);
-    if claimables.is_empty() {
-        return Ok(Recovery::Reloaded(Box::new(load_racing_key(final_path))));
-    }
-
-    // CLAIM every marker and foreign claim by rename. Each rename admits
-    // exactly one winner; NotFound means that item resolved concurrently (a
-    // publisher committed, or a competing recoverer claimed it) and is
-    // skipped. Names are never reused or clobbered: the monotonic counter
-    // plus the exists() probe keeps every destination fresh, bounded per
-    // item like the temp/marker/quarantine probes.
-    let claim_prefix = recovering_prefix(stem);
-    let mut claims: Vec<std::path::PathBuf> = Vec::new();
-    let mut next_name = 0u32;
-    for item in &claimables {
-        for _ in 0..KEY_TEMP_ATTEMPTS {
-            // The name carries a per-process nonce beside the pid: pid alone
-            // is not unique across recoverers (two PID-1 containers on one
-            // shared volume), and a colliding destination would let one
-            // recoverer's rename clobber the other's live claim; see
-            // `claim_nonce`.
-            let dest = dir.join(format!(
-                "{claim_prefix}{}.{:08x}.{next_name}",
-                std::process::id(),
-                claim_nonce()
-            ));
-            next_name = next_name.wrapping_add(1);
-            if dest.exists() {
-                continue;
-            }
-            match std::fs::rename(item, &dest) {
-                Ok(()) => {
-                    // The rename preserves the SOURCE's mtime, but the G1
-                    // sweep gate reads the CLAIM file's mtime: a claim made
-                    // from an aged stale marker would be born already past
-                    // CLAIM_SWEEP_MIN_AGE, and a concurrent healthy boot
-                    // could sweep this LIVE claim mid-round, early-waking
-                    // the demoted publisher it gates. The age gate needs
-                    // claim-time freshness, so stamp it now (two rungs; see
-                    // refresh_claim_mtime). Only if both rungs fail is the
-                    // live claim left exposed to the age-gated sweep, so
-                    // warn naming that hazard and continue: the exposure is
-                    // bounded to churn, not divergence, by the post-claim
-                    // re-parse and the restore's no-clobber republish.
-                    if let Err(e) = refresh_claim_mtime(&dest, set_mtime_now) {
-                        warn!(
-                            claim = %dest.display(),
-                            err = %e,
-                            "could not refresh a recovery claim's mtime by any rung: a \
-                             concurrent healthy boot's age-gated sweep may remove this \
-                             LIVE claim mid-round and early-wake the demoted publisher \
-                             it gates (bounded to churn, not divergence, by the \
-                             post-claim re-parse, the restore's no-clobber republish, \
-                             and the demoted publisher's waiter failing closed on an \
-                             unsettled round)"
-                        );
-                    }
-                    claims.push(dest);
-                    break;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
-                // Any other rename failure: probe the next fresh name, up to
-                // the per-item bound; an unclaimable item is left for the
-                // best-effort marker consumption below (or a later sweep).
-                Err(_) => continue,
-            }
-        }
-    }
-    if claims.is_empty() {
-        // Every item vanished before it could be claimed: the round resolved
-        // concurrently; one immediate re-load decides, with no recovery.
-        return Ok(Recovery::Reloaded(Box::new(load_racing_key(final_path))));
-    }
-    // CLAIM HEARTBEAT: from here until release these claims are load-bearing
-    // (they gate demoted publishers and arbitrate the round), and the G1 age
-    // rule reads aged-out as orphaned, so keep them visibly live for as long
-    // as this recovery actually runs; see spawn_claim_heartbeat.
-    let mut claims = ClaimSet::with_heartbeat(claims);
-
-    // POST-CLAIM RE-PARSE (#194, F2): between the crash-signature
-    // observation and the renames above, a live publisher may have completed
-    // its final. Now that the round is claimed no publisher can commit
-    // anymore, so one parse decides: a readable final means the round is
-    // already resolved, so release the claims and defer to it, never
-    // quarantining a good key. Only a CONTENT-class failure proceeds to the
-    // quarantine (#194, G2a): a transient (IO/permissions) failure of a
-    // PRESENT final proves nothing about the content, and quarantining on it
-    // would destroy a possibly good key, so the claims are released and the
-    // error surfaces loudly with nothing destroyed. A NotFound is neither: a
-    // vanished final means a competing recoverer disposed of it
-    // concurrently, there is nothing a quarantine could destroy, and the
-    // quarantine loop's own NotFound arm resolves it into a clean
-    // regenerate, so it falls through like the content class.
-    (seam.before_reparse)();
-    match (seam.reparse_fault)()
-        .map_err(anyhow::Error::new)
-        .and_then(|()| load_existing_key(final_path))
-    {
-        Ok(kp) => {
-            release_recovery_claims(final_path, &mut claims);
-            return Ok(Recovery::Reloaded(Box::new(Ok(kp))));
-        }
-        Err(e)
-            if is_key_content_error(&e)
-                || e.downcast_ref::<std::io::Error>()
-                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            // Still the crashed content, or vanished concurrently: fall
-            // through to the quarantine.
-        }
-        Err(e) => {
-            release_recovery_claims(final_path, &mut claims);
-            return Err(e.context(format!(
-                "transient failure re-parsing identity key {} after claiming crash \
-                 recovery; claims released, nothing quarantined",
-                final_path.display()
-            )));
-        }
-    }
-
-    // QUARANTINE the final under a bounded name probe (the KEY_TEMP_ATTEMPTS
-    // discipline: a stale quarantine from a crashed same-PID start must not
-    // wedge this one). The warn precedes the move and carries stable
-    // operator-greppable fields; the destination it names is the first free
-    // candidate, which the rename below tries first. `before_quarantine` is
-    // the test seam for the re-parse-to-rename window (#194, G2b; a no-op in
-    // production).
-    (seam.before_quarantine)();
-    let dest_for = |n: u32| {
-        dir.join(format!(
-            "{}{}.{n}",
-            quarantined_prefix(stem),
-            std::process::id()
-        ))
-    };
-    let start = (0..KEY_TEMP_ATTEMPTS)
-        .find(|&n| !dest_for(n).exists())
-        .unwrap_or(0);
-    warn!(
-        path = %final_path.display(),
-        claimables = ?claimables,
-        claims = ?claims.files,
-        quarantine = %dest_for(start).display(),
-        "crash-interrupted identity key publish: quarantining the unreadable key and \
-         regenerating the identity"
-    );
-    let mut quarantined = false;
-    let mut quarantined_at: Option<std::path::PathBuf> = None;
-    for n in start..KEY_TEMP_ATTEMPTS {
-        let dest = dest_for(n);
-        if dest.exists() {
-            continue;
-        }
-        match std::fs::rename(final_path, &dest) {
-            Ok(()) => {
-                quarantined = true;
-                quarantined_at = Some(dest);
-                break;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // The final vanished concurrently; nothing left to quarantine.
-                quarantined = true;
-                break;
-            }
-            Err(_) => continue,
-        }
-    }
-    if !quarantined {
-        // Every rename failed: removal still unblocks the regeneration
-        // (mirroring the publish paths' removal policy); only if even that
-        // fails is the boot left to its loud error, with the claims
-        // released first, so the dead round cannot stall later publishers
-        // (#194, F1).
-        if let Err(e) = std::fs::remove_file(final_path) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                release_recovery_claims(final_path, &mut claims);
-                return Err(load_err.context(format!(
-                    "could not quarantine or remove corrupt identity key {} during crash \
-                     recovery: {e}",
-                    final_path.display()
-                )));
-            }
-        }
-    }
-
-    // POST-QUARANTINE COMPLETED-WRITE CHECK (#194, G2b): the re-parse above
-    // and the quarantine rename are not atomic, so a publisher that
-    // completed its write inside the re-parse-to-rename window has its
-    // VALID key swept into the quarantine. The rename preserved the bytes
-    // (and the 0600 inode), so parse them: a parseable quarantine means that
-    // publisher already resolved the round, and its key is restored to the
-    // final name instead of being replaced by a regeneration, which would
-    // diverge from the Won the publisher already reported. The restore is a
-    // REPUBLISH of the quarantined PEM through publish_key_atomically, which
-    // holds no-clobber on EVERY tier: the hard-link tier refuses an existing
-    // final, and so does the fallback's create_new on link-hostile mounts (a
-    // plain rename here would clobber a final a fresh start published into
-    // the freed name on exactly those mounts). Won means the completed key
-    // is durably back at the final; the quarantine is then removed, because
-    // its bytes are an exact copy of what now lives at the final, so keeping
-    // it buys no forensics. The keypair returned is the one already parsed
-    // from the quarantined bytes, not a re-read of the final, which could
-    // race a writer that lands after our republish. Won also supersedes
-    // every OTHER young parseable quarantine sibling (they lost this round
-    // to the restored key, the N4 rule adoption-Won already applies); left
-    // adoptable, a later missing final would resurrect a different
-    // historical DID. Lost means someone else
-    // durably published meanwhile: the quarantined key provably LOST its
-    // round, so it is renamed into the superseded class (bytes preserved as
-    // forensics, never adoptable; a young parseable quarantine left in the
-    // adoptable class here would let the operator's delete-final-for-a-
-    // fresh-DID procedure resurrect the losing key, N2) and the boot defers
-    // to the settled final. A publish error keeps the quarantine ADOPTABLE
-    // (the next boot's F1 adoption is the remedy for a failed restore),
-    // releases the claims, and surfaces loudly, nothing destroyed. An
-    // unparseable quarantine is the expected crash state and falls through
-    // to regenerate.
-    if let Some(quarantine) = &quarantined_at {
-        let completed = std::fs::read_to_string(quarantine)
-            .ok()
-            .and_then(|pem| Keypair::from_pem(&pem).ok().map(|kp| (pem, kp)));
-        if let Some((pem, kp)) = completed {
-            (seam.before_restore)();
-            match publish_key_atomically(
-                final_path,
-                pem.as_bytes(),
-                &|| {},
-                &|| {},
-                seam.restore_faults,
-            ) {
-                Ok(KeyPublish::Won) => {
-                    // Mirror-arm invariant (N4): the restore decided this
-                    // round in favor of the restored key, so any OTHER
-                    // young parseable quarantine sibling provably lost it;
-                    // supersede each, exactly like adoption-Won, or a later
-                    // missing final resurrects a different historical DID.
-                    // ORDER: siblings first, THEN consume the chosen
-                    // quarantine, so a crash in the gap leaves the siblings
-                    // already superseded, never adoptable beside a final
-                    // that already holds the winner.
-                    supersede_sibling_quarantines(final_path, quarantine);
-                    let _ = std::fs::remove_file(quarantine);
-                    #[cfg(unix)]
-                    {
-                        let _ = fsync_parent_dir(final_path);
-                    }
-                    release_recovery_claims(final_path, &mut claims);
-                    return Ok(Recovery::Reloaded(Box::new(Ok(kp))));
-                }
-                Ok(KeyPublish::Lost) => {
-                    supersede_quarantine(final_path, quarantine);
-                    release_recovery_claims(final_path, &mut claims);
-                    return Ok(Recovery::Reloaded(Box::new(load_racing_key(final_path))));
-                }
-                Err(e) => {
-                    release_recovery_claims(final_path, &mut claims);
-                    return Err(e.context(format!(
-                        "could not restore the completed identity key to {} during crash \
-                         recovery; quarantine kept at {}",
-                        final_path.display(),
-                        quarantine.display()
-                    )));
-                }
-            }
-        }
-    }
-
-    // Consume any remaining markers (a multi-crash pile-up, or an item the
-    // claim probe could not rename) best-effort, and best-effort fsync the
-    // directory so the transition tends to be durable.
-    for marker in list_publish_markers(final_path) {
-        let _ = std::fs::remove_file(&marker);
-    }
-    #[cfg(unix)]
-    {
-        let _ = fsync_parent_dir(final_path);
-    }
-    Ok(Recovery::Claimed(claims))
-}
-
-/// Body of `load_or_create_keypair` with the test seams threaded in (#194,
-/// U2): `before_link`, `before_commit`, and `faults` pass through to
-/// `publish_key_atomically` (production: no-op / `NONE`), `seam` is the
-/// load-side recovery seam (production: `RecoverySeam::NONE`).
-///
-/// Load-or-generate with AT MOST ONE crash recovery per start: a load
-/// failure recovers (claim the round, quarantine the final, regenerate)
-/// only when it is content-class (`KeyContentError`), a `.publishing.`
-/// marker or `.recovering.` claim exists (the crash signature, persisting
-/// for `CRASH_SIGNATURE_MIN_PERSIST`), and no recovery has run yet this start. Every
-/// other failure surfaces unchanged. The Lost arm participates in the same
-/// policy; a recovery fired there loops back for one retry publish, and any
-/// failure on that second pass surfaces unchanged.
-fn load_or_create_keypair_with(
-    key_path: &std::path::Path,
-    before_link: &dyn Fn(),
-    before_commit: &dyn Fn(),
-    faults: PublishFaults,
-    seam: RecoverySeam<'_>,
-) -> Result<Keypair> {
-    // The claim set (files plus heartbeat) of a fired recovery. Held while
-    // the follow-up
-    // generate+publish runs, so a stalled winner our claims demoted can still
-    // observe them while waiting (U3 relies on this), and released on EVERY
-    // exit after that, success, Lost, and error alike (#194, F1): a leaked
-    // claim rides every later demoted publisher through the full wait bound
-    // and fails its publish closed until a sweep clears the orphan.
-    // Release order against the final or the markers does not matter; see
-    // release_recovery_claims.
-    let mut claims = ClaimSet::empty();
-    let mut recovery_allowed = true;
-
-    // N1 invariant: EVERY arm that returns a successfully resolved keypair
-    // (loaded, reloaded, adopted, or generated) must run the durability-gated
-    // stale-marker sweep before returning, by funneling through this closure.
-    // A healthy return that skips the sweep leaves unclaimable markers or
-    // aged orphan claims beside a good final, and a LATER content failure of
-    // that final would pair with the leftover residue and misclassify plain
-    // corruption as a recoverable crash. Route any future healthy return
-    // through here too, so no arm can forget the sweep.
-    let finish_healthy = |kp: Keypair| -> Result<Keypair> {
-        sweep_stale_markers(key_path, seam.sweep_sync);
-        Ok(kp)
-    };
-
-    // At most two passes: the second exists only so a Lost-arm recovery can
-    // retry the generate+publish once.
-    for _pass in 0..2 {
-        // Fast path for the common already-provisioned case (still race-safe: a
-        // concurrently-publishing winner is handled by the retry in
-        // boot_load_key).
-        if key_path.exists() {
-            if let Some(parent) = key_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let mode = std::fs::metadata(parent)
-                        .with_context(|| {
-                            format!("stat identity key directory {}", parent.display())
-                        })?
-                        .permissions()
-                        .mode()
-                        & 0o777;
-                    if mode & 0o077 != 0 {
-                        ensure_key_parent_dir_private(parent)?;
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    ensure_key_parent_dir_private(parent)?;
-                }
-            }
-            match boot_load_key(key_path, recovery_allowed, seam.load_fault) {
-                BootLoad::Loaded(kp) => {
-                    release_recovery_claims(key_path, &mut claims);
-                    return finish_healthy(*kp);
-                }
-                // Only emitted while recovery is still allowed (crash_exit is
-                // gated on it).
-                BootLoad::CrashSignature(e) => {
-                    match recover_crashed_publish(key_path, e, seam)? {
-                        Recovery::Claimed(c) => {
-                            claims = c;
-                            recovery_allowed = false;
-                            // Fall through to regenerate and publish.
-                        }
-                        Recovery::Reloaded(result) => return (*result).and_then(&finish_healthy),
-                    }
-                }
-                BootLoad::Failed(e) => {
-                    release_recovery_claims(key_path, &mut claims);
-                    return Err(e);
-                }
-            }
-        }
-
-        (seam.before_publish)();
-
-        // ADOPTION SCAN (F1): with no loadable final, a COMPLETED key may be
-        // stranded in a quarantine: the recoverer's restore republish
-        // errored, or the recoverer crashed between its quarantine rename
-        // and the restore. Generating here would mint a fresh DID over a
-        // still-live identity, so a YOUNG parseable quarantine (the current
-        // round's; see find_adoptable_quarantine's age bound) is republished
-        // and adopted instead: adoption preserves identity continuity across
-        // a crashed or failed restore. An unparseable quarantine is the
-        // expected crash state and stays on disk as forensics, as does an
-        // AGED parseable one (history, never resurrected); only when no
-        // quarantine qualifies does the boot fall through to generate. The republish holds no-clobber on every tier, so Lost
-        // means a concurrent starter durably published meanwhile: the
-        // quarantine provably LOST its round, so it moves to the superseded
-        // class and the boot defers to the winner, exactly like the G2b
-        // restore's Lost arm. A
-        // republish error surfaces loudly with the quarantine kept: minting
-        // a fresh identity over an adoptable one is the failure F1 exists to
-        // prevent.
-        if let Some((quarantine, pem, kp)) = find_adoptable_quarantine(key_path) {
-            match publish_key_atomically(key_path, pem.as_bytes(), &|| {}, &|| {}, faults) {
-                Ok(KeyPublish::Won) => {
-                    // N4: any OTHER young parseable quarantine sibling lost
-                    // this round to the adopted key; move each into the
-                    // superseded class so a later missing final cannot
-                    // resurrect a different historical DID. Unparseable
-                    // siblings stay plain quarantines as crash forensics.
-                    // ORDER: siblings first, THEN consume the chosen
-                    // quarantine, so a crash in the gap leaves the siblings
-                    // already superseded, never adoptable beside a final
-                    // that already holds the winner.
-                    supersede_sibling_quarantines(key_path, &quarantine);
-                    // The quarantine's bytes are an exact copy of what now
-                    // durably lives at the final, so keeping it buys no
-                    // forensics (the G2b restore's removal rationale).
-                    let _ = std::fs::remove_file(&quarantine);
-                    #[cfg(unix)]
-                    {
-                        let _ = fsync_parent_dir(key_path);
-                    }
-                    release_recovery_claims(key_path, &mut claims);
-                    info!(
-                        path = %key_path.display(),
-                        did = %kp.did(),
-                        "adopted a completed identity stranded in quarantine"
-                    );
-                    return finish_healthy(kp);
-                }
-                Ok(KeyPublish::Lost) => {
-                    // Mirror-arm invariant (N2): EVERY Lost outcome
-                    // supersedes the losing bytes. This quarantine just
-                    // provably LOST its round to the concurrent winner;
-                    // left adoptable, the operator's delete-final-for-a-
-                    // fresh-DID procedure would resurrect it within the age
-                    // floor, exactly the hazard the restore's Lost arm
-                    // already closes.
-                    supersede_quarantine(key_path, &quarantine);
-                    let result = load_racing_key(key_path);
-                    release_recovery_claims(key_path, &mut claims);
-                    return result.and_then(&finish_healthy);
-                }
-                Err(e) => {
-                    release_recovery_claims(key_path, &mut claims);
-                    return Err(e.context(format!(
-                        "could not republish the completed identity key stranded at {}; \
-                         quarantine kept",
-                        quarantine.display()
-                    )));
-                }
-            }
-        }
-
-        let kp = Keypair::generate();
-        // Every error exit below this point may hold a fired recovery's
-        // claims; release them before propagating (#194, F1). The bare `?`
-        // this replaces leaked the claim files on a failed retry publish.
-        let pem = match kp.to_pem() {
-            Ok(pem) => pem,
-            Err(e) => {
-                release_recovery_claims(key_path, &mut claims);
-                return Err(anyhow::anyhow!("failed to serialize key: {e}"));
-            }
-        };
-
-        if let Some(parent) = key_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            if let Err(e) = ensure_key_parent_dir_private(parent) {
-                release_recovery_claims(key_path, &mut claims);
-                return Err(e);
-            }
-        }
-
-        // Publish atomically: the final path only ever appears complete, and a
-        // lost race loads the winner's key rather than overwriting it.
-        let published = match publish_key_atomically(
-            key_path,
-            pem.as_bytes(),
-            before_link,
-            before_commit,
-            faults,
-        ) {
-            Ok(published) => published,
-            Err(e) => {
-                release_recovery_claims(key_path, &mut claims);
-                return Err(e);
-            }
-        };
-        match published {
-            KeyPublish::Won => {
-                release_recovery_claims(key_path, &mut claims);
-                info!(path = %key_path.display(), did = %kp.did(), "generated new node identity");
-                return finish_healthy(kp);
-            }
-            KeyPublish::Lost => {
-                match boot_load_key(key_path, recovery_allowed, seam.load_fault) {
-                    BootLoad::Loaded(kp) => {
-                        release_recovery_claims(key_path, &mut claims);
-                        return finish_healthy(*kp);
-                    }
-                    // Only emitted while recovery is still allowed (crash_exit
-                    // is gated on it).
-                    BootLoad::CrashSignature(e) => {
-                        match recover_crashed_publish(key_path, e, seam) {
-                            Ok(Recovery::Claimed(c)) => {
-                                claims = c;
-                                recovery_allowed = false;
-                                continue; // Second pass: regenerate and publish.
-                            }
-                            Ok(Recovery::Reloaded(result)) => {
-                                release_recovery_claims(key_path, &mut claims);
-                                return (*result).and_then(&finish_healthy);
-                            }
-                            Err(err) => {
-                                release_recovery_claims(key_path, &mut claims);
-                                return Err(err);
-                            }
-                        }
-                    }
-                    BootLoad::Failed(e) => {
-                        release_recovery_claims(key_path, &mut claims);
-                        return Err(e);
-                    }
-                }
-            }
-        }
-    }
-    unreachable!("the boot loop returns within two passes");
-}
-
-#[cfg(test)]
-mod lock_pool_sizing_tests {
-    use super::{lock_pool_size, LOCK_POOL_MAX_CONNECTIONS, LOCK_POOL_PUSH_HEADROOM};
-
-    #[test]
-    fn default_push_cap_gets_headroom_over_the_cap() {
-        assert_eq!(lock_pool_size(32), 32 + u32::from(LOCK_POOL_PUSH_HEADROOM));
-        assert_eq!(lock_pool_size(1), 1 + u32::from(LOCK_POOL_PUSH_HEADROOM));
-    }
-
-    #[test]
-    fn an_oversized_push_cap_is_clamped_not_propagated() {
-        assert_eq!(lock_pool_size(1_048_576), LOCK_POOL_MAX_CONNECTIONS);
-        assert_eq!(lock_pool_size(usize::MAX), LOCK_POOL_MAX_CONNECTIONS);
-        let widest = (LOCK_POOL_MAX_CONNECTIONS - u32::from(LOCK_POOL_PUSH_HEADROOM)) as usize;
-        assert_eq!(lock_pool_size(widest), LOCK_POOL_MAX_CONNECTIONS);
-        assert_eq!(
-            lock_pool_size(widest - 1),
-            LOCK_POOL_MAX_CONNECTIONS - 1,
-            "values below the clamp must not be rounded up to it"
-        );
     }
 }
 
@@ -3653,7 +1741,7 @@ mod gossip_ssrf_tests {
     // Build the client exactly as production does (super::build_http_client) so
     // these tests bind the redirect guarantee to the real shared client the
     // node runs. A regression that makes build_http_client follow redirects
-    // fails ping_peer_health_does_not_follow_redirect.
+    // fails ping_peer_readiness_does_not_follow_redirect.
     fn production_http_client() -> reqwest::Client {
         super::build_http_client().expect("failed to build production http client")
     }
@@ -3709,11 +1797,9 @@ mod gossip_ssrf_tests {
         .unwrap();
 
         let mut failed_once = HashSet::from(["did:key:z6MkRemovedPeer".to_owned()]);
-        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         gossip_ping_round(
             state.db.as_ref(),
             &production_http_client(),
-            &mut shutdown_rx,
             &mut failed_once,
             state.db.list_peers().await.unwrap(),
         )
@@ -3742,7 +1828,6 @@ mod gossip_ssrf_tests {
         gossip_ping_round(
             state.db.as_ref(),
             &production_http_client(),
-            &mut shutdown_rx,
             &mut failed_once,
             state.db.list_peers().await.unwrap(),
         )
@@ -3762,10 +1847,10 @@ mod gossip_ssrf_tests {
         ready.assert_async().await;
     }
 
-    // A peer answering `/health` with a 302 toward an internal address must not
+    // A peer answering `/ready` with a 302 toward an internal address must not
     // be followed: the redirect target must never be requested (#93).
     #[tokio::test]
-    async fn ping_peer_health_does_not_follow_redirect() {
+    async fn ping_peer_readiness_does_not_follow_redirect() {
         let mut server = mockito::Server::new_async().await;
         let internal = server
             .mock("GET", "/internal-metadata")
@@ -3775,11 +1860,6 @@ mod gossip_ssrf_tests {
             .await;
         let _ready = server
             .mock("GET", "/ready")
-            .with_status(404)
-            .create_async()
-            .await;
-        let _health = server
-            .mock("GET", "/health")
             .with_status(302)
             .with_header("location", &format!("{}/internal-metadata", server.url()))
             .create_async()
@@ -3792,37 +1872,6 @@ mod gossip_ssrf_tests {
         // was followed to the internal target.
         internal.assert_async().await;
     }
-
-    #[tokio::test]
-    async fn ping_peer_health_reports_success_on_200() {
-        let mut server = mockito::Server::new_async().await;
-        let _ready = server
-            .mock("GET", "/ready")
-            .with_status(404)
-            .create_async()
-            .await;
-        let _health = server
-            .mock("GET", "/health")
-            .with_status(200)
-            .create_async()
-            .await;
-
-        let ok = ping_peer_readiness(&production_http_client(), &server.url()).await;
-
-        assert!(ok, "a 200 /health must count as a healthy peer");
-    }
-
-    // A transport error (nothing listening) must map to unhealthy, never a
-    // spurious healthy — the .unwrap_or(false) arm.
-    #[tokio::test]
-    async fn ping_peer_health_reports_unhealthy_on_connection_error() {
-        let ok = ping_peer_readiness(&production_http_client(), "http://127.0.0.1:1").await;
-        assert!(!ok, "a connection error must count as an unhealthy peer");
-    }
-
-    // Restored from the lib+bin split (merge-base main.rs). These four tests
-    // were dropped when the module moved to lib.rs; production gossip behavior
-    // is unchanged, but CI guardrails shrank. No production code change needed.
 
     #[tokio::test]
     async fn ping_peer_readiness_reports_success_on_200() {
@@ -3942,4785 +1991,2001 @@ mod gossip_ssrf_tests {
         );
         server.abort();
     }
-}
 
-#[cfg(all(test, unix))]
-mod identity_key_tests {
-    use super::{
-        load_or_create_keypair, load_or_create_keypair_with, load_racing_key,
-        publish_key_atomically, Config, KeyPublish, Keypair, PublishFaults, RecoverySeam,
-        KEY_TEMP_ATTEMPTS,
-    };
-    use clap::Parser;
-    use std::os::unix::fs::PermissionsExt;
-
-    // #194 (P2): the racing loader must wait out a SLOW winner on a meaningful
-    // wall-clock deadline, not give up after an arbitrary ~100ms window. Simulate
-    // a winner that only publishes the key after 250ms (past the old 100ms budget)
-    // and assert the loader waits it out instead of failing with `invalid PEM key`.
-    // RED with the old `for _ in 0..50` (2ms) fixed-count loop.
-    #[test]
-    fn load_racing_key_waits_out_a_slow_winner() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let pem = Keypair::generate().to_pem().expect("pem");
-
-        let writer_path = key_path.clone();
-        let writer = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(250));
-            publish_key_atomically(
-                &writer_path,
-                pem.as_bytes(),
-                &|| {},
-                &|| {},
-                PublishFaults::NONE,
-            )
-            .expect("publish");
-        });
-
-        let started = std::time::Instant::now();
-        let kp = load_racing_key(&key_path)
-            .expect("racing load must wait out the slow winner, not fail");
-        let waited = started.elapsed();
-        writer.join().expect("writer joins");
-
-        assert!(
-            waited >= std::time::Duration::from_millis(200),
-            "loader should have waited for the ~250ms-slow winner, only waited {waited:?}"
-        );
-        assert!(
-            !format!("{}", kp.did()).is_empty(),
-            "loaded the published key"
-        );
-    }
-
-    // #194 (P2): the atomic publish preserves the single-winner no-clobber
-    // guarantee — a second publish of a DIFFERENT key must lose and leave the
-    // winner's key untouched — and it cleans up its temp files.
-    #[test]
-    fn publish_wins_then_second_publish_loses_without_clobbering() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let pem_a = Keypair::generate().to_pem().expect("pem a");
-        let pem_b = Keypair::generate().to_pem().expect("pem b");
-        assert_ne!(pem_a.as_str(), pem_b.as_str(), "fixtures must differ");
-
-        let out = publish_key_atomically(
-            &key_path,
-            pem_a.as_bytes(),
-            &|| {},
-            &|| {},
-            PublishFaults::NONE,
-        )
-        .expect("publish a");
-        assert!(matches!(out, KeyPublish::Won), "first publish wins");
-        assert_eq!(
-            std::fs::read_to_string(&key_path).unwrap().as_str(),
-            pem_a.as_str(),
-            "final holds the full PEM"
-        );
-
-        let out = publish_key_atomically(
-            &key_path,
-            pem_b.as_bytes(),
-            &|| {},
-            &|| {},
-            PublishFaults::NONE,
-        )
-        .expect("publish b");
-        assert!(matches!(out, KeyPublish::Lost), "second publish loses");
-        assert_eq!(
-            std::fs::read_to_string(&key_path).unwrap().as_str(),
-            pem_a.as_str(),
-            "the winner's key must NOT be clobbered by a losing publish"
-        );
-
-        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
-            .collect();
-        assert!(
-            leftovers.is_empty(),
-            "temp files must be cleaned up, found {leftovers:?}"
-        );
-    }
-
-    // #194 (P2, the core of jatmn's option b): while a winner is between writing
-    // its temp and linking it into place, a reader watching the FINAL path must
-    // see it absent or COMPLETE — never empty/partial. RED with a
-    // create_new(final)+write approach, which exposes an empty final for the whole
-    // write window.
-    #[test]
-    fn publish_never_exposes_a_partial_final() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = std::sync::Arc::new(dir.path().join("identity.pem"));
-        let pem = Keypair::generate().to_pem().expect("pem");
-
-        let wp = key_path.clone();
-        let writer = std::thread::spawn(move || {
-            // Hold the post-write / pre-link window open for 200ms.
-            publish_key_atomically(
-                &wp,
-                pem.as_bytes(),
-                &|| {
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                },
-                &|| {},
-                PublishFaults::NONE,
-            )
-            .expect("publish");
-        });
-
-        // Poll until the final path appears (bounded by a generous deadline:
-        // the publish now fsyncs the temp and the directory, so under parallel
-        // suite load the link can land well after the writer's 200ms hold).
-        // Every observation of an existing final must parse; the first
-        // complete observation ends the test, since a linked-complete final
-        // cannot become partial afterwards. The partial assertion still runs
-        // BEFORE the break, so a publish that exposes an empty/partial final
-        // during the write window is caught on the first poll that sees it.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let mut saw_complete = false;
-        while std::time::Instant::now() < deadline {
-            if key_path.exists() {
-                let body = std::fs::read_to_string(&*key_path).unwrap_or_default();
-                assert!(
-                    Keypair::from_pem(&body).is_ok(),
-                    "final key observed in a partial/empty state: {body:?}"
-                );
-                saw_complete = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        writer.join().expect("writer joins");
-        assert!(
-            saw_complete,
-            "reader should have observed the completed key within the deadline"
-        );
-    }
-
-    // #194: a temp file left by a crash between the temp write and its cleanup
-    // must not wedge the restart. A restarted container commonly runs as PID 1
-    // again, so the first name tried collides with the stale one; the publish
-    // must skip it and still win with the complete PEM. RED with a single
-    // deterministic temp name: `create_new` fails AlreadyExists and the node
-    // never starts until an operator deletes the temp.
-    #[test]
-    fn publish_recovers_from_a_stale_crashed_temp() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let pem = Keypair::generate().to_pem().expect("pem");
-
-        // The crashed prior start's leftover: the deterministic attempt-0 name,
-        // 0600, holding a partial write.
-        let stale = dir
-            .path()
-            .join(format!(".identity.pem.tmp.{}.0", std::process::id()));
-        std::fs::write(&stale, b"partial-").expect("seed stale temp");
-        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o600))
-            .expect("stale temp perms");
-
-        let out = publish_key_atomically(
-            &key_path,
-            pem.as_bytes(),
-            &|| {},
-            &|| {},
-            PublishFaults::NONE,
-        )
-        .expect("publish must recover from a stale temp, not wedge the start");
-        assert!(matches!(out, KeyPublish::Won), "publish wins");
-        assert_eq!(
-            std::fs::read_to_string(&key_path).unwrap().as_str(),
-            pem.as_str(),
-            "final holds the complete PEM, not the stale partial"
-        );
-    }
-
-    // #194: temp-name probing is bounded. With every candidate name taken the
-    // publish must return a clear error naming the directory and prefix (not
-    // hang or spin) and must not create the final path. Together with the
-    // stale-temp test this runs the exhaustion branch both ways.
-    #[test]
-    fn publish_errors_when_all_temp_names_are_taken() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let pem = Keypair::generate().to_pem().expect("pem");
-
-        for attempt in 0..KEY_TEMP_ATTEMPTS {
-            let tmp = dir.path().join(format!(
-                ".identity.pem.tmp.{}.{attempt}",
-                std::process::id()
-            ));
-            std::fs::write(&tmp, b"taken").expect("seed taken temp");
-        }
-
-        let err = match publish_key_atomically(
-            &key_path,
-            pem.as_bytes(),
-            &|| {},
-            &|| {},
-            PublishFaults::NONE,
-        ) {
-            Err(e) => e,
-            Ok(_) => panic!("publish must fail when every temp name is taken"),
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains(&format!(".identity.pem.tmp.{}", std::process::id()))
-                && msg.contains(&dir.path().display().to_string()),
-            "the error must name the temp prefix and directory: {msg}"
-        );
-        assert!(
-            !key_path.exists(),
-            "an exhausted publish must not create or modify the final key"
-        );
-    }
-
-    // A freshly created identity key must be 0600 immediately, with no
-    // world-readable disclosure window (the atomic create_new(...).mode(0o600)
-    // guarantee). This is the RED-then-GREEN anchor for the perms fix: the old
-    // fs::write + set_permissions sequence left a 0644 window.
-    #[test]
-    fn created_key_is_mode_0600() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let config = Config::parse_from([
-            "gitlawb-node",
-            "--key-path",
-            key_path.to_str().expect("utf8 path"),
-        ]);
-
-        let _kp = load_or_create_keypair(&config).expect("create keypair");
-
-        let mode = std::fs::metadata(&key_path)
-            .expect("key file exists")
-            .permissions()
-            .mode();
-        assert_eq!(
-            mode & 0o777,
-            0o600,
-            "identity key must be 0600, got {:o}",
-            mode & 0o777
-        );
-    }
-
-    // A lost create race (file already present) must load the existing key
-    // rather than overwrite it, and must not error on AlreadyExists. Loading an
-    // existing loose-permission key tightens it to 0600 defensively.
-    #[test]
-    fn existing_key_is_loaded_and_tightened() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let config = Config::parse_from([
-            "gitlawb-node",
-            "--key-path",
-            key_path.to_str().expect("utf8 path"),
-        ]);
-
-        let first = load_or_create_keypair(&config).expect("create keypair");
-        // Loosen perms to simulate a legacy/loose on-disk key.
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644))
-            .expect("loosen perms");
-
-        let second = load_or_create_keypair(&config).expect("load keypair");
-        assert_eq!(
-            first.did(),
-            second.did(),
-            "reloading must return the same identity, not a new one"
-        );
-
-        let mode = std::fs::metadata(&key_path)
-            .expect("key file exists")
-            .permissions()
-            .mode();
-        assert_eq!(
-            mode & 0o777,
-            0o600,
-            "load path must tighten loose perms to 0600, got {:o}",
-            mode & 0o777
-        );
-    }
-
-    // The create-race arm the single-threaded tests skip (they enter via the
-    // `exists()` fast path). N concurrent starts on ONE fresh path must converge
-    // on a single identity: the atomic publish links exactly one winner and the
-    // losers hit `AlreadyExists` and load the winner's key rather than overwriting
-    // it. RED: replace the atomic publish with a plain `fs::write` and each thread
-    // returns its own freshly generated key, so the DIDs diverge.
-    #[test]
-    fn concurrent_starts_converge_on_one_identity() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let config = std::sync::Arc::new(Config::parse_from([
-            "gitlawb-node",
-            "--key-path",
-            key_path.to_str().expect("utf8 path"),
-        ]));
-
-        let n = 8;
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(n));
-        let handles: Vec<_> = (0..n)
-            .map(|_| {
-                let c = config.clone();
-                let b = barrier.clone();
-                std::thread::spawn(move || {
-                    // Release all threads at once to maximize the race.
-                    b.wait();
-                    format!("{}", load_or_create_keypair(&c).expect("keypair").did())
-                })
-            })
-            .collect();
-        let dids: Vec<String> = handles
-            .into_iter()
-            .map(|h| h.join().expect("thread joins"))
-            .collect();
-
-        let first = &dids[0];
-        assert!(
-            dids.iter().all(|d| d == first),
-            "all concurrent starts must converge on one identity, got: {dids:?}"
-        );
-    }
-
-    /// #194 (F1): a failed write of a just-created key file removes it, so a later
-    /// start regenerates instead of re-parsing an empty/partial PEM forever and
-    /// wedging on `invalid PEM key`. RED without the `remove_file` in
-    /// `write_key_or_cleanup`: the partial file survives the error.
-    #[test]
-    fn failed_write_removes_the_partial_key_file() {
-        use super::write_key_or_cleanup;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        std::fs::write(&key_path, b"partial-pem").expect("seed partial file");
-        assert!(key_path.exists());
-
-        let err = std::io::Error::other("simulated ENOSPC");
-        let r = write_key_or_cleanup(&key_path, Err(err), || {});
-        assert!(r.is_err(), "the write error must propagate");
-        assert!(
-            !key_path.exists(),
-            "a failed first write must not leave a partial key file to wedge later starts"
-        );
-    }
-
-    /// A successful write leaves the file in place (the common case).
-    #[test]
-    fn successful_write_keeps_the_key_file() {
-        use super::write_key_or_cleanup;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        std::fs::write(&key_path, b"good-pem").expect("seed file");
-        assert!(write_key_or_cleanup(&key_path, Ok(()), || {}).is_ok());
-        assert!(
-            key_path.exists(),
-            "a successful write leaves the file in place"
-        );
-    }
-
-    /// Count of `/proc/self/fd` entries resolving to a `.fdprobe.pem.tmp.`
-    /// name, sampled by `probe_open_temp_fds` at temp-removal time. The stem
-    /// is unique to the ordering test, so a handle another test is holding
-    /// concurrently cannot be counted. `usize::MAX` is the never-sampled
-    /// sentinel, so a seam that never fires fails the assertion rather than
-    /// passing as zero.
-    #[cfg(target_os = "linux")]
-    static OPEN_TEMP_FDS_AT_REMOVE: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(usize::MAX);
-
-    /// `before_temp_remove` seam body for the ordering test. Resolves each
-    /// descriptor to its target PATH rather than comparing fd numbers, so a
-    /// recycled descriptor number cannot false-pass.
-    #[cfg(target_os = "linux")]
-    fn probe_open_temp_fds() {
-        let open = std::fs::read_dir("/proc/self/fd")
-            .expect("/proc/self/fd is readable on linux")
-            .filter_map(|e| e.ok())
-            .filter_map(|e| std::fs::read_link(e.path()).ok())
-            .filter(|target| target.to_string_lossy().contains(".fdprobe.pem.tmp."))
-            .count();
-        OPEN_TEMP_FDS_AT_REMOVE.store(open, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// #194 (P2): the temp key handle must be CLOSED before the error path
-    /// removes the temp. Windows cannot remove an open file, so with the
-    /// handle still live at removal time a failed write or fsync leaves
-    /// `.{stem}.tmp.{pid}.{n}` behind; those names are deterministic per pid
-    /// and bounded by `KEY_TEMP_ATTEMPTS`, so restarts under a reused
-    /// container pid exhaust all of them and block recovery once storage is
-    /// healthy again. Linux removes open files happily, so asserting the
-    /// removal succeeded would pass either way; the MECHANISM is asserted
-    /// instead, by sampling /proc/self/fd at the moment of removal. Linux-only
-    /// by cfg (CI is Linux); other Unixes still run the two behavioral
-    /// removal tests above. RED with the removal running before `drop(f)`.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn temp_handle_is_closed_before_error_path_removal() {
-        use std::sync::atomic::Ordering::SeqCst;
-        let dir = tempfile::tempdir().expect("tempdir");
-        // Stem unique to this test: the probe matches temp names by substring.
-        let key_path = dir.path().join("fdprobe.pem");
-        OPEN_TEMP_FDS_AT_REMOVE.store(usize::MAX, SeqCst);
-
-        let faults = PublishFaults {
-            temp_write: || Err(std::io::Error::other("simulated ENOSPC")),
-            before_temp_remove: probe_open_temp_fds,
-            ..PublishFaults::NONE
-        };
-        let err = match publish_key_atomically(&key_path, b"pem-bytes", &|| {}, &|| {}, faults) {
-            Err(e) => e,
-            Ok(_) => panic!("a failed temp write must fail the publish"),
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("failed to write key to"),
-            "the write error must be the one surfaced: {msg}"
-        );
-        assert_eq!(
-            OPEN_TEMP_FDS_AT_REMOVE.load(SeqCst),
-            0,
-            "the temp handle must already be closed when the error path removes the temp"
-        );
-        assert!(
-            names_containing(dir.path(), ".fdprobe.pem.tmp.").is_empty(),
-            "the failed write must leave no temp behind to burn a bounded name"
-        );
-    }
-
-    /// #194 (F2): a loose (world/group-readable) key that cannot be tightened is
-    /// rejected fail-closed rather than read and used exposed; a 0600 key is
-    /// accepted. RED without `ensure_key_mode_0600`: a 0644 key is used silently.
-    #[test]
-    fn loose_key_mode_is_rejected_not_used() {
-        use super::ensure_key_mode_0600;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        std::fs::write(&key_path, b"key").expect("seed file");
-
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644))
-            .expect("loosen perms");
-        let err = ensure_key_mode_0600(&key_path)
-            .expect_err("a world/group-readable key must be rejected")
-            .to_string();
-        assert!(
-            err.contains("644"),
-            "the failure must name the exposed mode: {err}"
-        );
-
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
-            .expect("tighten perms");
-        assert!(
-            ensure_key_mode_0600(&key_path).is_ok(),
-            "a 0600 key must be accepted"
-        );
-    }
-
-    /// Does this filesystem actually honor a mode change made the way the
-    /// loader makes it? The witness runs the EXACT operation the vulnerable
-    /// code performed (a path-based `set_permissions`) on a throwaway subject
-    /// and reports whether the bits moved. On a mode-ignoring mount they do
-    /// not, and a "the target's mode is unchanged" assertion would then pass
-    /// for a reason that has nothing to do with the guard under test, so the
-    /// callers below skip that assertion instead of banking a vacuous pass.
-    /// This also covers the euid-0 case the module otherwise has no guard
-    /// for: root cannot make a mode-ignoring mount honor a chmod either.
-    fn path_chmod_moves_the_bits(subject: &std::path::Path) -> bool {
-        let before = std::fs::metadata(subject)
-            .expect("witness subject exists")
-            .permissions()
-            .mode()
-            & 0o777;
-        let probe = if before == 0o600 { 0o644 } else { 0o600 };
-        if std::fs::set_permissions(subject, std::fs::Permissions::from_mode(probe)).is_err() {
-            return false;
-        }
-        let after = std::fs::metadata(subject)
-            .expect("witness subject exists")
-            .permissions()
-            .mode()
-            & 0o777;
-        // Restore before returning: a witness that leaves the subject
-        // narrowed would break the caller's own cleanup.
-        let _ = std::fs::set_permissions(subject, std::fs::Permissions::from_mode(before));
-        after == probe
-    }
-
-    /// #194 (P2): `GITLAWB_KEY` names a PATH, so an attacker who can plant a
-    /// symlink there redirects everything the loader does by name. The load
-    /// must refuse a symlinked key path outright; the symlink TARGET must
-    /// keep its original mode (the finding, stated in the must-not
-    /// direction: a privileged start must not chmod an arbitrary
-    /// service-readable file to 0600); and the refusal must NOT be
-    /// content-class, because the recovery path quarantines (destroys)
-    /// through that class and must never do so on a symlink. RED without
-    /// `O_NOFOLLOW`: the open follows the link, the target lands 0600, and
-    /// the non-PEM content is then misclassified as a corrupt key.
-    #[test]
-    fn symlinked_key_path_is_refused_and_target_untouched() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let victim = dir.path().join("victim.txt");
-        std::fs::write(&victim, b"not a key at all").expect("seed victim");
-        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644))
-            .expect("victim starts 0644");
-        let control = dir.path().join("control.txt");
-        std::fs::write(&control, b"witness").expect("seed control");
-        let bits_observable = path_chmod_moves_the_bits(&control);
-
-        let key_path = dir.path().join("identity.pem");
-        std::os::unix::fs::symlink(&victim, &key_path).expect("plant symlink at the key path");
-
-        let err = match super::load_existing_key(&key_path) {
-            Err(e) => e,
-            Ok(_) => panic!("a symlinked identity key path must be refused, not followed"),
-        };
-
-        if bits_observable {
-            let mode = std::fs::metadata(&victim)
-                .expect("the victim must still exist")
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(
-                mode, 0o644,
-                "the defensive chmod must not reach the symlink target; it landed {mode:o}"
-            );
-        }
-        assert!(
-            !super::is_key_content_error(&err),
-            "a symlink refusal must not be content-class; recovery quarantines through \
-             that class and would destroy a file it never validated. got: {err:#}"
-        );
-    }
-
-    /// #194 (P2): a key path that is not a regular file (here a directory) is
-    /// refused before anything is done to it. The discriminant matters: the
-    /// old path-based loader also ERRORED on a directory, but only at the
-    /// final `read_to_string`, after it had already chmodded the directory to
-    /// 0600, so `is_err()` alone proves nothing. The load-bearing assertions
-    /// are that the directory's mode is untouched and that the failure names
-    /// the refusal. Permissions are restored before any assertion that can
-    /// panic so `TempDir` cleanup succeeds, following
-    /// `quarantine_and_removal_both_blocked_errors_loudly`.
-    #[test]
-    fn non_regular_key_path_is_refused() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let control = dir.path().join("control");
-        std::fs::create_dir(&control).expect("seed control dir");
-        let bits_observable = path_chmod_moves_the_bits(&control);
-
-        let key_path = dir.path().join("identity.pem");
-        std::fs::create_dir(&key_path).expect("plant a directory at the key path");
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o755))
-            .expect("key dir starts 0755");
-
-        let result = super::load_existing_key(&key_path);
-        let mode = std::fs::metadata(&key_path)
-            .expect("the directory must still exist")
-            .permissions()
-            .mode()
-            & 0o777;
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o755))
-            .expect("restore the key dir before asserting");
-
-        let err = match result {
-            Err(e) => e,
-            Ok(_) => panic!("a directory at the key path must be refused, not loaded"),
-        };
-        if bits_observable {
-            assert_eq!(
-                mode, 0o755,
-                "a non-regular key path must be refused before it is chmodded; it landed {mode:o}"
-            );
-        }
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("not a regular file"),
-            "the refusal must name why it refused: {msg}"
-        );
-        assert!(
-            !super::is_key_content_error(&err),
-            "a non-regular refusal must not be content-class: {msg}"
-        );
-    }
-
-    /// A FIFO at the key path must be refused, not waited on. The directory
-    /// case above cannot catch this: opening a directory fails immediately with
-    /// EISDIR, so the `is_file` refusal is reached, while `open(O_RDONLY)` on a
-    /// FIFO BLOCKS until a writer connects and the refusal is never reached at
-    /// all. A planted named pipe therefore hangs startup forever rather than
-    /// being rejected, which is the same reachability the symlink case has (an
-    /// actor who can place the configured key path).
-    ///
-    /// The call runs on its own thread with a bounded wait so a regression
-    /// fails the test instead of hanging the suite. RED without `O_NONBLOCK` on
-    /// the open: the thread never sends and the recv times out.
-    #[test]
-    fn fifo_key_path_is_refused_rather_than_blocking() {
-        use std::os::unix::ffi::OsStrExt;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let c_path = std::ffi::CString::new(key_path.as_os_str().as_bytes()).expect("cstring");
-        // SAFETY: c_path is a valid NUL-terminated path that does not yet exist.
-        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
-        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        let probe_path = key_path.clone();
-        let handle = std::thread::spawn(move || {
-            let r = super::load_existing_key(&probe_path).map(|_| ());
-            let _ = tx.send(r);
-        });
-
-        let outcome = rx.recv_timeout(std::time::Duration::from_secs(5));
-        let err = match outcome {
-            Ok(Err(e)) => e,
-            Ok(Ok(())) => panic!("a FIFO at the key path must be refused, not loaded"),
-            Err(_) => panic!(
-                "load_existing_key blocked on a FIFO at the key path: the non-regular \
-                 refusal is unreachable because the open itself waits for a writer"
-            ),
-        };
-        handle.join().expect("probe thread");
-
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("not a regular file"),
-            "the refusal must name why it refused: {msg}"
-        );
-        assert!(
-            !super::is_key_content_error(&err),
-            "a FIFO refusal must not be content-class: {msg}"
-        );
-    }
-
-    /// Shared body for the link-failure fallback tests: with the link step
-    /// forced to fail with `kind`, the publish must fall back to a direct
-    /// `create_new(0o600)` on the final path and win; the key must be 0600 and
-    /// round-trip through the normal loader. RED without the fallback: the
-    /// link error propagates and the start fails.
-    fn assert_link_failure_falls_back(faults: PublishFaults) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let kp = Keypair::generate();
-        let pem = kp.to_pem().expect("pem");
-
-        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults)
-            .expect("a failed hard_link must fall back to a direct publish, not fail the start");
-        assert!(matches!(out, KeyPublish::Won), "fallback publish wins");
-
-        let mode = std::fs::metadata(&key_path)
-            .expect("key file exists")
-            .permissions()
-            .mode();
-        assert_eq!(
-            mode & 0o777,
-            0o600,
-            "fallback-published key must be 0600, got {:o}",
-            mode & 0o777
-        );
-        let loaded = super::load_existing_key(&key_path)
-            .expect("fallback-published key loads via the normal loader");
-        assert_eq!(
-            format!("{}", loaded.did()),
-            format!("{}", kp.did()),
-            "fallback publish must round-trip the same identity"
-        );
-    }
-
-    // A key directory whose filesystem rejects hard links with EPERM (some
-    // network/overlay mounts) must not brick a new node.
-    #[test]
-    fn permission_denied_link_falls_back_to_direct_create() {
-        assert_link_failure_falls_back(PublishFaults {
-            link: || Err(std::io::ErrorKind::PermissionDenied.into()),
-            ..PublishFaults::NONE
-        });
-    }
-
-    // A filesystem without hard-link support at all (Unsupported).
-    #[test]
-    fn unsupported_link_falls_back_to_direct_create() {
-        assert_link_failure_falls_back(PublishFaults {
-            link: || Err(std::io::ErrorKind::Unsupported.into()),
-            ..PublishFaults::NONE
-        });
-    }
-
-    // Link failure with the final ALREADY present must route to the lost-race
-    // path: the fallback's create_new hits AlreadyExists, the existing key is
-    // loaded, and it is never clobbered.
-    #[test]
-    fn link_failure_with_existing_final_loses_without_clobbering() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let winner = Keypair::generate();
-        let pem_winner = winner.to_pem().expect("pem winner");
-        let out = publish_key_atomically(
-            &key_path,
-            pem_winner.as_bytes(),
-            &|| {},
-            &|| {},
-            PublishFaults::NONE,
-        )
-        .expect("winner publishes");
-        assert!(matches!(out, KeyPublish::Won), "winner publish wins");
-
-        let pem_loser = Keypair::generate().to_pem().expect("pem loser");
-        let faults = PublishFaults {
-            link: || Err(std::io::ErrorKind::PermissionDenied.into()),
-            ..PublishFaults::NONE
-        };
-        let out = publish_key_atomically(&key_path, pem_loser.as_bytes(), &|| {}, &|| {}, faults)
-            .expect("an existing final must read as a lost race, not an error");
-        assert!(
-            matches!(out, KeyPublish::Lost),
-            "fallback loses to the existing key"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&key_path).unwrap().as_str(),
-            pem_winner.as_str(),
-            "the existing key must NOT be clobbered by the fallback"
-        );
-        let loaded = load_racing_key(&key_path).expect("lost race loads the winner");
-        assert_eq!(
-            format!("{}", loaded.did()),
-            format!("{}", winner.did()),
-            "the lost race must return the winner's identity"
-        );
-    }
-
-    // Two concurrent publishers, both with the link step failing: the
-    // fallback's create_new must admit exactly one winner and the loser must
-    // converge on the winner's key (no-clobber survives the fallback path).
-    #[test]
-    fn concurrent_fallback_publishers_converge_on_one_winner() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = std::sync::Arc::new(dir.path().join("identity.pem"));
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let handles: Vec<_> = (0..2)
-            .map(|_| {
-                let kp = key_path.clone();
-                let b = barrier.clone();
-                std::thread::spawn(move || {
-                    let me = Keypair::generate();
-                    let pem = me.to_pem().expect("pem");
-                    let faults = PublishFaults {
-                        link: || Err(std::io::ErrorKind::Unsupported.into()),
-                        ..PublishFaults::NONE
-                    };
-                    // Release both threads at once to maximize the race.
-                    b.wait();
-                    match publish_key_atomically(&kp, pem.as_bytes(), &|| {}, &|| {}, faults)
-                        .expect("fallback publish")
-                    {
-                        KeyPublish::Won => (true, format!("{}", me.did())),
-                        KeyPublish::Lost => (
-                            false,
-                            format!(
-                                "{}",
-                                load_racing_key(&kp).expect("loser loads winner").did()
-                            ),
-                        ),
-                    }
-                })
-            })
-            .collect();
-        let results: Vec<(bool, String)> = handles
-            .into_iter()
-            .map(|h| h.join().expect("thread joins"))
-            .collect();
-
-        let winners = results.iter().filter(|(won, _)| *won).count();
-        assert_eq!(
-            winners, 1,
-            "exactly one fallback create_new must win, got {results:?}"
-        );
-        assert_eq!(
-            results[0].1, results[1].1,
-            "the loser must converge on the winner's identity: {results:?}"
-        );
-    }
-
-    // A failed fallback WRITE leaves the partial final AND its marker in
-    // place: the pair is exactly the crash state boot-time recovery handles
-    // (claim, quarantine, regenerate), while an unlink here is a
-    // stat-then-unlink race against a recovery that already claimed this
-    // round and republished a live key at the name, and a marker disposed
-    // beside a kept partial final recreates the marker-less wedge the
-    // bracket exists to prevent. The error must surface the write failure
-    // AND the original link error, so a two-step failure is diagnosable.
-    #[test]
-    fn failed_fallback_write_leaves_the_partial_final_for_recovery() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let pem = Keypair::generate().to_pem().expect("pem");
-
-        let faults = PublishFaults {
-            link: || Err(std::io::ErrorKind::Unsupported.into()),
-            fallback_write: || Err(std::io::Error::other("injected write failure")),
-            ..PublishFaults::NONE
-        };
-        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults) {
-            Err(e) => e,
-            Ok(_) => panic!("a failed fallback write must error the start"),
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("injected write failure"),
-            "the error must surface the write failure: {msg}"
-        );
-        let link_display = std::io::Error::from(std::io::ErrorKind::Unsupported).to_string();
-        assert!(
-            msg.contains(&link_display),
-            "the error must chain the original link failure ({link_display}): {msg}"
-        );
-        assert!(
-            key_path.exists(),
-            "a failed fallback write must leave the partial final for boot-time recovery"
-        );
-        assert!(
-            std::fs::read(&key_path)
-                .expect("read partial final")
-                .is_empty(),
-            "the write fault fires before any byte lands, so the partial final is empty"
-        );
-    }
-
-    // A non-AlreadyExists error from the fallback's create_new open of the
-    // final path must surface, chained with the original link error, so a
-    // two-step failure (link failed, then the direct create also failed) is
-    // diagnosable. RED without the gate wired: the injected open error never
-    // reaches the real open, so the publish succeeds instead of erroring.
-    #[test]
-    fn failed_fallback_create_surfaces_the_open_error_and_chains_link_err() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let pem = Keypair::generate().to_pem().expect("pem");
-
-        let faults = PublishFaults {
-            link: || Err(std::io::ErrorKind::Unsupported.into()),
-            fallback_create: || Err(std::io::Error::other("injected fallback create failure")),
-            ..PublishFaults::NONE
-        };
-        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults) {
-            Err(e) => e,
-            Ok(_) => panic!("a failed fallback create must error the start"),
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("injected fallback create failure"),
-            "the error must surface the fallback create failure: {msg}"
-        );
-        let link_display = std::io::Error::from(std::io::ErrorKind::Unsupported).to_string();
-        assert!(
-            msg.contains(&link_display),
-            "the error must chain the original link failure ({link_display}): {msg}"
-        );
-        assert!(
-            !key_path.exists(),
-            "a failed fallback create must not leave the final key"
-        );
-    }
-
-    // A failed fallback FILE fsync takes the same keep-everything exit as
-    // the failed write: the final (complete but possibly non-durable bytes)
-    // and its marker stay in place for boot-time recovery. The
-    // complete-but-unsynced state is safe because a later healthy load
-    // fsyncs the final ITSELF before sweeping the marker
-    // (sweep_stale_markers' durability gate), and a crash before then
-    // re-enters recovery via the surviving marker.
-    #[test]
-    fn failed_fallback_fsync_leaves_the_final_for_recovery() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let pem = Keypair::generate().to_pem().expect("pem");
-
-        let faults = PublishFaults {
-            link: || Err(std::io::ErrorKind::Unsupported.into()),
-            fallback_fsync: || Err(std::io::Error::other("injected fsync failure")),
-            ..PublishFaults::NONE
-        };
-        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults) {
-            Err(e) => e,
-            Ok(_) => panic!("a failed fallback fsync must error the start"),
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("injected fsync failure"),
-            "the error must surface the fsync failure: {msg}"
-        );
-        assert!(
-            key_path.exists(),
-            "an fsync failure must leave the final in place for boot-time recovery"
-        );
-        assert_eq!(
-            std::fs::read(&key_path).expect("read final"),
-            pem.as_bytes(),
-            "the fsync fault fires after write_all, so the final holds the full PEM"
-        );
-    }
-
-    // #194: the fallback path can leave a durable empty/truncated final if a
-    // crash lands between the name becoming durable and the PEM fsync (the
-    // reconditioned KEY_RACE_DEADLINE / publish_key_atomically doc). This
-    // observes the promised behavior at the next start: such a residue must
-    // fail LOUDLY (an invalid-PEM parse error, or a mode rejection), never
-    // parse as Ok and never be replaced by a freshly generated key. This is a
-    // characterization/observation test of behavior that already exists, not a
-    // RED-first guard: it passes on current code.
-    #[test]
-    fn fallback_crash_residue_fails_loudly_not_silently() {
-        use super::{ensure_key_mode_0600, load_existing_key};
-        let dir = tempfile::tempdir().expect("tempdir");
-
-        // (1) an empty final at 0600 (durable name, no PEM bytes yet).
-        let empty = dir.path().join("empty.pem");
-        std::fs::write(&empty, b"").expect("seed empty final");
-        std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o600))
-            .expect("0600 empty");
-        let err = match load_existing_key(&empty) {
-            Err(e) => e.to_string(),
-            Ok(_) => panic!("an empty final must fail loudly, not parse as Ok"),
-        };
-        assert!(
-            err.contains("invalid PEM"),
-            "an empty final must surface a parse error, got: {err}"
-        );
-
-        // (2) a truncated/garbage non-PEM final at 0600.
-        let garbage = dir.path().join("garbage.pem");
-        std::fs::write(&garbage, b"-----BEGIN nonsense truncated").expect("seed garbage final");
-        std::fs::set_permissions(&garbage, std::fs::Permissions::from_mode(0o600))
-            .expect("0600 garbage");
-        let err = match load_existing_key(&garbage) {
-            Err(e) => e.to_string(),
-            Ok(_) => panic!("a truncated final must fail loudly, not parse as Ok"),
-        };
-        assert!(
-            err.contains("invalid PEM"),
-            "a truncated final must surface a parse error, got: {err}"
-        );
-
-        // (3) mode-rejection path: an empty final at 0400. The loader tightens a
-        // loose mode where the mount allows it, so the reachable rejection is
-        // `ensure_key_mode_0600` failing closed on a mode it cannot narrow (a
-        // mode-ignoring mount); assert that branch directly on a 0400 file.
-        let loose = dir.path().join("loose.pem");
-        std::fs::write(&loose, b"").expect("seed loose final");
-        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o400))
-            .expect("0400 loose");
-        let err = ensure_key_mode_0600(&loose)
-            .expect_err("a non-0600 final must be rejected, not used exposed")
-            .to_string();
-        assert!(
-            err.contains("400"),
-            "the mode rejection must name the exposed mode, got: {err}"
-        );
-    }
-
-    /// Env var carrying `mask:site` for `umask_worker_publish_lands_0600`.
-    const UMASK_WORKER_ENV: &str = "GITLAWB_TEST_UMASK_CASE";
-
-    /// Spawns this test binary again, running only the ignored umask worker
-    /// with `mask:site` in the environment. The umask is process-global, so
-    /// setting it in the shared test process narrows every concurrent test's
-    /// file and tempdir creation modes (observed: a parallel test's fresh
-    /// tempdir landing dr-x------ and its file create failing EACCES). A
-    /// child process that runs nothing but the one case confines the mask.
-    fn run_umask_case(mask: &str, site: &str) {
-        let exe = std::env::current_exe().expect("test binary path");
-        let out = std::process::Command::new(exe)
-            .args([
-                "identity_key_tests::umask_worker_publish_lands_0600",
-                "--exact",
-                "--ignored",
-            ])
-            .env(UMASK_WORKER_ENV, format!("{mask}:{site}"))
-            .output()
-            .expect("spawn umask worker");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        // status alone is not enough: a drifted worker name would match zero
-        // tests and still exit 0, a vacuous green.
-        assert!(
-            out.status.success() && stdout.contains("1 passed"),
-            "umask {mask} {site} worker did not pass:\nstdout:\n{stdout}\nstderr:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    /// In-child body of the umask tests: never runs in the shared suite
-    /// process (ignored without the spawning tests' env var). Publishes under
-    /// the given umask and asserts the key lands 0600 and round-trips. The
-    /// mode assertion runs BEFORE the loader call, which would otherwise
-    /// tighten a loose key itself and mask a publish-site regression.
-    #[test]
-    #[ignore = "umask worker: spawned in a child process by the umask_* tests"]
-    fn umask_worker_publish_lands_0600() {
-        let Ok(spec) = std::env::var(UMASK_WORKER_ENV) else {
-            // A manual `--ignored` sweep without the env var: nothing to do.
-            return;
-        };
-        let (mask_str, site) = spec.split_once(':').expect("spec is mask:site");
-        let mask = libc::mode_t::from_str_radix(mask_str, 8).expect("octal mask");
-        let faults = match site {
-            "hardlink" => PublishFaults::NONE,
-            "fallback" => PublishFaults {
-                link: || Err(std::io::ErrorKind::Unsupported.into()),
-                ..PublishFaults::NONE
-            },
-            other => panic!("unknown umask worker site {other:?}"),
-        };
-
-        // The tempdir is created BEFORE the mask narrows, as a deploy's key
-        // directory predates the process umask; 0277 would land the dir
-        // itself 0400. No restore: this process exists only for this case.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let kp = Keypair::generate();
-        let pem = kp.to_pem().expect("pem");
-        unsafe { libc::umask(mask) };
-
-        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults)
-            .expect("publish must succeed: the tighten repairs the umask-narrowed create mode");
-        assert!(matches!(out, KeyPublish::Won), "publish wins");
-
-        let mode = std::fs::metadata(&key_path)
-            .expect("key file exists")
-            .permissions()
-            .mode();
-        assert_eq!(
-            mode & 0o777,
-            0o600,
-            "under umask {mask:o} the published key must land 0600, got {:o}",
-            mode & 0o777
-        );
-        let loaded = super::load_existing_key(&key_path).expect("loader accepts the key");
-        assert_eq!(
-            format!("{}", loaded.did()),
-            format!("{}", kp.did()),
-            "publish under umask {mask:o} must round-trip the same identity"
-        );
-    }
-
-    /// #194 (U2): `create_new`'s requested 0600 is narrowed by the process
-    /// umask, so 0277 lands the file 0400; the tighten half of the
-    /// tighten-then-verify pair must repair it to 0600 (the verify alone
-    /// would falsely fail closed). Hard-link site. Pre-state note: before
-    /// U2 this publish already SUCCEEDED but left the key 0400 on disk, so
-    /// the mode assertion is what was RED.
-    #[test]
-    fn umask_0277_hardlink_publish_is_repaired_to_0600() {
-        run_umask_case("277", "hardlink");
-    }
-
-    /// Same repair, at the fallback creation site (link forced to fail).
-    #[test]
-    fn umask_0277_fallback_publish_is_repaired_to_0600() {
-        run_umask_case("277", "fallback");
-    }
-
-    /// #194 (U2): a permissive umask stays healthy: 0600 is already 0600 under
-    /// 0077, the tighten is a no-op, and the verify must not disturb a clean
-    /// publish. (`created_key_is_mode_0600` pins the suite's ambient umask;
-    /// these pin the boundary values explicitly.) Split per-umask so a
-    /// 0000-specific regression is not masked by a 0077 failure.
-    #[test]
-    fn permissive_umask_0077_still_publishes_0600() {
-        run_umask_case("077", "hardlink");
-    }
-
-    /// #194 (U2): the fully permissive umask 0000 stays healthy too — 0600 is
-    /// already 0600, the tighten is a no-op, and the verify must not disturb a
-    /// clean publish.
-    #[test]
-    fn permissive_umask_0000_still_publishes_0600() {
-        run_umask_case("000", "hardlink");
-    }
-
-    /// #194 (INV-23(a)): a pre-existing group/world-writable key directory is
-    /// tightened to 0700 before publish.
-    #[test]
-    fn writable_key_parent_dir_is_repaired_to_0700() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(root.path()).expect("root dir");
-        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o777))
-            .expect("world-writable root");
-        let key_path = root.path().join("keys").join("identity.pem");
-
-        let kp = load_or_create_keypair_with(
-            &key_path,
-            &|| {},
-            &|| {},
-            PublishFaults::NONE,
-            RecoverySeam::NONE,
-        )
-        .expect("publish under a writable parent must repair the parent dir");
-        assert!(key_path.exists());
-
-        let parent = key_path.parent().expect("parent dir");
-        let mode = std::fs::metadata(parent)
-            .expect("parent exists")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(
-            mode, 0o700,
-            "the identity key parent directory must be owner-only after publish"
-        );
-        let loaded = super::load_existing_key(&key_path).expect("load");
-        assert_eq!(format!("{}", loaded.did()), format!("{}", kp.did()));
-    }
-
-    /// #194 (INV-23(a)): loading an existing key still repairs a writable parent.
-    #[test]
-    fn existing_key_load_repairs_writable_parent_dir_to_0700() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = tempfile::tempdir().expect("tempdir");
-        let parent = root.path().join("keys");
-        std::fs::create_dir_all(&parent).expect("keys dir");
-        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777))
-            .expect("world-writable parent");
-        let key_path = parent.join("identity.pem");
-        let kp = Keypair::generate();
-        std::fs::write(&key_path, kp.to_pem().expect("pem")).expect("write key");
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
-            .expect("key mode");
-
-        let loaded = load_or_create_keypair_with(
-            &key_path,
-            &|| {},
-            &|| {},
-            PublishFaults::NONE,
-            RecoverySeam::NONE,
-        )
-        .expect("load existing key under a writable parent must repair the parent dir");
-
-        let mode = std::fs::metadata(&parent)
-            .expect("parent exists")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(
-            mode, 0o700,
-            "the identity key parent directory must be owner-only after load"
-        );
-        assert_eq!(format!("{}", loaded.did()), format!("{}", kp.did()));
-    }
-
-    /// #194 (INV-23(b)): fallback publish markers must land 0600 even under a
-    /// permissive umask when the write fails and the marker survives for recovery.
-    #[test]
-    fn fallback_publish_marker_is_mode_0600_under_permissive_umask() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let old_mask = unsafe { libc::umask(0) };
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let pem = Keypair::generate().to_pem().expect("pem");
-        let faults = PublishFaults {
-            link: || Err(std::io::ErrorKind::Unsupported.into()),
-            fallback_write: || Err(std::io::Error::other("injected fallback write failure")),
-            ..PublishFaults::NONE
-        };
-        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults) {
-            Err(e) => e,
-            Ok(_) => panic!("fallback write failure must surface"),
-        };
-        assert!(
-            format!("{err:#}").contains("injected fallback write failure"),
-            "write failure must propagate: {err:#}"
-        );
-        let markers = names_containing(dir.path(), ".publishing.");
-        assert_eq!(
-            markers.len(),
-            1,
-            "one publish marker must survive the failed write"
-        );
-        let marker_path = dir.path().join(&markers[0]);
-        let mode = std::fs::metadata(&marker_path)
-            .expect("marker exists")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(
-            mode, 0o600,
-            "fallback publish marker must be owner-only, got {mode:o}"
-        );
-        unsafe { libc::umask(old_mask) };
-    }
-
-    /// #194 (U2): on a mode-ignoring mount (vfat: chmod silently no-ops) the
-    /// 0600 verification of the just-created TEMP file must fail the publish
-    /// CLOSED, BEFORE any PEM byte is written. Afterwards the key directory
-    /// must be empty: the final never appeared, and the empty temp was
-    /// removed so a retry is not wedged. The error must name the temp file
-    /// and surface the verify failure.
-    #[test]
-    fn forced_temp_mode_verify_failure_fails_closed_before_any_pem_write() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let pem = Keypair::generate().to_pem().expect("pem");
-
-        let faults = PublishFaults {
-            temp_mode_verify: || Err(std::io::Error::other("injected mode-ignoring mount")),
-            ..PublishFaults::NONE
-        };
-        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults) {
-            Err(e) => e,
-            Ok(_) => panic!("an unverifiable temp mode must fail the publish closed"),
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("injected mode-ignoring mount") && msg.contains(".identity.pem.tmp."),
-            "the error must surface the verify failure and name the temp file: {msg}"
-        );
-        assert!(!key_path.exists(), "the final key must never appear");
-        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .collect();
-        assert!(
-            leftovers.is_empty(),
-            "no PEM byte may hit disk and the empty temp must be removed: {leftovers:?}"
-        );
-    }
-
-    /// #194 (U2): the same fail-closed check at the FALLBACK creation site
-    /// (link fault + verify fault). The just-created EMPTY final must be
-    /// removed, no PEM byte may have hit it, the error must chain the
-    /// original link failure, and a subsequent retry on a healthy mount must
-    /// publish cleanly rather than wedge on AlreadyExists.
-    #[test]
-    fn forced_fallback_mode_verify_failure_removes_the_empty_final() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let kp = Keypair::generate();
-        let pem = kp.to_pem().expect("pem");
-
-        let faults = PublishFaults {
-            link: || Err(std::io::ErrorKind::Unsupported.into()),
-            fallback_mode_verify: || Err(std::io::Error::other("injected mode-ignoring mount")),
-            ..PublishFaults::NONE
-        };
-        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults) {
-            Err(e) => e,
-            Ok(_) => panic!("an unverifiable final mode must fail the publish closed"),
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("injected mode-ignoring mount") && msg.contains("identity.pem"),
-            "the error must surface the verify failure and name the final: {msg}"
-        );
-        let link_display = std::io::Error::from(std::io::ErrorKind::Unsupported).to_string();
-        assert!(
-            msg.contains(&link_display),
-            "the error must chain the original link failure ({link_display}): {msg}"
-        );
-        assert!(
-            !key_path.exists(),
-            "the empty final must be removed so a retry is not wedged"
-        );
-        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .collect();
-        assert!(
-            leftovers.is_empty(),
-            "nothing may remain on disk after the fail-closed publish: {leftovers:?}"
-        );
-
-        // The removal is what un-wedges the retry: after a remount (or on a
-        // start whose chmod works) the same path must publish cleanly.
-        let retry_faults = PublishFaults {
-            link: || Err(std::io::ErrorKind::Unsupported.into()),
-            ..PublishFaults::NONE
-        };
-        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, retry_faults)
-            .expect("a retry after the fail-closed publish must not be wedged");
-        assert!(matches!(out, KeyPublish::Won), "retry wins cleanly");
-        let loaded = super::load_existing_key(&key_path).expect("retried key loads");
-        assert_eq!(
-            format!("{}", loaded.did()),
-            format!("{}", kp.did()),
-            "the retry must publish the intended identity"
-        );
-    }
-
-    /// Lists leftover `.{stem}.publishing.*` marker files in `dir` (#194, U1).
-    fn publishing_markers(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-        std::fs::read_dir(dir)
-            .unwrap()
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| {
-                p.file_name()
-                    .map(|n| n.to_string_lossy().contains(".publishing."))
-                    .unwrap_or(false)
-            })
-            .collect()
-    }
-
-    /// #194 (U1): a successful fallback publish (link forced to fail) must win,
-    /// round-trip the key through the normal loader, and leave NO publish
-    /// marker behind: the marker exists only for the non-atomic window.
-    #[test]
-    fn fallback_publish_succeeds_and_leaves_no_marker() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let kp = Keypair::generate();
-        let pem = kp.to_pem().expect("pem");
-
-        let faults = PublishFaults {
-            link: || Err(std::io::ErrorKind::Unsupported.into()),
-            ..PublishFaults::NONE
-        };
-        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults)
-            .expect("fallback publish");
-        assert!(matches!(out, KeyPublish::Won), "fallback publish wins");
-        let loaded = super::load_existing_key(&key_path).expect("published key loads");
-        assert_eq!(
-            format!("{}", loaded.did()),
-            format!("{}", kp.did()),
-            "fallback publish must round-trip the same identity"
-        );
-        let markers = publishing_markers(dir.path());
-        assert!(
-            markers.is_empty(),
-            "a successful fallback publish must remove its marker, found {markers:?}"
-        );
-    }
-
-    /// #194 (U1): a fallback that loses the create race (final already present)
-    /// must still behave as today (existing key loaded, never clobbered) and
-    /// must remove its own marker on the lost-race exit.
-    #[test]
-    fn lost_fallback_race_leaves_no_marker() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let winner = Keypair::generate();
-        let pem_winner = winner.to_pem().expect("pem winner");
-        let out = publish_key_atomically(
-            &key_path,
-            pem_winner.as_bytes(),
-            &|| {},
-            &|| {},
-            PublishFaults::NONE,
-        )
-        .expect("winner publishes");
-        assert!(matches!(out, KeyPublish::Won), "winner publish wins");
-
-        let pem_loser = Keypair::generate().to_pem().expect("pem loser");
-        let faults = PublishFaults {
-            link: || Err(std::io::ErrorKind::PermissionDenied.into()),
-            ..PublishFaults::NONE
-        };
-        let out = publish_key_atomically(&key_path, pem_loser.as_bytes(), &|| {}, &|| {}, faults)
-            .expect("an existing final must read as a lost race, not an error");
-        assert!(matches!(out, KeyPublish::Lost), "fallback loses");
-        let loaded = load_racing_key(&key_path).expect("lost race loads the winner");
-        assert_eq!(
-            format!("{}", loaded.did()),
-            format!("{}", winner.did()),
-            "the lost race must return the winner's identity"
-        );
-        let markers = publishing_markers(dir.path());
-        assert!(
-            markers.is_empty(),
-            "a lost fallback race must remove its own marker, found {markers:?}"
-        );
-    }
-
-    /// Shared body for the PRE-write fallback error arms (#194, U1): with the
-    /// link fault plus one injected fallback fault, the error must surface as
-    /// today, the final must be absent (nothing recoverable exists before the
-    /// first PEM byte, so those arms remove it), and no publish marker may
-    /// remain. The POST-write arms (write/fsync) have the opposite contract;
-    /// see `assert_post_write_failure_leaves_marker_and_final`.
-    fn assert_fallback_error_leaves_no_marker_or_final(faults: PublishFaults, injected: &str) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let pem = Keypair::generate().to_pem().expect("pem");
-
-        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults) {
-            Err(e) => e,
-            Ok(_) => panic!("the injected fallback fault must error the publish"),
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains(injected),
-            "the error must surface the injected fault: {msg}"
-        );
-        assert!(
-            !key_path.exists(),
-            "the final must be absent per the existing removal policy"
-        );
-        let markers = publishing_markers(dir.path());
-        assert!(
-            markers.is_empty(),
-            "an errored fallback must dispose its marker, found {markers:?}"
-        );
-    }
-
-    #[test]
-    fn failed_fallback_create_leaves_no_marker() {
-        assert_fallback_error_leaves_no_marker_or_final(
-            PublishFaults {
-                link: || Err(std::io::ErrorKind::Unsupported.into()),
-                fallback_create: || Err(std::io::Error::other("injected fallback create failure")),
-                ..PublishFaults::NONE
-            },
-            "injected fallback create failure",
-        );
-    }
-
-    /// Shared body for the POST-write fallback error arms (write/fsync): the
-    /// error must surface the injected fault AND name the boot-time recovery
-    /// handoff, the final must SURVIVE, and its `.publishing.` marker must
-    /// SURVIVE beside it: marker+final together is the recoverable crash
-    /// state, and marker-less partial final is the permanent wedge.
-    fn assert_post_write_failure_leaves_marker_and_final(faults: PublishFaults, injected: &str) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let pem = Keypair::generate().to_pem().expect("pem");
-
-        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults) {
-            Err(e) => e,
-            Ok(_) => panic!("the injected fallback fault must error the publish"),
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains(injected),
-            "the error must surface the injected fault: {msg}"
-        );
-        assert!(
-            msg.contains("left in place for boot-time crash recovery"),
-            "the error must name the recovery handoff: {msg}"
-        );
-        assert!(
-            key_path.exists(),
-            "the final must survive a post-write failure for boot-time recovery"
-        );
-        let markers = publishing_markers(dir.path());
-        assert_eq!(
-            markers.len(),
-            1,
-            "the marker must survive to vouch for the partial final, found {markers:?}"
-        );
-    }
-
-    #[test]
-    fn failed_fallback_write_leaves_the_marker_and_final() {
-        assert_post_write_failure_leaves_marker_and_final(
-            PublishFaults {
-                link: || Err(std::io::ErrorKind::Unsupported.into()),
-                fallback_write: || Err(std::io::Error::other("injected write failure")),
-                ..PublishFaults::NONE
-            },
-            "injected write failure",
-        );
-    }
-
-    #[test]
-    fn failed_fallback_fsync_leaves_the_marker_and_final() {
-        assert_post_write_failure_leaves_marker_and_final(
-            PublishFaults {
-                link: || Err(std::io::ErrorKind::Unsupported.into()),
-                fallback_fsync: || Err(std::io::Error::other("injected fsync failure")),
-                ..PublishFaults::NONE
-            },
-            "injected fsync failure",
-        );
-    }
-
-    // The handoff the post-write arms promise must actually work: take the
-    // exact state a failed fallback write leaves behind (partial final plus
-    // its marker) and run a fresh boot over it. The boot must classify the
-    // crash signature, claim the marker, quarantine the partial final, and
-    // regenerate: no wedge, no leftover marker or claim.
-    #[test]
-    fn post_write_failure_state_is_recoverable() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let pem = Keypair::generate().to_pem().expect("pem");
-        let faults = PublishFaults {
-            link: || Err(std::io::ErrorKind::Unsupported.into()),
-            fallback_write: || Err(std::io::Error::other("injected write failure")),
-            ..PublishFaults::NONE
-        };
-        if publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults).is_ok() {
-            panic!("the injected write fault must error the publish");
-        }
-        assert!(
-            key_path.exists() && publishing_markers(dir.path()).len() == 1,
-            "precondition: the failed publish leaves final plus marker"
-        );
-
-        let kp = load_or_create_keypair(&key_config(&key_path))
-            .expect("the left-behind crash state must recover, not wedge the start");
-
-        let on_disk = super::load_existing_key(&key_path).expect("regenerated final parses");
-        assert_eq!(
-            format!("{}", on_disk.did()),
-            format!("{}", kp.did()),
-            "the returned identity must match the regenerated on-disk key"
-        );
-        let quarantined = names_containing(dir.path(), ".quarantined.");
-        assert_eq!(
-            quarantined.len(),
-            1,
-            "the partial final must be quarantined: {quarantined:?}"
-        );
-        assert!(
-            names_containing(dir.path(), ".publishing.").is_empty(),
-            "recovery must consume the publish marker"
-        );
-        assert!(
-            names_containing(dir.path(), ".recovering.").is_empty(),
-            "the recovery claim must be released"
-        );
-    }
-
-    #[test]
-    fn failed_fallback_mode_verify_leaves_no_marker() {
-        assert_fallback_error_leaves_no_marker_or_final(
-            PublishFaults {
-                link: || Err(std::io::ErrorKind::Unsupported.into()),
-                fallback_mode_verify: || Err(std::io::Error::other("injected mode-ignoring mount")),
-                ..PublishFaults::NONE
-            },
-            "injected mode-ignoring mount",
-        );
-    }
-
-    /// #194 (U1): marker-name probing is bounded like the temp names. With
-    /// every candidate marker name taken the fallback must fail loudly, naming
-    /// the stale prefix and directory, and must never create the final.
-    #[test]
-    fn marker_name_exhaustion_errors_loudly_and_never_creates_the_final() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let pem = Keypair::generate().to_pem().expect("pem");
-
-        for attempt in 0..KEY_TEMP_ATTEMPTS {
-            let stale = dir.path().join(format!(
-                ".identity.pem.publishing.{}.{attempt}",
-                std::process::id()
-            ));
-            std::fs::write(&stale, b"").expect("seed stale marker");
-        }
-
-        let faults = PublishFaults {
-            link: || Err(std::io::ErrorKind::Unsupported.into()),
-            ..PublishFaults::NONE
-        };
-        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults) {
-            Err(e) => e,
-            Ok(_) => panic!("the fallback must fail when every marker name is taken"),
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains(&format!(".identity.pem.publishing.{}", std::process::id()))
-                && msg.contains(&dir.path().display().to_string()),
-            "the error must name the marker prefix and directory: {msg}"
-        );
-        assert!(
-            !key_path.exists(),
-            "an exhausted marker probe must not create the final key"
-        );
-    }
-
-    /// #194 (U1): a failed marker DIR fsync must NOT fail the publish
-    /// (warn-and-continue): on dir-fsync-hostile mounts a hard gate would turn
-    /// "wedge once then recover" into "never provisions". The publish must
-    /// still win, the key must load, and the marker must still be removed.
-    #[test]
-    fn marker_fsync_failure_does_not_fail_the_publish() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let kp = Keypair::generate();
-        let pem = kp.to_pem().expect("pem");
-
-        let faults = PublishFaults {
-            link: || Err(std::io::ErrorKind::Unsupported.into()),
-            marker_fsync: || Err(std::io::Error::other("injected marker dir fsync failure")),
-            ..PublishFaults::NONE
-        };
-        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults)
-            .expect("a marker dir fsync failure must not fail the publish");
-        assert!(matches!(out, KeyPublish::Won), "publish still wins");
-        let loaded = super::load_existing_key(&key_path).expect("published key loads");
-        assert_eq!(
-            format!("{}", loaded.did()),
-            format!("{}", kp.did()),
-            "publish must round-trip the same identity"
-        );
-        let markers = publishing_markers(dir.path());
-        assert!(
-            markers.is_empty(),
-            "the marker must still be removed, found {markers:?}"
-        );
-    }
-
-    /// #194 (U1): the primary hard-link path must never touch the marker
-    /// machinery. The `marker_create` hook is poisoned, so if the primary path
-    /// ever created a marker the publish would error; it must win untouched
-    /// and leave no `.publishing.` file.
-    #[test]
-    fn primary_hardlink_publish_never_creates_a_marker() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let kp = Keypair::generate();
-        let pem = kp.to_pem().expect("pem");
-
-        let faults = PublishFaults {
-            marker_create: || Err(std::io::Error::other("marker created on the primary path")),
-            ..PublishFaults::NONE
-        };
-        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults)
-            .expect("the primary path must never reach the marker machinery");
-        assert!(matches!(out, KeyPublish::Won), "primary publish wins");
-        let loaded = super::load_existing_key(&key_path).expect("published key loads");
-        assert_eq!(
-            format!("{}", loaded.did()),
-            format!("{}", kp.did()),
-            "primary publish must round-trip the same identity"
-        );
-        let markers = publishing_markers(dir.path());
-        assert!(
-            markers.is_empty(),
-            "the primary path must never create a marker, found {markers:?}"
-        );
-    }
-
-    /// Seed the on-disk signature of a fallback publish crashed mid-write
-    /// (#194, U2): a 0600 final holding `content` (empty or truncated) beside
-    /// a `.publishing.` marker carrying a foreign (crashed) process's pid.
-    /// Returns the final's path.
-    fn seed_crash_state(dir: &std::path::Path, content: &[u8]) -> std::path::PathBuf {
-        let key_path = dir.join("identity.pem");
-        std::fs::write(&key_path, content).expect("seed crashed final");
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
-            .expect("0600 crashed final");
-        std::fs::write(dir.join(".identity.pem.publishing.99999.0"), b"")
-            .expect("seed publish marker");
-        key_path
-    }
-
-    /// Set `path`'s mtime `spec` into the past via GNU `touch -d` (std::fs
-    /// cannot set arbitrary mtimes; spawning coreutils is test-only).
-    fn set_mtime_past(path: &std::path::Path, spec: &str) {
-        let status = std::process::Command::new("touch")
-            .arg("-d")
-            .arg(spec)
-            .arg(path)
-            .status()
-            .expect("run touch -d");
-        assert!(status.success(), "touch -d must succeed to age {path:?}");
-    }
-
-    /// Set `path`'s mtime an hour into the past, far beyond
-    /// `CLAIM_SWEEP_MIN_AGE`.
-    fn age_beyond_claim_sweep(path: &std::path::Path) {
-        set_mtime_past(path, "1 hour ago");
-    }
-
-    /// File names in `dir` containing `needle` (marker/claim/quarantine sweeps).
-    fn names_containing(dir: &std::path::Path, needle: &str) -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(dir)
-            .expect("read_dir")
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.contains(needle))
-            .collect();
-        names.sort();
-        names
-    }
-
-    fn key_config(key_path: &std::path::Path) -> Config {
-        Config::parse_from([
-            "gitlawb-node",
-            "--key-path",
-            key_path.to_str().expect("utf8 path"),
-        ])
-    }
-
-    // #194 (U2): a `.publishing.` marker beside an EMPTY final is the crash
-    // signature of an interrupted fallback publish; boot must claim the
-    // marker, quarantine the empty final, and regenerate instead of wedging
-    // on `invalid PEM key` forever. RED before U2: load_or_create_keypair
-    // errors with `invalid PEM key`.
-    #[test]
-    fn recovery_regenerates_after_crash_leaves_empty_final() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = seed_crash_state(dir.path(), b"");
-
-        let started = std::time::Instant::now();
-        let kp = load_or_create_keypair(&key_config(&key_path))
-            .expect("a crash-marked empty final must recover, not wedge the start");
-        let elapsed = started.elapsed();
-        // The crash signature short-circuits after two ~2ms polls; 2s is
-        // generous for CI machines yet far under the 5s KEY_RACE_DEADLINE a
-        // deadline-riding load would burn before recovery could even start.
-        assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "recovery must short-circuit on the crash signature, not ride \
-             KEY_RACE_DEADLINE: took {elapsed:?}"
-        );
-
-        let mode = std::fs::metadata(&key_path)
-            .expect("regenerated final exists")
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o600, "regenerated final must be 0600");
-        let on_disk = super::load_existing_key(&key_path).expect("regenerated final parses");
-        assert_eq!(
-            format!("{}", on_disk.did()),
-            format!("{}", kp.did()),
-            "the returned identity must match the regenerated on-disk key"
-        );
-        assert!(
-            names_containing(dir.path(), ".publishing.").is_empty(),
-            "recovery must consume the publish marker(s)"
-        );
-        assert!(
-            names_containing(dir.path(), ".recovering.").is_empty(),
-            "the recovery claim must be removed after the publish resolves"
-        );
-        let quarantined = names_containing(dir.path(), ".quarantined.");
-        assert_eq!(
-            quarantined.len(),
-            1,
-            "exactly one quarantine file must exist: {quarantined:?}"
-        );
-        let bytes = std::fs::read(dir.path().join(&quarantined[0])).expect("read quarantine");
-        assert!(
-            bytes.is_empty(),
-            "the quarantine must preserve the crashed final's (empty) content"
-        );
-    }
-
-    // #194 (U2): same recovery for a final holding a truncated PEM, and the
-    // quarantine (a rename) must preserve the truncated bytes exactly for
-    // post-mortem inspection.
-    #[test]
-    fn recovery_quarantines_truncated_final_preserving_bytes() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let pem = Keypair::generate().to_pem().expect("pem");
-        let truncated = &pem.as_bytes()[..pem.len() / 2];
-        let key_path = seed_crash_state(dir.path(), truncated);
-
-        let kp = load_or_create_keypair(&key_config(&key_path))
-            .expect("a crash-marked truncated final must recover, not wedge the start");
-
-        let on_disk = super::load_existing_key(&key_path).expect("regenerated final parses");
-        assert_eq!(
-            format!("{}", on_disk.did()),
-            format!("{}", kp.did()),
-            "the returned identity must match the regenerated on-disk key"
-        );
-        let quarantined = names_containing(dir.path(), ".quarantined.");
-        assert_eq!(
-            quarantined.len(),
-            1,
-            "exactly one quarantine file must exist: {quarantined:?}"
-        );
-        let bytes = std::fs::read(dir.path().join(&quarantined[0])).expect("read quarantine");
-        assert_eq!(
-            bytes, truncated,
-            "the quarantine must hold exactly the truncated input bytes"
-        );
-    }
-
-    // #194 (U2): quarantine-name probing is bounded like the temp and marker
-    // names. With EVERY candidate quarantine name taken, recovery must fall
-    // back to REMOVING the corrupt final (not rename it, not clobber a stale
-    // quarantine) and still regenerate successfully. Sentinel bytes in each
-    // stale quarantine prove no rename landed. Load-bearing by mutation
-    // check: with the remove_file fallback disabled, the corrupt final
-    // survives, the retry publish loses to it, and the boot fails loudly.
-    #[test]
-    fn quarantine_exhaustion_falls_back_to_removal() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = seed_crash_state(dir.path(), b"");
-        for n in 0..KEY_TEMP_ATTEMPTS {
-            let stale = dir.path().join(format!(
-                ".identity.pem.quarantined.{}.{n}",
-                std::process::id()
-            ));
-            std::fs::write(&stale, b"sentinel").expect("seed stale quarantine");
-        }
-
-        let kp = load_or_create_keypair(&key_config(&key_path))
-            .expect("an exhausted quarantine probe must fall back to removal, not wedge");
-
-        let on_disk = super::load_existing_key(&key_path).expect("regenerated final parses");
-        assert_eq!(
-            format!("{}", on_disk.did()),
-            format!("{}", kp.did()),
-            "the returned identity must match the regenerated on-disk key"
-        );
-        let quarantined = names_containing(dir.path(), ".quarantined.");
-        assert_eq!(
-            quarantined.len(),
-            KEY_TEMP_ATTEMPTS as usize,
-            "the final must be removed, not quarantined under a fresh name: {quarantined:?}"
-        );
-        for name in &quarantined {
-            let bytes = std::fs::read(dir.path().join(name)).expect("read stale quarantine");
-            assert_eq!(
-                bytes, b"sentinel",
-                "no stale quarantine may be clobbered by a rename: {name}"
-            );
-        }
-        assert!(
-            names_containing(dir.path(), ".publishing.").is_empty(),
-            "recovery must consume the publish marker(s)"
-        );
-        assert!(
-            names_containing(dir.path(), ".recovering.").is_empty(),
-            "the recovery claim must be released after the publish resolves"
-        );
-    }
-
-    // #194 (U2/F1): with every quarantine name taken AND removal blocked,
-    // recovery must surface the loud chained error, never a silent success.
-    // The dir turns read-only via the before_reparse seam (after the claim
-    // rename lands; a dir made read-only up front would fail the claim step
-    // and never reach the quarantine arm at all). The same read-only dir
-    // necessarily blocks the claim release too, so phase two restores
-    // permissions and proves the leftover claim is itself recoverable (F3):
-    // the next boot claims it, removes the final, and regenerates cleanly.
-    #[test]
-    fn quarantine_and_removal_both_blocked_errors_loudly() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = seed_crash_state(dir.path(), b"");
-        for n in 0..KEY_TEMP_ATTEMPTS {
-            let stale = dir.path().join(format!(
-                ".identity.pem.quarantined.{}.{n}",
-                std::process::id()
-            ));
-            std::fs::write(&stale, b"sentinel").expect("seed stale quarantine");
-        }
-        let lock_path = dir.path().to_path_buf();
-        let lock_dir = move || {
-            std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o555))
-                .expect("read-only key dir inside the claim window");
-        };
-        let seam = RecoverySeam {
-            before_reparse: &lock_dir,
-            ..RecoverySeam::NONE
-        };
-
-        let result =
-            load_or_create_keypair_with(&key_path, &|| {}, &|| {}, PublishFaults::NONE, seam);
-
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
-            .expect("restore key dir");
-        let err = match result {
-            Err(e) => e,
-            Ok(_) => panic!("a blocked quarantine AND removal must fail loudly, not resolve"),
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("could not quarantine or remove")
-                && msg.contains(&key_path.display().to_string())
-                && msg.contains("invalid PEM key"),
-            "the error must chain the recovery failure and the load failure: {msg}"
-        );
-        assert!(
-            key_path.exists(),
-            "the corrupt final must survive for post-mortem when nothing can dispose of it"
-        );
-
-        // Phase two: the claim left behind (the read-only dir blocked its
-        // release too) must make the state recoverable, not wedge it. F2
-        // makes a fresh claim invisible to recovery (it could gate a LIVE
-        // round), so age the leftovers past the floor first, standing in for
-        // the bounded wait a real next boot would incur.
-        for name in names_containing(dir.path(), ".recovering.") {
-            age_beyond_claim_sweep(&dir.path().join(name));
-        }
-        let kp = load_or_create_keypair(&key_config(&key_path))
-            .expect("the leftover claim must be claimable by the next boot, not a wedge");
-        let on_disk = super::load_existing_key(&key_path).expect("regenerated final parses");
-        assert_eq!(
-            format!("{}", on_disk.did()),
-            format!("{}", kp.did()),
-            "the returned identity must match the regenerated on-disk key"
-        );
-        assert!(
-            names_containing(dir.path(), ".recovering.").is_empty(),
-            "the follow-up boot must consume and release every claim"
-        );
-        assert!(
-            names_containing(dir.path(), ".publishing.").is_empty(),
-            "no publish markers may remain"
-        );
-        let quarantined = names_containing(dir.path(), ".quarantined.");
-        assert_eq!(
-            quarantined.len(),
-            KEY_TEMP_ATTEMPTS as usize,
-            "the follow-up boot must also fall back to removal: {quarantined:?}"
-        );
-    }
-
-    // MUST-NOT (#194, U2): an unparseable final WITHOUT a marker is operator
-    // corruption, not a crash signature; it must keep today's loud fail
-    // bit-for-bit: same `invalid PEM key` message, final left on disk with
-    // identical bytes, no quarantine, no regeneration. Rides the full
-    // KEY_RACE_DEADLINE (~5s), as today. Pre-implementation this must PASS;
-    // after GREEN it is the mutation guard for the marker-presence check.
-    #[test]
-    fn bad_final_without_marker_still_fails_loudly() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let garbage: &[u8] = b"-----BEGIN nonsense truncated";
-        std::fs::write(&key_path, garbage).expect("seed garbage final");
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
-            .expect("0600 garbage final");
-
-        let err = match load_or_create_keypair(&key_config(&key_path)) {
-            Err(e) => e,
-            Ok(_) => panic!("a marker-less corrupt final must fail loudly, never regenerate"),
-        };
-        assert!(
-            err.to_string().contains("invalid PEM key"),
-            "the load failure must surface unchanged: {err:#}"
-        );
-        assert_eq!(
-            std::fs::read(&key_path).expect("final still on disk"),
-            garbage,
-            "the corrupt final must be left untouched"
-        );
-        assert!(
-            names_containing(dir.path(), ".quarantined.").is_empty(),
-            "no quarantine may be created without a marker"
-        );
-    }
-
-    // MUST-NOT (#194, U2): a VALID final beside a stale marker loads
-    // unchanged: same identity, same bytes, no quarantine. (U4 adds marker
-    // hygiene; U2 may leave the stale marker in place.)
-    #[test]
-    fn valid_final_with_stale_marker_loads_unchanged() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let existing = Keypair::generate();
-        let pem = existing.to_pem().expect("pem");
-        let key_path = seed_crash_state(dir.path(), pem.as_bytes());
-
-        let kp = load_or_create_keypair(&key_config(&key_path))
-            .expect("a valid final with a stale marker must load");
-
-        assert_eq!(
-            format!("{}", kp.did()),
-            format!("{}", existing.did()),
-            "the pre-existing identity must be preserved, not regenerated"
-        );
-        assert_eq!(
-            std::fs::read(&key_path).expect("final still on disk"),
-            pem.as_bytes(),
-            "the valid final's bytes must be untouched"
-        );
-        assert!(
-            names_containing(dir.path(), ".quarantined.").is_empty(),
-            "a valid final must never be quarantined"
-        );
-    }
-
-    // MUST-NOT (#194, U2): a TRANSIENT (non-content) load failure must never
-    // recover, even with a marker present: loud error, no quarantine, final
-    // and marker untouched. The seam's load fault injects the transient class
-    // deterministically. Rides the full KEY_RACE_DEADLINE (~5s). RED if
-    // recovery keys on any-error instead of content-class.
-    #[test]
-    fn transient_error_with_marker_never_recovers() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let pem = Keypair::generate().to_pem().expect("pem");
-        let key_path = seed_crash_state(dir.path(), pem.as_bytes());
-        let seam = RecoverySeam {
-            load_fault: || Err(std::io::Error::other("injected transient load failure")),
-            ..RecoverySeam::NONE
-        };
-
-        let err =
-            match load_or_create_keypair_with(&key_path, &|| {}, &|| {}, PublishFaults::NONE, seam)
-            {
-                Err(e) => e,
-                Ok(_) => panic!("a transient-class load failure must stay loud, never recover"),
-            };
-        assert!(
-            format!("{err:#}").contains("injected transient load failure"),
-            "the transient failure must surface: {err:#}"
-        );
-        assert_eq!(
-            std::fs::read(&key_path).expect("final still on disk"),
-            pem.as_bytes(),
-            "the final must be untouched by a transient failure"
-        );
-        assert_eq!(
-            names_containing(dir.path(), ".publishing."),
-            vec![".identity.pem.publishing.99999.0".to_string()],
-            "the marker must be untouched"
-        );
-        assert!(
-            names_containing(dir.path(), ".quarantined.").is_empty(),
-            "a transient failure must never quarantine"
-        );
-    }
-
-    // #194 (U2): recovery runs AT MOST ONCE per start. After the first
-    // recovery completes, the seam re-plants a crash state (marker + empty
-    // final) before the retry publish; the second load failure must surface
-    // as an error, not recover again. Exactly one quarantine, from the first
-    // pass. Rides the full KEY_RACE_DEADLINE (~5s) on the second load.
-    #[test]
-    fn recovery_runs_at_most_once_per_start() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = seed_crash_state(dir.path(), b"");
-        let replanted = std::sync::atomic::AtomicBool::new(false);
-        let replant_path = key_path.clone();
-        let replant_marker = dir.path().join(".identity.pem.publishing.88888.0");
-        let before_publish = move || {
-            if !replanted.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                std::fs::write(&replant_marker, b"").expect("re-plant marker");
-                std::fs::write(&replant_path, b"").expect("re-plant empty final");
-                std::fs::set_permissions(&replant_path, std::fs::Permissions::from_mode(0o600))
-                    .expect("0600 re-planted final");
-            }
-        };
-        let seam = RecoverySeam {
-            before_publish: &before_publish,
-            ..RecoverySeam::NONE
-        };
-
-        let err =
-            match load_or_create_keypair_with(&key_path, &|| {}, &|| {}, PublishFaults::NONE, seam)
-            {
-                Err(e) => e,
-                Ok(_) => {
-                    panic!("a second crash state in the same start must error, not recover again")
-                }
-            };
-        assert!(
-            err.to_string().contains("invalid PEM key"),
-            "the second load failure must surface unchanged: {err:#}"
-        );
-        let quarantined = names_containing(dir.path(), ".quarantined.");
-        assert_eq!(
-            quarantined.len(),
-            1,
-            "exactly one quarantine, from the first recovery: {quarantined:?}"
-        );
-    }
-
-    // #194 (U2): two concurrent boots against the same crash state must admit
-    // exactly ONE recoverer (the atomic claim rename arbitrates); both end on
-    // the SAME identity, one quarantine, no markers or claims left behind.
-    // Modeled on concurrent_starts_converge_on_one_identity.
-    #[test]
-    fn claim_race_admits_exactly_one_recoverer() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = seed_crash_state(dir.path(), b"");
-        let config = std::sync::Arc::new(key_config(&key_path));
-
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let handles: Vec<_> = (0..2)
-            .map(|_| {
-                let c = config.clone();
-                let b = barrier.clone();
-                std::thread::spawn(move || {
-                    b.wait();
-                    format!(
-                        "{}",
-                        load_or_create_keypair(&c).expect("recovering start").did()
-                    )
-                })
-            })
-            .collect();
-        let dids: Vec<String> = handles
-            .into_iter()
-            .map(|h| h.join().expect("thread joins"))
-            .collect();
-
-        assert_eq!(
-            dids[0], dids[1],
-            "both concurrent recovering starts must converge on one identity"
-        );
-        let quarantined = names_containing(dir.path(), ".quarantined.");
-        assert_eq!(
-            quarantined.len(),
-            1,
-            "exactly one recoverer must quarantine: {quarantined:?}"
-        );
-        assert!(
-            names_containing(dir.path(), ".publishing.").is_empty(),
-            "no publish markers may remain"
-        );
-        assert!(
-            names_containing(dir.path(), ".recovering.").is_empty(),
-            "no recovery claims may remain"
-        );
-    }
-
-    // #194 (U2): the Lost arm participates in recovery. The publisher's link
-    // is forced to fail (fallback path) and the crash state (foreign marker +
-    // empty final) appears between the temp write and the link, so the
-    // publish loses to the crashed final; the Lost-arm load must then take
-    // the recovery path and regenerate.
-    #[test]
-    fn lost_race_load_failure_takes_recovery_path() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let planted = std::sync::atomic::AtomicBool::new(false);
-        let plant_path = key_path.clone();
-        let plant_marker = dir.path().join(".identity.pem.publishing.77777.0");
-        let before_link = move || {
-            if !planted.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                std::fs::write(&plant_marker, b"").expect("plant marker");
-                std::fs::write(&plant_path, b"").expect("plant empty final");
-                std::fs::set_permissions(&plant_path, std::fs::Permissions::from_mode(0o600))
-                    .expect("0600 planted final");
-            }
-        };
-        let faults = PublishFaults {
-            link: || Err(std::io::ErrorKind::Unsupported.into()),
-            ..PublishFaults::NONE
-        };
-
-        let kp = load_or_create_keypair_with(
-            &key_path,
-            &before_link,
-            &|| {},
-            faults,
-            RecoverySeam::NONE,
-        )
-        .expect("a lost race onto a crash-state final must recover, not fail the start");
-
-        let on_disk = super::load_existing_key(&key_path).expect("regenerated final parses");
-        assert_eq!(
-            format!("{}", on_disk.did()),
-            format!("{}", kp.did()),
-            "the returned identity must match the regenerated on-disk key"
-        );
-        let quarantined = names_containing(dir.path(), ".quarantined.");
-        assert_eq!(
-            quarantined.len(),
-            1,
-            "exactly one quarantine file must exist: {quarantined:?}"
-        );
-        assert!(
-            names_containing(dir.path(), ".publishing.").is_empty(),
-            "no publish markers may remain"
-        );
-        assert!(
-            names_containing(dir.path(), ".recovering.").is_empty(),
-            "no recovery claims may remain"
-        );
-    }
-
-    // #194 (U3): THE divergence race. A fallback winner whose final is already
-    // durable but which stalls before removing its marker can have its round
-    // stolen by a recovering peer: the peer claims the winner's marker,
-    // quarantines the winner's final, and republishes key B. The winner's
-    // OWN-MARKER removal is the commit check; losing it must demote the winner
-    // to Lost so it converges on B, never returning Won with key A while disk
-    // holds B. RED before U3: the publish returns Won with the quarantined key
-    // A while the final holds B (two-sided divergence).
-    #[test]
-    fn stalled_winner_demotes_when_recovery_claims_its_round() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let kp_b = Keypair::generate();
-        let pem_b = kp_b.to_pem().expect("pem b");
-
-        let fired = std::sync::atomic::AtomicBool::new(false);
-        let steal_dir = dir.path().to_path_buf();
-        let steal_path = key_path.clone();
-        let before_commit = move || {
-            if fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                return;
-            }
-            // A full concurrent recovery inside A's stall window (post
-            // final-fsync, pre commit check), step for step what
-            // recover_crashed_publish does: claim A's marker by rename,
-            // quarantine A's final, republish key B, clear the claim.
-            let markers = names_containing(&steal_dir, ".publishing.");
-            assert_eq!(
-                markers.len(),
-                1,
-                "A's window must be bracketed: {markers:?}"
-            );
-            let claim = steal_dir.join(".identity.pem.recovering.55555");
-            std::fs::rename(steal_dir.join(&markers[0]), &claim).expect("claim A's marker");
-            std::fs::rename(
-                &steal_path,
-                steal_dir.join(".identity.pem.quarantined.55555.0"),
-            )
-            .expect("quarantine A's final");
-            let out = publish_key_atomically(
-                &steal_path,
-                pem_b.as_bytes(),
-                &|| {},
-                &|| {},
-                PublishFaults::NONE,
-            )
-            .expect("peer republishes key B");
-            assert!(matches!(out, KeyPublish::Won), "peer's republish wins");
-            std::fs::remove_file(&claim).expect("clear the claim");
-        };
-        let faults = PublishFaults {
-            link: || Err(std::io::ErrorKind::Unsupported.into()),
-            ..PublishFaults::NONE
-        };
-
-        let kp = load_or_create_keypair_with(
-            &key_path,
-            &|| {},
-            &before_commit,
-            faults,
-            RecoverySeam::NONE,
-        )
-        .expect("a demoted winner must converge, not fail the start");
-
-        let on_disk = super::load_existing_key(&key_path).expect("final parses");
-        assert_eq!(
-            format!("{}", kp.did()),
-            format!("{}", kp_b.did()),
-            "the demoted winner must converge on the recovering peer's key B"
-        );
-        assert_eq!(
-            format!("{}", on_disk.did()),
-            format!("{}", kp_b.did()),
-            "the final must hold key B"
-        );
-        assert!(
-            names_containing(dir.path(), ".publishing.").is_empty(),
-            "no publish markers may remain"
-        );
-        assert!(
-            names_containing(dir.path(), ".recovering.").is_empty(),
-            "no recovery claims may remain"
-        );
-        let quarantined = names_containing(dir.path(), ".quarantined.");
-        assert_eq!(
-            quarantined.len(),
-            1,
-            "exactly one live identity: A's old final stays quarantined: {quarantined:?}"
-        );
-    }
-
-    // #194 (U3): with no interference the commit check is invisible. The
-    // winner removes its own marker, returns Won, and behaves exactly as U1's
-    // success test: the key round-trips and no marker is left. Also pins that
-    // the pre-commit seam runs on the fallback success path.
-    #[test]
-    fn winner_commits_first_without_interference() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let kp = Keypair::generate();
-        let pem = kp.to_pem().expect("pem");
-
-        let fired = std::sync::atomic::AtomicBool::new(false);
-        let before_commit = || {
-            fired.store(true, std::sync::atomic::Ordering::SeqCst);
-        };
-        let faults = PublishFaults {
-            link: || Err(std::io::ErrorKind::Unsupported.into()),
-            ..PublishFaults::NONE
-        };
-        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &before_commit, faults)
-            .expect("uncontended fallback publish");
-        assert!(
-            matches!(out, KeyPublish::Won),
-            "the uncontended winner commits and wins"
-        );
-        assert!(
-            fired.load(std::sync::atomic::Ordering::SeqCst),
-            "the pre-commit seam must run on the fallback success path"
-        );
-        let loaded = super::load_existing_key(&key_path).expect("published key loads");
-        assert_eq!(
-            format!("{}", loaded.did()),
-            format!("{}", kp.did()),
-            "the committed publish must round-trip the same identity"
-        );
-        assert!(
-            names_containing(dir.path(), ".publishing.").is_empty(),
-            "no marker may remain after commit"
-        );
-    }
-
-    // #194 (U3): a recovery attempt arriving AFTER the winner committed finds
-    // no marker to claim and must abort into a plain re-load: no quarantine,
-    // the winner's identity returned. Honest scope: recover_crashed_publish
-    // is invoked directly with a synthetic load error, the way the boot loop
-    // would after observing a (by now resolved) crash signature; the final on
-    // disk is GOOD here, so the vanished-marker arm's re-load succeeds.
-    #[test]
-    fn late_recovery_aborts_after_winner_commit() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let kp = Keypair::generate();
-        let pem = kp.to_pem().expect("pem");
-        let faults = PublishFaults {
-            link: || Err(std::io::ErrorKind::Unsupported.into()),
-            ..PublishFaults::NONE
-        };
-        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults)
-            .expect("winner publishes and commits");
-        assert!(matches!(out, KeyPublish::Won), "winner commits");
-
-        let recovery = super::recover_crashed_publish(
-            &key_path,
-            anyhow::anyhow!("synthetic post-commit crash signature"),
-            RecoverySeam::NONE,
-        )
-        .expect("a late recovery must not error");
-        let loaded = match recovery {
-            super::Recovery::Reloaded(result) => {
-                result.expect("the vanished-marker arm re-loads the winner's key")
-            }
-            super::Recovery::Claimed(claims) => {
-                panic!("no marker exists to claim after commit, got claims {claims:?}")
-            }
-        };
-        assert_eq!(
-            format!("{}", loaded.did()),
-            format!("{}", kp.did()),
-            "late recovery must resolve to the committed winner's identity"
-        );
-        assert!(
-            names_containing(dir.path(), ".quarantined.").is_empty(),
-            "a committed final must never be quarantined"
-        );
-    }
-
-    // #194 (U3, reshaped by F3 and the absence-keyed waiter): a demoted
-    // winner whose round is SETTLED (no `.recovering.` claim file remains,
-    // the recoverer released before the demoted publish reached its wait)
-    // must resolve Lost immediately: the waiter keys purely on claim-file
-    // absence, so an empty directory clears it on the first poll. The
-    // marker is stolen WITHOUT a real recovery (final left in place), so
-    // the follow-up load resolves the winner's OWN key: the
-    // demotion-is-safe property. waiter_holds_for_live_young_claims covers
-    // the hold side; frozen_claim_fails_the_waiter_closed covers a claim
-    // that never clears.
-    #[test]
-    fn demoted_winner_resolves_fast_when_claims_are_gone() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-
-        let fired = std::sync::atomic::AtomicBool::new(false);
-        let steal_dir = dir.path().to_path_buf();
-        let before_commit = move || {
-            if fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                return;
-            }
-            let markers = names_containing(&steal_dir, ".publishing.");
-            assert_eq!(
-                markers.len(),
-                1,
-                "A's window must be bracketed: {markers:?}"
-            );
-            // The demoting peer already resolved AND released its claims:
-            // only the stolen marker remains as evidence of the demotion.
-            std::fs::remove_file(steal_dir.join(&markers[0])).expect("steal A's marker");
-        };
-        let faults = PublishFaults {
-            link: || Err(std::io::ErrorKind::Unsupported.into()),
-            ..PublishFaults::NONE
-        };
-
-        let started = std::time::Instant::now();
-        let kp = load_or_create_keypair_with(
-            &key_path,
-            &|| {},
-            &before_commit,
-            faults,
-            RecoverySeam::NONE,
-        )
-        .expect("a demoted winner with no claims left must still resolve a key");
-        let waited = started.elapsed();
-
-        assert!(
-            waited < std::time::Duration::from_secs(4),
-            "an absent claim must not hold the demoted winner, waited {waited:?}"
-        );
-        let on_disk = super::load_existing_key(&key_path).expect("final parses");
-        assert_eq!(
-            format!("{}", kp.did()),
-            format!("{}", on_disk.did()),
-            "with the final untouched the demoted winner must resolve its own key"
-        );
-    }
-
-    // Q3: a demoted winner facing a claim whose mtime is FROZEN (its
-    // recoverer's heartbeat never span up and both stamp rungs failed on a
-    // hostile volume, or it is a long-crashed recovery's orphan) must fail
-    // the publish CLOSED, never resolve a key: the waiter keys purely on
-    // claim-file PRESENCE, so a claim that never leaves the directory rides
-    // the full bound and errors, whatever its age. Before this fix the
-    // waiter read an aged claim as orphaned residue and returned Ok, and
-    // the demoted publisher loaded a possibly pre-settlement key while an
-    // mtime-frozen LIVE recoverer could still settle disk differently. RED
-    // before the fix: the aged claim clears the wait as Ok and the demoted
-    // winner resolves its own key.
-    #[test]
-    fn frozen_claim_fails_the_waiter_closed() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-
-        let fired = std::sync::atomic::AtomicBool::new(false);
-        let steal_dir = dir.path().to_path_buf();
-        let final_bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-        let final_at_demotion = final_bytes.clone();
-        let observe_path = key_path.clone();
-        let before_commit = move || {
-            if fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                return;
-            }
-            let markers = names_containing(&steal_dir, ".publishing.");
-            assert_eq!(
-                markers.len(),
-                1,
-                "A's window must be bracketed: {markers:?}"
-            );
-            std::fs::remove_file(steal_dir.join(&markers[0])).expect("steal A's marker");
-            let claim = steal_dir.join(".identity.pem.recovering.44444");
-            std::fs::write(&claim, b"").expect("plant frozen claim");
-            // Freeze the claim's mtime far in the past: no heartbeat, no
-            // stamp, only the file itself, which never leaves the directory.
-            age_beyond_claim_sweep(&claim);
-            *final_at_demotion.lock().expect("final bytes lock") =
-                std::fs::read(&observe_path).expect("final is complete at the commit check");
-        };
-        let faults = PublishFaults {
-            link: || Err(std::io::ErrorKind::Unsupported.into()),
-            ..PublishFaults::NONE
-        };
-
-        let result = load_or_create_keypair_with(
-            &key_path,
-            &|| {},
-            &before_commit,
-            faults,
-            RecoverySeam::NONE,
-        );
-
-        let err = match result {
-            Err(e) => e,
-            Ok(_) => {
-                panic!("a claim still present at the wait bound must fail closed, not resolve")
-            }
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains(".identity.pem.recovering.44444"),
-            "the error must name the surviving claim file: {msg}"
-        );
-        assert!(
-            msg.contains("settle"),
-            "the error must name the unsettled round: {msg}"
-        );
-        assert_eq!(
-            std::fs::read(&key_path).expect("final still on disk"),
-            *final_bytes.lock().expect("final bytes lock"),
-            "the failed-closed publish must leave the final untouched"
-        );
-    }
-
-    // F3: the waiter's hold must follow the CLAIM_SWEEP_MIN_AGE-plus-margin
-    // bound, not KEY_RACE_DEADLINE: a live claim's round is allowed the
-    // full bound to finish, so a demoted winner that gives up at the 5s
-    // deadline can re-load the pre-quarantine key while a slow-mount
-    // recovery is still mid-round. Plant a claim, hold it in place for ~7s
-    // (past the old deadline), then remove it mid-wait: the waiter must
-    // still be holding past 5s (the file is present) and return shortly
-    // after the removal (absence is the release), well under the bound. RED
-    // before F3: the waiter expires at KEY_RACE_DEADLINE and the elapsed
-    // floor fails.
-    #[test]
-    fn waiter_holds_for_live_young_claims() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-
-        let fired = std::sync::atomic::AtomicBool::new(false);
-        let steal_dir = dir.path().to_path_buf();
-        let before_commit = move || {
-            if fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                return;
-            }
-            let markers = names_containing(&steal_dir, ".publishing.");
-            assert_eq!(
-                markers.len(),
-                1,
-                "A's window must be bracketed: {markers:?}"
-            );
-            std::fs::remove_file(steal_dir.join(&markers[0])).expect("steal A's marker");
-            std::fs::write(steal_dir.join(".identity.pem.recovering.55555"), b"")
-                .expect("plant fresh (live) claim");
-        };
-        let faults = PublishFaults {
-            link: || Err(std::io::ErrorKind::Unsupported.into()),
-            ..PublishFaults::NONE
-        };
-
-        // Model the live round resolving mid-wait: once the claim appears,
-        // keep it live for 7s (past the old 5s deadline, under the ~11s
-        // bound), then clear it as a finishing recoverer would.
-        let claim_path = dir.path().join(".identity.pem.recovering.55555");
-        let remover_path = claim_path.clone();
-        let remover = std::thread::spawn(move || {
-            while !remover_path.exists() {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            std::thread::sleep(std::time::Duration::from_secs(7));
-            std::fs::remove_file(&remover_path).expect("clear the live claim mid-wait");
-        });
-
-        let started = std::time::Instant::now();
-        let kp = load_or_create_keypair_with(
-            &key_path,
-            &|| {},
-            &before_commit,
-            faults,
-            RecoverySeam::NONE,
-        )
-        .expect("a demoted winner behind a live claim must still resolve a key");
-        let waited = started.elapsed();
-        remover.join().expect("remover joins");
-
-        assert!(
-            waited > super::KEY_RACE_DEADLINE + std::time::Duration::from_millis(1500),
-            "a young claim must hold the waiter past the old deadline, waited {waited:?}"
-        );
-        assert!(
-            waited < std::time::Duration::from_secs(10),
-            "the waiter must release on the claim's removal, not ride the full \
-             bound: waited {waited:?}"
-        );
-        let on_disk = super::load_existing_key(&key_path).expect("final parses");
-        assert_eq!(
-            format!("{}", kp.did()),
-            format!("{}", on_disk.did()),
-            "with the final untouched the demoted winner must resolve its own key"
-        );
-    }
-
-    // N3: a demoted fallback winner whose wait bound expires while a claim
-    // still persists has NOT observed a settled round: loading the final
-    // there can return a pre-settlement key into run() while the
-    // still-live recoverer settles disk on a different identity, the exact
-    // divergence the protocol forbids. The publish must fail closed (a loud
-    // Err naming the unsettled round), never resolve Lost and load. A
-    // refresher thread keeps the claim young past the full wait bound,
-    // modeling a recovery round still heartbeating (live but stuck) beyond
-    // it; frozen_claim_fails_the_waiter_closed covers the mtime-frozen
-    // side, which the absence-keyed waiter treats identically. RED before
-    // N3: the waiter expires silently and the demoted winner returns its
-    // own key.
-    #[test]
-    fn unsettled_round_fails_closed() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-
-        let fired = std::sync::atomic::AtomicBool::new(false);
-        let steal_dir = dir.path().to_path_buf();
-        let final_bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-        let final_at_demotion = final_bytes.clone();
-        let observe_path = key_path.clone();
-        let before_commit = move || {
-            if fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                return;
-            }
-            let markers = names_containing(&steal_dir, ".publishing.");
-            assert_eq!(
-                markers.len(),
-                1,
-                "A's window must be bracketed: {markers:?}"
-            );
-            std::fs::remove_file(steal_dir.join(&markers[0])).expect("steal A's marker");
-            std::fs::write(steal_dir.join(".identity.pem.recovering.55555"), b"")
-                .expect("plant live claim");
-            *final_at_demotion.lock().expect("final bytes lock") =
-                std::fs::read(&observe_path).expect("final is complete at the commit check");
-        };
-        let faults = PublishFaults {
-            link: || Err(std::io::ErrorKind::Unsupported.into()),
-            ..PublishFaults::NONE
-        };
-
-        // Keep the claim YOUNG for the waiter's whole bound, modeling a
-        // recovery round that heartbeats but never settles. The
-        // absence-keyed waiter fails closed on presence regardless of age
-        // (frozen_claim_fails_the_waiter_closed pins the frozen-mtime
-        // side); the refresher keeps this test honest about the LIVE-round
-        // shape it models.
-        let claim_path = dir.path().join(".identity.pem.recovering.55555");
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stop_refresher = stop.clone();
-        let refresher_path = claim_path.clone();
-        let refresher = std::thread::spawn(move || {
-            while !refresher_path.exists() {
-                if stop_refresher.load(std::sync::atomic::Ordering::SeqCst) {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            while !stop_refresher.load(std::sync::atomic::Ordering::SeqCst) {
-                let _ = std::fs::File::options()
-                    .write(true)
-                    .open(&refresher_path)
-                    .and_then(|f| f.set_modified(std::time::SystemTime::now()));
-                std::thread::sleep(std::time::Duration::from_millis(500));
-            }
-        });
-
-        let result = load_or_create_keypair_with(
-            &key_path,
-            &|| {},
-            &before_commit,
-            faults,
-            RecoverySeam::NONE,
-        );
-        stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        refresher.join().expect("refresher joins");
-
-        let err = match result {
-            Err(e) => e,
-            Ok(_) => {
-                panic!("an unsettled round past the wait bound must fail closed, not resolve a key")
-            }
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains(".identity.pem.recovering.55555"),
-            "the error must name the unsettled claim file: {msg}"
-        );
-        assert!(
-            msg.contains("settle"),
-            "the error must name the unsettled round: {msg}"
-        );
-        assert_eq!(
-            std::fs::read(&key_path).expect("final still on disk"),
-            *final_bytes.lock().expect("final bytes lock"),
-            "the failed-closed publish must leave the final untouched"
-        );
-    }
-
-    // #194 (U4): a HEALTHY load must sweep stale `.publishing.` markers and
-    // `.recovering.` claims, or they linger to misclassify a much-later real
-    // corruption of a good key as an interrupted first write. The claim is
-    // AGED past CLAIM_SWEEP_MIN_AGE: only orphaned claims are sweepable
-    // (#194, G1; healthy_load_spares_young_claims covers the young side).
-    // RED before U4: all three files survive the load.
-    #[test]
-    fn healthy_load_sweeps_stale_markers_and_claims() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let existing = Keypair::generate();
-        let pem = existing.to_pem().expect("pem");
-        let key_path = seed_crash_state(dir.path(), pem.as_bytes());
-        std::fs::write(dir.path().join(".identity.pem.publishing.88888.1"), b"")
-            .expect("seed second stale marker");
-        let claim = dir.path().join(".identity.pem.recovering.77777");
-        std::fs::write(&claim, b"").expect("seed stale recovery claim");
-        age_beyond_claim_sweep(&claim);
-
-        let kp = load_or_create_keypair(&key_config(&key_path))
-            .expect("a valid final with stale markers must load");
-
-        assert_eq!(
-            format!("{}", kp.did()),
-            format!("{}", existing.did()),
-            "the pre-existing identity must be preserved, not regenerated"
-        );
-        assert!(
-            names_containing(dir.path(), ".publishing.").is_empty(),
-            "a healthy load must sweep stale publish markers"
-        );
-        assert!(
-            names_containing(dir.path(), ".recovering.").is_empty(),
-            "a healthy load must sweep stale recovery claims"
-        );
-    }
-
-    // #194 (G1) MUST-NOT: the healthy-boot sweep must SPARE a young
-    // `.recovering.` claim. A live recoverer's claims exist only within one
-    // bounded recovery round, and a demoted publisher's
-    // wait_for_recovery_claims waits on them; a third start sweeping a live
-    // claim cancels that wait early, so the publisher re-loads the
-    // pre-quarantine key while the recoverer proceeds to quarantine and
-    // republish: two-sided divergence. Only a claim older than
-    // CLAIM_SWEEP_MIN_AGE (an orphan of a crashed recovery) may go.
-    // `.publishing.` markers keep the unconditional sweep: sweeping a live
-    // publisher's marker only fails its commit check, a safe demotion. RED
-    // before G1: the young claim is swept too.
-    #[test]
-    fn healthy_load_spares_young_claims() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let existing = Keypair::generate();
-        let pem = existing.to_pem().expect("pem");
-        let key_path = seed_crash_state(dir.path(), pem.as_bytes());
-        let young = dir.path().join(".identity.pem.recovering.11111");
-        std::fs::write(&young, b"").expect("seed young (possibly live) claim");
-        let old = dir.path().join(".identity.pem.recovering.22222");
-        std::fs::write(&old, b"").expect("seed orphaned claim");
-        age_beyond_claim_sweep(&old);
-
-        let kp = load_or_create_keypair(&key_config(&key_path))
-            .expect("a valid final must load regardless of claim ages");
-
-        assert_eq!(
-            format!("{}", kp.did()),
-            format!("{}", existing.did()),
-            "the pre-existing identity must be preserved"
-        );
-        assert!(
-            young.exists(),
-            "a young claim may belong to a LIVE recovery and must survive the sweep"
-        );
-        assert!(
-            !old.exists(),
-            "an orphaned claim past CLAIM_SWEEP_MIN_AGE must be swept"
-        );
-        assert!(
-            names_containing(dir.path(), ".publishing.").is_empty(),
-            "publish markers keep the unconditional sweep"
-        );
-    }
-
-    // F2 (function level): the boot sweep SPARES a young claim (it may gate
-    // a live round), so orphaned residue can outlive a healthy boot; once
-    // the claim ages past CLAIM_SWEEP_MIN_AGE a SECOND sweep over the same
-    // final must clear it, or the residue later pairs with a real content
-    // failure of the good final and misclassifies marker-less corruption as
-    // a crash. GREEN at introduction (the sweep is already age-correct);
-    // load-bearing by mutation check: inverting the sweep's age gate turns
-    // it RED. spawn_delayed_claim_resweep is the boot wiring that provides
-    // the second sweep in-process.
-    #[test]
-    fn second_sweep_clears_aged_orphan_claims() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let pem = Keypair::generate().to_pem().expect("pem");
-        std::fs::write(&key_path, pem.as_bytes()).expect("seed valid final");
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
-            .expect("0600 final");
-        let claim = dir.path().join(".identity.pem.recovering.33333");
-        std::fs::write(&claim, b"").expect("seed young claim");
-
-        super::sweep_stale_markers(&key_path, || Ok(()));
-        assert!(
-            claim.exists(),
-            "the first sweep must spare the young (possibly live) claim"
-        );
-
-        age_beyond_claim_sweep(&claim);
-        super::sweep_stale_markers(&key_path, || Ok(()));
-        assert!(
-            !claim.exists(),
-            "a second sweep must clear the claim once it ages into an orphan"
-        );
-    }
-
-    // M4: `.superseded.` forensic files never expired, so every lost round
-    // accumulated one beside the final forever. The healthy sweep must
-    // remove a superseded file older than SUPERSEDED_RETENTION (the
-    // operator's inspection window) while a YOUNG one survives; the sweep's
-    // durability gate already ran before any removal. RED before M4: the
-    // aged file survives every healthy boot.
-    #[test]
-    fn superseded_residue_is_retention_swept() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let pem = Keypair::generate().to_pem().expect("pem");
-        std::fs::write(&key_path, pem.as_bytes()).expect("seed valid final");
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
-            .expect("0600 final");
-        let aged = dir.path().join(".identity.pem.superseded.99999.0");
-        std::fs::write(&aged, b"old forensics").expect("seed aged superseded file");
-        set_mtime_past(&aged, "2 days ago");
-        let young = dir.path().join(".identity.pem.superseded.99999.1");
-        std::fs::write(&young, b"fresh forensics").expect("seed young superseded file");
-
-        load_or_create_keypair(&key_config(&key_path)).expect("healthy load");
-
-        assert!(
-            !aged.exists(),
-            "a superseded file past the retention window must be swept"
-        );
-        assert!(
-            young.exists(),
-            "a superseded file inside the retention window must survive"
-        );
-    }
-
-    // Q2: plain `.quarantined.` residue also never expired: an unparseable
-    // quarantine (crash forensics) and an aged parseable one (past the
-    // adoption floor, so pure history) sat beside a healthy final forever.
-    // The healthy sweep must remove a `.quarantined.` entry older than
-    // SUPERSEDED_RETENTION, while a YOUNG unparseable one (fresh crash
-    // forensics) and a parseable one past the adoption floor but inside
-    // retention (recent history, an operator may still want it) survive.
-    // RED before Q2: the aged unparseable quarantine survives every
-    // healthy boot.
-    #[test]
-    fn old_quarantine_forensics_are_retention_swept() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let pem = Keypair::generate().to_pem().expect("pem");
-        std::fs::write(&key_path, pem.as_bytes()).expect("seed valid final");
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
-            .expect("0600 final");
-        let aged_garbage = dir.path().join(".identity.pem.quarantined.99999.0");
-        std::fs::write(&aged_garbage, b"-----BEGIN nonsense").expect("seed aged forensics");
-        set_mtime_past(&aged_garbage, "2 days ago");
-        let young_garbage = dir.path().join(".identity.pem.quarantined.99999.1");
-        std::fs::write(&young_garbage, b"-----BEGIN nonsense").expect("seed young forensics");
-        let recent_parseable = dir.path().join(".identity.pem.quarantined.99999.2");
-        std::fs::write(
-            &recent_parseable,
-            Keypair::generate().to_pem().expect("pem").as_bytes(),
-        )
-        .expect("seed recent parseable quarantine");
-        // Past the adoption floor (CLAIM_SWEEP_MIN_AGE) but well inside the
-        // 24h retention window.
-        set_mtime_past(&recent_parseable, "1 hour ago");
-
-        load_or_create_keypair(&key_config(&key_path)).expect("healthy load");
-
-        assert!(
-            !aged_garbage.exists(),
-            "a quarantine past the retention window must be swept"
-        );
-        assert!(
-            young_garbage.exists(),
-            "young crash forensics must survive the healthy sweep"
-        );
-        assert!(
-            recent_parseable.exists(),
-            "a quarantine past the adoption floor but inside retention must survive"
-        );
-    }
-
-    // F2 (wiring): the delayed boot re-sweep must actually fire and sweep.
-    // Paused tokio time drives the real CLAIM_SWEEP_MIN_AGE-plus-margin
-    // sleep instantly; the claim is pre-aged on disk because paused time
-    // advances the tokio clock, not SystemTime mtimes. This covers "the
-    // spawned task runs the sweep after the delay";
-    // second_sweep_clears_aged_orphan_claims covers the age semantics.
-    #[tokio::test(start_paused = true)]
-    async fn delayed_resweep_clears_aged_orphan_claims() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let pem = Keypair::generate().to_pem().expect("pem");
-        std::fs::write(&key_path, pem.as_bytes()).expect("seed valid final");
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
-            .expect("0600 final");
-        let claim = dir.path().join(".identity.pem.recovering.66666");
-        std::fs::write(&claim, b"").expect("seed claim");
-        age_beyond_claim_sweep(&claim);
-
-        super::spawn_delayed_claim_resweep(key_path.clone())
-            .await
-            .expect("the re-sweep task must complete");
-
-        assert!(
-            !claim.exists(),
-            "the delayed re-sweep must clear the aged orphan claim"
-        );
-        assert!(
-            super::load_existing_key(&key_path).is_ok(),
-            "the final must survive the re-sweep intact"
-        );
-    }
-
-    // The G1 age gate reads the CLAIM file's mtime, but a claim is made by
-    // RENAMING a marker, and rename preserves the source's mtime: a claim
-    // made from an hours-old stale marker would be born already past
-    // CLAIM_SWEEP_MIN_AGE, so a concurrent healthy boot's sweep could remove
-    // the LIVE claim mid-round and early-wake the demoted publisher it
-    // gates. Recovery must therefore stamp each claim's mtime fresh at
-    // claim time. RED before the fix: the claim inherits the aged mtime.
-    #[test]
-    fn claim_freshness_is_stamped_at_claim_time() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = seed_crash_state(dir.path(), b"");
-        let marker = dir.path().join(".identity.pem.publishing.99999.0");
-        age_beyond_claim_sweep(&marker);
-
-        let recovery = super::recover_crashed_publish(
-            &key_path,
-            anyhow::anyhow!("synthetic crash signature"),
-            RecoverySeam::NONE,
-        )
-        .expect("recovery over an aged marker must not error");
-        let mut claims = match recovery {
-            super::Recovery::Claimed(claims) => claims,
-            super::Recovery::Reloaded(_) => {
-                panic!("an aged marker beside an empty final must be claimed")
-            }
-        };
-        assert!(
-            !claims.files.is_empty(),
-            "the aged marker must produce a claim"
-        );
-        for claim in &claims.files {
-            let mtime = std::fs::metadata(claim)
-                .expect("stat claim")
-                .modified()
-                .expect("claim mtime");
-            let age = std::time::SystemTime::now()
-                .duration_since(mtime)
-                .unwrap_or_default();
-            assert!(
-                age < super::CLAIM_SWEEP_MIN_AGE,
-                "a claim must be born fresh, not inherit the aged marker mtime \
-                 through the rename: age {age:?} at {claim:?}"
-            );
-        }
-        super::release_recovery_claims(&key_path, &mut claims);
-    }
-
-    // The G1 freshness stamp must survive a failing set_modified: some
-    // filesystems reject explicit timestamps while honoring write-driven
-    // mtime updates, and a claim left with its inherited aged mtime for the
-    // whole round is exposed to a concurrent healthy boot's age-gated sweep.
-    // The ladder's fallback appends a byte, which bumps the mtime on
-    // effectively every filesystem (claims are matched by name only, so a
-    // non-empty claim is safe). RED with the fallback rung absent: the
-    // claim keeps the aged mtime.
-    #[test]
-    fn stamp_fallback_bumps_mtime_by_write() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let claim = dir.path().join(".identity.pem.recovering.99999.deadbeef.0");
-        std::fs::write(&claim, b"").expect("seed claim");
-        age_beyond_claim_sweep(&claim);
-
-        super::refresh_claim_mtime(&claim, |_| Err(std::io::ErrorKind::Unsupported.into()))
-            .expect("the write fallback must stamp the mtime when the primary fails");
-
-        let mtime = std::fs::metadata(&claim)
-            .expect("stat claim")
-            .modified()
-            .expect("claim mtime");
-        let age = std::time::SystemTime::now()
-            .duration_since(mtime)
-            .unwrap_or_default();
-        assert!(
-            age < super::CLAIM_SWEEP_MIN_AGE,
-            "the fallback write must leave the claim fresh, age {age:?}"
-        );
-    }
-
-    // M3: claim liveness is age < CLAIM_SWEEP_MIN_AGE, but a single
-    // claim-time stamp lets a recoverer stalled longer than the floor
-    // between claim and settlement read as an orphan to the sweep and to
-    // claimability: the delayed re-sweep or a healthy boot removes the
-    // still-live claim (early-releasing any demoted publisher's
-    // absence-keyed wait to a pre-settlement load), or a competing
-    // recoverer steals the round: divergence returns on slow shared
-    // volumes. A live
-    // recovery must HEARTBEAT its claims so they never age out while it
-    // runs. The park holds recovery inside the claim-to-settlement window
-    // (before_quarantine) just past the floor while the test samples the
-    // claim's age throughout. RED before M3: the single stamp ages past the
-    // floor mid-park. The ~12s wall cost is the test's point: the floor is
-    // real time.
-    #[test]
-    fn heartbeat_keeps_live_claims_young() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = seed_crash_state(dir.path(), b"");
-
-        let park_dir = dir.path().to_path_buf();
-        let before_quarantine = move || {
-            let deadline = std::time::Instant::now()
-                + super::CLAIM_SWEEP_MIN_AGE
-                + std::time::Duration::from_secs(2);
-            while std::time::Instant::now() < deadline {
-                std::thread::sleep(std::time::Duration::from_millis(900));
-                let claims = names_containing(&park_dir, ".recovering.");
-                assert!(!claims.is_empty(), "the parked round's claim must persist");
-                for name in &claims {
-                    let mtime = std::fs::metadata(park_dir.join(name))
-                        .and_then(|m| m.modified())
-                        .expect("claim mtime");
-                    let age = std::time::SystemTime::now()
-                        .duration_since(mtime)
-                        .unwrap_or_default();
-                    assert!(
-                        age < super::CLAIM_SWEEP_MIN_AGE,
-                        "a LIVE recovery's claim must stay young mid-round: age {age:?}"
-                    );
-                }
-            }
-        };
-        let seam = RecoverySeam {
-            before_quarantine: &before_quarantine,
-            ..RecoverySeam::NONE
-        };
-
-        let started = std::time::Instant::now();
-        let kp = load_or_create_keypair_with(&key_path, &|| {}, &|| {}, PublishFaults::NONE, seam)
-            .expect("the parked recovery must still resolve a key");
-        let elapsed = started.elapsed();
-
-        // The recovery finished: claims released (the on-disk leak
-        // evidence) and the heartbeat joined (the elapsed ceiling bounds
-        // release plus join after the ~12s park).
-        assert!(
-            names_containing(dir.path(), ".recovering.").is_empty(),
-            "the finished recovery must release its claims"
-        );
-        assert!(
-            elapsed < super::CLAIM_SWEEP_MIN_AGE + std::time::Duration::from_secs(8),
-            "release and heartbeat join must be prompt after the park: took {elapsed:?}"
-        );
-        let on_disk = super::load_existing_key(&key_path).expect("regenerated final parses");
-        assert_eq!(
-            format!("{}", on_disk.did()),
-            format!("{}", kp.did()),
-            "the returned identity must match the on-disk key"
-        );
-    }
-
-    // Claim destinations must carry a per-process nonce beyond the pid:
-    // `.{stem}.recovering.{pid}.{nonce}.{n}`. The pid alone is not unique
-    // across recoverers on a shared volume (two PID-1 containers), so two
-    // concurrent recoverers could derive the SAME destination name, and the
-    // second's claim rename would replace the first's live claim inode (the
-    // exists() probe is a check-then-act, not an arbiter); the first release
-    // would then unlink the other's LIVE claim and early-wake the demoted
-    // publisher it gates. The cross-process collision itself cannot be
-    // executed from one test process (one pid, one nonce), so this test
-    // fences the mechanism: every claim name must carry the process nonce
-    // field between the pid and the counter. RED under pid-only naming.
-    #[test]
-    fn same_pid_recoverers_get_unique_claim_names() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = seed_crash_state(dir.path(), b"");
-
-        let recovery = super::recover_crashed_publish(
-            &key_path,
-            anyhow::anyhow!("synthetic crash signature"),
-            RecoverySeam::NONE,
-        )
-        .expect("recovery over a crash state must not error");
-        let mut claims = match recovery {
-            super::Recovery::Claimed(claims) => claims,
-            super::Recovery::Reloaded(_) => {
-                panic!("a marker beside an empty final must be claimed")
-            }
-        };
-        assert!(!claims.files.is_empty(), "the marker must produce a claim");
-        let pid_prefix = format!(".identity.pem.recovering.{}.", std::process::id());
-        for claim in &claims.files {
-            let name = claim
-                .file_name()
-                .and_then(|n| n.to_str())
-                .expect("claim name is utf8");
-            let rest = name
-                .strip_prefix(&pid_prefix)
-                .unwrap_or_else(|| panic!("claim {name:?} must start with {pid_prefix:?}"));
-            let fields: Vec<&str> = rest.split('.').collect();
-            assert_eq!(
-                fields.len(),
-                2,
-                "claim {name:?} must end in {{nonce}}.{{counter}}, got {rest:?}"
-            );
-            assert_eq!(
-                fields[0],
-                format!("{:08x}", super::claim_nonce()),
-                "the field between pid and counter must be the process nonce"
-            );
-            assert!(
-                fields[1].parse::<u32>().is_ok(),
-                "the final field must be the claim counter, got {:?}",
-                fields[1]
-            );
-        }
-        super::release_recovery_claims(&key_path, &mut claims);
-    }
-
-    // A final that VANISHES between the claim renames and the post-claim
-    // re-parse (a competing recoverer disposed of it concurrently) must join
-    // the content class and regenerate, not surface as a loud transient
-    // error: there is nothing a quarantine could destroy, and the quarantine
-    // loop's own NotFound arm resolves it cleanly. Locks the NotFound arm of
-    // the re-parse match (anyhow's downcast_ref::<io::Error> sees the
-    // NotFound through the with_context layers). RED with NotFound routed
-    // into the transient arm (mutation check): the boot fails loudly.
-    #[test]
-    fn vanished_final_at_reparse_still_regenerates() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = seed_crash_state(dir.path(), b"");
-        let vanish_path = key_path.clone();
-        let before_reparse = move || {
-            std::fs::remove_file(&vanish_path).expect("vanish the final inside the claim window");
-        };
-
-        let kp = load_or_create_keypair_with(
-            &key_path,
-            &|| {},
-            &|| {},
-            PublishFaults::NONE,
-            RecoverySeam {
-                before_reparse: &before_reparse,
-                ..RecoverySeam::NONE
-            },
-        )
-        .expect("a final vanished at the re-parse must regenerate, not fail the start");
-
-        let on_disk = super::load_existing_key(&key_path).expect("regenerated final parses");
-        assert_eq!(
-            format!("{}", on_disk.did()),
-            format!("{}", kp.did()),
-            "the returned identity must match the regenerated on-disk key"
-        );
-        assert!(
-            names_containing(dir.path(), ".quarantined.").is_empty(),
-            "a vanished final leaves nothing to quarantine"
-        );
-        assert!(
-            names_containing(dir.path(), ".publishing.").is_empty(),
-            "no publish markers may remain"
-        );
-        assert!(
-            names_containing(dir.path(), ".recovering.").is_empty(),
-            "no recovery claims may remain"
-        );
-    }
-
-    // #194 (U4): the generate path must sweep too. A crash between the
-    // marker's durability fsync and the final's `create_new` leaves a durable
-    // marker with NO final; only the Won arm of a later boot can ever clean
-    // that state, since no load will ever succeed beside it. RED before U4
-    // (the marker survives); RED again under a load-arm-only implementation
-    // (mutation check: with the Won-arm call site removed this test must
-    // fail while healthy_load_sweeps_stale_markers_and_claims stays green).
-    #[test]
-    fn generate_path_sweeps_stale_markers() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        std::fs::write(dir.path().join(".identity.pem.publishing.66666.0"), b"")
-            .expect("seed stale marker without a final");
-
-        let kp = load_or_create_keypair(&key_config(&key_path))
-            .expect("a stale marker with no final must not block generation");
-
-        let on_disk = super::load_existing_key(&key_path).expect("published key loads");
-        assert_eq!(
-            format!("{}", on_disk.did()),
-            format!("{}", kp.did()),
-            "the generated identity must be on disk"
-        );
-        assert!(
-            names_containing(dir.path(), ".publishing.").is_empty(),
-            "a Won publish on a healthy boot must sweep the stale marker"
-        );
-    }
-
-    // #194 (U4) MUST-NOT: the sweep must never remove a marker ahead of the
-    // content it vouches for. With the seam failing the sweep's durability
-    // sync, the load still succeeds but the marker SURVIVES. Vacuously green
-    // before U4 (no sweep exists, so the marker trivially survives); its
-    // load-bearing proof is the mutation check: with the durability gate
-    // removed (sweep unconditionally) this test must fail.
-    #[test]
-    fn sweep_durability_gate_leaves_markers_on_sync_failure() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let existing = Keypair::generate();
-        let pem = existing.to_pem().expect("pem");
-        let key_path = seed_crash_state(dir.path(), pem.as_bytes());
-        let seam = RecoverySeam {
-            sweep_sync: || Err(std::io::Error::other("injected sweep sync failure")),
-            ..RecoverySeam::NONE
-        };
-
-        let kp = load_or_create_keypair_with(&key_path, &|| {}, &|| {}, PublishFaults::NONE, seam)
-            .expect("a failed sweep durability sync must not fail the load");
-
-        assert_eq!(
-            format!("{}", kp.did()),
-            format!("{}", existing.did()),
-            "the identity must still load when the sweep is skipped"
-        );
-        assert_eq!(
-            names_containing(dir.path(), ".publishing."),
-            vec![".identity.pem.publishing.99999.0".to_string()],
-            "the marker must survive when the sweep cannot make the final durable"
-        );
-    }
-
-    // #194 (U4): the sweep's removals are best-effort; unremovable markers
-    // must never fail an otherwise healthy load. The key directory is made
-    // read-only (0555): the durability gate still passes (the file sync_all
-    // and the dir fsync both open read-only) but every remove_file fails
-    // EACCES. Vacuously green before U4 (no sweep exists); load-bearing once
-    // the sweep runs, since a sweep that surfaced removal errors would fail
-    // this load.
-    //
-    // After the reload mask fix (0o022 -> 0o077), a 0555 parent now has
-    // group/world read bits set, so the reload path tightens it to 0700
-    // before the sweep runs. The sweep then succeeds and the marker is
-    // removed. The test now asserts the tightened behavior: the load
-    // succeeds, the directory is 0700, and the marker is gone. The
-    // best-effort sweep-failure tolerance is still covered by
-    // sweep_durability_gate_leaves_markers_on_sync_failure (sync failure)
-    // and the unremovable case is now unreachable through a read-only
-    // directory because the reload path fixes the permissions first.
-    #[test]
-    fn sweep_failure_tolerated() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let existing = Keypair::generate();
-        let pem = existing.to_pem().expect("pem");
-        let key_path = seed_crash_state(dir.path(), pem.as_bytes());
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555))
-            .expect("read-only key dir");
-
-        let result = load_or_create_keypair(&key_config(&key_path));
-
-        let parent_mode = std::fs::metadata(dir.path())
-            .expect("parent exists")
-            .permissions()
-            .mode()
-            & 0o777;
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
-            .expect("restore key dir");
-        let kp = result.expect("a read-only key dir must not fail the load");
-        assert_eq!(
-            format!("{}", kp.did()),
-            format!("{}", existing.did()),
-            "the identity must load despite the read-only key dir"
-        );
-        assert_eq!(
-            parent_mode, 0o700,
-            "the reload path must tighten a 0555 parent to 0700 before the sweep, got {parent_mode:o}"
-        );
-        assert!(
-            names_containing(dir.path(), ".publishing.").is_empty(),
-            "the marker is removed once the directory is tightened to 0700"
-        );
-    }
-
-    // #194 (F1): a claimed recovery whose retry publish FAILS must release
-    // its `.recovering.` claim before surfacing the error. A leaked claim
-    // makes every later demoted fallback publisher ride the full wait
-    // bound in wait_for_recovery_claims and fail its publish closed until
-    // some healthy boot sweeps it. RED before F1: the bare `?` on the
-    // publish call returns with the claim still on disk.
-    #[test]
-    fn claim_released_when_post_recovery_publish_fails() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = seed_crash_state(dir.path(), b"");
-        let faults = PublishFaults {
-            link: || Err(std::io::ErrorKind::Unsupported.into()),
-            fallback_create: || Err(std::io::Error::other("injected fallback create failure")),
-            ..PublishFaults::NONE
-        };
-
-        let err = match load_or_create_keypair_with(
-            &key_path,
-            &|| {},
-            &|| {},
-            faults,
-            RecoverySeam::NONE,
-        ) {
-            Err(e) => e,
-            Ok(_) => panic!("the forced publish failure must surface, not resolve a key"),
-        };
-        assert!(
-            format!("{err:#}").contains("injected fallback create failure"),
-            "the publish failure must propagate: {err:#}"
-        );
-        assert!(
-            names_containing(dir.path(), ".recovering.").is_empty(),
-            "a failed retry publish must release the recovery claim, not leak it"
-        );
-    }
-
-    // #194 (F2): a stale marker must not let recovery steal a LIVE fallback
-    // publisher's round. Deterministic construction: publisher A parks at
-    // its commit check (final complete and durable, own marker M present,
-    // stale marker S beside it); the real recovery runs, and its
-    // before-reparse seam (inside the window between the claim step and the
-    // post-claim re-parse) unparks A and waits for A to finish, landing A's
-    // commit exactly in the claim window. Under F2 recovery claims EVERY
-    // claimable, so A's removal of M fails and A demotes; the re-parse then
-    // sees A's completed key and recovery aborts to Reloaded. Everyone
-    // converges on one on-disk identity. RED before F2: recovery claims only
-    // the lexicographically-first stale S, A's commit on M succeeds, and A
-    // returns Won with key A while recovery quarantines A's final and
-    // republishes key B: the two-sided divergence R4 forbids.
-    #[test]
-    fn stale_marker_cannot_steal_a_live_publishers_round() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        // Sorts before any real-pid marker (pids never start with '0').
-        std::fs::write(dir.path().join(".identity.pem.publishing.00000.0"), b"")
-            .expect("seed stale marker");
-
-        let (parked_tx, parked_rx) = std::sync::mpsc::channel::<()>();
-        let (unpark_tx, unpark_rx) = std::sync::mpsc::channel::<()>();
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<String>();
-        let p_path = key_path.clone();
-        let publisher = std::thread::spawn(move || {
-            let before_commit = move || {
-                parked_tx.send(()).expect("signal parked");
-                unpark_rx
-                    .recv()
-                    .expect("wait inside the recovery's claim window");
-            };
-            let faults = PublishFaults {
-                link: || Err(std::io::ErrorKind::Unsupported.into()),
-                ..PublishFaults::NONE
-            };
-            let kp = load_or_create_keypair_with(
-                &p_path,
-                &|| {},
-                &before_commit,
-                faults,
-                RecoverySeam::NONE,
-            )
-            .expect("the publisher must resolve a key, demoted or not");
-            done_tx
-                .send(format!("{}", kp.did()))
-                .expect("report the publisher's identity");
-        });
-        parked_rx
-            .recv()
-            .expect("publisher reaches its commit check");
-
-        // The concurrent recovery, via the REAL recovery path. Its
-        // before-reparse hook unparks A inside the window between the claim
-        // step and the post-claim re-parse: A's marker is already claimed,
-        // so A's commit check fails and A demotes, then waits out the LIVE
-        // claims until this recovery releases them. (The hook must not park
-        // recovery until A finishes: A's waiter holds while the claim
-        // files are present, until release, so that cycle would correctly
-        // fail A closed; the pre-heartbeat, age-keyed version only
-        // unblocked because the live claims aged out mid-round, the exact
-        // divergence window M3 and the absence-keyed waiter close.)
-        let before_reparse = || {
-            unpark_tx.send(()).expect("unpark the publisher");
-        };
-        let recovery = super::recover_crashed_publish(
-            &key_path,
-            anyhow::anyhow!("synthetic crash signature"),
-            RecoverySeam {
-                before_reparse: &before_reparse,
-                ..RecoverySeam::NONE
-            },
-        )
-        .expect("recovery must not error");
-        let recovered_did = match recovery {
-            super::Recovery::Reloaded(result) => format!(
-                "{}",
-                result
-                    .expect("the post-claim re-parse resolves the completed key")
-                    .did()
-            ),
-            super::Recovery::Claimed(mut recovery_claims) => {
-                // The boot loop's follow-through: regenerate, publish, release.
-                let kp_b = Keypair::generate();
-                let pem_b = kp_b.to_pem().expect("pem b");
-                let out = publish_key_atomically(
-                    &key_path,
-                    pem_b.as_bytes(),
-                    &|| {},
-                    &|| {},
-                    PublishFaults::NONE,
-                )
-                .expect("recovery's republish");
-                assert!(matches!(out, KeyPublish::Won), "recovery's republish wins");
-                super::release_recovery_claims(&key_path, &mut recovery_claims);
-                format!("{}", kp_b.did())
-            }
-        };
-        publisher.join().expect("publisher joins");
-
-        let p_did = done_rx.recv().expect("the publisher reported its identity");
-        let disk_did = format!(
-            "{}",
-            super::load_existing_key(&key_path)
-                .expect("final parses")
-                .did()
-        );
-        assert_eq!(
-            p_did, disk_did,
-            "the publisher must never resolve an identity that diverges from disk"
-        );
-        assert_eq!(
-            recovered_did, disk_did,
-            "recovery must converge on the same on-disk identity"
-        );
-        assert!(
-            names_containing(dir.path(), ".quarantined.").is_empty(),
-            "a completed publisher's final must not be quarantined"
-        );
-        assert!(
-            names_containing(dir.path(), ".publishing.").is_empty(),
-            "no publish markers may remain"
-        );
-        assert!(
-            names_containing(dir.path(), ".recovering.").is_empty(),
-            "no recovery claims may remain"
-        );
-    }
-
-    // #194 (F3): a recoverer crashed between its claim rename and the
-    // quarantine leaves a content-bad final beside a stale `.recovering.`
-    // claim and ZERO `.publishing.` markers: the claim IS the renamed
-    // marker. The claim must count toward the crash signature and be
-    // claimable itself, or no later boot can ever recover: the permanent
-    // wedge this protocol exists to eliminate. RED before F3: the signature
-    // counts only `.publishing.` names, so the boot rides the deadline and
-    // fails loudly forever.
-    #[test]
-    fn claim_crash_state_is_recoverable() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        std::fs::write(&key_path, b"").expect("seed crashed final");
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
-            .expect("0600 crashed final");
-        let claim = dir.path().join(".identity.pem.recovering.99999.0");
-        std::fs::write(&claim, b"").expect("seed stale recovery claim");
-        // F2 age gate: only a claim past CLAIM_SWEEP_MIN_AGE is claimable; a
-        // fresh one may gate a LIVE round (live_claims_are_not_claimable is
-        // the must-not side). Age the orphan so this stays the positive case.
-        age_beyond_claim_sweep(&claim);
-
-        let kp = load_or_create_keypair(&key_config(&key_path))
-            .expect("a claim-crash state must recover, not wedge every later boot");
-
-        let on_disk = super::load_existing_key(&key_path).expect("regenerated final parses");
-        assert_eq!(
-            format!("{}", on_disk.did()),
-            format!("{}", kp.did()),
-            "the returned identity must match the regenerated on-disk key"
-        );
-        let quarantined = names_containing(dir.path(), ".quarantined.");
-        assert_eq!(
-            quarantined.len(),
-            1,
-            "exactly one quarantine file must exist: {quarantined:?}"
-        );
-        assert!(
-            names_containing(dir.path(), ".recovering.").is_empty(),
-            "the stale claim must be consumed and the fresh claim released"
-        );
-        assert!(
-            names_containing(dir.path(), ".publishing.").is_empty(),
-            "no publish markers may remain"
-        );
-    }
-
-    // F2 MUST-NOT: a FRESH `.recovering.` claim may gate a LIVE recovery
-    // round (claim, quarantine, republish), and a second starter claiming it
-    // mid-round steals that round: the recoverer's own re-parse and restore
-    // then race the thief's quarantine-and-regenerate. A fresh claim must
-    // therefore never count as claimable: with no `.publishing.` marker
-    // beside it the claimable set is empty, no crash signature fires, and
-    // the load fails loudly with the claim untouched. The positive case (an
-    // ORPHANED claim past CLAIM_SWEEP_MIN_AGE) is
-    // claim_crash_state_is_recoverable. Rides the full KEY_RACE_DEADLINE
-    // (~5s), as every loud-fail load does. RED before F2: the fresh claim is
-    // claimed and recovery proceeds.
-    #[test]
-    fn live_claims_are_not_claimable() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        std::fs::write(&key_path, b"").expect("seed crashed final");
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
-            .expect("0600 crashed final");
-        let claim = dir.path().join(".identity.pem.recovering.99999.0");
-        std::fs::write(&claim, b"").expect("seed fresh (possibly live) claim");
-
-        let err = match load_or_create_keypair(&key_config(&key_path)) {
-            Err(e) => e,
-            Ok(_) => panic!("a fresh claim must never be stolen; the load must fail loudly"),
-        };
-
-        assert!(
-            err.to_string().contains("invalid PEM key"),
-            "the load failure must surface unchanged: {err:#}"
-        );
-        assert!(
-            claim.exists(),
-            "the possibly-live claim must survive untouched"
-        );
-        assert!(
-            names_containing(dir.path(), ".quarantined.").is_empty(),
-            "no quarantine may be created off a live claim"
-        );
-    }
-
-    // F1: a COMPLETED key stranded in a quarantine (the recoverer's restore
-    // republish errored, or the recoverer crashed between its quarantine
-    // rename and the restore) must be ADOPTED by the next boot: the final is
-    // absent, so without adoption the boot mints a fresh DID and the node's
-    // durable identity silently changes. The generate arm scans for
-    // parseable quarantines and republishes the stranded bytes instead. RED
-    // before F1: a fresh identity is minted and the quarantine is stranded
-    // forever.
-    #[test]
-    fn stranded_quarantine_is_adopted_not_replaced() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let stranded = Keypair::generate();
-        let pem = stranded.to_pem().expect("pem");
-        std::fs::write(
-            dir.path().join(".identity.pem.quarantined.99999.0"),
-            pem.as_bytes(),
-        )
-        .expect("seed stranded quarantine");
-
-        let kp = load_or_create_keypair(&key_config(&key_path))
-            .expect("a stranded completed key must be adopted, not fail the boot");
-
-        assert_eq!(
-            format!("{}", kp.did()),
-            format!("{}", stranded.did()),
-            "the stranded identity must be adopted, never replaced by a fresh DID"
-        );
-        let on_disk = super::load_existing_key(&key_path).expect("republished final parses");
-        assert_eq!(
-            format!("{}", on_disk.did()),
-            format!("{}", stranded.did()),
-            "the final must hold the adopted key"
-        );
-        assert!(
-            names_containing(dir.path(), ".quarantined.").is_empty(),
-            "the quarantine must be consumed once its bytes are durably republished"
-        );
-    }
-
-    // F1 MUST-NOT (age bound): adoption exists for the CURRENT round only (a
-    // recoverer that crashed or failed seconds ago), so a parseable
-    // quarantine AGED past CLAIM_SWEEP_MIN_AGE is history, not a stranded
-    // round: kept forensics after a Lost restore, or an old identity the
-    // operator already moved past. Adopting it would resurrect a dead DID
-    // whenever the final later goes missing. The aged quarantine must
-    // survive untouched as forensics while boot generates fresh. RED before
-    // the age bound: the aged quarantine is adopted.
-    #[test]
-    fn aged_quarantine_is_never_adopted() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let stranded = Keypair::generate();
-        let pem = stranded.to_pem().expect("pem");
-        let quarantine = dir.path().join(".identity.pem.quarantined.99999.0");
-        std::fs::write(&quarantine, pem.as_bytes()).expect("seed aged quarantine");
-        age_beyond_claim_sweep(&quarantine);
-
-        let kp = load_or_create_keypair(&key_config(&key_path))
-            .expect("an aged quarantine must not block a fresh generation");
-
-        assert_ne!(
-            format!("{}", kp.did()),
-            format!("{}", stranded.did()),
-            "an aged quarantine is history and must never be resurrected"
-        );
-        assert_eq!(
-            std::fs::read(&quarantine).expect("quarantine still on disk"),
-            pem.as_bytes(),
-            "the aged quarantine must survive byte-for-byte as forensics"
-        );
-    }
-
-    // F1 (operator procedure): deleting identity.pem is the documented way
-    // to mint a fresh DID. With an old parseable quarantine sitting beside
-    // the final as forensics, the post-delete boot must GENERATE a new
-    // identity, not adopt the quarantined one; unbounded adoption silently
-    // defeats the procedure. RED before the age bound: the old quarantine's
-    // DID comes back.
-    #[test]
-    fn operator_fresh_identity_procedure_works() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let first = load_or_create_keypair(&key_config(&key_path)).expect("provision identity");
-        let old = Keypair::generate();
-        let old_pem = old.to_pem().expect("pem");
-        let quarantine = dir.path().join(".identity.pem.quarantined.88888.0");
-        std::fs::write(&quarantine, old_pem.as_bytes()).expect("seed forensic quarantine");
-        age_beyond_claim_sweep(&quarantine);
-
-        // The operator action: delete the final to get a fresh DID.
-        std::fs::remove_file(&key_path).expect("operator deletes the final");
-
-        let kp = load_or_create_keypair(&key_config(&key_path))
-            .expect("the post-delete boot must provision a fresh identity");
-
-        assert_ne!(
-            format!("{}", kp.did()),
-            format!("{}", old.did()),
-            "the old quarantined identity must not be resurrected"
-        );
-        assert_ne!(
-            format!("{}", kp.did()),
-            format!("{}", first.did()),
-            "the operator must get a genuinely fresh DID"
-        );
-    }
-
-    // N2: a quarantine kept by a LOST restore is provably outcompeted (a
-    // concurrent winner durably published while its key sat quarantined),
-    // yet it is young and parseable: exactly what adoption prefers. Left in
-    // the `.quarantined.` class, the operator's
-    // delete-identity.pem-for-a-fresh-DID procedure resurrects the LOSING
-    // key instead of minting fresh. The Lost restore must rename its kept
-    // quarantine into the `.superseded.` class: bytes preserved as
-    // forensics, never adoptable. RED before N2: the post-delete boot
-    // adopts and returns the losing key A.
-    #[test]
-    fn lost_restore_quarantine_is_never_adopted() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = seed_crash_state(dir.path(), b"");
-        let completed = Keypair::generate();
-        let pem_a = completed.to_pem().expect("pem a");
-        let kp_b = Keypair::generate();
-        let pem_b = kp_b.to_pem().expect("pem b");
-
-        // restore_never_clobbers_a_concurrent_winner's construction: A's
-        // completed key is swept into quarantine, B takes the freed name
-        // inside the quarantine-to-restore window, and the link-hostile
-        // restore republish of A loses to B.
-        let heal_path = key_path.clone();
-        let pem_a_disk = pem_a.clone();
-        let before_quarantine = move || {
-            std::fs::write(&heal_path, pem_a_disk.as_bytes())
-                .expect("complete the final inside the re-parse-to-rename window");
-        };
-        let steal_path = key_path.clone();
-        let pem_b_disk = pem_b.clone();
-        let before_restore = move || {
-            let out = publish_key_atomically(
-                &steal_path,
-                pem_b_disk.as_bytes(),
-                &|| {},
-                &|| {},
-                PublishFaults::NONE,
-            )
-            .expect("concurrent starter republishes key B at the freed name");
-            assert!(
-                matches!(out, KeyPublish::Won),
-                "B's publish wins the free name"
-            );
-        };
-        let seam = RecoverySeam {
-            before_quarantine: &before_quarantine,
-            before_restore: &before_restore,
-            restore_faults: PublishFaults {
-                link: || Err(std::io::ErrorKind::Unsupported.into()),
-                ..PublishFaults::NONE
-            },
-            ..RecoverySeam::NONE
-        };
-        let kp = load_or_create_keypair_with(&key_path, &|| {}, &|| {}, PublishFaults::NONE, seam)
-            .expect("the losing restore must converge on B");
-        assert_eq!(
-            format!("{}", kp.did()),
-            format!("{}", kp_b.did()),
-            "the recovering boot must converge on the concurrent winner's key B"
-        );
-
-        // The operator action: delete the final for a fresh DID.
-        std::fs::remove_file(&key_path).expect("operator deletes the final");
-        let fresh = load_or_create_keypair(&key_config(&key_path))
-            .expect("the post-delete boot must provision an identity");
-        assert_ne!(
-            format!("{}", fresh.did()),
-            format!("{}", completed.did()),
-            "the key that LOST its round must never be resurrected by adoption"
-        );
-        assert_ne!(
-            format!("{}", fresh.did()),
-            format!("{}", kp_b.did()),
-            "the operator must get a genuinely fresh DID"
-        );
-        // A's bytes survive as forensics, in the never-adoptable class.
-        assert!(
-            names_containing(dir.path(), ".quarantined.").is_empty(),
-            "no adoptable quarantine may survive a lost restore"
-        );
-        let superseded = names_containing(dir.path(), ".superseded.");
-        assert_eq!(
-            superseded.len(),
-            1,
-            "the losing key must be kept once, superseded: {superseded:?}"
-        );
-        assert_eq!(
-            std::fs::read(dir.path().join(&superseded[0])).expect("superseded readable"),
-            pem_a.as_bytes(),
-            "the superseded file must preserve the losing key's bytes as forensics"
-        );
-    }
-
-    // N4: adoption decides its round in favor of ONE quarantine, but a
-    // crashed pile-up can leave several young parseable quarantines side by
-    // side. Adopting the newest while leaving the siblings adoptable means
-    // a later missing final resurrects a DIFFERENT historical DID. On Won,
-    // adoption must rename every other young parseable sibling into the
-    // `.superseded.` class (bytes intact, never adoptable). RED before N4:
-    // the sibling stays `.quarantined.` and the post-delete boot adopts it.
-    #[test]
-    fn adoption_supersedes_sibling_quarantines() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let older = Keypair::generate();
-        let older_pem = older.to_pem().expect("pem");
-        let q_old = dir.path().join(".identity.pem.quarantined.99999.0");
-        std::fs::write(&q_old, older_pem.as_bytes()).expect("seed older quarantine");
-        // A strictly newer mtime on the second quarantine, so newest-first
-        // adoption is deterministic.
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let newer = Keypair::generate();
-        let q_new = dir.path().join(".identity.pem.quarantined.99999.1");
-        std::fs::write(&q_new, newer.to_pem().expect("pem").as_bytes())
-            .expect("seed newer quarantine");
-
-        let kp = load_or_create_keypair(&key_config(&key_path))
-            .expect("adoption must resolve the stranded round");
-        assert_eq!(
-            format!("{}", kp.did()),
-            format!("{}", newer.did()),
-            "adoption must prefer the newest quarantine"
-        );
-        assert!(
-            names_containing(dir.path(), ".quarantined.").is_empty(),
-            "the adopted quarantine is consumed and the sibling must be superseded"
-        );
-        let superseded = names_containing(dir.path(), ".superseded.");
-        assert_eq!(
-            superseded.len(),
-            1,
-            "exactly the outcompeted sibling is superseded: {superseded:?}"
-        );
-        assert_eq!(
-            std::fs::read(dir.path().join(&superseded[0])).expect("superseded readable"),
-            older_pem.as_bytes(),
-            "the superseded sibling must preserve its bytes as forensics"
-        );
-
-        // The sibling must not come back as a different historical DID once
-        // the final goes missing: the post-delete boot mints fresh.
-        std::fs::remove_file(&key_path).expect("operator deletes the final");
-        let fresh = load_or_create_keypair(&key_config(&key_path))
-            .expect("the post-delete boot must provision an identity");
-        assert_ne!(
-            format!("{}", fresh.did()),
-            format!("{}", older.did()),
-            "the superseded sibling must never be resurrected"
-        );
-        assert_ne!(
-            format!("{}", fresh.did()),
-            format!("{}", newer.did()),
-            "the operator must get a genuinely fresh DID"
-        );
-    }
-
-    // Q1: both Won arms now supersede the sibling quarantines BEFORE
-    // consuming the chosen one, so a crash in the gap leaves the
-    // POST-SUPERSEDE image: final present, siblings already superseded,
-    // only the chosen quarantine (the winner's own bytes) still adoptable.
-    // No seam reaches the reordered gap, so this test pins the two crash
-    // images directly rather than interposing. First the post-fix image: a
-    // later missing final may re-adopt only the winner's own key, never a
-    // different historical DID. Then the PRE-fix image (chosen consumed
-    // first, sibling still plain): a concrete demonstration that the old
-    // ordering's crash gap left the sibling adoptable, resurrecting a
-    // different DID after delete-final. The ordering itself is not
-    // runtime-observable without a production seam; see the fix report.
-    #[test]
-    fn crash_between_won_and_sibling_supersede_leaves_no_adoptable() {
-        // POST-fix crash image: crash fell between the sibling supersede
-        // and the chosen quarantine's removal.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let winner = Keypair::generate();
-        let winner_pem = winner.to_pem().expect("pem");
-        let sibling = Keypair::generate();
-        let sibling_pem = sibling.to_pem().expect("pem");
-        std::fs::write(&key_path, winner_pem.as_bytes()).expect("seed final");
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
-            .expect("0600 final");
-        std::fs::write(
-            dir.path().join(".identity.pem.superseded.99999.0"),
-            sibling_pem.as_bytes(),
-        )
-        .expect("seed superseded sibling");
-        let chosen = dir.path().join(".identity.pem.quarantined.99999.1");
-        std::fs::write(&chosen, winner_pem.as_bytes()).expect("seed un-consumed chosen");
-
-        let kp = load_or_create_keypair(&key_config(&key_path))
-            .expect("the post-supersede crash image must boot healthy");
-        assert_eq!(
-            format!("{}", kp.did()),
-            format!("{}", winner.did()),
-            "the final's key wins the crash-image boot"
-        );
-
-        std::fs::remove_file(&key_path).expect("final goes missing");
-        let readopted = load_or_create_keypair(&key_config(&key_path))
-            .expect("the post-delete boot must provision an identity");
-        assert_ne!(
-            format!("{}", readopted.did()),
-            format!("{}", sibling.did()),
-            "a crash in the supersede-then-consume gap must leave no sibling adoptable"
-        );
-        assert_eq!(
-            format!("{}", readopted.did()),
-            format!("{}", winner.did()),
-            "only the winner's own quarantined bytes may be re-adopted"
-        );
-
-        // PRE-fix crash image (the old ordering's gap): chosen already
-        // consumed, sibling still in the plain adoptable class. This is the
-        // hazard: the sibling IS adopted once the final goes missing.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        std::fs::write(&key_path, winner_pem.as_bytes()).expect("seed final");
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
-            .expect("0600 final");
-        std::fs::write(
-            dir.path().join(".identity.pem.quarantined.99999.0"),
-            sibling_pem.as_bytes(),
-        )
-        .expect("seed still-plain sibling");
-        std::fs::remove_file(&key_path).expect("final goes missing");
-        let resurrected = load_or_create_keypair(&key_config(&key_path))
-            .expect("the post-delete boot must provision an identity");
-        assert_eq!(
-            format!("{}", resurrected.did()),
-            format!("{}", sibling.did()),
-            "the pre-fix image demonstrably resurrects the sibling's DID"
-        );
-    }
-
-    // M1, the N2 mirror on the ADOPTION arm: a quarantine whose adoption
-    // republish LOSES (a concurrent winner durably published first) is
-    // provably outcompeted, yet the adoption-Lost arm used to leave it in
-    // the adoptable class while restore-Lost superseded its kept
-    // quarantine. Within the age floor, the operator's
-    // delete-identity.pem-for-a-fresh-DID procedure then resurrects the key
-    // that just LOST its round. EVERY Lost outcome must supersede the
-    // losing bytes. RED before M1: A survives as `.quarantined.` and the
-    // post-delete boot adopts A.
-    #[test]
-    fn adoption_lost_supersedes_the_losing_quarantine() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let stranded = Keypair::generate();
-        let pem_a = stranded.to_pem().expect("pem a");
-        let quarantine = dir.path().join(".identity.pem.quarantined.99999.0");
-        std::fs::write(&quarantine, pem_a.as_bytes()).expect("seed young quarantine A");
-
-        // A concurrent starter durably publishes C at the free final name
-        // before the adoption scan (before_publish runs at the top of the
-        // pass), so the adoption republish of A returns Lost.
-        let winner = Keypair::generate();
-        let winner_pem = winner.to_pem().expect("pem c");
-        let race_path = key_path.clone();
-        let before_publish = move || {
-            if race_path.exists() {
-                return;
-            }
-            let out = publish_key_atomically(
-                &race_path,
-                winner_pem.as_bytes(),
-                &|| {},
-                &|| {},
-                PublishFaults::NONE,
-            )
-            .expect("concurrent winner publishes C");
-            assert!(
-                matches!(out, KeyPublish::Won),
-                "C's publish takes the free name"
-            );
-        };
-        let seam = RecoverySeam {
-            before_publish: &before_publish,
-            ..RecoverySeam::NONE
-        };
-        let kp = load_or_create_keypair_with(&key_path, &|| {}, &|| {}, PublishFaults::NONE, seam)
-            .expect("the adoption-Lost arm must defer to the winner");
-        assert_eq!(
-            format!("{}", kp.did()),
-            format!("{}", winner.did()),
-            "the boot must converge on the concurrent winner's key C"
-        );
-
-        // A's bytes survive as forensics, in the never-adoptable class.
-        assert!(
-            names_containing(dir.path(), ".quarantined.").is_empty(),
-            "no adoptable quarantine may survive a lost adoption"
-        );
-        let superseded = names_containing(dir.path(), ".superseded.");
-        assert_eq!(
-            superseded.len(),
-            1,
-            "the losing quarantine must be superseded: {superseded:?}"
-        );
-        assert_eq!(
-            std::fs::read(dir.path().join(&superseded[0])).expect("superseded readable"),
-            pem_a.as_bytes(),
-            "the superseded file must preserve A's bytes as forensics"
-        );
-
-        // The operator action: delete the final for a fresh DID; A must not
-        // come back.
-        std::fs::remove_file(&key_path).expect("operator deletes the final");
-        let fresh = load_or_create_keypair(&key_config(&key_path))
-            .expect("the post-delete boot must provision an identity");
-        assert_ne!(
-            format!("{}", fresh.did()),
-            format!("{}", stranded.did()),
-            "the key that LOST its adoption round must never be resurrected"
-        );
-        assert_ne!(
-            format!("{}", fresh.did()),
-            format!("{}", winner.did()),
-            "the operator must get a genuinely fresh DID"
-        );
-    }
-
-    // F1 MUST-NOT: an UNPARSEABLE quarantine is the expected crash state and
-    // stays as forensics; boot must fall through to a fresh generation, not
-    // wedge on it or delete it.
-    #[test]
-    fn unparseable_quarantine_falls_through_to_generate() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let garbage: &[u8] = b"-----BEGIN nonsense truncated";
-        let quarantine = dir.path().join(".identity.pem.quarantined.99999.0");
-        std::fs::write(&quarantine, garbage).expect("seed unparseable quarantine");
-
-        let kp = load_or_create_keypair(&key_config(&key_path))
-            .expect("an unparseable quarantine must not block generation");
-
-        let on_disk = super::load_existing_key(&key_path).expect("generated final parses");
-        assert_eq!(
-            format!("{}", on_disk.did()),
-            format!("{}", kp.did()),
-            "the generated identity must be on disk"
-        );
-        assert_eq!(
-            std::fs::read(&quarantine).expect("quarantine still on disk"),
-            garbage,
-            "the unparseable quarantine must survive byte-for-byte as forensics"
-        );
-    }
-
-    // #194 (grace): the crash signature must persist beyond a single
-    // observation. A reader that catches a live fallback publisher's
-    // mid-write window sees content-bad-plus-marker ONCE; if the state heals
-    // before the next poll, no CrashSignature may fire, since a single
-    // observation classifying a crash would let a crash-free boot hijack the
-    // publisher's round and churn a quarantine. The load-fault hook heals
-    // the state on the second attempt; the boot must LOAD the healed key.
-    // RED before the grace: the first observation returns CrashSignature
-    // immediately. (G3 widened the grace from two polls to a
-    // CRASH_SIGNATURE_MIN_PERSIST window; signature_requires_sustained_observation
-    // covers the widened floor.)
-    #[test]
-    fn mid_write_reader_does_not_hijack_before_grace() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        use std::sync::OnceLock;
-        static CALLS: AtomicU32 = AtomicU32::new(0);
-        static STATE: OnceLock<(std::path::PathBuf, std::path::PathBuf, String)> = OnceLock::new();
-        fn heal_on_second_attempt() -> std::io::Result<()> {
-            if CALLS.fetch_add(1, Ordering::SeqCst) == 1 {
-                let (marker, final_path, pem) = STATE.get().expect("state seeded");
-                std::fs::remove_file(marker)?;
-                std::fs::write(final_path, pem.as_bytes())?;
-            }
-            Ok(())
-        }
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = seed_crash_state(dir.path(), b"");
-        let marker = dir.path().join(".identity.pem.publishing.99999.0");
-        let pem = Keypair::generate().to_pem().expect("pem");
-        let expected = format!("{}", Keypair::from_pem(&pem).expect("fixture parses").did());
-        STATE
-            .set((marker, key_path.clone(), pem.to_string()))
-            .expect("state seeded once");
-
-        match super::boot_load_key(&key_path, true, heal_on_second_attempt) {
-            super::BootLoad::Loaded(kp) => {
-                assert_eq!(
-                    format!("{}", kp.did()),
-                    expected,
-                    "the healed key must be the one loaded"
-                );
-            }
-            super::BootLoad::CrashSignature(e) => {
-                panic!("a single mid-write observation must not classify a crash: {e:#}")
-            }
-            super::BootLoad::Failed(e) => panic!("the healed key must load: {e:#}"),
-        }
-    }
-
-    // #194 (G3): the crash signature must persist for
-    // CRASH_SIGNATURE_MIN_PERSIST of consecutive observations before boot
-    // classifies a crash. A few-millisecond glimpse of claimable+content-bad
-    // is exactly what a reader sees inside a LIVE publisher's mid-write
-    // window once chmod/stat/scheduling latency on shared volumes exceeds
-    // one ~2ms poll, and classifying on it hijacks a live round into a
-    // quarantine churn. Construction: the crash state persists for THREE
-    // observations (~6ms, far under the persistence floor) and then heals;
-    // boot must LOAD the healed key. RED before G3: the two-poll grace fires
-    // CrashSignature on the second observation, before the heal.
-    #[test]
-    fn signature_requires_sustained_observation() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        use std::sync::OnceLock;
-        static CALLS: AtomicU32 = AtomicU32::new(0);
-        static STATE: OnceLock<(std::path::PathBuf, std::path::PathBuf, String)> = OnceLock::new();
-        fn heal_before_persistence() -> std::io::Result<()> {
-            if CALLS.fetch_add(1, Ordering::SeqCst) == 3 {
-                let (marker, final_path, pem) = STATE.get().expect("state seeded");
-                std::fs::remove_file(marker)?;
-                std::fs::write(final_path, pem.as_bytes())?;
-            }
-            Ok(())
-        }
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = seed_crash_state(dir.path(), b"");
-        let marker = dir.path().join(".identity.pem.publishing.99999.0");
-        let pem = Keypair::generate().to_pem().expect("pem");
-        let expected = format!("{}", Keypair::from_pem(&pem).expect("fixture parses").did());
-        STATE
-            .set((marker, key_path.clone(), pem.to_string()))
-            .expect("state seeded once");
-
-        match super::boot_load_key(&key_path, true, heal_before_persistence) {
-            super::BootLoad::Loaded(kp) => {
-                assert_eq!(
-                    format!("{}", kp.did()),
-                    expected,
-                    "the healed key must be the one loaded"
-                );
-            }
-            super::BootLoad::CrashSignature(e) => panic!(
-                "a signature cleared inside the persistence window must not classify \
-                 a crash: {e:#}"
-            ),
-            super::BootLoad::Failed(e) => panic!("the healed key must load: {e:#}"),
-        }
-    }
-
-    // #194 (F2, window-1): a publisher that completes between recovery's
-    // claim step and its re-parse must win the round retroactively. The
-    // post-claim re-parse sees the completed key, so recovery releases its
-    // claims and aborts to Reloaded: no quarantine of a good key, no claim
-    // left behind, the completed identity returned. RED before F2: no
-    // re-parse exists, so recovery quarantines the just-completed key and
-    // regenerates over it.
-    #[test]
-    fn post_claim_reparse_aborts_to_reload() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = seed_crash_state(dir.path(), b"");
-        let completed = Keypair::generate();
-        let pem = completed.to_pem().expect("pem");
-        let heal_path = key_path.clone();
-        let before_reparse = move || {
-            std::fs::write(&heal_path, pem.as_bytes())
-                .expect("complete the final inside the claim window");
-        };
-        let seam = RecoverySeam {
-            before_reparse: &before_reparse,
-            ..RecoverySeam::NONE
-        };
-
-        let kp = load_or_create_keypair_with(&key_path, &|| {}, &|| {}, PublishFaults::NONE, seam)
-            .expect("recovery must abort to the completed key");
-
-        assert_eq!(
-            format!("{}", kp.did()),
-            format!("{}", completed.did()),
-            "the identity completed inside the window must be the one returned"
-        );
-        assert!(
-            names_containing(dir.path(), ".quarantined.").is_empty(),
-            "a key completed before the re-parse must never be quarantined"
-        );
-        assert!(
-            names_containing(dir.path(), ".recovering.").is_empty(),
-            "the aborting recovery must release its claims"
-        );
-        assert!(
-            names_containing(dir.path(), ".publishing.").is_empty(),
-            "the claimed markers must not reappear"
-        );
-    }
-
-    // N1: EVERY arm of load_or_create_keypair_with that returns a
-    // successfully resolved keypair must run the stale-marker sweep first,
-    // including the post-claim-reparse Reloaded arm and the adoption-Lost
-    // re-load. Residue that lands after the claim step (or beside a missing
-    // final) otherwise persists past a healthy return, and a LATER content
-    // failure of the good final would pair with it and misclassify plain
-    // corruption as a recoverable crash. RED before N1: both arms return
-    // without sweeping and the planted marker and aged claim survive.
-    #[test]
-    fn reloaded_and_adoption_paths_sweep_before_returning() {
-        // Scenario 1: the post-claim-reparse Reloaded arm
-        // (post_claim_reparse_aborts_to_reload's construction), with fresh
-        // residue planted inside the claim window.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = seed_crash_state(dir.path(), b"");
-        let completed = Keypair::generate();
-        let pem = completed.to_pem().expect("pem");
-        let heal_path = key_path.clone();
-        let residue_dir = dir.path().to_path_buf();
-        let before_reparse = move || {
-            std::fs::write(&heal_path, pem.as_bytes())
-                .expect("complete the final inside the claim window");
-            std::fs::write(residue_dir.join(".identity.pem.publishing.31337.0"), b"")
-                .expect("plant stale marker inside the claim window");
-            let claim = residue_dir.join(".identity.pem.recovering.31337");
-            std::fs::write(&claim, b"").expect("plant orphan claim");
-            age_beyond_claim_sweep(&claim);
-        };
-        let seam = RecoverySeam {
-            before_reparse: &before_reparse,
-            ..RecoverySeam::NONE
-        };
-        let kp = load_or_create_keypair_with(&key_path, &|| {}, &|| {}, PublishFaults::NONE, seam)
-            .expect("the healed final must load");
-        assert_eq!(
-            format!("{}", kp.did()),
-            format!("{}", completed.did()),
-            "the reloaded identity must be the healed key"
-        );
-        assert!(
-            names_containing(dir.path(), ".publishing.").is_empty(),
-            "the Reloaded return must sweep stale publish markers"
-        );
-        assert!(
-            names_containing(dir.path(), ".recovering.").is_empty(),
-            "the Reloaded return must sweep aged orphan claims"
-        );
-
-        // Scenario 2: the adoption-Lost re-load. A young adoptable
-        // quarantine loses its republish to a final that appears
-        // concurrently (before_publish), and the follow-up load returns
-        // the winner; the same residue must not survive that return.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let stranded = Keypair::generate();
-        std::fs::write(
-            dir.path().join(".identity.pem.quarantined.99999.0"),
-            stranded.to_pem().expect("pem").as_bytes(),
-        )
-        .expect("seed young quarantine");
-        std::fs::write(dir.path().join(".identity.pem.publishing.31337.0"), b"")
-            .expect("seed stale marker");
-        let claim = dir.path().join(".identity.pem.recovering.31337");
-        std::fs::write(&claim, b"").expect("seed orphan claim");
-        age_beyond_claim_sweep(&claim);
-        let winner = Keypair::generate();
-        let winner_pem = winner.to_pem().expect("pem");
-        let race_path = key_path.clone();
-        let before_publish = move || {
-            if race_path.exists() {
-                return;
-            }
-            let out = publish_key_atomically(
-                &race_path,
-                winner_pem.as_bytes(),
-                &|| {},
-                &|| {},
-                PublishFaults::NONE,
-            )
-            .expect("concurrent winner publishes");
-            assert!(matches!(out, KeyPublish::Won), "the winner takes the name");
-        };
-        let seam = RecoverySeam {
-            before_publish: &before_publish,
-            ..RecoverySeam::NONE
-        };
-        let kp = load_or_create_keypair_with(&key_path, &|| {}, &|| {}, PublishFaults::NONE, seam)
-            .expect("the adoption-Lost re-load must resolve the winner");
-        assert_eq!(
-            format!("{}", kp.did()),
-            format!("{}", winner.did()),
-            "the adoption-Lost arm must defer to the concurrent winner"
-        );
-        assert!(
-            names_containing(dir.path(), ".publishing.").is_empty(),
-            "the adoption-Lost return must sweep stale publish markers"
-        );
-        assert!(
-            names_containing(dir.path(), ".recovering.").is_empty(),
-            "the adoption-Lost return must sweep aged orphan claims"
-        );
-    }
-
-    // #194 (G2a) MUST-NOT: a TRANSIENT (non-content) failure of the
-    // post-claim RE-parse proves nothing about the final's content, so
-    // recovery must release its claims and surface the error loudly,
-    // destroying nothing: quarantining on it would destroy a possibly good
-    // key, the protocol's own must-not. The reparse_fault seam injects the
-    // transient class deterministically (load_fault only reaches
-    // boot_load_key's attempts, never this re-parse). RED before G2a: any
-    // re-parse error is treated as still-crashed and the final is
-    // quarantined.
-    #[test]
-    fn transient_reparse_error_releases_claims_and_fails_loudly() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = seed_crash_state(dir.path(), b"");
-        let seam = RecoverySeam {
-            reparse_fault: || Err(std::io::Error::other("injected transient reparse failure")),
-            ..RecoverySeam::NONE
-        };
-
-        let err =
-            match load_or_create_keypair_with(&key_path, &|| {}, &|| {}, PublishFaults::NONE, seam)
-            {
-                Err(e) => e,
-                Ok(_) => panic!("a transient re-parse failure must stay loud, never resolve"),
-            };
-        assert!(
-            format!("{err:#}").contains("injected transient reparse failure"),
-            "the transient failure must surface: {err:#}"
-        );
-        assert_eq!(
-            std::fs::read(&key_path).expect("final still on disk"),
-            b"",
-            "the final's bytes must be untouched"
-        );
-        assert!(
-            names_containing(dir.path(), ".quarantined.").is_empty(),
-            "a transient re-parse failure must never quarantine"
-        );
-        assert!(
-            names_containing(dir.path(), ".recovering.").is_empty(),
-            "the failing recovery must release its claims, not leak them"
-        );
-    }
-
-    // #194 (G2b): a publisher that completes its write AFTER the re-parse
-    // observation and BEFORE the quarantine rename has its VALID key swept
-    // into quarantine; the rename preserves the bytes, so recovery must
-    // parse the quarantined bytes, detect the completed key, restore it to
-    // the final name, release its claims, and return that identity: no
-    // regeneration, no divergence from the Won the publisher already
-    // reported. The before_quarantine seam lands the completed write in
-    // exactly that window (before_reparse fires too early: the re-parse
-    // would catch it). RED before G2b: the completed key stays quarantined
-    // and a fresh identity is regenerated over it.
-    #[test]
-    fn completed_key_is_restored_from_quarantine() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = seed_crash_state(dir.path(), b"");
-        let completed = Keypair::generate();
-        let pem = completed.to_pem().expect("pem");
-        let heal_path = key_path.clone();
-        let before_quarantine = move || {
-            std::fs::write(&heal_path, pem.as_bytes())
-                .expect("complete the final inside the re-parse-to-rename window");
-        };
-        let seam = RecoverySeam {
-            before_quarantine: &before_quarantine,
-            ..RecoverySeam::NONE
-        };
-
-        let kp = load_or_create_keypair_with(&key_path, &|| {}, &|| {}, PublishFaults::NONE, seam)
-            .expect("recovery must restore the completed key, not fail or regenerate");
-
-        assert_eq!(
-            format!("{}", kp.did()),
-            format!("{}", completed.did()),
-            "the completed identity must be the one returned, never a regeneration"
-        );
-        let on_disk = super::load_existing_key(&key_path).expect("restored final parses");
-        assert_eq!(
-            format!("{}", on_disk.did()),
-            format!("{}", completed.did()),
-            "the final must hold the restored key"
-        );
-        assert!(
-            names_containing(dir.path(), ".quarantined.").is_empty(),
-            "the quarantine must be removed once its key is republished at the final"
-        );
-        assert!(
-            names_containing(dir.path(), ".recovering.").is_empty(),
-            "the aborting recovery must release its claims"
-        );
-        assert!(
-            names_containing(dir.path(), ".publishing.").is_empty(),
-            "the claimed markers must not reappear"
-        );
-    }
-
-    // M2, the N4 mirror on the RESTORE arm: the G2b restore decides its
-    // round in favor of the restored key, but it used to remove only the
-    // quarantine it consumed. A second young parseable quarantine (an
-    // earlier crash's residue) stayed adoptable, so a later missing final
-    // resurrected a DIFFERENT historical DID. On Won the restore must
-    // supersede every other young parseable sibling, exactly like
-    // adoption-Won. RED before M2: Q_old stays `.quarantined.` and the
-    // post-delete boot adopts it.
-    #[test]
-    fn restore_won_supersedes_siblings() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = seed_crash_state(dir.path(), b"");
-        let older = Keypair::generate();
-        let older_pem = older.to_pem().expect("pem");
-        let q_old = dir.path().join(".identity.pem.quarantined.11111.0");
-        std::fs::write(&q_old, older_pem.as_bytes()).expect("seed sibling quarantine");
-
-        // completed_key_is_restored_from_quarantine's construction: the
-        // publisher completes inside the re-parse-to-rename window, so its
-        // key is swept into a fresh quarantine and restored from there.
-        let completed = Keypair::generate();
-        let pem = completed.to_pem().expect("pem");
-        let heal_path = key_path.clone();
-        let before_quarantine = move || {
-            std::fs::write(&heal_path, pem.as_bytes())
-                .expect("complete the final inside the re-parse-to-rename window");
-        };
-        let seam = RecoverySeam {
-            before_quarantine: &before_quarantine,
-            ..RecoverySeam::NONE
-        };
-        let kp = load_or_create_keypair_with(&key_path, &|| {}, &|| {}, PublishFaults::NONE, seam)
-            .expect("recovery must restore the completed key");
-        assert_eq!(
-            format!("{}", kp.did()),
-            format!("{}", completed.did()),
-            "the restored identity must be the completed key"
-        );
-
-        assert!(
-            names_containing(dir.path(), ".quarantined.").is_empty(),
-            "the restore-Won round must leave no adoptable quarantine behind"
-        );
-        let superseded = names_containing(dir.path(), ".superseded.");
-        assert_eq!(
-            superseded.len(),
-            1,
-            "exactly the outcompeted sibling is superseded: {superseded:?}"
-        );
-        assert_eq!(
-            std::fs::read(dir.path().join(&superseded[0])).expect("superseded readable"),
-            older_pem.as_bytes(),
-            "the superseded sibling must preserve its bytes as forensics"
-        );
-
-        // The sibling must not come back once the final goes missing.
-        std::fs::remove_file(&key_path).expect("operator deletes the final");
-        let fresh = load_or_create_keypair(&key_config(&key_path))
-            .expect("the post-delete boot must provision an identity");
-        assert_ne!(
-            format!("{}", fresh.did()),
-            format!("{}", older.did()),
-            "the superseded sibling must never be resurrected"
-        );
-        assert_ne!(
-            format!("{}", fresh.did()),
-            format!("{}", completed.did()),
-            "the operator must get a genuinely fresh DID"
-        );
-    }
-
-    // R1: the post-quarantine restore must hold no-clobber on EVERY tier. A
-    // completed key A is swept into quarantine (G2b), a concurrent starter
-    // publishes a fresh key B at the freed final name inside the
-    // quarantine-to-restore window (before_restore), and the restore's link
-    // tier is forced onto its link-hostile degradation (restore_faults.link).
-    // The restore must defer to B (keep A's bytes as forensics, converge
-    // on B), never replace B with A: B's owner already holds B in memory, so
-    // a clobber leaves that node's memory and disk diverged. RED before the
-    // fix: the old restore ladder degraded to a plain rename(quarantine ->
-    // final), which clobbered B with A. Since N2, the kept forensics live in
-    // the SUPERSEDED class (A provably lost the round, so it must never be
-    // adoptable); lost_restore_quarantine_is_never_adopted covers that side.
-    #[test]
-    fn restore_never_clobbers_a_concurrent_winner() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = seed_crash_state(dir.path(), b"");
-        let completed = Keypair::generate();
-        let pem_a = completed.to_pem().expect("pem a");
-        let kp_b = Keypair::generate();
-        let pem_b = kp_b.to_pem().expect("pem b");
-
-        let heal_path = key_path.clone();
-        let before_quarantine = move || {
-            std::fs::write(&heal_path, pem_a.as_bytes())
-                .expect("complete the final inside the re-parse-to-rename window");
-        };
-        let steal_path = key_path.clone();
-        let pem_b_disk = pem_b.clone();
-        let before_restore = move || {
-            let out = publish_key_atomically(
-                &steal_path,
-                pem_b_disk.as_bytes(),
-                &|| {},
-                &|| {},
-                PublishFaults::NONE,
-            )
-            .expect("concurrent starter republishes key B at the freed name");
-            assert!(
-                matches!(out, KeyPublish::Won),
-                "B's publish wins the free name"
-            );
-        };
-        let seam = RecoverySeam {
-            before_quarantine: &before_quarantine,
-            before_restore: &before_restore,
-            restore_faults: PublishFaults {
-                link: || Err(std::io::ErrorKind::Unsupported.into()),
-                ..PublishFaults::NONE
-            },
-            ..RecoverySeam::NONE
-        };
-
-        let kp = load_or_create_keypair_with(&key_path, &|| {}, &|| {}, PublishFaults::NONE, seam)
-            .expect("the restore must converge on B, not fail the start");
-
-        assert_eq!(
-            format!("{}", kp.did()),
-            format!("{}", kp_b.did()),
-            "the recovering boot must converge on the concurrent winner's key B"
-        );
-        let on_disk = super::load_existing_key(&key_path).expect("final parses");
-        assert_eq!(
-            format!("{}", on_disk.did()),
-            format!("{}", kp_b.did()),
-            "key B must survive at the final name on every restore tier"
-        );
-        let superseded = names_containing(dir.path(), ".superseded.");
-        assert_eq!(
-            superseded.len(),
-            1,
-            "the losing restore must keep A's bytes as superseded forensics: {superseded:?}"
-        );
-        assert!(
-            names_containing(dir.path(), ".quarantined.").is_empty(),
-            "the losing key must not stay in the adoptable quarantine class"
-        );
-        assert!(
-            names_containing(dir.path(), ".recovering.").is_empty(),
-            "the recovery must release its claims"
-        );
-        assert!(
-            names_containing(dir.path(), ".publishing.").is_empty(),
-            "no publish markers may remain"
-        );
-    }
-
-    // Regression guard: a fallback publisher whose round was claimed by a
-    // recovery (its inode quarantined away, a live key B republished at the
-    // name) must NOT let its own failure cleanup unlink B. The post-write
-    // error arms now remove nothing at all (any unlink there is a
-    // stat-then-unlink race against the recoverer), which this interleave
-    // pins. It runs inside the fallback_fsync fault (before_commit never
-    // fires on the error arms), step for step what a claiming recovery does:
-    // claim A's marker, quarantine A's final by rename, republish B, clear
-    // the claim; then the injected Err forces A's fsync-failure arm. RED if
-    // any by-name removal returns to that arm: A deletes B, destroying the
-    // live identity whose owner already returned Won.
-    #[test]
-    fn failed_publisher_cleanup_spares_a_republished_final() {
-        thread_local! {
-            static STEAL: std::cell::RefCell<
-                Option<(std::path::PathBuf, std::path::PathBuf, String)>,
-            > = const { std::cell::RefCell::new(None) };
-        }
-        fn steal_round_then_fail_fsync() -> std::io::Result<()> {
-            STEAL.with(|s| {
-                if let Some((dir, key_path, pem_b)) = s.borrow_mut().take() {
-                    let markers = names_containing(&dir, ".publishing.");
-                    assert_eq!(
-                        markers.len(),
-                        1,
-                        "A's window must be bracketed: {markers:?}"
-                    );
-                    let claim = dir.join(".identity.pem.recovering.55555");
-                    std::fs::rename(dir.join(&markers[0]), &claim).expect("claim A's marker");
-                    std::fs::rename(&key_path, dir.join(".identity.pem.quarantined.55555.0"))
-                        .expect("quarantine A's inode away");
-                    let out = publish_key_atomically(
-                        &key_path,
-                        pem_b.as_bytes(),
-                        &|| {},
-                        &|| {},
-                        PublishFaults::NONE,
-                    )
-                    .expect("recoverer republishes key B");
-                    assert!(matches!(out, KeyPublish::Won), "recoverer's republish wins");
-                    std::fs::remove_file(&claim).expect("clear the claim");
-                }
-            });
-            Err(std::io::Error::other("injected fsync failure"))
-        }
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let key_path = dir.path().join("identity.pem");
-        let kp_b = Keypair::generate();
-        let pem_b = kp_b.to_pem().expect("pem b");
-        STEAL.with(|s| {
-            *s.borrow_mut() = Some((dir.path().to_path_buf(), key_path.clone(), (*pem_b).clone()));
-        });
-        let pem_a = Keypair::generate().to_pem().expect("pem a");
-        let faults = PublishFaults {
-            link: || Err(std::io::ErrorKind::Unsupported.into()),
-            fallback_fsync: steal_round_then_fail_fsync,
-            ..PublishFaults::NONE
-        };
-
-        let err = match publish_key_atomically(&key_path, pem_a.as_bytes(), &|| {}, &|| {}, faults)
-        {
-            Err(e) => e,
-            Ok(_) => panic!("A's failed fsync must still error A's publish"),
-        };
-        assert!(
-            format!("{err:#}").contains("injected fsync failure"),
-            "the fsync failure must surface: {err:#}"
-        );
-        let on_disk = super::load_existing_key(&key_path)
-            .expect("the republished final must survive A's cleanup");
-        assert_eq!(
-            format!("{}", on_disk.did()),
-            format!("{}", kp_b.did()),
-            "A's error-arm cleanup must spare the recoverer's key B"
-        );
-        let quarantined = names_containing(dir.path(), ".quarantined.");
-        assert_eq!(
-            quarantined.len(),
-            1,
-            "A's quarantined inode stays where the recoverer put it: {quarantined:?}"
-        );
-        assert!(
-            names_containing(dir.path(), ".recovering.").is_empty(),
-            "no recovery claims may remain"
-        );
-        assert!(
-            names_containing(dir.path(), ".publishing.").is_empty(),
-            "no publish markers may remain"
-        );
-    }
-
-    /// A parent directory at 0755 (group/world READ but no write) must be
-    /// tightened to 0700 on reload, matching publish-time policy. Before the
-    /// fix the reload fast-path checked only write bits (0o022), so a 0755
-    /// parent survived reload but was tightened on publish, leaving the
-    /// on-disk policy inconsistent across restarts. RED with the old mask:
-    /// the parent stays 0755 after load.
-    #[test]
-    fn reload_tightens_0755_parent_dir_to_0700() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = tempfile::tempdir().expect("tempdir");
-        let parent = root.path().join("keys");
-        std::fs::create_dir_all(&parent).expect("keys dir");
-        let key_path = parent.join("identity.pem");
-        let kp = Keypair::generate();
-        let pem = kp.to_pem().expect("pem");
-        std::fs::write(&key_path, pem.as_bytes()).expect("write key");
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
-            .expect("0600 key");
-        // 0755: group/world can read but not write. The old reload mask
-        // (0o022) missed this; the publish mask (0o077) caught it.
-        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755))
-            .expect("0755 parent");
-
-        let loaded = load_or_create_keypair_with(
-            &key_path,
-            &|| {},
-            &|| {},
-            PublishFaults::NONE,
-            RecoverySeam::NONE,
-        )
-        .expect("load existing key under a 0755 parent must tighten the parent dir");
-
-        let mode = std::fs::metadata(&parent)
-            .expect("parent exists")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(
-            mode, 0o700,
-            "the identity key parent directory must be owner-only after reload, got {mode:o}"
-        );
-        assert_eq!(
-            format!("{}", loaded.did()),
-            format!("{}", kp.did()),
-            "the identity must be unchanged"
-        );
+    #[tokio::test]
+    async fn ping_peer_readiness_legacy_fallback_does_not_follow_redirect() {
+        let mut server = mockito::Server::new_async().await;
+        let internal = server
+            .mock("GET", "/internal-metadata")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+        let _ready = server
+            .mock("GET", "/ready")
+            .with_status(404)
+            .create_async()
+            .await;
+        let _health = server
+            .mock("GET", "/health")
+            .with_status(302)
+            .with_header("location", &format!("{}/internal-metadata", server.url()))
+            .create_async()
+            .await;
+
+        let ok = ping_peer_readiness(&production_http_client(), &server.url()).await;
+
+        assert!(!ok, "the legacy fallback must not follow redirects");
+        internal.assert_async().await;
+    }
+
+    // A transport error (nothing listening) must map to unhealthy, never a
+    // spurious healthy — the .unwrap_or(false) arm.
+    #[tokio::test]
+    async fn ping_peer_readiness_reports_unready_on_connection_error() {
+        let ok = ping_peer_readiness(&production_http_client(), "http://127.0.0.1:1").await;
+        assert!(!ok, "a connection error must count as an unready peer");
     }
 }
 
 #[cfg(test)]
-mod shutdown_grace_tests {
-    use super::drive_serve_with_grace;
-    use std::time::{Duration, Instant};
+mod identity_key_storage_tests {
+    use super::*;
 
-    // The must-not case: the drain (serve future) never completes but the signal
-    // has fired. The grace deadline must fire, report `grace_expired = true`, and
-    // return promptly so teardown proceeds — not hang forever. RED: a helper that
-    // just awaits `serve` (ignoring grace) hangs this test past its bound.
-    #[tokio::test]
-    async fn hung_drain_is_abandoned_after_grace() {
-        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
-        let _ = armed_tx.send(()); // signal already fired
-        let serve = std::future::pending::<std::io::Result<()>>(); // never drains
-        let start = Instant::now();
+    /// Requested modes for the objects this invocation creates. Named once so
+    /// a failure prints achieved against requested rather than a bare boolean.
+    #[cfg(unix)]
+    const IDENTITY_WANT_DIR_MODE: u32 = 0o700;
+    #[cfg(unix)]
+    const IDENTITY_WANT_KEY_MODE: u32 = 0o600;
+    /// Mode a PRE-EXISTING ancestor is built at. Not group-writable, so the
+    /// write-authority check accepts it, and nothing this process does may
+    /// change it: only directories this invocation creates are its business.
+    #[cfg(unix)]
+    const IDENTITY_PREEXISTING_MODE: u32 = 0o755;
+    /// Mode the group-writable rows build. A parent carrying it must be
+    /// refused before anything is created inside it.
+    #[cfg(unix)]
+    const IDENTITY_LOOSE_MODE: u32 = 0o775;
 
-        let (result, grace_expired) =
-            drive_serve_with_grace(serve, armed_rx, Duration::from_millis(50)).await;
+    #[cfg(unix)]
+    fn identity_mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(path)
+            .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()))
+            .permissions()
+            .mode()
+            & 0o7777
+    }
 
-        assert!(grace_expired, "a drain outlasting grace must be abandoned");
+    /// Every directory on the key path with its achieved mode against what the
+    /// contract requested, so a RED is attributable to the mode rather than to
+    /// "something failed".
+    #[cfg(unix)]
+    fn identity_key_tree(base: &std::path::Path, key: &std::path::Path) -> String {
+        let mut dirs = Vec::new();
+        let mut cur = key.parent();
+        while let Some(d) = cur {
+            dirs.push(d.to_path_buf());
+            if d == base {
+                break;
+            }
+            cur = d.parent();
+        }
+        dirs.reverse();
+        let mut out = String::new();
+        for d in dirs {
+            match std::fs::symlink_metadata(&d) {
+                Ok(_) => out.push_str(&format!(
+                    "  dir  {} achieved mode {:04o}, requested {:04o}\n",
+                    d.display(),
+                    identity_mode_of(&d),
+                    IDENTITY_WANT_DIR_MODE
+                )),
+                Err(e) => out.push_str(&format!("  dir  {} absent ({e})\n", d.display())),
+            }
+        }
+        match std::fs::symlink_metadata(key) {
+            Ok(_) => out.push_str(&format!(
+                "  key  {} achieved mode {:04o}, requested {:04o}\n",
+                key.display(),
+                identity_mode_of(key),
+                IDENTITY_WANT_KEY_MODE
+            )),
+            Err(e) => out.push_str(&format!("  key  {} absent ({e})\n", key.display())),
+        }
+        out
+    }
+
+    /// An object a refused boot must not have left behind. The message is the
+    /// fixture's own: the anyhow text never carries the phrase, so a `contains`
+    /// on the error would be a check that can never pass.
+    #[cfg(unix)]
+    fn assert_identity_absent(path: &std::path::Path) {
         assert!(
-            result.is_ok(),
-            "abandon path returns Ok so teardown proceeds"
-        );
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "must not wait indefinitely for the hung drain"
+            std::fs::symlink_metadata(path).is_err(),
+            "{} left behind by a refused boot",
+            path.display()
         );
     }
 
-    // Normal drain: the serve future completes before grace, so the real serve
-    // result is propagated and `grace_expired` is false.
-    #[tokio::test]
-    async fn completed_drain_keeps_result_and_does_not_expire() {
-        let (_armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
-        let serve = std::future::ready(Ok::<(), std::io::Error>(()));
-
-        let (result, grace_expired) =
-            drive_serve_with_grace(serve, armed_rx, Duration::from_secs(3600)).await;
-
+    /// A symlink refusal must name the symlink. An unrelated EACCES, ENOENT,
+    /// or write-authority failure satisfies "an error happened" while proving
+    /// nothing about whether the interior component was followed, so every
+    /// symlink row asserts the reason rather than the bare failure.
+    #[cfg(unix)]
+    fn assert_names_symlink_refusal(text: &str, what: &str) {
+        let lower = text.to_lowercase();
         assert!(
-            !grace_expired,
-            "a completed drain must not report grace expiry"
+            lower.contains("symlink") || lower.contains("symbolic link"),
+            "{what} must be refused for the symlink on the path, and the refusal must say so, \
+             got: {text}"
         );
-        assert!(result.is_ok());
     }
 
-    // The grace clock starts at the SIGNAL, not at call time. With the signal
-    // unsent, a finite drain longer than `grace` still completes normally — total
-    // uptime is never bounded by grace. RED: drop `armed.await` from the grace
-    // branch and the deadline fires at 10ms, expiring before the 80ms drain.
-    #[tokio::test]
-    async fn grace_clock_starts_at_signal_not_call() {
-        let (_armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
-        // Signal never fires; drain finishes after > grace.
-        let serve = async {
-            tokio::time::sleep(Duration::from_millis(80)).await;
-            Ok::<(), std::io::Error>(())
+    /// Every regular file under `root`, following no symlink out of it. Used
+    /// to prove a refused boot published nothing where a followed interior
+    /// link would have put it, including a target outside the base.
+    #[cfg(unix)]
+    fn identity_collect_files(root: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
         };
-
-        let (result, grace_expired) =
-            drive_serve_with_grace(serve, armed_rx, Duration::from_millis(10)).await;
-
-        assert!(
-            !grace_expired,
-            "grace must not fire while the shutdown signal is unsent"
-        );
-        assert!(result.is_ok());
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(md) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if md.is_dir() {
+                identity_collect_files(&path, found);
+            } else if md.is_file() {
+                found.push(path);
+            }
+        }
     }
 
-    // Real-socket contract: at grace expiry the server abandons a request still
-    // in flight; the client never receives a 503 (or any late error response),
-    // it just observes the connection going away or no response at all. Wires a
-    // real `axum::serve` future through `drive_serve_with_grace` exactly as the
-    // production path does. RED: asserting the client reads back an
-    // "HTTP/1.1 503" status line fails (no response bytes ever arrive).
-    #[tokio::test]
-    async fn real_socket_in_flight_request_abandoned_without_503() {
-        use axum::routing::get;
-        use std::sync::Arc;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        // The slow handler signals once the request is in flight, then outlasts
-        // the grace by a wide margin.
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let entered_tx = entered.clone();
-        let app = axum::Router::new().route(
-            "/slow",
-            get(move || {
-                let entered_tx = entered_tx.clone();
-                async move {
-                    entered_tx.notify_one();
-                    tokio::time::sleep(Duration::from_secs(10)).await;
-                    "done"
-                }
-            }),
+    /// No key anywhere beneath `root`. Stronger than naming one expected path,
+    /// because a followed link can land the key at a name the test did not
+    /// predict.
+    #[cfg(unix)]
+    fn assert_no_identity_key_under(root: &std::path::Path, what: &str) {
+        let mut found = Vec::new();
+        identity_collect_files(root, &mut found);
+        let keys: Vec<String> = found
+            .iter()
+            .filter(|p| p.file_name().is_some_and(|n| n == "identity.pem"))
+            .map(|p| p.display().to_string())
+            .collect();
+        assert!(
+            keys.is_empty(),
+            "{what}: a refused boot published an identity under {}: {keys:?}",
+            root.display()
         );
+    }
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+    /// The assertions every success row shares: exact 0700 on each directory
+    /// this invocation created, 0600 on the key, no scratch residue beside it,
+    /// and a base this process never touched.
+    #[cfg(unix)]
+    fn assert_identity_success(
+        base: &std::path::Path,
+        key: &std::path::Path,
+        created: &[std::path::PathBuf],
+    ) {
+        for d in created {
+            let mode = identity_mode_of(d);
+            assert_eq!(
+                mode,
+                IDENTITY_WANT_DIR_MODE,
+                "created directory {} achieved mode {:04o}, requested {:04o}\n{}",
+                d.display(),
+                mode,
+                IDENTITY_WANT_DIR_MODE,
+                identity_key_tree(base, key)
+            );
+        }
+        let key_mode = identity_mode_of(key);
+        assert_eq!(
+            key_mode,
+            IDENTITY_WANT_KEY_MODE,
+            "identity key achieved mode {key_mode:04o}, requested 0600\n{}",
+            identity_key_tree(base, key)
+        );
+        let leaf = key.parent().expect("the key names a parent");
+        let entries: Vec<String> = std::fs::read_dir(leaf)
+            .expect("read the key directory")
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![key.file_name().unwrap().to_string_lossy().into_owned()],
+            "the key directory must hold only the published key, no scratch residue: {entries:?}"
+        );
+        let base_mode = identity_mode_of(base);
+        assert_eq!(
+            base_mode, 0o700,
+            "the base directory must be left at 0700, achieved {base_mode:04o}"
+        );
+    }
 
-        // Mirror the production wiring: axum drains on a watch flip, and the
-        // graceful-shutdown closure arms the grace clock at the signal.
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
-        let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
-            while !*shutdown_rx.borrow_and_update() {
-                if shutdown_rx.changed().await.is_err() {
-                    break;
+    /// Boot a success row and check its contract. `call_path` is what the code
+    /// is handed (relative for the relative row); `key` is the same key under
+    /// `base`, so the mode checks never depend on the child's cwd.
+    #[cfg(unix)]
+    fn run_identity_success_row(
+        base: &std::path::Path,
+        call_path: &std::path::Path,
+        key: &std::path::Path,
+        created: &[std::path::PathBuf],
+        phase: &str,
+    ) -> String {
+        if phase == "reload" {
+            assert!(
+                key.exists(),
+                "the reload phase requires the create phase to have published a key at {}",
+                key.display()
+            );
+        }
+        let kp = load_or_create_keypair_at(call_path).unwrap_or_else(|e| {
+            panic!(
+                "{} the node identity, got: {e:#}\nkey storage at failure:\n{}",
+                if phase == "reload" {
+                    "reload in a fresh process must load"
+                } else {
+                    "first boot must create"
+                },
+                identity_key_tree(base, key)
+            )
+        });
+        assert_identity_success(base, key, created);
+        kp.did().to_string()
+    }
+
+    /// Fixture: one (layout, umask, phase) row of the identity lifecycle
+    /// matrix.
+    ///
+    /// `~/.gitlawb` holds BOTH keys, and `load_or_create_keypair` runs before
+    /// the listener binds, so a mask that strips owner bits here takes the
+    /// whole node down before any p2p code is reached. `umask` is
+    /// process-global, so every row is a child. Double-gated like the p2p
+    /// fixtures: `#[ignore]` keeps it out of a normal run and the env check
+    /// keeps it inert under a bare `--ignored` sweep, which would otherwise set
+    /// a process-global umask inside the shared test process.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=identity-key-umask"]
+    fn fixture_identity_key_under_hostile_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref() != Some("identity-key-umask") {
+            return;
+        }
+        let base = std::path::PathBuf::from(
+            std::env::var("GITLAWB_TEST_BASE").expect("GITLAWB_TEST_BASE"),
+        );
+        let umask_val =
+            u32::from_str_radix(&std::env::var("GITLAWB_TEST_UMASK").unwrap(), 8).unwrap();
+        let layout = std::env::var("GITLAWB_TEST_LAYOUT").expect("GITLAWB_TEST_LAYOUT");
+        let phase = std::env::var("GITLAWB_TEST_PHASE").expect("GITLAWB_TEST_PHASE");
+
+        // SAFETY: `umask` only reads and replaces the process-wide value, and
+        // this process exists solely for this probe. No restore: the value dies
+        // with the child. Set FIRST, before any layout is built, so the
+        // explicit chmods below are what give a pre-existing directory its
+        // mode regardless of the mask.
+        unsafe { libc::umask(umask_val as libc::mode_t) };
+
+        match layout.as_str() {
+            "one-missing" => {
+                let dir = base.join(".gitlawb");
+                let key = dir.join("identity.pem");
+                let did = run_identity_success_row(&base, &key, &key, &[dir], &phase);
+                println!("identity-key-umask: asserted did={did}");
+            }
+            "multi-missing" => {
+                let one = base.join("one");
+                let two = one.join("two");
+                let key = two.join("identity.pem");
+                let did = run_identity_success_row(&base, &key, &key, &[one, two], &phase);
+                println!("identity-key-umask: asserted did={did}");
+            }
+            "three-missing" => {
+                let one = base.join("one");
+                let two = one.join("two");
+                let three = two.join("three");
+                let key = three.join("identity.pem");
+                let did = run_identity_success_row(&base, &key, &key, &[one, two, three], &phase);
+                println!("identity-key-umask: asserted did={did}");
+            }
+            "under-preexisting" => {
+                let pre = base.join("pre");
+                if phase == "create" {
+                    std::fs::create_dir(&pre).expect("create the pre-existing ancestor");
+                    std::fs::set_permissions(
+                        &pre,
+                        std::fs::Permissions::from_mode(IDENTITY_PREEXISTING_MODE),
+                    )
+                    .expect("chmod the pre-existing ancestor");
+                }
+                let one = pre.join("one");
+                let two = one.join("two");
+                let key = two.join("identity.pem");
+                let did = run_identity_success_row(&base, &key, &key, &[one, two], &phase);
+                let pre_mode = identity_mode_of(&pre);
+                assert_eq!(
+                    pre_mode,
+                    IDENTITY_PREEXISTING_MODE,
+                    "a pre-existing ancestor is neither chmodded nor judged: {} achieved \
+                     {pre_mode:04o}, expected {:04o}",
+                    pre.display(),
+                    IDENTITY_PREEXISTING_MODE
+                );
+                println!("identity-key-umask: asserted did={did}");
+            }
+            "relative-multi-missing" => {
+                std::env::set_current_dir(&base).expect("chdir into the row's base");
+                let one = base.join("one");
+                let two = one.join("two");
+                let key = two.join("identity.pem");
+                let call_path = std::path::PathBuf::from("one/two/identity.pem");
+                let did = run_identity_success_row(&base, &call_path, &key, &[one, two], &phase);
+                println!("identity-key-umask: asserted did={did}");
+            }
+            "loose-ancestor" => {
+                let loose = base.join("loose");
+                std::fs::create_dir(&loose).expect("create the group-writable ancestor");
+                std::fs::set_permissions(
+                    &loose,
+                    std::fs::Permissions::from_mode(IDENTITY_LOOSE_MODE),
+                )
+                .expect("chmod the group-writable ancestor");
+                let one = loose.join("one");
+                let two = one.join("two");
+                let key = two.join("identity.pem");
+                let Err(err) = load_or_create_keypair_at(&key) else {
+                    panic!(
+                        "a group-writable deepest ancestor must be refused\nkey storage:\n{}",
+                        identity_key_tree(&base, &key)
+                    )
+                };
+                let text = format!("{err:#}");
+                // The reason is checked before the leftovers so a refusal for
+                // the wrong reason is reported as that, not as a stray file.
+                assert!(
+                    text.contains("writable beyond its owner"),
+                    "a group-writable deepest ancestor must be refused for the write-authority \
+                     reason, got: {text}"
+                );
+                assert_identity_absent(&one);
+                assert_identity_absent(&two);
+                assert_identity_absent(&key);
+                let loose_mode = identity_mode_of(&loose);
+                assert_eq!(
+                    loose_mode,
+                    IDENTITY_LOOSE_MODE,
+                    "a refusal must not chmod {}: achieved {loose_mode:04o}",
+                    loose.display()
+                );
+                println!("identity-key-umask: refused");
+            }
+            "write-failure" => {
+                let one = base.join("one");
+                let two = one.join("two");
+                let three = two.join("three");
+                let key = three.join("identity.pem");
+                // Armed on this thread only, and disarmed before the
+                // assertions so a later boot in this process is unaffected.
+                p2p::FAIL_KEY_WRITE.with(|f| f.set(true));
+                let result = load_or_create_keypair_at(&key);
+                p2p::FAIL_KEY_WRITE.with(|f| f.set(false));
+                let Err(err) = result else {
+                    panic!("an injected key-write failure must not report a created identity")
+                };
+                let text = format!("{err:#}");
+                assert!(
+                    text.contains("injected key-write failure"),
+                    "the failure must name the injected key write, got: {text}"
+                );
+                assert_identity_absent(&one);
+                assert_identity_absent(&two);
+                assert_identity_absent(&three);
+                assert_identity_absent(&key);
+                let residue: Vec<String> = std::fs::read_dir(&base)
+                    .expect("read the base directory")
+                    .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect();
+                assert!(
+                    residue.is_empty(),
+                    "a failed first boot must leave nothing under the base: {residue:?}"
+                );
+                println!("identity-key-umask: refused");
+            }
+            "race-loose-intermediate" => {
+                let one = base.join("one");
+                let two = one.join("two");
+                let key = two.join("identity.pem");
+                // A concurrent process wins the mkdir with a group-writable
+                // mode. The loser adopts nothing it did not create, so its
+                // rollback must leave the winner's directory alone.
+                p2p::pin::RACE_CREATE_MODE.with(|c| c.set(Some(IDENTITY_LOOSE_MODE)));
+                let result = load_or_create_keypair_at(&key);
+                let Err(err) = result else {
+                    panic!("a race-won group-writable intermediate must be refused")
+                };
+                let text = format!("{err:#}");
+                assert!(
+                    text.contains("writable beyond its owner"),
+                    "the refusal must name the write-authority problem, got: {text}"
+                );
+                assert!(
+                    one.exists(),
+                    "a directory this invocation did not create must not be removed: {} is gone",
+                    one.display()
+                );
+                let one_mode = identity_mode_of(&one);
+                assert_eq!(
+                    one_mode,
+                    IDENTITY_LOOSE_MODE,
+                    "a directory this invocation did not create must not be removed or chmodded: \
+                     {} achieved {one_mode:04o}",
+                    one.display()
+                );
+                assert_identity_absent(&two);
+                assert_identity_absent(&key);
+                println!("identity-key-umask: refused");
+            }
+            "symlinked-deepest-ancestor" => {
+                let real = base.join("real");
+                std::fs::create_dir(&real).expect("create the real ancestor");
+                std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700))
+                    .expect("chmod the real ancestor");
+                let link = base.join("link");
+                std::os::unix::fs::symlink("real", &link).expect("plant the symlinked ancestor");
+                let key = link.join("one").join("two").join("identity.pem");
+                let Err(err) = load_or_create_keypair_at(&key) else {
+                    panic!("a symlinked deepest existing ancestor must be refused, not followed")
+                };
+                let text = format!("{err:#}");
+                assert!(
+                    text.contains("a symlink here is refused rather than followed"),
+                    "a symlinked deepest existing ancestor must be refused, not followed, and the \
+                     refusal must say so, got: {text}"
+                );
+                for p in [
+                    link.join("one"),
+                    link.join("one").join("two"),
+                    key.clone(),
+                    real.join("one"),
+                    real.join("one").join("two"),
+                    real.join("one").join("two").join("identity.pem"),
+                ] {
+                    assert_identity_absent(&p);
+                }
+                println!("identity-key-umask: refused");
+            }
+            "populated-leaf-refuses-rollback" => {
+                let one = base.join("one");
+                let two = one.join("two");
+                let key = two.join("identity.pem");
+                // The key is published and only the scratch removal fails, so
+                // the leaf this invocation created is no longer empty when the
+                // rollback reaches it. `AT_REMOVEDIR` must refuse it.
+                p2p::FAIL_SCRATCH_UNLINK.with(|f| f.set(true));
+                let result = load_or_create_keypair_at(&key);
+                p2p::FAIL_SCRATCH_UNLINK.with(|f| f.set(false));
+                let Err(err) = result else {
+                    panic!("an injected scratch-unlink failure must not report success")
+                };
+                let text = format!("{err:#}");
+                assert!(
+                    text.contains("failed to remove the scratch name"),
+                    "the failure must name the scratch it could not remove, got: {text}"
+                );
+                assert!(
+                    text.contains("also failed to remove")
+                        && text.contains("which this process created"),
+                    "the rollback must report the populated leaf it was refused, got: {text}"
+                );
+                let key_mode = identity_mode_of(&key);
+                assert_eq!(
+                    key_mode, IDENTITY_WANT_KEY_MODE,
+                    "a published key must survive its own boot's rollback: achieved \
+                     {key_mode:04o}, requested 0600"
+                );
+                for d in [&one, &two] {
+                    let mode = identity_mode_of(d);
+                    assert_eq!(
+                        mode,
+                        IDENTITY_WANT_DIR_MODE,
+                        "created directory {} achieved mode {mode:04o}, requested {:04o}",
+                        d.display(),
+                        IDENTITY_WANT_DIR_MODE
+                    );
+                }
+                let scratch: Vec<String> = std::fs::read_dir(&two)
+                    .expect("read the key directory")
+                    .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.starts_with(".p2p.key.") && n.ends_with(".tmp"))
+                    .collect();
+                assert_eq!(
+                    scratch.len(),
+                    1,
+                    "the refused unlink must leave exactly one scratch beside the key: {scratch:?}"
+                );
+                let kp = load_or_create_keypair_at(&key)
+                    .expect("a boot after the injected failure must load the published key");
+                println!("identity-key-umask: refused did={}", kp.did());
+            }
+            // One process of a real concurrent first boot. Every child of a
+            // race runs this arm; the driver owns the tree assertions, because
+            // only it knows the race has finished.
+            "concurrent-first-boot" => {
+                let barrier = std::path::PathBuf::from(
+                    std::env::var("GITLAWB_TEST_BARRIER").expect("GITLAWB_TEST_BARRIER"),
+                );
+                let id = std::env::var("GITLAWB_TEST_RACE_ID").expect("GITLAWB_TEST_RACE_ID");
+                let role = std::env::var("GITLAWB_TEST_RACE_ROLE").expect("GITLAWB_TEST_RACE_ROLE");
+                let key = base.join("one").join("two").join("identity.pem");
+
+                // Two-phase rendezvous: each child announces itself with
+                // `ready.<id>` and then spins on `go`, which the driver creates
+                // only once every ready file is present. Chosen over a shared
+                // wake-up timestamp because a deadline bounds only the skew it
+                // cannot observe: a child that is slow to exec still arrives
+                // late and the race never overlaps. Here every child is already
+                // inside the spin loop before `go` can appear, so the spread
+                // across the racing call is one loop iteration rather than the
+                // tens of milliseconds a process takes to start. The deadline
+                // exists so a child whose sibling died never hangs the suite.
+                std::fs::write(barrier.join(format!("ready.{id}")), b"")
+                    .expect("announce readiness at the starting barrier");
+                let go = barrier.join("go");
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+                while !go.exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the starting barrier never opened"
+                    );
+                    std::hint::spin_loop();
+                }
+
+                // The `fail-write` role is the only injected part of the race,
+                // and it is what puts a REAL second process into the window
+                // section 7 of the plan describes: this child creates a
+                // component, the other adopts it, this one fails before either
+                // has written, and its rollback reaches the still-empty
+                // directory the other is holding open.
+                if role == "fail-write" {
+                    p2p::FAIL_KEY_WRITE.with(|f| f.set(true));
+                }
+                let result = load_or_create_keypair_at(&key);
+                p2p::FAIL_KEY_WRITE.with(|f| f.set(false));
+
+                match result {
+                    Ok(kp) => {
+                        // A boot that reports success must have the identity it
+                        // returned on disk, at 0600, and readable as a keypair.
+                        // Checked here rather than in the driver so a success
+                        // that raced with a rollback is attributed to the
+                        // process that claimed it.
+                        let mode = identity_mode_of(&key);
+                        assert_eq!(
+                            mode,
+                            IDENTITY_WANT_KEY_MODE,
+                            "a successful concurrent boot published {} at {mode:04o}, requested \
+                             0600",
+                            key.display()
+                        );
+                        let pem = std::fs::read_to_string(&key)
+                            .unwrap_or_else(|e| panic!("read {}: {e}", key.display()));
+                        let on_disk = Keypair::from_pem(&pem)
+                            .expect("a successful concurrent boot must leave a loadable keypair");
+                        assert_eq!(
+                            on_disk.did().to_string(),
+                            kp.did().to_string(),
+                            "a successful boot must return the identity that is on disk"
+                        );
+                        println!("identity-key-race: ok did={}", kp.did());
+                    }
+                    Err(err) => {
+                        // One line so the driver can classify it; the anyhow
+                        // chain is multi-line under `{:#}` only when a context
+                        // carries a newline, but flattening is free insurance.
+                        let text = format!("{err:#}").replace('\n', " ");
+                        println!("identity-key-race: err {text}");
+                    }
                 }
             }
-            let _ = armed_tx.send(());
-        });
+            other => panic!("unknown layout {other}"),
+        }
+    }
 
-        let driver = tokio::spawn(drive_serve_with_grace(
-            serve,
-            armed_rx,
-            Duration::from_millis(250),
-        ));
+    /// GITLAWB_KEY names a PEM file, not a dedicated key directory. An existing
+    /// 0755 parent is usable (no group/world write) and must not be chmodded.
+    #[cfg(unix)]
+    #[test]
+    fn existing_identity_parent_is_not_chmodded() {
+        use std::os::unix::fs::PermissionsExt;
 
-        // Put a request in flight on the slow route and wait until the handler
-        // is actually running, so the drain has something to abandon.
-        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
-        client
-            .write_all(b"GET /slow HTTP/1.1\r\nhost: test\r\nconnection: close\r\n\r\n")
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), entered.notified())
-            .await
-            .expect("slow handler must start before the shutdown signal fires");
+        for parent_name in [".gitlawb", "shared"] {
+            let base = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let dir = base.path().join(parent_name);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        // Fire the shutdown signal; the in-flight request now outlasts grace.
-        let signal_at = Instant::now();
-        shutdown_tx.send(true).unwrap();
+            let key = dir.join("identity.pem");
+            load_or_create_keypair_at(&key).expect("first boot into an existing 0755 parent");
 
-        let (result, grace_expired) = tokio::time::timeout(Duration::from_secs(5), driver)
-            .await
-            .expect("driver must return soon after grace expiry, not hang on the drain")
-            .expect("driver task must not panic");
+            let mode = std::fs::symlink_metadata(&dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(
+                mode, 0o755,
+                "{parent_name}: an existing 0755 identity parent must stay 0755, found {mode:04o}"
+            );
+            assert_eq!(
+                std::fs::symlink_metadata(&key)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o600,
+                "the identity key must be owner-only"
+            );
+        }
+    }
+
+    /// A parent this process creates is still pinned to 0700. That is the
+    /// missing-directory path, not an adopt of an operator-owned tree.
+    #[cfg(unix)]
+    #[test]
+    fn missing_identity_parent_is_created_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = base.path().join(".gitlawb");
+        let key = dir.join("identity.pem");
+        load_or_create_keypair_at(&key).expect("first boot creates the identity parent");
+        let mode = std::fs::symlink_metadata(&dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o700, "a parent this process created must be 0700");
+    }
+
+    /// Group/world write on the parent is replacement authority over a 0600
+    /// key. Refuse, and leave the directory untouched.
+    #[cfg(unix)]
+    #[test]
+    fn writable_identity_parent_is_refused_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = base.path().join("tmp");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let key = dir.join("identity.pem");
+        let Err(err) = load_or_create_keypair_at(&key) else {
+            panic!("a world-writable identity parent must be refused");
+        };
+        let text = format!("{err:#}");
         assert!(
-            grace_expired,
-            "an in-flight request outlasting grace must be abandoned"
+            text.contains("writable") || text.contains("replace"),
+            "the refusal must name the write-authority problem, got: {text}"
+        );
+        let mode = std::fs::symlink_metadata(&dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o777, "a refusal must not chmod the parent");
+        assert!(!key.exists(), "a refusal must not publish the identity key");
+    }
+
+    /// An existing key is loaded, never rewritten and never chmodded: the
+    /// creation path is the only thing this change touches.
+    #[cfg(unix)]
+    #[test]
+    fn existing_identity_key_is_loaded_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let key = base.path().join(".gitlawb").join("identity.pem");
+
+        let created = load_or_create_keypair_at(&key).expect("first boot");
+        let before = std::fs::read(&key).unwrap();
+
+        // A deliberately odd but readable mode must survive: an existing key is
+        // the operator's, and this path does not repair it.
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let reloaded = load_or_create_keypair_at(&key).expect("reload");
+
+        assert_eq!(created.did(), reloaded.did(), "the identity must be stable");
+        assert_eq!(
+            std::fs::read(&key).unwrap(),
+            before,
+            "the key must not be rewritten"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&key)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o400,
+            "an existing key's mode must not be changed"
+        );
+    }
+
+    /// Parent for the identity lifecycle matrix: drives every row as a child
+    /// process and requires create and reload to agree on the DID.
+    #[cfg(unix)]
+    #[test]
+    fn identity_key_storage_is_umask_independent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const SUCCESS_SENTINEL: &str = "identity-key-umask: asserted did=";
+        const REFUSED_SENTINEL: &str = "identity-key-umask: refused";
+        // Fixed order, and part of the contract: 0000 and 0002 are the masks
+        // that leave a group/world-writable ancestor behind, 0022 is the one
+        // that boots with the wrong mode, and 0777 strips owner bits. Rows
+        // abort at the first failing mask, so several load-bearing proofs are
+        // pinned to which mask that is.
+        const ALL_UMASKS: &[&str] = &["0000", "0002", "0022", "0777"];
+
+        // (layout, umasks, succeeds). A success row runs create then reload
+        // against one base and must return the same DID; a reject row runs
+        // create alone and must print the refusal sentinel.
+        let rows: &[(&str, &[&str], bool)] = &[
+            ("one-missing", ALL_UMASKS, true),
+            ("multi-missing", ALL_UMASKS, true),
+            ("three-missing", ALL_UMASKS, true),
+            ("under-preexisting", ALL_UMASKS, true),
+            ("relative-multi-missing", ALL_UMASKS, true),
+            ("loose-ancestor", ALL_UMASKS, false),
+            ("write-failure", ALL_UMASKS, false),
+            ("race-loose-intermediate", &["0002"], false),
+            ("symlinked-deepest-ancestor", &["0022"], false),
+            ("populated-leaf-refuses-rollback", &["0022"], false),
+        ];
+
+        // Both filters are optional and both panic on a value that names
+        // nothing: a typo that quietly ran no child would be an empty green,
+        // which is the failure this matrix exists to rule out.
+        let layout_only = std::env::var("GITLAWB_TEST_LAYOUT_ONLY").ok();
+        let umask_only = std::env::var("GITLAWB_TEST_UMASK_ONLY").ok();
+        if let Some(l) = layout_only.as_deref() {
+            assert!(
+                rows.iter().any(|r| r.0 == l),
+                "GITLAWB_TEST_LAYOUT_ONLY={l} names no row in the matrix"
+            );
+        }
+        if let Some(u) = umask_only.as_deref() {
+            assert!(
+                ALL_UMASKS.contains(&u),
+                "GITLAWB_TEST_UMASK_ONLY={u} names no umask in the matrix"
+            );
+        }
+
+        // Run one row in a child and return whatever follows its sentinel.
+        fn run_row(
+            base: &std::path::Path,
+            umask: &str,
+            layout: &str,
+            phase: &str,
+            sentinel: &str,
+        ) -> String {
+            let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+            cmd.args([
+                "identity_key_storage_tests::fixture_identity_key_under_hostile_umask",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("GITLAWB_TEST_FIXTURE", "identity-key-umask")
+            .env("GITLAWB_TEST_BASE", base)
+            .env("GITLAWB_TEST_UMASK", umask)
+            .env("GITLAWB_TEST_LAYOUT", layout)
+            .env("GITLAWB_TEST_PHASE", phase);
+            let output = cmd.output().expect("spawn the identity-key fixture");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let row = format!("layout={layout} umask={umask} phase={phase}");
+
+            assert!(
+                output.status.success(),
+                "row {row}: the identity-key fixture must pass\n\
+                 --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+            );
+            // A filter matching nothing exits 0, and the fixture's env gate
+            // returns early as a passing test, so neither alone is proof.
+            assert!(
+                stdout.contains("1 passed"),
+                "row {row}: filter must select one passing test\n{stdout}"
+            );
+            let line = stdout
+                .lines()
+                .find(|l| l.starts_with(sentinel))
+                .unwrap_or_else(|| {
+                    panic!("row {row}: fixture must print its sentinel\n--- stdout ---\n{stdout}")
+                });
+            line[sentinel.len()..].trim().to_string()
+        }
+
+        let mut ran = 0usize;
+        for (layout, umasks, succeeds) in rows {
+            if layout_only.as_deref().is_some_and(|l| l != *layout) {
+                continue;
+            }
+            for umask in *umasks {
+                if umask_only.as_deref().is_some_and(|u| u != *umask) {
+                    continue;
+                }
+                let base = tempfile::tempdir().unwrap();
+                std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                if *succeeds {
+                    let created = run_row(base.path(), umask, layout, "create", SUCCESS_SENTINEL);
+                    let reloaded = run_row(base.path(), umask, layout, "reload", SUCCESS_SENTINEL);
+                    assert_eq!(
+                        created, reloaded,
+                        "layout={layout} umask={umask}: a fresh process must reload the same DID"
+                    );
+                } else {
+                    run_row(base.path(), umask, layout, "create", REFUSED_SENTINEL);
+                }
+                ran += 1;
+            }
+        }
+        assert!(
+            ran > 0,
+            "the row and umask filters selected no child; a matrix that runs nothing is not a \
+             passing matrix"
+        );
+    }
+
+    /// Two or more real first boots racing the same multi-level missing key
+    /// path.
+    ///
+    /// The rollback added by this round can remove an intermediate a concurrent
+    /// boot has already adopted, so the plan's section 7 claims both processes
+    /// still fail closed. That claim was reasoned, not executed. This drives it
+    /// with real processes: `umask` and the injection hooks are process-global,
+    /// so threads inside one process would not be the production path.
+    ///
+    /// The race is nondeterministic and the assertions are not. Nothing here
+    /// asserts a particular interleaving; every check is a property that must
+    /// hold for all of them, so the test is deterministic in PASS/FAIL:
+    ///
+    /// * a boot that reports success has its own identity on disk at 0600 and
+    ///   parseable (asserted in the child, which is the process that claimed
+    ///   it);
+    /// * every surviving directory this run created is exactly 0700, never
+    ///   group or world writable;
+    /// * every successful boot agrees on the DID;
+    /// * if no boot succeeded, nothing partial is left (no key, no scratch) and
+    ///   a retry in this process then succeeds, which is the explicit form of
+    ///   "fail closed and recover on the next boot".
+    #[cfg(unix)]
+    #[test]
+    fn identity_concurrent_first_boots_fail_closed() {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+
+        const OK_SENTINEL: &str = "identity-key-race: ok did=";
+        const ERR_SENTINEL: &str = "identity-key-race: err ";
+        // 0002 is the mask that produced finding 1, so a directory this run
+        // creates without pinning it lands 0775 and the exact-mode assertions
+        // below catch it.
+        const RACE_UMASK: &str = "0002";
+
+        // (arm, one role per child). The pure arm is three unaided first boots.
+        // The other two add losers that fail after the walk and before any key
+        // is written, so their rollback reaches a directory a sibling may
+        // already hold open: that is the window the plan describes and the only
+        // injected part of the race. Two children hit it rarely, because the
+        // winner reaches its scratch file before a single loser reaches its
+        // rmdir; four losers against one unaided boot hit it often, so the
+        // pressure arm is what actually executes the interleaving. The
+        // assertions do not depend on which arm hits it.
+        let arms: &[(&str, &[&str])] = &[
+            ("pure", &["pure", "pure", "pure"][..]),
+            ("loser-fails", &["fail-write", "pure"][..]),
+            (
+                "rollback-pressure",
+                &[
+                    "fail-write",
+                    "fail-write",
+                    "fail-write",
+                    "fail-write",
+                    "pure",
+                ][..],
+            ),
+        ];
+
+        // A single run of a nondeterministic test proves very little, so the
+        // default loops the whole race; raise it through the env for a longer
+        // shake without editing the test.
+        let iterations: usize = std::env::var("GITLAWB_TEST_RACE_ITERATIONS")
+            .ok()
+            .map(|v| {
+                v.parse()
+                    .expect("GITLAWB_TEST_RACE_ITERATIONS must be a count")
+            })
+            .unwrap_or(50);
+        assert!(iterations > 0, "a race run zero times proves nothing");
+
+        #[derive(Default)]
+        struct Tally {
+            all_ok: usize,
+            some_ok: usize,
+            none_ok: usize,
+            /// A boot refused because the directory it was holding had been
+            /// removed under it: the interleaving section 7 describes.
+            adopted_dir_unlinked: usize,
+        }
+        let mut tallies: Vec<(&str, Tally)> = arms
+            .iter()
+            .map(|(name, _)| (*name, Tally::default()))
+            .collect();
+
+        for iteration in 0..iterations {
+            for (arm_idx, (arm, roles)) in arms.iter().enumerate() {
+                let base = tempfile::tempdir().unwrap();
+                std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                let barrier = tempfile::tempdir().unwrap();
+                let one = base.path().join("one");
+                let two = one.join("two");
+                let key = two.join("identity.pem");
+                let label = format!("arm={arm} iteration={iteration}");
+
+                let mut children = Vec::new();
+                for (id, role) in roles.iter().enumerate() {
+                    let mut cmd =
+                        std::process::Command::new(std::env::current_exe().expect("current_exe"));
+                    cmd.args([
+                        "identity_key_storage_tests::fixture_identity_key_under_hostile_umask",
+                        "--exact",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env("GITLAWB_TEST_FIXTURE", "identity-key-umask")
+                    .env("GITLAWB_TEST_BASE", base.path())
+                    .env("GITLAWB_TEST_UMASK", RACE_UMASK)
+                    .env("GITLAWB_TEST_LAYOUT", "concurrent-first-boot")
+                    .env("GITLAWB_TEST_PHASE", "create")
+                    .env("GITLAWB_TEST_BARRIER", barrier.path())
+                    .env("GITLAWB_TEST_RACE_ID", id.to_string())
+                    .env("GITLAWB_TEST_RACE_ROLE", *role)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+                    children.push(cmd.spawn().expect("spawn a racing identity boot"));
+                }
+
+                // Open the barrier only once every child has announced itself.
+                // If one died before announcing, the deadline lets the run
+                // proceed to the exit-status assertion below rather than hang.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+                loop {
+                    let ready = (0..roles.len())
+                        .filter(|id| barrier.path().join(format!("ready.{id}")).exists())
+                        .count();
+                    if ready == roles.len() || std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                std::fs::write(barrier.path().join("go"), b"").expect("open the starting barrier");
+
+                let mut oks = Vec::new();
+                let mut errs = Vec::new();
+                for (id, child) in children.into_iter().enumerate() {
+                    let output = child.wait_with_output().expect("await a racing boot");
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let who = format!("{label} child={id} role={}", roles[id]);
+                    assert!(
+                        output.status.success(),
+                        "{who}: the racing fixture must pass whichever way the race went\n\
+                         --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+                    );
+                    assert!(
+                        stdout.contains("1 passed"),
+                        "{who}: filter must select one passing test\n{stdout}"
+                    );
+                    let line = stdout
+                        .lines()
+                        .find(|l| l.starts_with("identity-key-race: "))
+                        .unwrap_or_else(|| {
+                            panic!("{who}: the child must report its outcome\n{stdout}")
+                        });
+                    if let Some(did) = line.strip_prefix(OK_SENTINEL) {
+                        oks.push(did.trim().to_string());
+                    } else if let Some(text) = line.strip_prefix(ERR_SENTINEL) {
+                        errs.push((roles[id], text.to_string()));
+                    } else {
+                        panic!("{who}: unrecognized outcome line {line:?}");
+                    }
+                }
+
+                // Invariant: every surviving directory this run created is
+                // exactly 0700. A missing one is legal (a loser rolled it
+                // back); a group or world writable one never is.
+                for d in [&one, &two] {
+                    if d.exists() {
+                        let mode = identity_mode_of(d);
+                        assert_eq!(
+                            mode,
+                            IDENTITY_WANT_DIR_MODE,
+                            "{label}: surviving directory {} achieved mode {mode:04o}, requested \
+                             {:04o}",
+                            d.display(),
+                            IDENTITY_WANT_DIR_MODE
+                        );
+                        let residue: Vec<String> = std::fs::read_dir(d)
+                            .expect("read a surviving directory")
+                            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                            .filter(|n| n.starts_with(".p2p.key.") && n.ends_with(".tmp"))
+                            .collect();
+                        assert!(
+                            residue.is_empty(),
+                            "{label}: a finished race must leave no scratch behind in {}: \
+                             {residue:?}",
+                            d.display()
+                        );
+                    }
+                }
+
+                if key.exists() {
+                    // Invariant: the published key is 0600 and loadable, and
+                    // every boot that reported success agrees on it.
+                    let mode = identity_mode_of(&key);
+                    assert_eq!(
+                        mode, IDENTITY_WANT_KEY_MODE,
+                        "{label}: the surviving key achieved mode {mode:04o}, requested 0600"
+                    );
+                    let mut pem = String::new();
+                    std::fs::File::open(&key)
+                        .expect("open the surviving key")
+                        .read_to_string(&mut pem)
+                        .expect("read the surviving key");
+                    let on_disk = Keypair::from_pem(&pem)
+                        .expect("the surviving key must parse as a keypair")
+                        .did()
+                        .to_string();
+                    for did in &oks {
+                        assert_eq!(
+                            *did, on_disk,
+                            "{label}: a successful boot reported an identity the disk does not \
+                             hold"
+                        );
+                    }
+                } else {
+                    // Invariant: no key means no boot may claim success, and
+                    // the tree must be clean enough that the next boot works.
+                    assert!(
+                        oks.is_empty(),
+                        "{label}: a boot reported success with no key on disk: {oks:?}"
+                    );
+                    let kp = load_or_create_keypair_at(&key).unwrap_or_else(|e| {
+                        panic!(
+                            "{label}: every boot failed, so a retry must succeed, got: {e:#}\n\
+                             errors: {errs:?}\nkey storage:\n{}",
+                            identity_key_tree(base.path(), &key)
+                        )
+                    });
+                    assert_identity_success(base.path(), &key, &[one.clone(), two.clone()]);
+                    assert!(
+                        !kp.did().to_string().is_empty(),
+                        "{label}: the recovering boot must produce an identity"
+                    );
+                }
+
+                let tally = &mut tallies[arm_idx].1;
+                if oks.len() == roles.len() {
+                    tally.all_ok += 1;
+                } else if oks.is_empty() {
+                    tally.none_ok += 1;
+                } else {
+                    tally.some_ok += 1;
+                }
+                // The rollback-under-an-adopted-directory window: a boot that
+                // was refused because the directory it held was unlinked.
+                if errs.iter().any(|(_, t)| {
+                    t.contains("No such file or directory") || t.contains("(os error 2)")
+                }) {
+                    tally.adopted_dir_unlinked += 1;
+                }
+            }
+        }
+
+        for (arm, tally) in &tallies {
+            println!(
+                "identity-race-summary: arm={arm} iterations={iterations} all_ok={} some_ok={} \
+                 none_ok={} adopted_dir_unlinked={}",
+                tally.all_ok, tally.some_ok, tally.none_ok, tally.adopted_dir_unlinked
+            );
+        }
+    }
+
+    /// Bare `GITLAWB_KEY=identity.pem` (and `./identity.pem`) must still create
+    /// the identity in the working directory. The p2p key refuses that form on
+    /// purpose; the node identity has always allowed it.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=identity-key-bare"]
+    fn fixture_bare_identity_key_in_cwd() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref() != Some("identity-key-bare") {
+            return;
+        }
+        let cwd = std::path::PathBuf::from(
+            std::env::var("GITLAWB_TEST_BASE").expect("GITLAWB_TEST_BASE"),
+        );
+        std::env::set_current_dir(&cwd).expect("chdir into isolated tempdir");
+        let cwd_mode_before = std::fs::symlink_metadata(".").unwrap().permissions().mode() & 0o7777;
+
+        let name = std::env::var("GITLAWB_TEST_KEY_NAME").expect("GITLAWB_TEST_KEY_NAME");
+        let kp = load_or_create_keypair_at(std::path::Path::new(&name))
+            .unwrap_or_else(|e| panic!("bare identity path {name:?} must create, got: {e:#}"));
+        assert!(
+            std::path::Path::new(&name).exists() || std::path::Path::new("identity.pem").exists(),
+            "the key must land in the working directory"
+        );
+        let key = if std::path::Path::new(&name).exists() {
+            std::path::PathBuf::from(&name)
+        } else {
+            std::path::PathBuf::from("identity.pem")
+        };
+        assert_eq!(
+            std::fs::symlink_metadata(&key)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600,
+            "the identity key must be owner-only"
+        );
+        let cwd_mode_after = std::fs::symlink_metadata(".").unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            cwd_mode_before, cwd_mode_after,
+            "creating a bare identity key must not chmod the working directory"
+        );
+        let reloaded = load_or_create_keypair_at(std::path::Path::new(&name)).expect("reload");
+        assert_eq!(kp.did(), reloaded.did(), "the identity must be stable");
+        println!("identity-key-bare: asserted did={}", kp.did());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bare_identity_key_path_creates_in_cwd_without_chmodding_cwd() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for name in ["identity.pem", "./identity.pem"] {
+            let base = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+            cmd.args([
+                "identity_key_storage_tests::fixture_bare_identity_key_in_cwd",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("GITLAWB_TEST_FIXTURE", "identity-key-bare")
+            .env("GITLAWB_TEST_BASE", base.path())
+            .env("GITLAWB_TEST_KEY_NAME", name);
+            let output = cmd.output().expect("spawn the bare-identity fixture");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "name={name}: bare identity path must create\n\
+                 --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+            );
+            assert!(
+                stdout.contains("1 passed"),
+                "name={name}: filter must select one passing test\n{stdout}"
+            );
+            assert!(
+                stdout.contains("identity-key-bare: asserted did="),
+                "name={name}: fixture must print its sentinel\n{stdout}"
+            );
+            let cwd_mode = std::fs::symlink_metadata(base.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(
+                cwd_mode, 0o755,
+                "name={name}: the parent test must also see cwd left at 0755"
+            );
+        }
+    }
+
+    /// A 0600 identity file is not protected if cwd is group/world-writable:
+    /// another local user can unlink or replace the entry. Creating into that
+    /// cwd must fail, and must not leave a key behind. Do not chmod cwd.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=identity-key-bare-writable"]
+    fn fixture_bare_identity_key_in_writable_cwd_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref()
+            != Some("identity-key-bare-writable")
+        {
+            return;
+        }
+        let cwd = std::path::PathBuf::from(
+            std::env::var("GITLAWB_TEST_BASE").expect("GITLAWB_TEST_BASE"),
+        );
+        std::env::set_current_dir(&cwd).expect("chdir into isolated tempdir");
+        std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let cwd_mode_before = std::fs::symlink_metadata(".").unwrap().permissions().mode() & 0o7777;
+
+        let Err(err) = load_or_create_keypair_at(std::path::Path::new("identity.pem")) else {
+            panic!("a bare identity path under a writable cwd must be refused");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("writable beyond its owner") || msg.contains("0777"),
+            "the refusal must name the writable-parent reason, got: {msg}"
         );
         assert!(
-            result.is_ok(),
-            "abandon path returns Ok so teardown proceeds"
+            !std::path::Path::new("identity.pem").exists(),
+            "a refused cwd must not have identity.pem created"
+        );
+        let cwd_mode_after = std::fs::symlink_metadata(".").unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            cwd_mode_before, cwd_mode_after,
+            "refusing a writable cwd must not chmod it"
+        );
+        println!("identity-key-bare-writable: asserted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bare_identity_key_path_refuses_a_writable_cwd() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+        cmd.args([
+            "identity_key_storage_tests::fixture_bare_identity_key_in_writable_cwd_is_refused",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("GITLAWB_TEST_FIXTURE", "identity-key-bare-writable")
+        .env("GITLAWB_TEST_BASE", base.path());
+        let output = cmd
+            .output()
+            .expect("spawn the writable-cwd identity fixture");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "writable cwd must refuse the bare identity path\n\
+             --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
         );
         assert!(
-            signal_at.elapsed() < Duration::from_secs(5),
-            "must return within a bounded window past the grace"
+            stdout.contains("1 passed"),
+            "filter must select one passing test\n{stdout}"
+        );
+        assert!(
+            stdout.contains("identity-key-bare-writable: asserted"),
+            "fixture must print its sentinel\n{stdout}"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(base.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "parent must also see no identity.pem, found: {leftovers:?}"
+        );
+        let cwd_mode = std::fs::symlink_metadata(base.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(cwd_mode, 0o777, "cwd must stay 0777");
+    }
+
+    /// An existing key in a writable directory still loads. Create is refused
+    /// there; turning that into a boot failure on upgrade would strand nodes
+    /// that already have a key.
+    #[cfg(unix)]
+    #[test]
+    fn existing_identity_in_a_writable_dir_still_loads() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let key = base.path().join("identity.pem");
+        let created = load_or_create_keypair_at(&key).expect("create under 0755");
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let reloaded = load_or_create_keypair_at(&key)
+            .expect("an existing identity in a writable directory must still load");
+        assert_eq!(created.did(), reloaded.did());
+        assert_eq!(
+            std::fs::symlink_metadata(base.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o777,
+            "load must not chmod the writable directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_symlink_key_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let real = base.path().join("real.pem");
+        let created = load_or_create_keypair_at(&real).expect("create the symlink target");
+        std::os::unix::fs::symlink(&real, base.path().join("identity.pem")).unwrap();
+        let err = match load_or_create_keypair_at(&base.path().join("identity.pem")) {
+            Ok(kp) => panic!(
+                "a symlink at the identity path must be refused, not followed; loaded did={}",
+                kp.did()
+            ),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("symlink") || err.to_lowercase().contains("too many levels"),
+            "symlink refusal must name the link, got: {err}"
+        );
+        let reread = load_or_create_keypair_at(&real).expect("target still loads by its real path");
+        assert_eq!(
+            created.did(),
+            reread.did(),
+            "the symlink target must be unchanged"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_symlinked_grandparent_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let key = link.join("keys").join("identity.pem");
+        let err = match load_or_create_keypair_at(&key) {
+            Ok(_) => panic!("a symlinked grandparent must be refused, not followed"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("symlink")
+                || err.to_lowercase().contains("too many levels")
+                || err.contains("loop"),
+            "symlinked grandparent refusal must name the link, got: {err}"
+        );
+        assert!(
+            !real.join("keys").exists(),
+            "symlink target must be untouched"
+        );
+    }
+
+    /// Build `base/evil/one` plus `base/link -> evil`, the layout every
+    /// interior-symlink row shares. `link` is relative so the layout is
+    /// self-contained; the absolute row builds its own.
+    #[cfg(unix)]
+    fn plant_interior_symlink_layout(base: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let evil = base.join("evil");
+        std::fs::create_dir(&evil).expect("create the symlink target directory");
+        std::fs::set_permissions(&evil, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod the symlink target directory");
+        let one = evil.join("one");
+        std::fs::create_dir(&one).expect("create the already-existing next level");
+        std::fs::set_permissions(&one, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod the already-existing next level");
+        std::os::unix::fs::symlink("evil", base.join("link")).expect("plant the interior symlink");
+        evil
+    }
+
+    /// `O_NOFOLLOW` binds the FINAL component only, so an interior symlink
+    /// whose next level already exists is resolved in one open and followed.
+    /// With `link -> evil` and `evil/one` present, the walk-up opens
+    /// `link/one` by pathname, anchors on `evil/one`, and creates the node
+    /// identity inside the attacker's tree.
+    #[cfg(unix)]
+    #[test]
+    fn identity_interior_symlink_with_existing_next_level_is_refused_not_followed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let evil = plant_interior_symlink_layout(base.path());
+
+        let key = base
+            .path()
+            .join("link")
+            .join("one")
+            .join("two")
+            .join("identity.pem");
+        match load_or_create_keypair_at(&key) {
+            Ok(kp) => panic!(
+                "an interior symlink on the key path was followed, not refused: the identity \
+                 {} was created through {} into the symlink's target\nkey storage:\n{}",
+                kp.did(),
+                key.display(),
+                identity_key_tree(base.path(), &key)
+            ),
+            Err(e) => assert_names_symlink_refusal(
+                &format!("{e:#}"),
+                "an interior symlink whose next level already exists",
+            ),
+        }
+        assert_identity_absent(&evil.join("one").join("two"));
+        assert_no_identity_key_under(
+            base.path(),
+            "an interior symlink with an existing next level",
+        );
+    }
+
+    /// The same interior symlink pointed by absolute path at a directory
+    /// outside the base. Following it publishes the node's identity somewhere
+    /// the configured path does not name at all, so the assertion is that no
+    /// key appears outside the base.
+    #[cfg(unix)]
+    #[test]
+    fn identity_interior_symlink_escaping_the_base_must_not_publish_the_key_outside_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(outside.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let outside_one = outside.path().join("one");
+        std::fs::create_dir(&outside_one).expect("create the escaped next level");
+        std::fs::set_permissions(&outside_one, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(outside.path(), base.path().join("link"))
+            .expect("plant the absolute escaping symlink");
+
+        let key = base
+            .path()
+            .join("link")
+            .join("one")
+            .join("two")
+            .join("identity.pem");
+        match load_or_create_keypair_at(&key) {
+            Ok(kp) => panic!(
+                "an absolute interior symlink was followed out of the base: the identity {} \
+                 was created outside {} through {}",
+                kp.did(),
+                base.path().display(),
+                key.display()
+            ),
+            Err(e) => assert_names_symlink_refusal(
+                &format!("{e:#}"),
+                "an interior symlink whose target is outside the base",
+            ),
+        }
+        assert_no_identity_key_under(outside.path(), "an escaping interior symlink");
+        assert_identity_absent(&outside_one.join("two"));
+    }
+
+    /// A chain, because refusing one link is not the same property as
+    /// refusing the path. `l1 -> l2 -> evil`, so the resolution that must be
+    /// refused takes two hops before it reaches the existing next level.
+    #[cfg(unix)]
+    #[test]
+    fn identity_chained_interior_symlinks_are_refused_not_followed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let evil = base.path().join("evil");
+        std::fs::create_dir(&evil).unwrap();
+        std::fs::set_permissions(&evil, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let one = evil.join("one");
+        std::fs::create_dir(&one).unwrap();
+        std::fs::set_permissions(&one, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink("evil", base.path().join("l2")).expect("plant the second hop");
+        std::os::unix::fs::symlink("l2", base.path().join("l1")).expect("plant the first hop");
+
+        let key = base
+            .path()
+            .join("l1")
+            .join("one")
+            .join("two")
+            .join("identity.pem");
+        match load_or_create_keypair_at(&key) {
+            Ok(kp) => panic!(
+                "a two-link chain on the key path was followed, not refused: the identity {} \
+                 was created through {}",
+                kp.did(),
+                key.display()
+            ),
+            Err(e) => {
+                assert_names_symlink_refusal(&format!("{e:#}"), "a chain of two interior symlinks")
+            }
+        }
+        assert_identity_absent(&one.join("two"));
+        assert_no_identity_key_under(base.path(), "a chain of two interior symlinks");
+    }
+
+    /// The existing-named-parent fast path never enters the walk: it opens the
+    /// whole configured parent pathname in one call and publishes into
+    /// whatever that resolves to. `link/one` exists through the symlink, so
+    /// this row reaches the fast path and not the walk-up.
+    #[cfg(unix)]
+    #[test]
+    fn identity_existing_named_parent_reached_through_a_symlink_is_refused_not_followed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let evil = plant_interior_symlink_layout(base.path());
+
+        let key = base.path().join("link").join("one").join("identity.pem");
+        match load_or_create_keypair_at(&key) {
+            Ok(kp) => panic!(
+                "the existing-named-parent fast path followed an interior symlink: the identity \
+                 {} was published into {} through {}",
+                kp.did(),
+                evil.join("one").display(),
+                key.display()
+            ),
+            Err(e) => assert_names_symlink_refusal(
+                &format!("{e:#}"),
+                "an interior symlink on the existing-named-parent fast path",
+            ),
+        }
+        assert_identity_absent(&evil.join("one").join("identity.pem"));
+        assert_no_identity_key_under(base.path(), "the existing-named-parent fast path");
+    }
+
+    /// Fixture: the relative-path row. `cwd` is process-global, so the row
+    /// that proves a relative configured path is judged the same way runs in
+    /// its own process. Double-gated like the other fixtures here: `#[ignore]`
+    /// keeps it out of a normal run and the env check keeps it inert under a
+    /// bare `--ignored` sweep, which would otherwise chdir the shared test
+    /// process.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=identity-symlink-relative"]
+    fn fixture_identity_relative_path_with_interior_symlink() {
+        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref()
+            != Some("identity-symlink-relative")
+        {
+            return;
+        }
+        let base = std::path::PathBuf::from(
+            std::env::var("GITLAWB_TEST_BASE").expect("GITLAWB_TEST_BASE"),
+        );
+        let evil = plant_interior_symlink_layout(&base);
+        std::env::set_current_dir(&base).expect("chdir into the row's base");
+
+        let call_path = std::path::Path::new("link/one/two/identity.pem");
+        match load_or_create_keypair_at(call_path) {
+            Ok(kp) => panic!(
+                "an interior symlink on a RELATIVE key path was followed, not refused: the \
+                 identity {} was created through {}",
+                kp.did(),
+                call_path.display()
+            ),
+            Err(e) => assert_names_symlink_refusal(
+                &format!("{e:#}"),
+                "an interior symlink on a relative configured path",
+            ),
+        }
+        assert_identity_absent(&evil.join("one").join("two"));
+        assert_no_identity_key_under(&base, "a relative path with an interior symlink");
+        println!("identity-symlink-relative: refused");
+    }
+
+    /// Driver for the relative row. An absolute path is not the only shape an
+    /// operator configures, and the walk resolves a relative pathname against
+    /// the process cwd, so the same interior-symlink refusal has to hold there.
+    #[cfg(unix)]
+    #[test]
+    fn identity_relative_key_path_with_interior_symlink_is_refused_not_followed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const REFUSED_SENTINEL: &str = "identity-symlink-relative: refused";
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+        cmd.args([
+            "identity_key_storage_tests::fixture_identity_relative_path_with_interior_symlink",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("GITLAWB_TEST_FIXTURE", "identity-symlink-relative")
+        .env("GITLAWB_TEST_BASE", base.path());
+        let output = cmd
+            .output()
+            .expect("spawn the relative-path symlink fixture");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            output.status.success(),
+            "a relative key path with an interior symlink must be refused, not followed\n\
+             --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+        // A filter matching nothing exits 0, and the fixture's env gate returns
+        // early as a passing test, so neither alone is proof the row ran.
+        assert!(
+            stdout.contains("1 passed"),
+            "the filter must select one passing test\n{stdout}"
+        );
+        assert!(
+            stdout.contains(REFUSED_SENTINEL),
+            "the fixture must print its refusal sentinel\n--- stdout ---\n{stdout}"
+        );
+    }
+
+    /// THE LOAD PATH, which is the identity-substitution primitive rather than
+    /// a permissions bug. The node's real key sits at `a/keys/identity.pem`
+    /// and the configured path is `link/keys/identity.pem`. An attacker who
+    /// can only repoint `link` from `a` to `b` makes the load resolve to a PEM
+    /// they supplied, and the node boots as THEIR DID while the real key is
+    /// still on disk, untouched, with nothing logged as wrong.
+    ///
+    /// The assertion is on the DID, not on a mode or an error string: a mode
+    /// assertion cannot see a substitution, because the substituted key is
+    /// a perfectly well-formed 0600 PEM.
+    #[cfg(unix)]
+    #[test]
+    fn identity_load_through_repointed_interior_symlink_must_not_adopt_the_substituted_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let real_key = base.path().join("a").join("keys").join("identity.pem");
+        let real_did = load_or_create_keypair_at(&real_key)
+            .expect("plant the node's real identity")
+            .did()
+            .to_string();
+        let attacker_key = base.path().join("b").join("keys").join("identity.pem");
+        let attacker_did = load_or_create_keypair_at(&attacker_key)
+            .expect("plant the attacker's identity")
+            .did()
+            .to_string();
+        assert_ne!(
+            real_did, attacker_did,
+            "the row needs two distinct identities to tell substitution from a load"
+        );
+        let real_bytes = std::fs::read(&real_key).expect("read the real key");
+
+        // The configured path never changes. Only the interior component does,
+        // which is exactly the authority an attacker with write access to one
+        // directory has.
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink("a", &link).expect("point the configured path at the real key");
+        std::fs::remove_file(&link).expect("the attacker repoints the interior component");
+        std::os::unix::fs::symlink("b", &link).expect("repoint the interior component");
+
+        let configured = link.join("keys").join("identity.pem");
+        match load_or_create_keypair_at(&configured) {
+            Ok(kp) => {
+                let booted = kp.did().to_string();
+                if booted == attacker_did {
+                    panic!(
+                        "identity substitution: repointing the interior symlink {} made the node \
+                         boot as the attacker's identity {attacker_did} (planted at {}) instead \
+                         of its own {real_did} at {}",
+                        link.display(),
+                        attacker_key.display(),
+                        real_key.display()
+                    );
+                }
+                panic!(
+                    "the load followed the interior symlink at {} and returned {booted} rather \
+                     than refusing the path",
+                    link.display()
+                );
+            }
+            Err(e) => assert_names_symlink_refusal(
+                &format!("{e:#}"),
+                "a repointed interior symlink on the load path",
+            ),
+        }
+
+        assert_eq!(
+            std::fs::read(&real_key).expect("read the real key"),
+            real_bytes,
+            "the real key must be untouched by the refused boot"
+        );
+        assert_eq!(
+            load_or_create_keypair_at(&real_key)
+                .expect("the real key must still load by its real path")
+                .did()
+                .to_string(),
+            real_did,
+            "the node's own identity must be unchanged"
+        );
+    }
+
+    /// The weaker variant of the same primitive. The attacker repoints the
+    /// interior component at an EMPTY directory, the load finds no key, and
+    /// the create path mints a fresh identity and logs it as a first boot. The
+    /// node comes up with a DID nobody knows and its real key is orphaned in
+    /// place with nothing reported.
+    #[cfg(unix)]
+    #[test]
+    fn identity_load_through_symlink_to_an_empty_directory_must_not_silently_mint_a_new_identity() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let real_key = base.path().join("a").join("keys").join("identity.pem");
+        let real_did = load_or_create_keypair_at(&real_key)
+            .expect("plant the node's real identity")
+            .did()
+            .to_string();
+        let real_bytes = std::fs::read(&real_key).expect("read the real key");
+
+        let empty_keys = base.path().join("empty").join("keys");
+        std::fs::create_dir_all(&empty_keys).expect("create the empty target tree");
+        std::fs::set_permissions(&empty_keys, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            base.path().join("empty"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink("a", &link).expect("point the configured path at the real key");
+        std::fs::remove_file(&link).expect("the attacker repoints the interior component");
+        std::os::unix::fs::symlink("empty", &link).expect("repoint at an empty directory");
+
+        let configured = link.join("keys").join("identity.pem");
+        match load_or_create_keypair_at(&configured) {
+            Ok(kp) => {
+                let booted = kp.did().to_string();
+                panic!(
+                    "silent identity loss: repointing the interior symlink {} at an empty \
+                     directory made the node mint a fresh identity {booted} as if this were a \
+                     first boot, orphaning its real identity {real_did} at {}",
+                    link.display(),
+                    real_key.display()
+                );
+            }
+            Err(e) => assert_names_symlink_refusal(
+                &format!("{e:#}"),
+                "an interior symlink repointed at an empty directory",
+            ),
+        }
+
+        assert_identity_absent(&empty_keys.join("identity.pem"));
+        assert_eq!(
+            std::fs::read(&real_key).expect("read the real key"),
+            real_bytes,
+            "the real key must be untouched by the refused boot"
+        );
+        assert_eq!(
+            load_or_create_keypair_at(&real_key)
+                .expect("the real key must still load by its real path")
+                .did()
+                .to_string(),
+            real_did,
+            "the node's own identity must be unchanged"
+        );
+    }
+
+    /// Already correct, and here so it stays that way: a symlink at the key's
+    /// IMMEDIATE parent is the final component of the load's directory open,
+    /// which is the one position `O_NOFOLLOW` does bind.
+    #[cfg(unix)]
+    #[test]
+    fn identity_symlinked_immediate_parent_is_refused_at_load() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let real = base.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let planted_did = load_or_create_keypair_at(&real.join("identity.pem"))
+            .expect("plant a key behind the symlink")
+            .did()
+            .to_string();
+        std::os::unix::fs::symlink("real", base.path().join("link")).unwrap();
+
+        let configured = base.path().join("link").join("identity.pem");
+        match load_or_create_keypair_at(&configured) {
+            Ok(kp) => panic!(
+                "a symlink at the key's immediate parent was followed: loaded {} (planted \
+                 {planted_did}) through {}",
+                kp.did(),
+                configured.display()
+            ),
+            Err(e) => assert_names_symlink_refusal(
+                &format!("{e:#}"),
+                "a symlink at the key's immediate parent",
+            ),
+        }
+    }
+
+    /// Already correct, and here so it stays that way: a dangling symlink is
+    /// refused rather than replaced by a real directory of the same name,
+    /// both when it is the top component of the missing suffix and when it
+    /// sits under a real directory.
+    #[cfg(unix)]
+    #[test]
+    fn identity_dangling_symlink_on_the_key_path_is_refused_never_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for under_real_dir in [false, true] {
+            let base = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let holder = if under_real_dir {
+                let real = base.path().join("real");
+                std::fs::create_dir(&real).unwrap();
+                std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+                real
+            } else {
+                base.path().to_path_buf()
+            };
+            let link = holder.join("link");
+            std::os::unix::fs::symlink("nowhere", &link).expect("plant the dangling symlink");
+
+            let key = link.join("one").join("identity.pem");
+            let where_ = if under_real_dir {
+                "a dangling symlink under a real directory"
+            } else {
+                "a dangling symlink at the top of the path"
+            };
+            match load_or_create_keypair_at(&key) {
+                Ok(kp) => panic!(
+                    "{where_} was not refused: the identity {} was created through {}",
+                    kp.did(),
+                    key.display()
+                ),
+                Err(e) => assert_names_symlink_refusal(&format!("{e:#}"), where_),
+            }
+            assert!(
+                std::fs::symlink_metadata(&link)
+                    .expect("the dangling symlink must still be there")
+                    .file_type()
+                    .is_symlink(),
+                "{where_}: the refused boot replaced {} with something else",
+                link.display()
+            );
+            assert_no_identity_key_under(base.path(), where_);
+        }
+    }
+
+    /// 0111 grandparent cannot mkdir, so the key directory must already exist.
+    /// Opening that grandparent must not require directory-list permission.
+    #[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+    #[test]
+    fn identity_search_only_grandparent_publishes_into_existing_key_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let gp = base.path().join("searchonly");
+        let keys = gp.join("keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&gp, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let key = keys.join("identity.pem");
+        let created = match load_or_create_keypair_at(&key) {
+            Ok(kp) => kp,
+            Err(e) => {
+                let _ = std::fs::set_permissions(&gp, std::fs::Permissions::from_mode(0o700));
+                panic!("search-only grandparent must be enough to publish into an existing 0700 key dir: {e:#}");
+            }
+        };
+        let reloaded = load_or_create_keypair_at(&key);
+        std::fs::set_permissions(&gp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let reloaded = reloaded.expect("reload");
+        assert_eq!(created.did(), reloaded.did());
+    }
+
+    /// `/identity.pem` is a pathname contract, not a filesystem probe: its
+    /// parent is the root, which the operator has already nominated, so
+    /// `create_pinned_dir_and_publish` must take the already-nominated branch.
+    /// Asserted lexically because a probe against the real `/` cannot be
+    /// isolated and, run as root, leaves a real key at `/identity.pem`.
+    #[cfg(unix)]
+    #[test]
+    fn identity_root_adjacent_path_is_an_already_nominated_parent() {
+        use std::path::{Component, Path};
+
+        let root_adjacent = Path::new("/identity.pem");
+
+        assert!(
+            !p2p::path_denotes_a_directory(root_adjacent, None),
+            "the lexical gate in load_or_create_keypair_at must admit /identity.pem"
+        );
+        assert!(
+            !root_adjacent
+                .components()
+                .any(|c| c == Component::ParentDir),
+            "/identity.pem walks back out through no `..`"
+        );
+        assert_eq!(
+            p2p::key_parent(root_adjacent),
+            Path::new("/"),
+            "the lexical parent of /identity.pem is the filesystem root"
+        );
+        assert!(
+            p2p::identity_parent_is_already_nominated(root_adjacent),
+            "root-adjacent identity path must take the already-nominated branch, not the named-parent branch that fails with 'names no final directory component'"
         );
 
-        // The client must never see a 503 status line: the request is abandoned
-        // at the transport, not answered. Read whatever arrives before a bounded
-        // window; a clean close (EOF) and no bytes at all both satisfy the
-        // contract.
-        let mut buf = Vec::new();
-        let _ = tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut buf)).await;
+        for nominated in ["identity.pem", "./identity.pem"] {
+            assert!(
+                p2p::identity_parent_is_already_nominated(Path::new(nominated)),
+                "{nominated} publishes into the working directory, which is already nominated"
+            );
+        }
+
+        for named in [
+            "/data/identity.pem",
+            "keys/identity.pem",
+            "/identity/identity.pem",
+        ] {
+            assert!(
+                !p2p::identity_parent_is_already_nominated(Path::new(named)),
+                "{named} names a parent component this process may create"
+            );
+        }
+    }
+
+    /// A terminal `.` is a directory spelling. Path drops it, so this would
+    /// otherwise publish a 0600 file named `keys` under `data`.
+    #[cfg(unix)]
+    #[test]
+    fn identity_terminal_dot_path_is_refused_without_retargeting() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let data = base.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let spelling = format!("{}/keys/.", data.display());
+        let key = std::path::Path::new(&spelling);
+        let Err(err) = load_or_create_keypair_at(key) else {
+            panic!("a terminal `.` identity path must be refused");
+        };
+        let text = format!("{err:#}");
         assert!(
-            !buf.starts_with(b"HTTP/1.1 503"),
-            "abandoned in-flight request must not be answered with a 503; got: {:?}",
-            String::from_utf8_lossy(&buf)
+            text.contains("must name a key file") || text.contains("directory"),
+            "the refusal must name the directory spelling, got: {text}"
+        );
+        let mode = std::fs::symlink_metadata(&data)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o755, "rejection must not chmod the parent");
+        assert!(
+            !data.join("keys").exists(),
+            "rejection must not create a file named keys"
         );
     }
 }

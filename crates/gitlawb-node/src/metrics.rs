@@ -1,4 +1,4 @@
-//! Prometheus metrics for the gitlawb node.
+//! Prometheus metrics for the Twigpine node.
 //!
 //! Exposes a small, deliberately conservative set of counters and histograms
 //! that cover the questions an operator actually asks of a live node:
@@ -11,10 +11,18 @@
 //!     `gitlawb_sync_queue_processed_total{status}`
 //!   * are webhooks reaching their endpoints? —
 //!     `gitlawb_webhook_deliveries_total{result}`
+//!   * is inbound gossip being admitted or shed, and for which reason?
+//!     `gitlawb_gossip_ingest_events_total{outcome}`
+//!   * is the gossip replay seen-set full, and therefore admitting events it
+//!     cannot deduplicate?
+//!     `gitlawb_gossip_replay_guard_saturated_total`
 //!   * how big are the packs we're sending and receiving? —
 //!     `gitlawb_pack_size_bytes`
 //!   * a single `gitlawb_info{version, did}` gauge = 1, for joins/dashboards
 //!   * currently-connected peer count — `gitlawb_peers_connected`
+//!   * reconciliation sweep gaps found and filled —
+//!     `gitlawb_reconciliation_gaps_found_total` /
+//!     `gitlawb_reconciliation_gaps_filled_total`
 //!
 //! All metrics live in a single process-wide registry initialized by
 //! [`init`]. Increment helpers (`record_push`, `record_auth_failure`, ...)
@@ -33,8 +41,8 @@
 use std::sync::OnceLock;
 
 use prometheus::{
-    Encoder, Histogram, HistogramOpts, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
-    TextEncoder,
+    Encoder, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry, TextEncoder,
 };
 
 /// The single, process-wide metrics registry. Initialized by [`init`].
@@ -49,8 +57,17 @@ static AUTH_SUCCESSES: OnceLock<IntCounterVec> = OnceLock::new();
 static AUTH_FAILURES: OnceLock<IntCounterVec> = OnceLock::new();
 static SYNC_PROCESSED: OnceLock<IntCounterVec> = OnceLock::new();
 static WEBHOOK_DELIVERIES: OnceLock<IntCounterVec> = OnceLock::new();
+static GOSSIP_INGEST: OnceLock<IntCounterVec> = OnceLock::new();
+static GOSSIP_REPLAY_GUARD_SATURATED: OnceLock<IntCounter> = OnceLock::new();
 static PACK_SIZE: OnceLock<Histogram> = OnceLock::new();
 static PEERS_CONNECTED: OnceLock<IntGauge> = OnceLock::new();
+static RECONCILIATION_GAPS_FOUND: OnceLock<IntCounter> = OnceLock::new();
+static RECONCILIATION_GAPS_FILLED: OnceLock<IntCounter> = OnceLock::new();
+/// 1 when the node started without its p2p identity because the key storage
+/// could not be used. The node keeps serving HTTP in that state and /health
+/// stays green, so without this the outage is visible only to whoever reads
+/// the startup log.
+static P2P_KEY_LOAD_FAILED: OnceLock<IntGauge> = OnceLock::new();
 
 /// One-time initializer. Builds the registry, registers every metric,
 /// and sets the constant `gitlawb_info` gauge. Idempotent — calling
@@ -168,6 +185,33 @@ fn init_inner(version: &str, node_did: &str) {
         .set(webhook_deliveries)
         .expect("set WEBHOOK_DELIVERIES once");
 
+    let gossip_ingest = IntCounterVec::new(
+        Opts::new(
+            "gitlawb_gossip_ingest_events_total",
+            "Total inbound gossip ref-update events and what the ingest path decided about each",
+        ),
+        &["outcome"],
+    )
+    .expect("gitlawb_gossip_ingest_events_total definition");
+    registry
+        .register(Box::new(gossip_ingest.clone()))
+        .expect("register gitlawb_gossip_ingest_events_total");
+    GOSSIP_INGEST
+        .set(gossip_ingest)
+        .expect("set GOSSIP_INGEST once");
+
+    let gossip_replay_guard_saturated = IntCounter::with_opts(Opts::new(
+        "gitlawb_gossip_replay_guard_saturated_total",
+        "Inbound gossip ref-updates admitted without being recorded because the replay seen-set was at capacity",
+    ))
+    .expect("gitlawb_gossip_replay_guard_saturated_total definition");
+    registry
+        .register(Box::new(gossip_replay_guard_saturated.clone()))
+        .expect("register gitlawb_gossip_replay_guard_saturated_total");
+    GOSSIP_REPLAY_GUARD_SATURATED
+        .set(gossip_replay_guard_saturated)
+        .expect("set GOSSIP_REPLAY_GUARD_SATURATED once");
+
     let pack_size = Histogram::with_opts(
         HistogramOpts::new(
             "gitlawb_pack_size_bytes",
@@ -201,6 +245,41 @@ fn init_inner(version: &str, node_did: &str) {
     PEERS_CONNECTED
         .set(peers_connected)
         .expect("set PEERS_CONNECTED once");
+
+    let gaps_found = IntCounter::with_opts(Opts::new(
+        "gitlawb_reconciliation_gaps_found_total",
+        "Total reconciliation sweep gaps detected (objects that should be pinned but are not)",
+    ))
+    .expect("gitlawb_reconciliation_gaps_found_total definition");
+    registry
+        .register(Box::new(gaps_found.clone()))
+        .expect("register gitlawb_reconciliation_gaps_found_total");
+    RECONCILIATION_GAPS_FOUND
+        .set(gaps_found)
+        .expect("set RECONCILIATION_GAPS_FOUND once");
+
+    let gaps_filled = IntCounter::with_opts(Opts::new(
+        "gitlawb_reconciliation_gaps_filled_total",
+        "Total reconciliation sweep gaps successfully filled (objects pinned by the sweep)",
+    ))
+    .expect("gitlawb_reconciliation_gaps_filled_total definition");
+    registry
+        .register(Box::new(gaps_filled.clone()))
+        .expect("register gitlawb_reconciliation_gaps_filled_total");
+    RECONCILIATION_GAPS_FILLED
+        .set(gaps_filled)
+        .expect("set RECONCILIATION_GAPS_FILLED once");
+    let p2p_key_load_failed = IntGauge::with_opts(Opts::new(
+        "gitlawb_p2p_identity_key_load_failed",
+        "1 if the node is running without p2p because its identity key could not be loaded",
+    ))
+    .expect("gitlawb_p2p_identity_key_load_failed definition");
+    registry
+        .register(Box::new(p2p_key_load_failed.clone()))
+        .expect("register gitlawb_p2p_identity_key_load_failed");
+    P2P_KEY_LOAD_FAILED
+        .set(p2p_key_load_failed)
+        .expect("set P2P_KEY_LOAD_FAILED once");
 
     REGISTRY
         .set(registry)
@@ -263,11 +342,75 @@ pub fn record_sync_processed(status: &str) {
 }
 
 /// Record one webhook delivery attempt outcome. `result` ∈
-/// {ok, http_error, network_error, skipped}.
+/// {ok, http_error, network_error, skipped, invalid_url, secret_unopenable}.
+/// `invalid_url` is a policy skip: the stored hook URL failed the public-URL
+/// check at delivery time and the POST was never sent. `secret_unopenable` is
+/// a withheld delivery: the hook carries a secret the node could not open, so
+/// the POST was never sent rather than going out unsigned.
 pub fn record_webhook_delivery(result: &str) {
     if let Some(c) = WEBHOOK_DELIVERIES.get() {
         c.with_label_values(&[result]).inc();
     }
+}
+
+/// Record what the gossip ingest path decided about one inbound ref-update.
+/// `outcome` ∈ {accepted, unsigned_admitted, write_failed, rejected,
+/// source_rate_limited, author_rate_limited, unsigned_source_rate_limited,
+/// replayed, stale_timestamp}.
+///
+/// `accepted` is reserved for signature-verified events. An unsigned event that
+/// survives the rolling-upgrade window is `unsigned_admitted`, so the
+/// authenticated-admission rate is not silently padded by legacy compatibility
+/// traffic; an operator can tell whether the fleet still relies on the
+/// compatibility allowance.
+///
+/// The three shed reasons stay separate labels rather than one `rate_limited`
+/// because they answer different operator questions: `source_rate_limited` is a
+/// forwarding peer over the pre-parse brake, `unsigned_source_rate_limited` is
+/// that same forwarder relaying unproven traffic, and `author_rate_limited`
+/// names a principal a signature actually proved. Collapsing them would make a
+/// flood of unauthenticated garbage indistinguishable from one registered peer
+/// pushing too hard, which is exactly the distinction an alert needs.
+///
+/// The label is the variant, never the free-form reason string that
+/// `Rejected`/`WriteFailed` carry: those are attacker-influenced and would blow
+/// up the label cardinality of a process-wide registry.
+pub fn record_gossip_ingest(outcome: &str) {
+    if let Some(c) = GOSSIP_INGEST.get() {
+        c.with_label_values(&[outcome]).inc();
+    }
+}
+
+/// Record one inbound gossip ref-update that the replay seen-set could not
+/// record because it was at capacity.
+///
+/// Label-less on purpose: there is one degradation mode and nothing about it
+/// varies per event, so a label would only add cardinality.
+///
+/// This is an alert-worthy signal, not a debug counter, and it is the ONLY way
+/// the degraded state is visible. At capacity the guard fails open, which means
+/// the event is admitted and `gitlawb_gossip_ingest_events_total{outcome=
+/// "accepted"}` counts it exactly as it counts a healthy admission. Fail-open is
+/// the right policy (a saturated set that dropped all fresh gossip would convert
+/// a loud resource attack into quiet mesh-wide censorship), but it is not a free
+/// one: while this counter is moving, a captured signature can again be replayed
+/// against the freshness window's full 10 minutes, spending a `peer_exists`
+/// round trip and a debit from the victim author's budget on every replay.
+pub fn record_gossip_replay_guard_saturated() {
+    if let Some(c) = GOSSIP_REPLAY_GUARD_SATURATED.get() {
+        c.inc();
+    }
+}
+
+/// Test-only: current `gitlawb_gossip_replay_guard_saturated_total` value (0 if
+/// the registry is not initialized). Lets the seen-set tests assert the
+/// saturation signal fires without scraping the encoded text.
+#[cfg(test)]
+pub fn replay_guard_saturated_count_for_test() -> u64 {
+    GOSSIP_REPLAY_GUARD_SATURATED
+        .get()
+        .map(|c| c.get())
+        .unwrap_or(0)
 }
 
 /// Record a pack body size observation (bytes).
@@ -281,6 +424,27 @@ pub fn observe_pack_size(bytes: f64) {
 pub fn set_peers_connected(count: i64) {
     if let Some(g) = PEERS_CONNECTED.get() {
         g.set(count);
+    }
+}
+
+/// Record reconciliation sweep gaps found (objects that should be pinned but are not).
+pub fn record_reconciliation_gaps_found(count: u64) {
+    if let Some(c) = RECONCILIATION_GAPS_FOUND.get() {
+        c.inc_by(count);
+    }
+}
+
+/// Record reconciliation sweep gaps filled (objects successfully pinned by the sweep).
+pub fn record_reconciliation_gaps_filled(count: u64) {
+    if let Some(c) = RECONCILIATION_GAPS_FILLED.get() {
+        c.inc_by(count);
+    }
+}
+
+/// Record whether the node is running without its p2p identity.
+pub fn set_p2p_key_load_failed(failed: bool) {
+    if let Some(g) = P2P_KEY_LOAD_FAILED.get() {
+        g.set(i64::from(failed));
     }
 }
 
@@ -321,6 +485,8 @@ mod tests {
             .expect("PUSHES set after init")
             .with_label_values(&["alice/repo"])
             .inc();
+        record_reconciliation_gaps_found(7);
+        record_reconciliation_gaps_filled(3);
 
         let body = encode().expect("encode should succeed after init");
         assert!(
@@ -334,6 +500,14 @@ mod tests {
         assert!(
             body.contains("gitlawb_pushes_total{repo=\"alice/repo\"} 1"),
             "expected the incremented counter to be visible in: {body}"
+        );
+        assert!(
+            body.contains("gitlawb_reconciliation_gaps_found_total 7"),
+            "expected the reconciliation gaps-found counter to be visible in: {body}"
+        );
+        assert!(
+            body.contains("gitlawb_reconciliation_gaps_filled_total 3"),
+            "expected the reconciliation gaps-filled counter to be visible in: {body}"
         );
     }
 
@@ -365,6 +539,12 @@ mod tests {
         record_auth_failure("test/route", "test_reason");
         record_sync_processed("done");
         record_webhook_delivery("ok");
+        // `record_gossip_replay_guard_saturated` is deliberately NOT called
+        // here. It is a label-less process-wide counter and the seen-set test
+        // that asserts it asserts a before/after delta, so an increment from a
+        // second test running concurrently in this binary would be a flake with
+        // no diagnostic value.
+        record_gossip_ingest("accepted");
         observe_pack_size(1024.0);
         set_peers_connected(0);
     }

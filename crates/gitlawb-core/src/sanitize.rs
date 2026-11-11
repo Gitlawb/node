@@ -30,9 +30,29 @@ pub fn is_bidi_format(c: char) -> bool {
     )
 }
 
+/// Both halves of INV-6 in one call: drop every `Cc` control (which defangs
+/// ANSI and OSC escapes) and every bidi/format control that
+/// [`is_bidi_format`] names. What remains is safe to write to a terminal.
+///
+/// Length is not this function's business: a caller that shows the text
+/// decides how much of it to show.
+pub fn strip_terminal_controls(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() && !is_bidi_format(*c))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_removes_escapes_and_reordering_but_keeps_text() {
+        let hostile = "ok\u{1b}[31m red\u{1b}]0;title\u{7}\u{202E}dlrow\u{202C} \u{0627}\u{200D}";
+        let clean = strip_terminal_controls(hostile);
+        assert_eq!(clean, "ok[31m red]0;titledlrow \u{0627}\u{200D}");
+        assert!(!clean.chars().any(|c| c.is_control() || is_bidi_format(c)));
+    }
 
     #[test]
     fn strips_every_reordering_code_point() {

@@ -17,22 +17,112 @@ use crate::state::AppState;
 #[derive(Clone, Debug)]
 pub struct AuthenticatedDid(pub String);
 
+/// A UCAN that passed full chain validation, with the root issuer the chain
+/// rests on. Inserted into request extensions by [`require_ucan_chain`] when
+/// `X-Ucan` is present; absent when the header is.
+///
+/// `root` is carried rather than recomputed so the chain is walked once per
+/// request. Holding this is not itself an authorization decision — a caller must
+/// still compare `root` against an identity it independently trusts, because
+/// `did:key` is self-certifying and anyone can mint a chain that verifies.
+#[derive(Clone, Debug)]
+pub struct VerifiedUcan {
+    pub ucan: Ucan,
+    pub root: Did,
+}
+
 /// Whether `caller` is authorized to push to `record`.
 ///
-/// Phase 1 (`GITLAWB_ENFORCE_OWNER_PUSH`): owner-only, via the canonical
-/// [`crate::api::did_matches`] owner comparison (DID-safe on both sides). This is
-/// intentionally a distinct, intent-named gate rather than a bare owner check so
-/// that Phase 2 can extend it to honor a verified UCAN `git/push` capability as a
-/// pure addition (`did_matches(..) || ucan_grants_push(..)`) without rewriting
-/// call sites.
-pub fn caller_authorized_to_push(record: &crate::db::RepoRecord, caller: &str) -> bool {
+/// The repo owner, or a caller presenting a verified UCAN whose chain roots at
+/// that owner and which carries `git/push` for this repo.
+///
+/// `verified` is optional because `X-Ucan` is: a push carrying no token reaches
+/// the same owner-only decision it always did. The owner check is unconditional
+/// and runs first, so this can only ever turn a refusal into an acceptance,
+/// never the reverse.
+pub fn caller_authorized_to_push(
+    record: &crate::db::RepoRecord,
+    caller: &str,
+    verified: Option<&VerifiedUcan>,
+) -> bool {
     crate::api::did_matches(caller, &record.owner_did)
+        || verified.is_some_and(|v| ucan_grants_push(record, v))
+}
+
+/// Whether a verified UCAN authorizes a push to `record`.
+///
+/// Three conditions, all required:
+///   1. The chain roots at this repo's owner. This is the trust anchor — the
+///      repo record is data the node holds independently of the token, so a
+///      self-minted chain cannot satisfy it.
+///   2. Every link is bounded. There is no revocation path, so an unbounded link
+///      is a permanent grant.
+///   3. Every link — the leaf and every proof behind it — carries an
+///      unconstrained push-class capability naming this repository. That is
+///      [`gitlawb_core::ucan::Ucan::chain_grants_push_to`], the same rule
+///      `gl ucan import` applies before storing a token and `git-remote-gitlawb`
+///      applies before minting an invocation, so what one boundary accepts the
+///      next does not refuse.
+///
+/// (3) walks the whole chain on purpose. Refusing a wildcard leaf alone did
+/// nothing: `is_attenuated_by` accepts a concrete child under a `*` parent, and
+/// that narrowing was exactly what the helper performed, so one owner-issued
+/// `with: "*"` proof let a delegate mint a concrete leaf for ANY repository the
+/// owner had — or created later — and both the chain check and the owner-root
+/// check passed. A delegation's scope is fixed when it is issued.
+pub fn ucan_grants_push(record: &crate::db::RepoRecord, verified: &VerifiedUcan) -> bool {
+    if !crate::api::did_matches(&verified.root.to_string(), &record.owner_did) {
+        return false;
+    }
+    // A write capability must lapse on its own. `exp` is optional in the format and
+    // there is no revocation path, so a chain with an unbounded link is a permanent
+    // grant: once the token leaks, the owner cannot withdraw it short of rotating
+    // the DID the repo is keyed on. Refusing here is what makes "the damage window
+    // is the token's expiry" a true statement rather than an aspiration.
+    if !verified.ucan.chain_lifetime_is_bounded() {
+        return false;
+    }
+    verified
+        .ucan
+        .chain_grants_push_to(&record.owner_did, &record.name)
 }
 
 use gitlawb_core::http_sig::{
     build_signing_string, compute_content_digest, HttpSignature, COVERED_COMPONENTS,
 };
 use gitlawb_core::identity::verify;
+
+/// Per-route-group ceiling on how much request body [`require_signature`] will
+/// buffer BEFORE it has authenticated anything.
+///
+/// This is middleware state rather than a constant because a single number cannot
+/// serve both a 2 GB git push and a 2 MB profile update: the git write group
+/// passes `GITLAWB_MAX_PACK_BYTES`, every other signed group passes
+/// [`crate::server::SIGNED_BODY_LIMIT`]. Making it a required piece of state means
+/// a new signed route group cannot be wired up without choosing a limit.
+#[derive(Clone, Copy, Debug)]
+pub struct SignatureBodyLimit(pub usize);
+
+/// The hint for an unresolvable DID, chosen by method. The hint is only true
+/// for a method we have no resolver for: a did:key that parsed and then failed
+/// on its key material (a small-order key, wrong multicodec, wrong length)
+/// would be sent looking for the wrong problem by the alpha-support wording.
+fn unresolvable_did_hint(key_id: &Did) -> &'static str {
+    if key_id.is_did_key() {
+        "the DID is a did:key whose key material did not resolve"
+    } else {
+        "only did:key is supported in alpha"
+    }
+}
+
+/// Bound the echoed keyid in the unresolvable-DID message. `key_id` is
+/// unauthenticated request input, so reflecting it back at whatever length the
+/// caller chose would amplify attacker input into the response body. The bound
+/// is slack (a did:key method-id is a fixed 48 characters) and only defends
+/// the echo, not the resolution.
+fn bounded_did_echo(key_id: &str) -> String {
+    key_id.chars().take(96).collect()
+}
 
 /// Axum middleware that enforces HTTP Signature authentication (RFC 9421).
 ///
@@ -48,20 +138,52 @@ use gitlawb_core::identity::verify;
 ///   4. Resolves the did:key to an Ed25519 VerifyingKey
 ///   5. Rebuilds the signing string and verifies the Ed25519 signature
 ///   6. Verifies Content-Digest matches the request body
-pub async fn require_signature(request: Request, next: Next) -> Response {
-    // Buffer the body so we can verify content-digest and pass it downstream
+pub async fn require_signature(
+    State(SignatureBodyLimit(limit)): State<SignatureBodyLimit>,
+    request: Request,
+    next: Next,
+) -> Response {
+    verify_signature(limit, request, next).await
+}
+
+/// The signature check itself, shared by [`require_signature`] and the optional
+/// variant. `limit` bounds the pre-auth buffer; see [`SignatureBodyLimit`].
+async fn verify_signature(limit: usize, request: Request, next: Next) -> Response {
+    // Buffer the body so we can verify content-digest and pass it downstream.
+    //
+    // The buffer is bounded, because this runs BEFORE any identity check: an
+    // unauthenticated caller with no DID, no signature and no repo reaches this
+    // line. Nothing upstream supplies the bound. On the git write routes
+    // `RequestBodyLimitLayer` sits on the inner router, and a later `.layer()` is
+    // the OUTER service, so this middleware runs first and sees the raw body. On
+    // every other signed group axum's 2 MB `DefaultBodyLimit` is enforced by the
+    // `Bytes`/`Json` extractors through a request extension, which collecting the
+    // body here bypasses. `Limited` stops reading at the limit rather than reading
+    // everything and then measuring it, which is the property that matters.
     let (parts, body) = request.into_parts();
-    let body_bytes =
-        match body.collect().await {
-            Ok(collected) => collected.to_bytes(),
-            Err(_) => return (
+    let body_bytes = match http_body_util::Limited::new(body, limit).collect().await {
+        Ok(collected) => collected.to_bytes(),
+        // Over the limit: a distinct status from the 401 an unsigned request gets
+        // and the 400 below, so a client can tell "too big" from "not authenticated"
+        // and from "your body did not arrive".
+        Err(e) if e.is::<http_body_util::LengthLimitError>() => return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({
+                "error": "body_too_large",
+                "message": format!("request body exceeds the {limit}-byte limit for this route"),
+            })),
+        )
+            .into_response(),
+        Err(_) => {
+            return (
                 StatusCode::BAD_REQUEST,
                 Json(
                     json!({ "error": "unreadable_body", "message": "could not read request body" }),
                 ),
             )
-                .into_response(),
-        };
+                .into_response()
+        }
+    };
 
     let sig_input = parts
         .headers
@@ -120,7 +242,7 @@ pub async fn require_signature(request: Request, next: Next) -> Response {
                     COVERED_COMPONENTS.join(", "),
                     missing.join(", ")
                 ),
-                "hint": "See https://gitlawb.com/agents#authentication",
+                "hint": "See https://twigpine.com/agents#authentication",
             })),
         )
             .into_response();
@@ -145,11 +267,14 @@ pub async fn require_signature(request: Request, next: Next) -> Response {
                 StatusCode::BAD_REQUEST,
                 Json(json!({
                     "error": "unresolvable_did",
-                    "message": format!("cannot resolve DID '{}': {e}", sig.key_id),
-                    "hint": "only did:key is supported in alpha",
+                    "message": format!(
+                        "cannot resolve DID '{}': {e}",
+                        bounded_did_echo(&sig.key_id.to_string())
+                    ),
+                    "hint": unresolvable_did_hint(&sig.key_id),
                 })),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -162,17 +287,34 @@ pub async fn require_signature(request: Request, next: Next) -> Response {
         .unwrap_or("/")
         .to_string();
 
-    let content_digest = parts
+    // Required, never defaulted. The signing string is rebuilt from the request,
+    // so an absent header would make the covered `content-digest` empty on both
+    // sides: verification would pass and the digest-versus-body comparison below
+    // would have nothing to compare, leaving a signed request free to carry a
+    // body its signature never covered. `sign_request` always emits the header,
+    // so refusing here costs no conforming client anything.
+    let content_digest = match parts
         .headers
         .get("content-digest")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    {
+        Some(v) => v.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "missing_content_digest",
+                    "message": "Content-Digest header is required on a signed request",
+                })),
+            )
+                .into_response()
+        }
+    };
 
     let mut request_values: HashMap<String, String> = HashMap::new();
     request_values.insert("@method".to_string(), method);
     request_values.insert("@path".to_string(), path_and_query);
-    request_values.insert("content-digest".to_string(), content_digest);
+    request_values.insert("content-digest".to_string(), content_digest.clone());
 
     // The @signature-params value is the part of Signature-Input after "sig1="
     let sig_params_value = sig_input.strip_prefix("sig1=").unwrap_or(&sig_input);
@@ -217,23 +359,18 @@ pub async fn require_signature(request: Request, next: Next) -> Response {
             .into_response();
     }
 
-    // Verify Content-Digest matches the actual request body
-    if let Some(claimed) = parts
-        .headers
-        .get("content-digest")
-        .and_then(|v| v.to_str().ok())
-    {
-        let actual = compute_content_digest(&body_bytes);
-        if claimed != actual {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": "content_digest_mismatch",
-                    "message": "Content-Digest does not match request body",
-                })),
-            )
-                .into_response();
-        }
+    // Verify Content-Digest matches the actual request body. Unconditional: the
+    // header's presence was established above, so there is no branch here that
+    // skips the comparison.
+    if content_digest != compute_content_digest(&body_bytes) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "content_digest_mismatch",
+                "message": "Content-Digest does not match request body",
+            })),
+        )
+            .into_response();
     }
 
     tracing::info!(did = %sig.key_id, "✓ authenticated request");
@@ -248,11 +385,17 @@ pub async fn require_signature(request: Request, next: Next) -> Response {
 /// Optional variant for rolling upgrades: verify and inject `AuthenticatedDid` when
 /// RFC 9421 signature headers are present, but allow legacy unsigned requests to
 /// continue when no signature attempt was made.
-pub async fn optional_signature(request: Request, next: Next) -> Response {
+pub async fn optional_signature(
+    State(SignatureBodyLimit(limit)): State<SignatureBodyLimit>,
+    request: Request,
+    next: Next,
+) -> Response {
     let has_signature_headers = request.headers().contains_key("signature-input")
         || request.headers().contains_key("signature");
     if has_signature_headers {
-        return require_signature(request, next).await;
+        // Same pre-auth buffer, same bound: presenting signature headers is not
+        // authentication, so this path is as reachable as the required one.
+        return verify_signature(limit, request, next).await;
     }
     next.run(request).await
 }
@@ -270,7 +413,7 @@ fn validate_ucan_chain(
     token: &str,
     expected_aud: &Did,
     signer_did: &Did,
-) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<VerifiedUcan, (StatusCode, Json<serde_json::Value>)> {
     let ucan = Ucan::decode(token).map_err(|e| {
         (
             StatusCode::UNAUTHORIZED,
@@ -298,14 +441,14 @@ fn validate_ucan_chain(
         )
     })?;
 
-    ucan.verify_chain().map_err(|e| {
+    let root = ucan.verify_chain().map_err(|e| {
         (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "invalid_ucan", "message": e.to_string() })),
         )
     })?;
 
-    Ok(())
+    Ok(VerifiedUcan { ucan, root })
 }
 
 /// Axum middleware that validates a UCAN chain when `X-Ucan` is present.
@@ -358,11 +501,18 @@ pub async fn require_ucan_chain(
         }
     };
 
-    if let Err((status, body)) = validate_ucan_chain(&token, &state.node_did, &signer_did) {
-        return (status, body).into_response();
-    }
+    let verified = match validate_ucan_chain(&token, &state.node_did, &signer_did) {
+        Ok(v) => v,
+        Err((status, body)) => return (status, body).into_response(),
+    };
 
-    tracing::debug!(did = %signer_did, "UCAN chain validated");
+    tracing::debug!(did = %signer_did, root = %verified.root, "UCAN chain validated");
+
+    // Park the verified token where a handler can reach it. Validation alone
+    // grants nothing; the authorization decision is made downstream, by a caller
+    // that knows which identity it trusts for the resource being touched.
+    let mut request = request;
+    request.extensions_mut().insert(verified);
     next.run(request).await
 }
 
@@ -380,7 +530,7 @@ fn human_detected(message: &str) -> impl IntoResponse {
             "error": "not_an_agent",
             "message": message,
             "hint": "gl identity new && gl register",
-            "docs": "https://gitlawb.com/agents",
+            "docs": "https://twigpine.com/agents",
         })),
     )
 }
@@ -396,6 +546,37 @@ mod tests {
 
     fn bootstrap_ucan(node: &Keypair, agent_did: Did) -> Ucan {
         Ucan::bootstrap(node, agent_did).unwrap()
+    }
+
+    /// The middleware validated a token and threw the result away, so no handler
+    /// could ever read it and `Ucan::can` had no call site in the node. Validation
+    /// must hand back both the token and the root the chain rests on.
+    #[test]
+    fn validate_ucan_chain_hands_back_the_root_and_the_token() {
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let caps_vec = vec![Capability::new("gitlawb://repos/zowner/r", caps::GIT_PUSH)];
+
+        let delegation =
+            Ucan::issue(&owner, agent.did(), caps_vec.clone(), None).expect("issue delegation");
+        let invocation = Ucan::delegate(&agent, node.did(), caps_vec, None, &delegation)
+            .expect("wrap invocation");
+        let token = invocation.encode().expect("encode");
+
+        let verified = validate_ucan_chain(&token, &node.did(), &agent.did())
+            .expect("a well-formed owner-rooted invocation must validate");
+
+        assert_eq!(
+            verified.root,
+            owner.did(),
+            "the root must be the owner, so a caller can anchor against the repo record"
+        );
+        assert_eq!(
+            verified.ucan.payload.iss,
+            agent.did(),
+            "the token itself must come back so a caller can read its capabilities"
+        );
     }
 
     fn delegation_ucan(agent: &Keypair, node_did: Did, proof: &Ucan) -> Ucan {
@@ -421,6 +602,58 @@ mod tests {
         let token = delegation.encode().unwrap();
 
         assert!(validate_ucan_chain(&token, &node_did, &agent_did).is_ok());
+    }
+
+    /// The two-branch hint selection is the point of the unresolvable-DID
+    /// change: a did:key that failed on its key material must be told the key
+    /// material did not resolve, and any other method must be told only did:key
+    /// is supported. A regression that drops the is_did_key() check would send
+    /// a did:key caller after the wrong problem, so both branches are pinned.
+    #[test]
+    fn unresolvable_did_hint_distinguishes_key_material_from_method() {
+        // A real did:key whose key material fails to resolve (small-order):
+        // key-material hint.
+        let mut weak = [0u8; 32];
+        weak[0] = 1; // compressed identity point
+        let weak_vk = ed25519_dalek::VerifyingKey::from_bytes(&weak).unwrap();
+        let weak_did = Did::from_verifying_key(&weak_vk);
+        assert!(
+            weak_did.to_verifying_key().is_err(),
+            "fixture precondition: small-order did:key must not resolve"
+        );
+        assert_eq!(
+            unresolvable_did_hint(&weak_did),
+            "the DID is a did:key whose key material did not resolve"
+        );
+
+        // A method with no resolver: alpha-support hint.
+        let web = Did::web("example.com");
+        assert!(
+            web.to_verifying_key().is_err(),
+            "fixture precondition: did:web must not resolve locally"
+        );
+        assert_eq!(
+            unresolvable_did_hint(&web),
+            "only did:key is supported in alpha"
+        );
+    }
+
+    /// The unresolvable-DID message echoes the keyid, which is unauthenticated
+    /// request input. The echoed value must be bounded so a hostile caller
+    /// cannot amplify arbitrary-length input into the response body.
+    #[test]
+    fn unresolvable_did_message_bounds_the_echoed_keyid() {
+        let long_keyid = format!("did:key:z{}", "A".repeat(2000));
+        let shown = bounded_did_echo(&long_keyid);
+        assert!(
+            shown.len() <= 96,
+            "echoed keyid must be bounded, got {} chars",
+            shown.len()
+        );
+        assert!(
+            !shown.contains(&"A".repeat(1000)),
+            "the full keyid must not survive into the message"
+        );
     }
 
     #[test]
@@ -491,16 +724,19 @@ mod tests {
 
         let keypair = Keypair::generate();
         let scan_token_key = crate::state::AppState::derive_scan_token_key(&keypair);
+        let webhook_secret_key = crate::state::AppState::derive_webhook_secret_key(&keypair);
         let (ref_tx, _) = tokio::sync::broadcast::channel(1);
         let (task_tx, _) = tokio::sync::broadcast::channel(1);
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
             .expect("lazy pool creation should not fail");
         let db = Arc::new(crate::db::Db::for_testing(pool.clone()));
+        let task_cursor_key = crate::api::task_cursor::TaskCursorKey::derive(&keypair.to_seed());
         let schema = Arc::new(graphql::build_schema(
             db.clone(),
             ref_tx.clone(),
             task_tx.clone(),
+            task_cursor_key.clone(),
         ));
         crate::state::AppState {
             config: Arc::new(Config::parse_from(["gitlawb-node"])),
@@ -512,11 +748,13 @@ mod tests {
             ref_update_tx: ref_tx,
             task_event_tx: task_tx,
             graphql_schema: schema,
+            task_cursor_key,
             machine_id: None,
             repo_store: crate::git::repo_store::RepoStore::for_testing(PathBuf::from("/tmp"), pool),
             rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
             create_ip_rate_limiter: RateLimiter::new(1000, Duration::from_secs(3600)),
             push_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
+            close_issue_rate_limiter: RateLimiter::new(120, Duration::from_secs(3600)),
             ipfs_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
             ipfs_work_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
             ipfs_max_history_walks: crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST,
@@ -526,10 +764,12 @@ mod tests {
             ipfs_max_legacy_scan_rule_bytes:
                 crate::api::ipfs::MAX_LEGACY_SCAN_RULE_BYTES_PER_REQUEST,
             ipfs_scan_token_key: Arc::new(scan_token_key),
+            webhook_secret_key: Arc::new(webhook_secret_key),
             ipfs_max_served_object_bytes: crate::api::ipfs::MAX_SERVED_OBJECT_BYTES,
             push_limiter_trust: crate::rate_limit::TrustedProxy::None,
             sync_trigger_rate_limiter: RateLimiter::new(60, Duration::from_secs(3600)),
             peer_write_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
+            federated_rate_limiter: RateLimiter::new_bounded(12, Duration::from_secs(60), 10_000),
             shutdown_tx: tokio::sync::watch::channel(false).0,
             git_read_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
             git_write_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
@@ -545,6 +785,7 @@ mod tests {
             git_ipfs_walk_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
             git_ipfs_walk_per_caller:
                 crate::rate_limit::PerCallerConcurrency::with_default_max_keys(16),
+            task_read_rate_limiter: RateLimiter::new(1200, Duration::from_secs(3600)),
             git_bin: "git".to_string(),
         }
     }
@@ -635,5 +876,511 @@ mod tests {
         let body_bytes = axum::body::to_bytes(resp.into_body(), 2048).await.unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body_json["error"], "invalid_ucan");
+    }
+
+    /// A request that signs `content-digest` as the EMPTY string and then sends
+    /// no Content-Digest header at all must be refused before any handler runs.
+    ///
+    /// This is the whole point of requiring the header rather than defaulting it:
+    /// the middleware rebuilds the signing string from the request, so an absent
+    /// header makes the covered digest empty on both sides. The Ed25519 check
+    /// passes, the body-versus-digest comparison is skipped for want of a header,
+    /// and a signed request carries a body the signature never covered.
+    #[tokio::test]
+    async fn signed_request_without_content_digest_is_rejected() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static REACHED: AtomicBool = AtomicBool::new(false);
+
+        let kp = Keypair::generate();
+        let did = kp.did();
+        let created = chrono::Utc::now().timestamp();
+        let signature_input = format!(
+            r#"sig1=("@method" "@path" "content-digest");keyid="{did}";alg="ed25519";created={created}"#
+        );
+        let sig_params_value = &signature_input["sig1=".len()..];
+
+        let mut values: HashMap<String, String> = HashMap::new();
+        values.insert("@method".to_string(), "POST".to_string());
+        values.insert("@path".to_string(), "/x".to_string());
+        // Exactly what the middleware derives when the header is absent.
+        values.insert("content-digest".to_string(), String::new());
+        let signing_string =
+            build_signing_string(COVERED_COMPONENTS, sig_params_value, &values).unwrap();
+        let signature = format!(
+            "sig1=:{}:",
+            STANDARD.encode(kp.sign(signing_string.as_bytes()).to_bytes())
+        );
+
+        let app = Router::new()
+            .route(
+                "/x",
+                axum::routing::post(|| async {
+                    REACHED.store(true, Ordering::SeqCst);
+                    StatusCode::OK
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                SignatureBodyLimit(crate::server::SIGNED_BODY_LIMIT),
+                require_signature,
+            ));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/x")
+            .header("signature-input", signature_input)
+            .header("signature", signature)
+            .body(Body::from("a body no signature covers"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a signed request with no Content-Digest header must be refused"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 2048).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["error"], "missing_content_digest",
+            "the refusal must name the absent Content-Digest header"
+        );
+        assert!(
+            !REACHED.load(Ordering::SeqCst),
+            "the handler must never see a request whose body no signature covers"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ucan_push_tests {
+    use super::*;
+    use gitlawb_core::identity::Keypair;
+    use gitlawb_core::ucan::{caps, Capability, Ucan};
+
+    const OWNER_KEY: &str = "z6MkOwnerAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    /// `RepoRecord` does not derive `Default`, and adding the derive to a
+    /// production DB type purely to serve a test is the wrong direction.
+    fn repo(owner_did: &str, name: &str) -> crate::db::RepoRecord {
+        crate::db::RepoRecord {
+            id: "repo-id".to_string(),
+            name: name.to_string(),
+            owner_did: owner_did.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            disk_path: "/unused".to_string(),
+            forked_from: None,
+            machine_id: None,
+        }
+    }
+
+    /// The token's own issuer and audience are irrelevant to this predicate: the
+    /// middleware has already bound `iss` to the request signer and `aud` to this
+    /// node. Only the capabilities and the chain's root matter here.
+    fn verified(root: &str, caps_vec: Vec<Capability>) -> VerifiedUcan {
+        verified_with_exp(
+            root,
+            caps_vec,
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        )
+    }
+
+    fn verified_with_exp(
+        root: &str,
+        caps_vec: Vec<Capability>,
+        exp: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> VerifiedUcan {
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let ucan = Ucan::issue(&agent, node.did(), caps_vec, exp).expect("issue");
+        VerifiedUcan {
+            ucan,
+            root: root.parse().expect("root DID must parse"),
+        }
+    }
+
+    fn owner_full() -> String {
+        format!("did:key:{OWNER_KEY}")
+    }
+
+    fn push_cap_for(owner: &str, name: &str) -> Capability {
+        Capability::new(format!("gitlawb://repos/{owner}/{name}"), caps::GIT_PUSH)
+    }
+
+    #[test]
+    fn grants_push_when_the_chain_roots_at_the_owner_and_names_the_repo() {
+        let rec = repo(&owner_full(), "myrepo");
+        let v = verified(&owner_full(), vec![push_cap_for(&owner_full(), "myrepo")]);
+        assert!(ucan_grants_push(&rec, &v));
+    }
+
+    #[test]
+    fn matches_a_bare_owner_key_against_a_full_did_record() {
+        // Mirror rows store the bare key. A literal string compare would fail
+        // here, denying a delegation that is in fact valid.
+        let rec = repo(OWNER_KEY, "myrepo");
+        let v = verified(&owner_full(), vec![push_cap_for(&owner_full(), "myrepo")]);
+        assert!(ucan_grants_push(&rec, &v));
+    }
+
+    /// A perpetual grant is refused even when it is otherwise perfectly valid:
+    /// owner-rooted, right repo, right action. Without revocation, an unbounded
+    /// delegation cannot be withdrawn once it leaks.
+    #[test]
+    fn refuses_a_delegation_that_never_expires() {
+        let rec = repo(&owner_full(), "myrepo");
+        let v = verified_with_exp(
+            &owner_full(),
+            vec![push_cap_for(&owner_full(), "myrepo")],
+            None,
+        );
+        assert!(!ucan_grants_push(&rec, &v));
+    }
+
+    #[test]
+    fn refuses_a_self_minted_root() {
+        // The whole point: a token nobody delegated grants nothing, however
+        // permissive its capabilities look.
+        let stranger = Keypair::generate();
+        let rec = repo(&owner_full(), "myrepo");
+        let v = verified(&stranger.did().to_string(), vec![Capability::new("*", "*")]);
+        assert!(!ucan_grants_push(&rec, &v));
+    }
+
+    #[test]
+    fn refuses_a_capability_for_a_different_repo() {
+        let rec = repo(&owner_full(), "myrepo");
+        let v = verified(
+            &owner_full(),
+            vec![push_cap_for(&owner_full(), "otherrepo")],
+        );
+        assert!(!ucan_grants_push(&rec, &v));
+    }
+
+    /// A delegation can be issued against the remote's spelling (`myrepo.git`):
+    /// the matcher strips the same single `.git` the smart-HTTP routes do, so
+    /// the capability lands on the canonical record name.
+    #[test]
+    fn grants_push_when_the_capability_carries_the_git_suffix() {
+        let rec = repo(&owner_full(), "myrepo");
+        let v = verified(
+            &owner_full(),
+            vec![push_cap_for(&owner_full(), "myrepo.git")],
+        );
+        assert!(ucan_grants_push(&rec, &v));
+    }
+
+    /// Mirror-created rows can carry a literal `.git` name; reaching one takes
+    /// `foo.git.git`, the same spelling the remote URL uses. A single `.git`
+    /// capability resolves to `foo` and must not fall through to `foo.git`.
+    #[test]
+    fn a_repo_literally_named_dot_git_needs_the_doubled_suffix() {
+        let rec = repo(&owner_full(), "foo.git");
+        let single = verified(&owner_full(), vec![push_cap_for(&owner_full(), "foo.git")]);
+        assert!(!ucan_grants_push(&rec, &single));
+        let doubled = verified(
+            &owner_full(),
+            vec![push_cap_for(&owner_full(), "foo.git.git")],
+        );
+        assert!(ucan_grants_push(&rec, &doubled));
+    }
+
+    #[test]
+    fn refuses_a_capability_carrying_constraints() {
+        // `nb` is not interpreted yet. An owner who writes {"refs": [...]} means
+        // to restrict; honouring the capability while ignoring nb would grant
+        // strictly more than they intended, so it authorizes nothing.
+        let rec = repo(&owner_full(), "myrepo");
+        let v = verified(
+            &owner_full(),
+            vec![push_cap_for(&owner_full(), "myrepo")
+                .with_constraints(serde_json::json!({ "refs": ["refs/heads/feat/*"] }))],
+        );
+        assert!(!ucan_grants_push(&rec, &v));
+    }
+
+    #[test]
+    fn refuses_a_non_push_capability() {
+        let rec = repo(&owner_full(), "myrepo");
+        let v = verified(
+            &owner_full(),
+            vec![Capability::new(
+                format!("gitlawb://repos/{}/myrepo", owner_full()),
+                caps::ISSUE_CREATE,
+            )],
+        );
+        assert!(!ucan_grants_push(&rec, &v));
+    }
+
+    /// A resource wildcard must NOT authorize a push, even though attenuation
+    /// accepts it. The helper narrows a `*` delegation before signing, but the node
+    /// cannot rely on that: a delegate can sign an invocation that keeps the
+    /// wildcard, and it would otherwise reach every repository the owner has — or
+    /// will later create. This test previously asserted the opposite.
+    #[test]
+    fn refuses_a_resource_wildcard_and_honours_repo_admin() {
+        let rec = repo(&owner_full(), "myrepo");
+        let wildcard = verified(&owner_full(), vec![Capability::new("*", caps::GIT_PUSH)]);
+        assert!(
+            !ucan_grants_push(&rec, &wildcard),
+            "a wildcard resource must not authorize a push at the node"
+        );
+
+        // The ACTION wildcard is a different axis and stays: attenuation bounds it,
+        // and it still has to name a concrete repository.
+        let action_wildcard = verified(
+            &owner_full(),
+            vec![Capability::new(
+                format!("gitlawb://repos/{}/myrepo", owner_full()),
+                "*",
+            )],
+        );
+        assert!(ucan_grants_push(&rec, &action_wildcard));
+
+        let admin = verified(
+            &owner_full(),
+            vec![Capability::new(
+                format!("gitlawb://repos/{}/myrepo", owner_full()),
+                caps::REPO_ADMIN,
+            )],
+        );
+        assert!(ucan_grants_push(&rec, &admin));
+    }
+
+    /// The attack the wildcard refusal exists to stop: one `*` delegation reaching a
+    /// repository it was never issued against, including one created afterwards.
+    #[test]
+    fn a_wildcard_delegation_cannot_reach_a_second_repository() {
+        let other = repo(&owner_full(), "a-repo-created-later");
+        let wildcard = verified(&owner_full(), vec![Capability::new("*", caps::GIT_PUSH)]);
+        assert!(!ucan_grants_push(&other, &wildcard));
+    }
+
+    /// The round-8 P1, executed rather than reasoned: an owner-issued `*` PROOF with
+    /// a concrete leaf for a repository that did not exist at issuance. Refusing a
+    /// wildcard *leaf* did nothing here — `is_attenuated_by` accepts a concrete child
+    /// under a `*` parent, and that narrowing is exactly what `build_invocation` did,
+    /// so the first-party helper was the working mint path.
+    #[test]
+    fn a_wildcard_proof_cannot_reach_a_repo_created_later() {
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        let parent = Ucan::issue(
+            &owner,
+            agent.did(),
+            vec![Capability::new("*", caps::GIT_PUSH)],
+            Some(hour),
+        )
+        .unwrap();
+        let later = format!("gitlawb://repos/{}/a-repo-created-later", owner.did());
+        let invocation = Ucan::delegate(
+            &agent,
+            node.did(),
+            vec![Capability::new(&later, caps::GIT_PUSH)],
+            Some(hour),
+            &parent,
+        )
+        .unwrap();
+
+        let root = invocation.verify_chain().expect("the chain still verifies");
+        let rec = repo(&owner.did().to_string(), "a-repo-created-later");
+        assert!(
+            !ucan_grants_push(
+                &rec,
+                &VerifiedUcan {
+                    ucan: invocation,
+                    root
+                }
+            ),
+            "a wildcard proof must not authorize a repo it never named"
+        );
+    }
+
+    /// The shipping flow must keep working: a proof that names the repository
+    /// authorizes a push to it. Guards against fixing the wildcard by refusing
+    /// everything with a `prf`.
+    #[test]
+    fn a_concrete_proof_still_authorizes_the_repo_it_names() {
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+        let resource = format!("gitlawb://repos/{}/myrepo", owner.did());
+
+        let parent = Ucan::issue(
+            &owner,
+            agent.did(),
+            vec![Capability::new(&resource, caps::GIT_PUSH)],
+            Some(hour),
+        )
+        .unwrap();
+        let invocation = Ucan::delegate(
+            &agent,
+            node.did(),
+            vec![Capability::new(&resource, caps::GIT_PUSH)],
+            Some(hour),
+            &parent,
+        )
+        .unwrap();
+
+        let root = invocation.verify_chain().expect("chain verifies");
+        let rec = repo(&owner.did().to_string(), "myrepo");
+        assert!(ucan_grants_push(
+            &rec,
+            &VerifiedUcan {
+                ucan: invocation,
+                root
+            }
+        ));
+    }
+
+    /// A `*` two links up. The immediate proof names the repository, so a walk that
+    /// checks only one level of `prf` stays green here — this is the case that
+    /// makes the recursion load-bearing rather than incidental.
+    #[test]
+    fn a_wildcard_grandparent_cannot_reach_the_repo_through_a_concrete_parent() {
+        let owner = Keypair::generate();
+        let intermediary = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+        let resource = format!("gitlawb://repos/{}/myrepo", owner.did());
+
+        let grandparent = Ucan::issue(
+            &owner,
+            intermediary.did(),
+            vec![Capability::new("*", caps::GIT_PUSH)],
+            Some(hour),
+        )
+        .unwrap();
+        let parent = Ucan::delegate(
+            &intermediary,
+            agent.did(),
+            vec![Capability::new(&resource, caps::GIT_PUSH)],
+            Some(hour),
+            &grandparent,
+        )
+        .unwrap();
+        let invocation = Ucan::delegate(
+            &agent,
+            node.did(),
+            vec![Capability::new(&resource, caps::GIT_PUSH)],
+            Some(hour),
+            &parent,
+        )
+        .unwrap();
+
+        let root = invocation.verify_chain().expect("chain verifies");
+        assert_eq!(root, owner.did());
+        let rec = repo(&owner.did().to_string(), "myrepo");
+        assert!(
+            !ucan_grants_push(
+                &rec,
+                &VerifiedUcan {
+                    ucan: invocation,
+                    root
+                }
+            ),
+            "a wildcard anywhere in the chain must deny, not just in the immediate proof"
+        );
+    }
+
+    /// And the same three-link shape with every link concrete must still grant, so
+    /// the walk is refusing the wildcard and not the depth.
+    #[test]
+    fn a_three_link_concrete_chain_still_authorizes() {
+        let owner = Keypair::generate();
+        let intermediary = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+        let resource = format!("gitlawb://repos/{}/myrepo", owner.did());
+        let cap = || vec![Capability::new(&resource, caps::GIT_PUSH)];
+
+        let grandparent = Ucan::issue(&owner, intermediary.did(), cap(), Some(hour)).unwrap();
+        let parent =
+            Ucan::delegate(&intermediary, agent.did(), cap(), Some(hour), &grandparent).unwrap();
+        let invocation = Ucan::delegate(&agent, node.did(), cap(), Some(hour), &parent).unwrap();
+
+        let root = invocation.verify_chain().unwrap();
+        let rec = repo(&owner.did().to_string(), "myrepo");
+        assert!(ucan_grants_push(
+            &rec,
+            &VerifiedUcan {
+                ucan: invocation,
+                root
+            }
+        ));
+    }
+
+    /// The round-ten P1, pinned where it bites. The middleware verifies the chain
+    /// on the `X-Ucan` header of any signed request before the scope walk runs,
+    /// so a depth bound that lived only in `chain_grants_push_to` protected
+    /// nothing: a hand-built header reached the unbounded recursion first. A
+    /// chain at `MAX_CHAIN_DEPTH` links validates; one link more is refused here,
+    /// with 401 and a message that names depth, before any authorization runs.
+    #[test]
+    fn validate_ucan_chain_stops_at_the_depth_bound() {
+        use gitlawb_core::ucan::MAX_CHAIN_DEPTH;
+
+        let owner = Keypair::generate();
+        let node = Keypair::generate();
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+        let resource = format!("gitlawb://repos/{}/myrepo", owner.did());
+        let cap = || vec![Capability::new(&resource, caps::GIT_PUSH)];
+
+        // owner -> k1 -> ... -> signer: MAX_CHAIN_DEPTH - 1 links, all concrete,
+        // all signed, all expiring. Only the length is in question.
+        let mut signer = Keypair::generate();
+        let mut cur = Ucan::issue(&owner, signer.did(), cap(), Some(hour)).unwrap();
+        for _ in 2..MAX_CHAIN_DEPTH {
+            let next = Keypair::generate();
+            cur = Ucan::delegate(&signer, next.did(), cap(), Some(hour), &cur).unwrap();
+            signer = next;
+        }
+
+        // Wrapped into an invocation for the node: exactly MAX_CHAIN_DEPTH links.
+        let at_bound = Ucan::delegate(&signer, node.did(), cap(), Some(hour), &cur).unwrap();
+        let verified = validate_ucan_chain(&at_bound.encode().unwrap(), &node.did(), &signer.did())
+            .expect("a chain at the bound must still validate");
+        assert_eq!(verified.root, owner.did());
+
+        // One more link and it is past the bound.
+        let next = Keypair::generate();
+        let deeper = Ucan::delegate(&signer, next.did(), cap(), Some(hour), &cur).unwrap();
+        let past_bound = Ucan::delegate(&next, node.did(), cap(), Some(hour), &deeper).unwrap();
+        let (status, body) =
+            match validate_ucan_chain(&past_bound.encode().unwrap(), &node.did(), &next.did()) {
+                Ok(_) => panic!("a chain past the bound must be refused, not walked"),
+                Err(refusal) => refusal,
+            };
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let message = body.0["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("deeper than"),
+            "the refusal must name depth as the reason: {message}"
+        );
+    }
+
+    #[test]
+    fn refuses_a_malformed_resource_uri() {
+        let rec = repo(&owner_full(), "myrepo");
+        for bad in [
+            "",
+            "myrepo",
+            "https://repos/x/myrepo",
+            "gitlawb://repos/myrepo",
+        ] {
+            let v = verified(&owner_full(), vec![Capability::new(bad, caps::GIT_PUSH)]);
+            assert!(!ucan_grants_push(&rec, &v), "{bad} must not grant push");
+        }
     }
 }
