@@ -17952,12 +17952,12 @@ mod tests {
     }
 
     /// The periodic cleanup task must sweep the ipfs walk limiter, not only its
-    /// five siblings. Drives `AppState::sweep_rate_limiters` — the exact method the
+    /// five siblings. Drives `AppState::cleanup_rate_limiters` — the exact method the
     /// 300s loop calls — and asserts the ipfs limiter's expired entry is evicted.
     /// Dropping `ipfs_rate_limiter.cleanup()` from that method leaves the entry in
     /// place (`tracked_keys` stays 1): the RED proof that the sweep covers it.
     #[sqlx::test]
-    async fn sweep_rate_limiters_includes_ipfs_limiter(pool: PgPool) {
+    async fn cleanup_rate_limiters_includes_ipfs_limiter(pool: PgPool) {
         let mut state = test_state(pool).await;
         // Short window so a single recorded hit is already expired at sweep time.
         state.ipfs_rate_limiter = crate::rate_limit::RateLimiter::new(5, Duration::from_millis(50));
@@ -17974,7 +17974,7 @@ mod tests {
 
         // Expire the entry (still mapped — cleanup hasn't run), then sweep.
         tokio::time::sleep(Duration::from_millis(60)).await;
-        state.sweep_rate_limiters().await;
+        state.cleanup_rate_limiters().await;
 
         assert_eq!(
             state.ipfs_rate_limiter.tracked_keys().await,
@@ -18277,12 +18277,12 @@ mod tests {
 
     /// U5 (R6): the periodic cleanup task sweeps the NEW work-budget limiter too, not
     /// only the route limiter and its siblings. Mirrors
-    /// `sweep_rate_limiters_includes_ipfs_limiter`: drive `sweep_rate_limiters` and
+    /// `cleanup_rate_limiters_includes_ipfs_limiter`: drive `cleanup_rate_limiters` and
     /// assert the work limiter's expired entry is evicted. Dropping the
     /// `ipfs_work_rate_limiter.cleanup()` call from that method leaves the entry in place
     /// (`tracked_keys` stays 1): the RED proof the sweep covers it.
     #[sqlx::test]
-    async fn sweep_rate_limiters_includes_ipfs_work_limiter(pool: PgPool) {
+    async fn cleanup_rate_limiters_includes_ipfs_work_limiter(pool: PgPool) {
         let mut state = test_state(pool).await;
         state.ipfs_work_rate_limiter =
             crate::rate_limit::RateLimiter::new(5, Duration::from_millis(50));
@@ -18298,7 +18298,7 @@ mod tests {
         );
 
         tokio::time::sleep(Duration::from_millis(60)).await;
-        state.sweep_rate_limiters().await;
+        state.cleanup_rate_limiters().await;
 
         assert_eq!(
             state.ipfs_work_rate_limiter.tracked_keys().await,

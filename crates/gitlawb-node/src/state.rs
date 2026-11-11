@@ -382,8 +382,6 @@ impl AppState {
         self.shutdown_tx.subscribe()
     }
 
-    /// Sweep expired entries from every per-IP/DID rate limiter. Driven by the
-
     /// Trigger graceful shutdown. Idempotent — calling more than once
     /// has no effect. Returns `true` if this call was the one that
     /// flipped the signal.

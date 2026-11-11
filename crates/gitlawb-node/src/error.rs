@@ -352,20 +352,6 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_maps_to_503_distinct_from_git_500() {
-        // The create-repo lock-acquire failure returns Unavailable so a client sees
-        // a retryable 503, not a terminal 500 git_error.
-        assert_eq!(
-            AppError::Unavailable("lock pool pinned".into())
-                .into_response()
-                .status(),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-        assert_eq!(
-            AppError::Git("x".into()).into_response().status(),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-    }
     fn overloaded_maps_to_503_with_retry_after() {
         let resp = AppError::Overloaded("x".into()).into_response();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);

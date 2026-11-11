@@ -920,8 +920,12 @@ mod db_tests {
         let app_pool = sized_no_reap_pool(&connect_opts, 1).await;
         let lock_pool = sized_no_reap_pool(&connect_opts, 1).await;
         let db = Db::for_testing(app_pool);
-        let store =
-            crate::git::repo_store::RepoStore::new(tmp.path().to_path_buf(), None, lock_pool);
+        let store = crate::git::repo_store::RepoStore::new(
+            tmp.path().to_path_buf(),
+            None,
+            lock_pool,
+            std::time::Duration::from_secs(300),
+        );
         let summary = run_purge_spam(&db, &store, tmp.path(), true).await.unwrap();
 
         assert_eq!(
@@ -1308,81 +1312,48 @@ mod db_tests {
 
     // ── Tigris-authoritative purge (P1b) ───────────────────────────────────
 
-    /// In-test object store. `download` materializes a bare repo with (or
-    /// without) a ref so the purge tool's authoritative recheck can be driven
-    /// without a live bucket; error flags exercise the fail-closed and
-    /// archive-delete-failure paths.
-    struct FakeStore {
-        has_archive: bool,
-        archive_has_refs: bool,
-        fail_recheck: bool,
-        fail_delete: bool,
-        deleted: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    }
+    use crate::git::repo_store::tests as rs_tests;
+    use crate::git::tigris::{TigrisClient, UploadPrecondition};
 
-    #[async_trait::async_trait]
-    impl crate::git::tigris::ObjectStore for FakeStore {
-        async fn exists(&self, _owner: &str, _repo: &str) -> Result<bool> {
-            if self.fail_recheck {
-                anyhow::bail!("fake object store unreachable");
-            }
-            Ok(self.has_archive)
-        }
-        async fn upload(&self, _owner: &str, _repo: &str, _path: &Path) -> Result<()> {
-            Ok(())
-        }
-        async fn download(&self, _owner: &str, _repo: &str, local_path: &Path) -> Result<()> {
-            if self.fail_recheck {
-                anyhow::bail!("fake object store unreachable");
-            }
-            // Materialize the authoritative archive on local disk so
-            // ref_count_on_disk reflects remote state.
-            let _ = std::fs::remove_dir_all(local_path);
-            store::init_bare(local_path).unwrap();
-            if self.archive_has_refs {
-                seed_one_ref(local_path);
-            }
-            Ok(())
-        }
-        async fn delete(&self, _owner: &str, _repo: &str) -> Result<()> {
-            self.deleted
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            if self.fail_delete {
-                anyhow::bail!("fake object store delete failed");
-            }
-            Ok(())
-        }
-    }
-
+    /// A RepoStore backed by the conditional-semantics S3 mock, so the purge
+    /// tool's authoritative recheck can be driven without a live bucket; the
+    /// mock's fault injection (failed HEAD, generation roll between HEAD and
+    /// DELETE) exercises the fail-closed and archive-delete-failure paths.
     fn store_backed(
         repos_dir: &Path,
         pool: &PgPool,
-        fake: FakeStore,
+        endpoint: &str,
     ) -> crate::git::repo_store::RepoStore {
-        crate::git::repo_store::RepoStore::new(
+        crate::git::repo_store::RepoStore::for_testing_with_tigris(
             repos_dir.to_path_buf(),
-            Some(std::sync::Arc::new(fake)),
             pool.clone(),
+            TigrisClient::for_testing_with_endpoint("test-bucket", endpoint),
         )
     }
 
-    fn fake(
-        has_archive: bool,
-        archive_has_refs: bool,
-        fail_recheck: bool,
-        fail_delete: bool,
-    ) -> (FakeStore, std::sync::Arc<std::sync::atomic::AtomicBool>) {
-        let deleted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        (
-            FakeStore {
-                has_archive,
-                archive_has_refs,
-                fail_recheck,
-                fail_delete,
-                deleted: deleted.clone(),
-            },
-            deleted,
-        )
+    /// Publish `owner_did/repo_name` into the mock so the purge's recheck sees
+    /// a real archive: an empty bare repo, or one carrying a single commit.
+    async fn seed_archive(
+        mock: &rs_tests::S3Mock,
+        owner_did: &str,
+        repo_name: &str,
+        with_ref: bool,
+    ) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bare = dir.path().join("repo.git");
+        store::init_bare(&bare).unwrap();
+        if with_ref {
+            seed_one_ref(&bare);
+        }
+        rs_tests::mock_tigris(mock)
+            .upload(
+                &rs_tests::owner_slug_of(owner_did),
+                repo_name,
+                &bare,
+                UploadPrecondition::Unconditional,
+            )
+            .await
+            .expect("seeding the archive");
     }
 
     // A locally-empty repo whose authoritative archive HAS refs (pushed via
@@ -1403,8 +1374,9 @@ mod db_tests {
             "local starts empty"
         );
 
-        let (f, _deleted) = fake(true, true, false, false);
-        let repo_store = store_backed(tmp.path(), &pool, f);
+        let mock = rs_tests::S3Mock::start().await;
+        seed_archive(&mock, &target.owner_did, &target.name, true).await;
+        let repo_store = store_backed(tmp.path(), &pool, mock.endpoint());
         let summary = run_purge_spam(&db, &repo_store, tmp.path(), true)
             .await
             .unwrap();
@@ -1433,8 +1405,9 @@ mod db_tests {
         let path = store::repo_disk_path(tmp.path(), &target.owner_did, &target.name);
         store::init_bare(&path).unwrap();
 
-        let (f, deleted) = fake(true, false, false, false);
-        let repo_store = store_backed(tmp.path(), &pool, f);
+        let mock = rs_tests::S3Mock::start().await;
+        seed_archive(&mock, &target.owner_did, &target.name, false).await;
+        let repo_store = store_backed(tmp.path(), &pool, mock.endpoint());
         let summary = run_purge_spam(&db, &repo_store, tmp.path(), true)
             .await
             .unwrap();
@@ -1447,7 +1420,8 @@ mod db_tests {
             "a genuinely-empty repo is deleted"
         );
         assert!(
-            deleted.load(std::sync::atomic::Ordering::SeqCst),
+            mock.object_for(&rs_tests::owner_slug_of(&target.owner_did), &target.name)
+                .is_none(),
             "the object-store archive must be deleted on a successful purge"
         );
         assert_eq!(summary.deleted, 1);
@@ -1467,8 +1441,9 @@ mod db_tests {
         let path = store::repo_disk_path(tmp.path(), &target.owner_did, &target.name);
         store::init_bare(&path).unwrap();
 
-        let (f, _deleted) = fake(true, false, true, false);
-        let repo_store = store_backed(tmp.path(), &pool, f);
+        // A dead endpoint makes every store call fail, so the recheck
+        // errors and the purge must fail closed.
+        let repo_store = store_backed(tmp.path(), &pool, "http://127.0.0.1:1");
         let summary = run_purge_spam(&db, &repo_store, tmp.path(), true)
             .await
             .unwrap();
@@ -1495,8 +1470,14 @@ mod db_tests {
         let path = store::repo_disk_path(tmp.path(), &target.owner_did, &target.name);
         store::init_bare(&path).unwrap();
 
-        let (f, deleted) = fake(true, false, false, true);
-        let repo_store = store_backed(tmp.path(), &pool, f);
+        let mock = rs_tests::S3Mock::start().await;
+        seed_archive(&mock, &target.owner_did, &target.name, false).await;
+        // Two HEADs precede the DELETE (the recheck's `exists`, then
+        // `delete_current`'s generation read); rolling the generation after
+        // the second makes the conditional DELETE refuse as a racing publish
+        // would.
+        mock.roll_generation_after_next_heads(2);
+        let repo_store = store_backed(tmp.path(), &pool, mock.endpoint());
         let summary = run_purge_spam(&db, &repo_store, tmp.path(), true)
             .await
             .unwrap();
@@ -1508,7 +1489,12 @@ mod db_tests {
                 .is_none(),
             "the row+dir are still deleted"
         );
-        assert!(deleted.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(mock.deletes(), 0, "the refused DELETE must not land");
+        assert!(
+            mock.object_for(&rs_tests::owner_slug_of(&target.owner_did), &target.name)
+                .is_some(),
+            "a refused DELETE leaves the archive in place"
+        );
         assert_eq!(summary.deleted, 1);
         assert_eq!(
             summary.archive_failed, 1,
@@ -1530,8 +1516,9 @@ mod db_tests {
         let path = store::repo_disk_path(tmp.path(), &target.owner_did, &target.name);
         assert!(!path.exists(), "no local copy — remote-only");
 
-        let (f, deleted) = fake(true, false, false, false); // archive exists, empty
-        let repo_store = store_backed(tmp.path(), &pool, f);
+        let mock = rs_tests::S3Mock::start().await;
+        seed_archive(&mock, &target.owner_did, &target.name, false).await;
+        let repo_store = store_backed(tmp.path(), &pool, mock.endpoint());
         let summary = run_purge_spam(&db, &repo_store, tmp.path(), true)
             .await
             .unwrap();
@@ -1544,7 +1531,8 @@ mod db_tests {
             "a remote-only empty archive must be reached and deleted"
         );
         assert!(
-            deleted.load(std::sync::atomic::Ordering::SeqCst),
+            mock.object_for(&rs_tests::owner_slug_of(&target.owner_did), &target.name)
+                .is_none(),
             "the archive must be deleted too"
         );
         assert_eq!(summary.deleted, 1);
@@ -1565,8 +1553,9 @@ mod db_tests {
         let path = store::repo_disk_path(tmp.path(), &target.owner_did, &target.name);
         assert!(!path.exists());
 
-        let (f, _deleted) = fake(true, true, false, false); // archive exists, HAS refs
-        let repo_store = store_backed(tmp.path(), &pool, f);
+        let mock = rs_tests::S3Mock::start().await;
+        seed_archive(&mock, &target.owner_did, &target.name, true).await;
+        let repo_store = store_backed(tmp.path(), &pool, mock.endpoint());
         let summary = run_purge_spam(&db, &repo_store, tmp.path(), true)
             .await
             .unwrap();
@@ -1602,8 +1591,9 @@ mod db_tests {
         let sentinel = path.join("keep.txt");
         std::fs::write(&sentinel, b"operator data").unwrap();
 
-        let (f, deleted) = fake(true, false, false, false); // archive exists, empty
-        let repo_store = store_backed(tmp.path(), &pool, f);
+        let mock = rs_tests::S3Mock::start().await;
+        seed_archive(&mock, &target.owner_did, &target.name, false).await;
+        let repo_store = store_backed(tmp.path(), &pool, mock.endpoint());
         let summary = run_purge_spam(&db, &repo_store, tmp.path(), true)
             .await
             .unwrap();
@@ -1629,10 +1619,7 @@ mod db_tests {
             summary.remote_unverified, 0,
             "a non-bare existing dir must never be admitted remote-unverified"
         );
-        assert!(
-            !deleted.load(std::sync::atomic::Ordering::SeqCst),
-            "the archive must not be deleted"
-        );
+        assert_eq!(mock.deletes(), 0, "the archive must not be deleted");
     }
 
     // AE5/R5: no local copy AND no archive — the candidate is admitted (a store is
@@ -1644,8 +1631,8 @@ mod db_tests {
         let target = rec("t-missing-both", SPAM_BURST_TARGET_DID, "spam1");
         db.create_repo(&target).await.unwrap();
 
-        let (f, _deleted) = fake(false, false, false, false); // NO archive
-        let repo_store = store_backed(tmp.path(), &pool, f);
+        let mock = rs_tests::S3Mock::start().await; // no archive seeded
+        let repo_store = store_backed(tmp.path(), &pool, mock.endpoint());
         let summary = run_purge_spam(&db, &repo_store, tmp.path(), true)
             .await
             .unwrap();

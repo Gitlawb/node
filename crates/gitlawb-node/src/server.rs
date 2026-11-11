@@ -147,19 +147,26 @@ pub fn build_router(state: AppState) -> Router {
         trust: state.push_limiter_trust,
     };
 
-    let graphql_routes = Router::new()
+    let graphql_http = Router::new()
         .route("/graphql", get(graphql_playground).post(graphql_handler))
-        .route("/graphql/ws", get(graphql_ws_handler))
-        // Attach the verified DID to /graphql and /graphql/ws when a signature is
-        // present. The per-IP write brake covers the same /graphql (KTD-5: an
-        // HTTP-layer brake cannot tell a query POST from a mutation POST, so it
-        // counts every /graphql request — acceptable, both cost work);
-        // /graphql/ws subscriptions stay unbraked.
+        // Attach the verified DID to /graphql when a signature is present. The
+        // layer covers only routes added before it, so /graphql/ws (mounted on
+        // its own router below, read-only subscriptions) gets no brake. The
+        // per-IP write brake covers /graphql (KTD-5: an HTTP-layer brake cannot
+        // tell a query POST from a mutation POST, so it counts every /graphql
+        // request — acceptable, both cost work); /graphql/ws stays unbraked.
         .layer(middleware::from_fn_with_state(
             auth::SignatureBodyLimit(SIGNED_BODY_LIMIT),
             auth::optional_signature,
         ))
         .write_braked(&write_ip_limiter);
+    let graphql_ws = Router::new()
+        .route("/graphql/ws", get(graphql_ws_handler))
+        .layer(middleware::from_fn_with_state(
+            auth::SignatureBodyLimit(SIGNED_BODY_LIMIT),
+            auth::optional_signature,
+        ));
+    let graphql_routes = graphql_http.merge(graphql_ws);
 
     // ── Task routes (write — require HTTP Signature + per-IP write brake) ──
     let task_write_routes = add_auth_layers(

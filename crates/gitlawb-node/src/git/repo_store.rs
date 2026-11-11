@@ -153,14 +153,6 @@ impl RepoStore {
         }
     }
 
-    /// Shrink the `release()` upload timeout — test-only, so a stall test can
-    /// assert the lock connection is freed within a short bound.
-    #[cfg(test)]
-    pub fn with_release_upload_timeout(mut self, timeout: std::time::Duration) -> Self {
-        self.release_upload_timeout = timeout;
-        self
-    }
-
     /// Ensure a repo is available on local disk, downloading from Tigris if needed.
     /// If the repo exists locally but not yet in Tigris, a background upload is
     /// spawned to lazily migrate it (on-demand migration for pre-Tigris repos).
@@ -918,8 +910,6 @@ impl RepoStore {
         self.tigris.is_some()
     }
 
-    /// Bounded-wait lock-only acquire, without any object-store I/O. Retries
-
     /// Try to take the per-repo advisory lock WITHOUT the write guard's
     /// download/upload pipeline: a bare lock for callers (purge-spam, the
     /// create/fork namespace serialization) that must serialize against the
@@ -965,6 +955,42 @@ impl RepoStore {
             lock_key,
             repo_name: repo_name.to_string(),
         }))
+    }
+
+    /// Bounded-wait lock-only acquire, without any object-store I/O. Retries
+    /// `try_lock_repo` with short backoff. Used by `create_repo` and `fork_repo`
+    /// to serialize their existence-check -> write -> row-insert spans against a
+    /// concurrent same-key purge (which holds this same lock across delete-row +
+    /// remove-dir). A key held past the bounded wait surfaces as `Ok(None)`,
+    /// which the create/fork handlers map to a retryable 503.
+    pub async fn lock_repo_blocking(
+        &self,
+        owner_did: &str,
+        repo_name: &str,
+    ) -> Result<Option<RepoLockGuard>> {
+        self.lock_repo_blocking_on(&self.lock_pool, owner_did, repo_name)
+            .await
+    }
+
+    /// [`lock_repo_blocking`](Self::lock_repo_blocking) against a caller-chosen
+    /// pool. The advisory lock is DB-global, so the guard mutually excludes the same
+    /// key across pools; only the pinned connection comes from `pool`. Backs the
+    /// `lock_pool`-based [`lock_repo_blocking`](Self::lock_repo_blocking) delegator.
+    pub async fn lock_repo_blocking_on(
+        &self,
+        pool: &PgPool,
+        owner_did: &str,
+        repo_name: &str,
+    ) -> Result<Option<RepoLockGuard>> {
+        for attempt in 0..30 {
+            if let Some(g) = self.try_lock_repo_on(pool, owner_did, repo_name).await? {
+                return Ok(Some(g));
+            }
+            if attempt < 29 {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+        Ok(None)
     }
 
     /// Compute the local disk path and owner slug for a repo.
@@ -2867,18 +2893,6 @@ pub fn build_lock_pool(source: &PgPool, max_connections: u32, acquire_timeout: D
         .connect_lazy_with((*source.connect_options()).clone())
 }
 
-/// Compute a stable i64 hash for a Postgres advisory lock key.
-///
-/// Uses SHA-256 (not `DefaultHasher`) so the same `(owner_slug, repo_name)`
-/// produces the same `i64` key across every Rust toolchain version, operating
-/// system, and machine — the algorithm is frozen by the SHA-2 standard rather
-/// than by a std-internal implementation detail.
-///
-/// Domain separation is `owner_slug + ":" + repo_name` with no length prefix,
-/// so the mapping is injective only while `owner_slug` contains no `:` (the
-/// `did:key:`→`did_key_` slug form `local_path` produces). A raw DID would
-/// collide: `("did:key:abc", "x")` and `("did", "key:abc:x")` hash the same.
-
 /// Lock-only guard from [`RepoStore::try_lock_repo`]. Holds the Postgres advisory
 /// lock (and the dedicated connection it lives on) until `release()`. No Tigris
 /// I/O — unlike [`RepoWriteGuard`], releasing does NOT upload anything.
@@ -2914,6 +2928,17 @@ impl Drop for RepoLockGuard {
     }
 }
 
+/// Compute a stable i64 hash for a Postgres advisory lock key.
+///
+/// Uses SHA-256 (not `DefaultHasher`) so the same `(owner_slug, repo_name)`
+/// produces the same `i64` key across every Rust toolchain version, operating
+/// system, and machine — the algorithm is frozen by the SHA-2 standard rather
+/// than by a std-internal implementation detail.
+///
+/// Domain separation is `owner_slug + ":" + repo_name` with no length prefix,
+/// so the mapping is injective only while `owner_slug` contains no `:` (the
+/// `did:key:`→`did_key_` slug form `local_path` produces). A raw DID would
+/// collide: `("did:key:abc", "x")` and `("did", "key:abc:x")` hash the same.
 pub(crate) fn advisory_lock_key(owner_slug: &str, repo_name: &str) -> i64 {
     debug_assert!(
         !owner_slug.contains(':'),
@@ -2928,7 +2953,7 @@ pub(crate) fn advisory_lock_key(owner_slug: &str, repo_name: &str) -> i64 {
     i64::from_le_bytes(digest[..8].try_into().expect("sha256 output is >= 8 bytes"))
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::git::tigris::ATTEMPT_METADATA_KEY;
     use std::collections::HashMap;
@@ -5065,7 +5090,7 @@ mod tests {
     }
 
     /// Seed the minimum bare-repo shape so the upload has something to archive.
-    fn seed_bare_repo(path: &Path) {
+    pub(crate) fn seed_bare_repo(path: &Path) {
         std::fs::create_dir_all(path.join("objects/info")).unwrap();
         std::fs::create_dir_all(path.join("refs/heads")).unwrap();
         std::fs::write(path.join("HEAD"), "ref: refs/heads/main\n").unwrap();
@@ -5228,7 +5253,7 @@ mod tests {
     /// models the real S3 arm we care about (body fully transmitted, commit
     /// decided later) with no timing in it.
     #[derive(Clone, Debug)]
-    struct CapturedPut {
+    pub(crate) struct CapturedPut {
         key: String,
         body: Vec<u8>,
         if_match: Option<String>,
@@ -5238,7 +5263,7 @@ mod tests {
 
     /// One stored object.
     #[derive(Clone, Debug)]
-    struct MockObject {
+    pub(crate) struct MockObject {
         body: Vec<u8>,
         etag: String,
         /// The `x-amz-meta-gitlawb-attempt` it was written with. This is what
@@ -5251,14 +5276,14 @@ mod tests {
     /// `status` is `None` while a PUT is parked: it arrived and was logged, but
     /// no precondition has been evaluated for it yet.
     #[derive(Clone, Debug, PartialEq)]
-    struct PutAttempt {
+    pub(crate) struct PutAttempt {
         if_match: Option<String>,
         if_none_match: Option<String>,
         status: Option<u16>,
     }
 
     #[derive(Default)]
-    struct MockState {
+    pub(crate) struct MockState {
         /// Keyed by request path. A single-slot store was enough while every test
         /// drove one repo; fork creation touches the SOURCE key and the FORK key
         /// in one request, and collapsing them would make an assertion about one
@@ -5293,7 +5318,7 @@ mod tests {
     ///
     /// The fence tests downstream are only worth anything if a precondition can
     /// actually fail here, so this helper carries its own semantics tests below.
-    struct S3Mock {
+    pub(crate) struct S3Mock {
         endpoint: String,
         state: Arc<std::sync::Mutex<MockState>>,
         gate: Arc<tokio::sync::Notify>,
@@ -5363,7 +5388,7 @@ mod tests {
     }
 
     impl S3Mock {
-        async fn start() -> Self {
+        pub(crate) async fn start() -> Self {
             use axum::response::IntoResponse;
 
             let state = Arc::new(std::sync::Mutex::new(MockState::default()));
@@ -5572,7 +5597,7 @@ mod tests {
             }
         }
 
-        fn endpoint(&self) -> &str {
+        pub(crate) fn endpoint(&self) -> &str {
             &self.endpoint
         }
 
@@ -5593,7 +5618,7 @@ mod tests {
         }
 
         /// The stored object under a specific repo key.
-        fn object_for(&self, owner_slug: &str, repo_name: &str) -> Option<MockObject> {
+        pub(crate) fn object_for(&self, owner_slug: &str, repo_name: &str) -> Option<MockObject> {
             let key = format!("test-bucket/repos/v1/{owner_slug}/{repo_name}.tar.zst");
             self.state.lock().unwrap().objects.get(&key).cloned()
         }
@@ -5607,7 +5632,7 @@ mod tests {
         /// to pick up a precondition and then PUTs on it is therefore fencing
         /// on a generation that is already gone, which is the only way to drive
         /// two consecutive lost preconditions deterministically.
-        fn roll_generation_after_next_heads(&self, n: u32) {
+        pub(crate) fn roll_generation_after_next_heads(&self, n: u32) {
             self.state.lock().unwrap().roll_after_heads = n;
         }
 
@@ -5626,7 +5651,7 @@ mod tests {
         /// Deliver the next PUT in full and then fail it WITHOUT committing. The
         /// client's knowledge is identical to the arm above — that is the whole
         /// point — so only asking the store can tell the two apart.
-        fn fail_next_put_after_delivery(&self) {
+        pub(crate) fn fail_next_put_after_delivery(&self) {
             self.state.lock().unwrap().lose_next_response = Some(false);
         }
 
@@ -5637,7 +5662,7 @@ mod tests {
 
         /// Fail the next HEAD for ONE repo key with a 500, so a caller's
         /// reconciliation cannot be answered either way.
-        fn fail_next_head_for(&self, owner_slug: &str, repo_name: &str) {
+        pub(crate) fn fail_next_head_for(&self, owner_slug: &str, repo_name: &str) {
             let key = format!("test-bucket/repos/v1/{owner_slug}/{repo_name}.tar.zst");
             *self
                 .state
@@ -5649,7 +5674,7 @@ mod tests {
         }
 
         /// How many DELETEs the mock actually carried out.
-        fn deletes(&self) -> u32 {
+        pub(crate) fn deletes(&self) -> u32 {
             self.state.lock().unwrap().deletes
         }
 
@@ -5679,7 +5704,7 @@ mod tests {
             .0
         }
 
-        fn shutdown(&self) {
+        pub(crate) fn shutdown(&self) {
             self.server.abort();
         }
     }
@@ -6410,25 +6435,25 @@ mod tests {
 
     /// A client aimed at the same key the store under test publishes to, so a
     /// test can seed the archive or land an interfering publish of its own.
-    fn mock_tigris(mock: &S3Mock) -> TigrisClient {
+    pub(crate) fn mock_tigris(mock: &S3Mock) -> TigrisClient {
         TigrisClient::for_testing_with_endpoint("test-bucket", mock.endpoint())
     }
 
     /// The slug `local_path` derives from a DID, needed because a test seeds
     /// and reads the archive key directly.
-    fn owner_slug_of(owner_did: &str) -> String {
+    pub(crate) fn owner_slug_of(owner_did: &str) -> String {
         owner_did.replace([':', '/'], "_")
     }
 
     /// A bare-repo-shaped directory carrying `marker`, so a test can tell whose
     /// tree is stored without comparing compressed bytes.
-    fn marked_repo(path: &Path, marker: &str) {
+    pub(crate) fn marked_repo(path: &Path, marker: &str) {
         seed_bare_repo(path);
         std::fs::write(path.join("MARKER"), marker).unwrap();
     }
 
     /// The marker inside whatever archive is currently stored under the key.
-    async fn stored_marker(mock: &S3Mock, owner_slug: &str, repo_name: &str) -> String {
+    pub(crate) async fn stored_marker(mock: &S3Mock, owner_slug: &str, repo_name: &str) -> String {
         let out = TempDir::new().unwrap();
         let validated = super::validated_repo_disk_path(out.path(), "did:key:stored", "stored")
             .expect("test repo path must validate");

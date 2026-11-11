@@ -72,17 +72,7 @@ impl RateLimiter {
 
     /// Returns `true` if the request is allowed. Thin wrapper over
     /// [`check_retry`](Self::check_retry) for callers that only need the
-    /// allow/deny decision, not the rejection's Retry-After delay. Test-only now:
-    /// production 429 sites use `check_retry` so they can advertise Retry-After.
-    #[cfg(test)]
-    /// The configured window, exposed so a 429 can carry an honest
-    /// `retry-after`: a hardcoded value lies when the operator retunes the
-    /// window, and a client that honors the header would retry into another
-    /// 429 until the real window elapses.
-    pub fn window(&self) -> Duration {
-        self.window
-    }
-
+    /// allow/deny decision, not the rejection's Retry-After delay.
     pub(crate) async fn check(&self, key: &str) -> bool {
         self.check_retry(key).await.is_none()
     }

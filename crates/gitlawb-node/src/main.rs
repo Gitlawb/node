@@ -1611,7 +1611,7 @@ mod rate_limiter_sweep_tests {
         }
 
         tokio::time::sleep(window * 3).await;
-        state.sweep_rate_limiters().await;
+        state.cleanup_rate_limiters().await;
 
         for (i, l) in limiters(&state).into_iter().enumerate() {
             assert_eq!(l.tracked_keys().await, 0, "limiter {i} was not swept");
