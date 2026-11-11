@@ -61,13 +61,17 @@ walk: that walk holds the slot too, and bounds only each child git process
 individually (no aggregate deadline).
 
 De-duplication is per sink and best-effort, backed by the single `pinned_cids`
-table: the hot tier keys on its `cid`/`sha256_hex` rows and the warm tier on the
-nullable `pinata_cid` column, so later pushes normally skip objects whose
-successful pin is already recorded. The isolation is one-directional: a hot-only
-pin does not suppress the warm tier (`pinata_cid` stays null), but the hot tier's
-skip check is row *presence*, and a warm-tier pin inserts the row — so an object
-warm-pinned while `GITLAWB_IPFS_API` was unset is skipped by the hot tier after
-Kubo is configured, until something re-pins it. The check-upload-record sequence is not atomic,
+table: the hot tier skips an object when `has_ipfs_cid` reports true, which is
+`local_ipfs_provenance = TRUE` — a row that records a real local Kubo CID — and
+the warm tier on the nullable `pinata_cid` column, so later pushes normally skip
+objects whose successful pin is already recorded for that sink. The isolation is
+one-directional: a hot-only pin does not suppress the warm tier (`pinata_cid`
+stays null), and a warm-tier pin does not suppress the hot tier either: a row
+with only `pinata_cid` set has `local_ipfs_provenance = FALSE`, so an object
+warm-pinned while `GITLAWB_IPFS_API` was unset still enters the hot upload path
+on later pushes once Kubo is configured, subject to the normal budgets and
+failure handling (enabling Kubo can backfill local copies rather than leaving
+the object warm-only). The check-upload-record sequence is not atomic,
 so concurrent post-push tasks for the same object, or a failure to record after a
 successful upload, can still cause a repeat upload attempt.
 
@@ -80,8 +84,9 @@ successful upload, can still cause a repeat upload attempt.
   storage and makes objects reachable through the public IPFS gateway.
 - Running **both** gives a node-local hot copy plus an off-node warm copy for
   objects pinned while both sinks are enabled. An object warm-pinned before
-  Kubo was configured keeps only the warm copy (the dedup paragraph above)
-  unless something re-pins it.
+  Kubo was configured still enters the hot path on later pushes (the dedup
+  paragraph above), so enabling Kubo can backfill local copies instead of
+  leaving it warm-only.
 
 > The two sinks are currently invoked as separate call paths. Unifying them
 > behind a single pluggable backend interface (to add providers such as direct
