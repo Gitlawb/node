@@ -190,7 +190,12 @@ fn local_refs_on_disk(repos_dir: &Path, owner_did: &str, name: &str) -> Option<u
             "purge-spam: unsafe repo name — treating as non-empty (skipped)");
         return Some(1);
     }
-    let path = store::repo_disk_path(repos_dir, owner_did, name);
+    let Ok(path) = crate::git::repo_store::validated_repo_disk_path(repos_dir, owner_did, name)
+    else {
+        warn!("purge-spam: could not validate repo path — treating as non-empty (skipped)");
+        return Some(1);
+    };
+    let path = path.into_path_buf();
     // Only a VERIFIED NotFound (the path truly does not exist) may return None,
     // which promotes the repo to remote_unverified — and that refresh path does a
     // remove_dir_all on the target. Use `symlink_metadata` (not `metadata`) so a
@@ -248,7 +253,12 @@ fn ref_count_on_disk(repos_dir: &Path, owner_did: &str, name: &str) -> usize {
             "purge-spam: unsafe repo name — treating as non-empty (skipped)");
         return 1;
     }
-    let path = store::repo_disk_path(repos_dir, owner_did, name);
+    let Ok(path) = crate::git::repo_store::validated_repo_disk_path(repos_dir, owner_did, name)
+    else {
+        warn!("purge-spam: could not validate repo path — treating as non-empty (skipped)");
+        return 1;
+    };
+    let path = path.into_path_buf();
     if !path.join("HEAD").is_file() || !path.join("objects").is_dir() {
         // Not a bare git repo at the exact expected path. Do NOT trust a ref
         // count that git discovery could have read from a parent repository.
@@ -450,7 +460,19 @@ pub async fn run_purge_spam(
                 // A disk-removal failure is counted separately, NOT folded into the
                 // deleted total, so the summary never reports a clean success while
                 // an on-disk dir survives (DB/disk drift the operator must fix).
-                let path = store::repo_disk_path(&repos_dir, &c.owner_did, &c.name);
+                let path = match crate::git::repo_store::validated_repo_disk_path(
+                    &repos_dir,
+                    &c.owner_did,
+                    &c.name,
+                ) {
+                    Ok(p) => p.into_path_buf(),
+                    Err(e) => {
+                        warn!(repo = %c.id, err = %e,
+                            "purge-spam: could not validate repo path — refusing to remove");
+                        summary.disk_failed += 1;
+                        continue;
+                    }
+                };
                 if !path_within(&path, &repos_dir) {
                     warn!(repo = %c.id, path = %path.display(),
                         "purge-spam: on-disk path escapes repos_dir — refusing to remove");

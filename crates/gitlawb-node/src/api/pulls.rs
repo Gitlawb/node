@@ -50,6 +50,17 @@ pub async fn create_pr(
     let target_branch = req
         .target_branch
         .unwrap_or_else(|| record.default_branch.clone());
+
+    // Validate both refs before they are stored, since both are later
+    // interpolated into git argv (git diff / worktree add / merge). Validate the
+    // RESOLVED target, not just a caller-supplied one: create_repo also gates
+    // default_branch, but validating here as well means a PR can never feed the
+    // git sink an unchecked ref even if a default was poisoned by an older row
+    // or a future path that skips create_repo's gate.
+    crate::api::validate_git_ref_with_git(&state.git_bin, &req.source_branch)
+        .map_err(crate::api::map_git_ref_validation_error)?;
+    crate::api::validate_git_ref_with_git(&state.git_bin, &target_branch)
+        .map_err(crate::api::map_git_ref_validation_error)?;
     let number = state.db.next_pr_number(&record.id).await?;
     let now = Utc::now().to_rfc3339();
 
@@ -84,6 +95,7 @@ pub async fn create_pr(
     webhooks::fire_event(
         std::sync::Arc::clone(&state.db),
         std::sync::Arc::clone(&state.http_client),
+        std::sync::Arc::clone(&state.webhook_secret_key),
         &record.id,
         "pull_request.opened",
         serde_json::json!({
@@ -188,11 +200,8 @@ pub async fn merge_pr(
     Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, name, number)): Path<(String, String, i64)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, Some(auth.0.as_str()), "/").await?;
 
     // Owner-only merge (N7). Merging writes the served tree, so this is the same
     // trust boundary as owner-only push; it subsumes branch protection (a
@@ -213,16 +222,9 @@ pub async fn merge_pr(
         .repo_store
         .acquire_write(&record.owner_did, &record.name)
         .await
-        .map_err(|e| AppError::Git(e.to_string()))?;
+        .map_err(|e| crate::api::repos::acquire_write_app_error(&e, &name))?;
     let disk_path = guard.path().to_path_buf();
     let merger_did = auth.0;
-
-    // Snapshot the target branch's pre-merge tip so a failed durable upload can
-    // roll the merge commit back on local disk (mirrors create_issue). Without
-    // this the local fast path in RepoStore::acquire serves the merged tree until
-    // a later write refreshes the archive, even though the client got a 5xx.
-    let target_ref = format!("refs/heads/{}", pr.target_branch);
-    let prior_target = store::ref_oid(&disk_path, &target_ref).ok().flatten();
 
     let merge_result = store::merge_branch(
         &disk_path,
@@ -232,36 +234,13 @@ pub async fn merge_pr(
         &pr.title,
     );
 
-    // Always release the advisory lock, even on error; upload to Tigris only on
-    // success. A false return means the durable upload failed/timed out: the merge
-    // commit applied to local disk but never reached object storage, so the next
-    // acquire_write reverts it from the stale archive. Report 5xx so the client
-    // retries rather than marking the PR merged in the DB while the merged tree
-    // was silently lost. Fail BEFORE merge_pr / touch_repo / webhooks. (P1
-    // data-loss guard, same as receive-pack.) On that failure, roll the local
-    // merge back to the captured tip BEFORE the lock releases.
-    let upload_ok = guard
-        .release_with_failure_cleanup(merge_result.is_ok(), |path| {
-            if let Some(oid) = &prior_target {
-                if let Err(e) = store::set_ref(path, &target_ref, oid) {
-                    tracing::warn!(repo = %record.name, err = %e,
-                        "failed to roll back local merge commit after failed durable upload; \
-                         a local-fast-path read may serve the un-uploaded merged tree");
-                }
-            }
-        })
-        .await;
+    // Always release the advisory lock — even on error; upload to Tigris only on success.
+    // Short-circuit on a refused publish before the PR is marked merged and
+    // before the webhook fires. Both are irreversible announcements of a merge
+    // commit that only exists on this node's disk.
+    guard.release(merge_result.is_ok()).await.into_result()?;
 
     let merge_sha = merge_result.map_err(|e| AppError::Git(e.to_string()))?;
-
-    if !upload_ok {
-        tracing::error!(repo = %record.name,
-            "durable upload failed after merge; reporting failure so the client retries");
-        return Err(AppError::Git(format!(
-            "durable storage upload failed for {}",
-            record.name
-        )));
-    }
 
     state.db.merge_pr(&pr.id, &merger_did).await?;
     let _ = state.db.touch_repo(&record.id).await;
@@ -269,6 +248,7 @@ pub async fn merge_pr(
     webhooks::fire_event(
         std::sync::Arc::clone(&state.db),
         std::sync::Arc::clone(&state.http_client),
+        std::sync::Arc::clone(&state.webhook_secret_key),
         &record.id,
         "pull_request.merged",
         serde_json::json!({
@@ -294,11 +274,8 @@ pub async fn close_pr(
     Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, name, number)): Path<(String, String, i64)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, Some(auth.0.as_str()), "/").await?;
 
     let pr = state
         .db
@@ -320,6 +297,7 @@ pub async fn close_pr(
     webhooks::fire_event(
         std::sync::Arc::clone(&state.db),
         std::sync::Arc::clone(&state.http_client),
+        std::sync::Arc::clone(&state.webhook_secret_key),
         &record.id,
         "pull_request.closed",
         serde_json::json!({
@@ -370,6 +348,7 @@ pub async fn create_review(
     webhooks::fire_event(
         std::sync::Arc::clone(&state.db),
         std::sync::Arc::clone(&state.http_client),
+        std::sync::Arc::clone(&state.webhook_secret_key),
         &record.id,
         "pull_request.reviewed",
         serde_json::json!({
@@ -459,133 +438,57 @@ pub async fn list_comments(
     Ok(Json(serde_json::json!({ "comments": comments })))
 }
 
+/// #173 F1 follow-up: merge holds no admission permit, so an exhausted write-lock
+/// pool must shed 503 + Retry-After.
 #[cfg(test)]
-mod tests {
-    // super::* brings in the handler plus the axum Extension/Path/State
-    // extractors and the Utc/Uuid/PullRequest types the seed uses.
+mod lock_pool_shed_tests {
     use super::*;
-    use std::path::Path as StdPath;
-    use std::time::Duration;
+    use axum::response::IntoResponse;
+    use sqlx::PgPool;
 
-    // Object store whose upload() parks forever, so release()'s bounded timeout
-    // is the only thing that completes it, modeling a stalled durable PUT.
-    // exists() is false so acquire_write never downloads over the local bare repo.
-    struct StallStore;
-    #[async_trait::async_trait]
-    impl crate::git::tigris::ObjectStore for StallStore {
-        async fn exists(&self, _o: &str, _r: &str) -> anyhow::Result<bool> {
-            Ok(false)
-        }
-        async fn upload(&self, _o: &str, _r: &str, _p: &StdPath) -> anyhow::Result<()> {
-            std::future::pending::<()>().await;
-            Ok(())
-        }
-        async fn download(&self, _o: &str, _r: &str, _p: &StdPath) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn delete(&self, _o: &str, _r: &str) -> anyhow::Result<()> {
-            Ok(())
+    fn seed_repo(owner_did: &str, name: &str) -> crate::db::RepoRecord {
+        let now = Utc::now();
+        crate::db::RepoRecord {
+            id: Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            owner_did: owner_did.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: now,
+            updated_at: now,
+            disk_path: format!("/tmp/{name}"),
+            forked_from: None,
+            machine_id: None,
         }
     }
 
-    // The failed-upload rollback on the merge path. merge_pr writes the merge
-    // commit to LOCAL disk, then release() uploads to durable storage. When
-    // that upload times out the handler must 5xx (before merge_pr/webhooks)
-    // AND roll the target branch back to its pre-merge tip while the advisory
-    // lock is held, so a local-fast-path read never serves the un-uploaded
-    // merged tree. RED with the cleanup closure at ~pulls.rs:244 reverted to
-    // `|_| {}`: main stays at the merge commit.
     #[sqlx::test]
-    async fn merge_failed_upload_rolls_back_target_ref(pool: sqlx::PgPool) {
-        use axum::response::IntoResponse;
-        use std::process::Command;
-
+    async fn merge_pr_lock_pool_exhaustion_sheds_503_not_500(pool: PgPool) {
+        let owner = "did:key:zMERGELOCKPOOLOWNERAAAAAAAAAAAAAAAAAAAAA";
         let mut state = crate::test_support::test_state(pool.clone()).await;
-        let repos_dir = tempfile::TempDir::new().unwrap();
         state.repo_store = crate::git::repo_store::RepoStore::new(
-            repos_dir.path().to_path_buf(),
-            Some(std::sync::Arc::new(StallStore)),
-            pool.clone(),
-        )
-        .with_release_upload_timeout(Duration::from_millis(200));
-
-        let owner = "z6mergerollbackowner";
-        let name = "mergerollback";
-        let owner_slug = owner.replace([':', '/'], "_");
-        let bare = repos_dir
-            .path()
-            .join(&owner_slug)
-            .join(format!("{name}.git"));
-
-        state
-            .db
-            .upsert_mirror_repo(owner, name, &bare.to_string_lossy(), None, false)
-            .await
-            .unwrap();
-
-        fn git(args: &[&str], dir: &StdPath) -> String {
-            let out = Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "git {args:?} failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        }
-
-        // Scratch repo: c1 on main, c2 on feature; the bare clone carries both
-        // branches, so the merge of feature into main has real work to do.
-        let work = tempfile::TempDir::new().unwrap();
-        git(&["init", "-q", "-b", "main", "."], work.path());
-        git(&["config", "user.email", "t@t"], work.path());
-        git(&["config", "user.name", "t"], work.path());
-        std::fs::write(work.path().join("f.txt"), "one").unwrap();
-        git(&["add", "f.txt"], work.path());
-        git(&["commit", "-q", "-m", "c1"], work.path());
-        git(&["checkout", "-q", "-b", "feature"], work.path());
-        std::fs::write(work.path().join("g.txt"), "two").unwrap();
-        git(&["add", "g.txt"], work.path());
-        git(&["commit", "-q", "-m", "c2"], work.path());
-
-        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
-        let out = Command::new("git")
-            .args([
-                "clone",
-                "--bare",
-                "-q",
-                &work.path().to_string_lossy(),
-                &bare.to_string_lossy(),
-            ])
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "clone --bare failed: {}",
-            String::from_utf8_lossy(&out.stderr)
+            std::path::PathBuf::from("/tmp/gitlawb-pulls-lockpool"),
+            None,
+            crate::git::repo_store::build_lock_pool(&pool, 1, std::time::Duration::from_secs(1)),
+            std::time::Duration::from_secs(300),
         );
 
-        let pre_merge_tip = store::ref_oid(&bare, "refs/heads/main")
-            .unwrap()
-            .expect("main exists before the merge");
-
-        // Seed the open PR row the handler looks up.
-        let record = state.db.get_repo(owner, name).await.unwrap().unwrap();
+        let repo = seed_repo(owner, "lp-merge");
+        let repo_id = repo.id.clone();
+        state.db.create_repo(&repo).await.expect("seed repo");
         let now = Utc::now().to_rfc3339();
         state
             .db
             .create_pr(&PullRequest {
                 id: Uuid::new_v4().to_string(),
-                repo_id: record.id.clone(),
+                repo_id: repo_id.clone(),
                 number: 1,
-                title: "t".into(),
+                title: "lp".to_string(),
                 body: None,
                 author_did: owner.to_string(),
-                source_branch: "feature".into(),
-                target_branch: "main".into(),
+                source_branch: "feature".to_string(),
+                target_branch: "main".to_string(),
                 status: "open".to_string(),
                 merged_by_did: None,
                 merged_at: None,
@@ -593,34 +496,46 @@ mod tests {
                 updated_at: now,
             })
             .await
-            .unwrap();
+            .expect("seed open PR");
 
-        // Merge as the owner: the merge commit applies locally, the durable
-        // upload stalls and times out, and the handler must report 5xx.
-        let resp = super::merge_pr(
+        let held = state
+            .repo_store
+            .acquire_write(owner, "other-repo")
+            .await
+            .expect("the first write takes the only lock-pool connection");
+
+        let shed = merge_pr(
             State(state.clone()),
             Extension(AuthenticatedDid(owner.to_string())),
-            Path((owner.to_string(), name.to_string(), 1)),
+            Path((owner.to_string(), "lp-merge".to_string(), 1)),
         )
         .await;
-        let status = match resp {
-            Ok(_) => StatusCode::OK,
-            Err(e) => e.into_response().status(),
-        };
-        assert!(
-            status.is_server_error(),
-            "a stalled durable upload on merge must 5xx, got {status}"
+        let err = shed.expect_err("an exhausted lock pool must fail the call");
+        let resp = err.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "merge_pr: an exhausted write-lock pool must shed 503, not a 500 git error"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .map(|v| v.to_str().unwrap()),
+            Some("1"),
+            "merge_pr: a capacity shed must tell the client when to retry"
         );
 
-        // The target branch must still point at the pre-merge tip: the failed
-        // upload rolled the merge commit back while the lock was held.
-        let tip = store::ref_oid(&bare, "refs/heads/main")
-            .unwrap()
-            .expect("main still exists after the rollback");
-        assert_eq!(
-            tip, pre_merge_tip,
-            "a failed durable upload must roll the target branch back to its \
-             pre-merge tip; a local-fast-path read served the un-uploaded merge"
+        let _ = held.release(false).await;
+        let admitted = merge_pr(
+            State(state.clone()),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((owner.to_string(), "lp-merge".to_string(), 1)),
+        )
+        .await;
+        assert!(
+            !matches!(admitted, Err(AppError::Overloaded(_))),
+            "with the lock pool free, merge_pr must not be shed as capacity; got {:?}",
+            admitted.err()
         );
     }
 }

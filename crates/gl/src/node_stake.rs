@@ -72,7 +72,7 @@ pub async fn cmd_register(
     let token_addr: Address = token.parse().context("invalid token address")?;
     let contract_addr: Address = contract.parse().context("invalid contract address")?;
 
-    println!("Registering gitlawb node on Base L2...");
+    println!("Registering Twigpine node on Base L2...");
     println!("  DID:      {did}");
     println!("  Stake:    {stake} $GITLAWB");
     println!("  HTTP URL: {http_url}");
@@ -328,12 +328,10 @@ pub async fn cmd_unstake(
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn load_did(dir: Option<PathBuf>) -> Result<String> {
-    let base = dir.unwrap_or_else(|| {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".gitlawb")
-    });
-    let path = base.join("identity.pem");
+    // The shared resolver, not a local `~/.gitlawb`: `gl identity new` writes the
+    // key wherever `GITLAWB_KEY` points, and the old fallback to `.` on a missing
+    // home made the answer depend on the working directory.
+    let path = crate::identity::key_path_for(dir.as_deref())?;
     let pem = std::fs::read_to_string(&path).with_context(|| {
         format!(
             "No identity at {} — run `gl identity new` first",

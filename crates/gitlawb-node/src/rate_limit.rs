@@ -75,6 +75,14 @@ impl RateLimiter {
     /// allow/deny decision, not the rejection's Retry-After delay. Test-only now:
     /// production 429 sites use `check_retry` so they can advertise Retry-After.
     #[cfg(test)]
+    /// The configured window, exposed so a 429 can carry an honest
+    /// `retry-after`: a hardcoded value lies when the operator retunes the
+    /// window, and a client that honors the header would retry into another
+    /// 429 until the real window elapses.
+    pub fn window(&self) -> Duration {
+        self.window
+    }
+
     pub(crate) async fn check(&self, key: &str) -> bool {
         self.check_retry(key).await.is_none()
     }
@@ -153,6 +161,45 @@ impl RateLimiter {
         None
     }
 
+    /// Non-consuming check: is this key ALREADY at its limit for the current window?
+    /// Unlike [`check`], it records nothing and never inserts a new key — used to shed
+    /// expensive preparatory work (e.g. the `/ipfs/{cid}` legacy scan's O(repos) DB
+    /// preload) BEFORE it runs, without perturbing the per-unit budget the consuming
+    /// `check` maintains (#173, F3). An unknown key or a disabled limiter is not
+    /// throttled. Prunes the key's expired timestamps as a side effect (keeps state
+    /// tidy) but adds none, so it cannot itself fill or grow the map.
+    pub(crate) async fn is_throttled(&self, key: &str) -> bool {
+        if self.max_requests == 0 {
+            return false;
+        }
+        let now = Instant::now();
+        let mut state = self.state.lock().await;
+        if let Some(window) = state.get_mut(key) {
+            window
+                .timestamps
+                .retain(|t| now.duration_since(*t) < self.window);
+            return window.timestamps.len() >= self.max_requests;
+        }
+        false
+    }
+
+    /// The configured key ceiling. Tests use it to assert that a limiter a
+    /// production factory builds is actually bounded, which flooding the real
+    /// ceiling in distinct keys would be far too slow to show.
+    #[cfg(test)]
+    pub fn max_keys(&self) -> usize {
+        self.max_keys
+    }
+
+    /// The configured per-key request cap. Tests use it to assert that a
+    /// limiter a production factory builds carries the cap it is documented
+    /// with; re-asserting the constant on its own cannot tell whether the
+    /// factory passed that constant or a different one.
+    #[cfg(test)]
+    pub fn max_requests(&self) -> usize {
+        self.max_requests
+    }
+
     pub async fn cleanup(&self) {
         let now = Instant::now();
         let mut state = self.state.lock().await;
@@ -176,6 +223,9 @@ impl RateLimiter {
     }
 
     /// Test-only: number of distinct keys currently tracked.
+    /// Number of distinct keys currently tracked. Test-only introspection so a
+    /// cross-module test can assert that a sweep actually evicted expired entries
+    /// and observe what it reclaimed. There is no production reader.
     #[cfg(test)]
     pub(crate) async fn tracked_keys(&self) -> usize {
         self.state.lock().await.len()
@@ -196,6 +246,110 @@ impl RateLimiter {
             .lock()
             .await
             .insert(key.to_string(), Window { timestamps });
+    }
+}
+
+/// Per-source concurrency cap derived from the write-pool size: one resolved client
+/// key (see [`client_key`]) may hold at most an eighth of the pool, so saturating it
+/// takes ~8 distinct keys. Real for an IPv4 or single-address caller; a caller with a
+/// routed IPv6 /64 has 2^64 keys, because `client_key` returns the full address with
+/// no prefix folding. Narrowing that keying is a deferred decision, so this cap is a
+/// bound per key, not a bound per operator.
+///
+/// Floored at 1 because the value feeds [`PerCallerConcurrency`], where a cap of 0
+/// would shed EVERY receive-pack advertisement and break all pushes. The floor is
+/// load-bearing at the minimum write-pool size (1), which integer-divides to 0.
+pub(crate) fn per_source_push_cap(max_concurrent_git_pushes: usize) -> usize {
+    (max_concurrent_git_pushes / 8).max(1)
+}
+
+/// A bounded per-caller CONCURRENCY limiter — distinct from [`RateLimiter`], which
+/// caps request RATE. Each caller key may hold at most `per_caller` in-flight
+/// permits at once; beyond that [`try_acquire`](Self::try_acquire) returns `None`
+/// and the caller sheds. Used to stop one caller (a single anonymous source-IP or
+/// DID) monopolizing the served-git read pool (#174).
+///
+/// The key map is self-bounding: a key is removed the instant its in-flight count
+/// reaches zero, so it never holds more keys than there are concurrently-active
+/// callers (itself bounded by the read semaphore). A `max_keys` reject-before-insert
+/// backstop guarantees a key farm can never grow the map even if that invariant
+/// weakened — a NEW key at the cap is rejected WITHOUT allocating an entry (INV-15).
+///
+/// Uses a `std::sync::Mutex` (not the file's `tokio::sync::Mutex`) because the
+/// permit's `Drop` must release synchronously; the critical section holds no await.
+#[derive(Clone)]
+pub struct PerCallerConcurrency {
+    state: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    per_caller: usize,
+    max_keys: usize,
+}
+
+/// RAII permit from [`PerCallerConcurrency::try_acquire`]. On drop it decrements
+/// the caller's in-flight count and removes the key when it reaches zero.
+pub struct PerCallerPermit {
+    state: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    key: String,
+}
+
+impl PerCallerConcurrency {
+    pub fn new(per_caller: usize, max_keys: usize) -> Self {
+        Self {
+            state: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            per_caller: per_caller.max(1),
+            max_keys: max_keys.max(1),
+        }
+    }
+
+    /// Convenience constructor with the default key bound.
+    pub fn with_default_max_keys(per_caller: usize) -> Self {
+        Self::new(per_caller, DEFAULT_MAX_KEYS)
+    }
+
+    /// `Some(permit)` when the caller is under its cap and the map has room;
+    /// `None` (shed) otherwise. Reject-before-insert: a new key at `max_keys` is
+    /// rejected without allocating.
+    pub fn try_acquire(&self, key: &str) -> Option<PerCallerPermit> {
+        // Recover from a poisoned lock rather than panicking: the critical section
+        // is pure counter arithmetic and cannot itself panic, so a poisoned mutex
+        // would only ever come from an unrelated abort, and a slightly-off count
+        // self-heals as permits drop. A panic here would instead brick the limiter
+        // for every caller (each subsequent lock re-panics).
+        let mut map = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        match map.get_mut(key) {
+            Some(count) => {
+                if *count >= self.per_caller {
+                    return None;
+                }
+                *count += 1;
+            }
+            None => {
+                if map.len() >= self.max_keys {
+                    return None;
+                }
+                map.insert(key.to_string(), 1);
+            }
+        }
+        Some(PerCallerPermit {
+            state: self.state.clone(),
+            key: key.to_string(),
+        })
+    }
+
+    #[cfg(test)]
+    pub fn tracked_keys(&self) -> usize {
+        self.state.lock().unwrap().len()
+    }
+}
+
+impl Drop for PerCallerPermit {
+    fn drop(&mut self) {
+        let mut map = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = map.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                map.remove(&self.key);
+            }
+        }
     }
 }
 
@@ -315,13 +469,70 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerAddr {
 /// The shared 429 response for the rate-limit middlewares (per-DID and per-IP
 /// alike). Route-agnostic: the message stays generic (the offending path, when
 /// logged, is recorded at the call site).
+/// The message every per-IP brake answers with, shared so the GraphQL surface
+/// (which cannot return a 429 status inside a 200 GraphQL envelope) says the
+/// same thing as the REST routes.
+pub const RATE_LIMIT_MESSAGE: &str = "rate limit exceeded — try again later";
+
+/// The shared 429 response for the rate-limit middlewares (per-DID and per-IP
+/// alike). Route-agnostic: the message stays generic (the offending path, when
+/// logged, is recorded at the call site).
 pub fn too_many_requests(retry_after: Duration) -> Response {
     (
         StatusCode::TOO_MANY_REQUESTS,
         [("retry-after", retry_after.as_secs().to_string())],
-        "rate limit exceeded — try again later",
+        RATE_LIMIT_MESSAGE,
     )
         .into_response()
+}
+
+/// The per-IP task-read brake carried as GraphQL request data: the limiter plus
+/// the client key the transport already resolved.
+///
+/// `/graphql` is a single POST endpoint, so this brake cannot sit in middleware
+/// the way `task_read_routes` mounts `rate_limit_by_ip`: that would charge every
+/// unrelated query and every mutation against the task-read bucket. The two task
+/// resolvers debit it instead, which also prices an aliased query honestly — ten
+/// aliased `tasks` fields run the visibility gate ten times and pay ten slots,
+/// where one request-scoped debit would pay one (#327 review).
+/// Default cap on the number of task read fields (across all aliases) permitted
+/// in a single GraphQL request before rejecting further field executions (#327 review).
+pub const MAX_GRAPHQL_TASK_READS_PER_REQUEST: usize = 5;
+
+#[derive(Clone)]
+pub struct TaskReadBrake {
+    pub limiter: RateLimiter,
+    /// `None` when no key could be resolved at all (no trusted header and no
+    /// `ConnectInfo`, e.g. a synthetic test request). Never braked, matching
+    /// [`rate_limit_by_ip`].
+    pub key: Option<String>,
+    pub request_count: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl TaskReadBrake {
+    /// Debit one slot for one task-read field. `true` = proceed.
+    pub async fn check(&self, field: &str) -> bool {
+        let Some(key) = self.key.as_deref() else {
+            return true;
+        };
+        let count = self
+            .request_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count >= MAX_GRAPHQL_TASK_READS_PER_REQUEST {
+            tracing::warn!(
+                key = %key,
+                field = %field,
+                count = count + 1,
+                "per-request GraphQL task field limit exceeded"
+            );
+            return false;
+        }
+        if self.limiter.check(key).await {
+            return true;
+        }
+        tracing::warn!(key = %key, field = %field, "per-IP rate limit exceeded");
+        false
+    }
 }
 
 /// Throttle the git push path by resolved client IP. The socket peer address is
@@ -349,6 +560,63 @@ pub async fn rate_limit_by_ip(request: Request, next: Next) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn per_caller_concurrency_caps_one_caller_and_frees_on_drop() {
+        let lim = PerCallerConcurrency::new(2, 100);
+        let p1 = lim.try_acquire("did:key:zA").expect("first under cap");
+        let p2 = lim.try_acquire("did:key:zA").expect("second under cap");
+        assert!(
+            lim.try_acquire("did:key:zA").is_none(),
+            "a third in-flight op for the same caller sheds (over the per-caller cap)"
+        );
+        // A DIFFERENT caller is unaffected — the cap is per-caller, not global.
+        let _other = lim
+            .try_acquire("did:key:zB")
+            .expect("a different caller has its own budget");
+        drop(p1);
+        assert!(
+            lim.try_acquire("did:key:zA").is_some(),
+            "freeing one in-flight slot lets the same caller back in"
+        );
+        drop(p2);
+    }
+
+    #[test]
+    fn per_caller_concurrency_map_is_self_bounding_and_reject_before_insert() {
+        // Self-bounding: acquire+drop many distinct keys — the map never grows
+        // because a key is removed the instant its in-flight count hits zero.
+        let lim = PerCallerConcurrency::new(4, 3);
+        for i in 0..50 {
+            let _p = lim.try_acquire(&format!("k{i}"));
+        }
+        assert_eq!(
+            lim.tracked_keys(),
+            0,
+            "keys with zero in-flight ops are removed, so an acquire+drop flood leaves the map empty"
+        );
+        // Reject-before-insert: HOLD max_keys distinct keys, then a new key sheds
+        // WITHOUT growing the map past the cap (INV-15 — a rejected request never
+        // allocates an entry).
+        let held: Vec<_> = (0..3)
+            .map(|i| lim.try_acquire(&format!("h{i}")).unwrap())
+            .collect();
+        assert_eq!(
+            lim.tracked_keys(),
+            3,
+            "three distinct callers held concurrently"
+        );
+        assert!(
+            lim.try_acquire("h3").is_none(),
+            "a new key at max_keys is rejected"
+        );
+        assert_eq!(
+            lim.tracked_keys(),
+            3,
+            "the rejected new key did not allocate an entry (reject-before-insert)"
+        );
+        drop(held);
+    }
 
     #[tokio::test]
     async fn allows_within_limit() {

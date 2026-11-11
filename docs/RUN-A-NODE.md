@@ -1,4 +1,4 @@
-# Running a gitlawb node
+# Running a Twigpine node
 
 Step-by-step guide to staking $GITLAWB, registering your node on-chain, and earning protocol fees as a PoS operator.
 
@@ -8,6 +8,7 @@ Step-by-step guide to staking $GITLAWB, registering your node on-chain, and earn
 
 - A wallet with at least **10,000 $GITLAWB** (minimum stake) plus a small amount of ETH on Base for gas
 - Docker or Rust 1.91+ (for running the node process)
+- PostgreSQL 16+ — the node uses `pg_input_is_valid`, which exists only on PostgreSQL 16 and later. The bundled `docker-compose.yml` pins `postgres:16-alpine`; if you supply your own `DATABASE_URL`, the server must be 16+.
 - A public HTTP URL (your-host.com) — can be a VPS, Fly.io app, or anything reachable. A Fly.io config is provided at `infra/fly/fly.toml` (deploy from the repo root with `fly deploy -c infra/fly/fly.toml`)
 
 ---
@@ -15,12 +16,12 @@ Step-by-step guide to staking $GITLAWB, registering your node on-chain, and earn
 ## 1. Install the CLI
 
 ```bash
-curl -fsSL https://gitlawb.com/install.sh | sh
+curl -fsSL https://twigpine.com/install.sh | sh
 # or build from source:
 cargo install --path crates/gl
 ```
 
-## 2. Create a gitlawb identity
+## 2. Create a Twigpine identity
 
 Every node is identified by an Ed25519 DID keypair:
 
@@ -69,7 +70,7 @@ docker run -d \
   -e GITLAWB_CONTRACT_NODE_STAKING=$GITLAWB_CONTRACT_NODE_STAKING \
   -e GITLAWB_CHAIN_RPC_URL=$GITLAWB_CHAIN_RPC_URL \
   -e GITLAWB_OPERATOR_STRICT_MODE=true \
-  ghcr.io/gitlawb/node:latest
+  ghcr.io/twigpine/node:latest
 ```
 
 ### Option B — docker-compose
@@ -90,6 +91,7 @@ Required env for on-chain PoS mode:
 Optional:
 - `GITLAWB_OPERATOR_STRICT_MODE=true` — refuse to start if not registered or not currently active
 - `GITLAWB_HEARTBEAT_INTERVAL_HOURS=20` — how often to post heartbeats (must be < 24)
+- `GITLAWB_RECONCILIATION_SWEEP=true` — enable the hourly durability sweep that re-pins/backstops missing objects (default `true`; disabled when no IPFS/Pinata backend is configured). Public pin repair runs against any configured backend. Encrypted recovery repair requires local IPFS (`GITLAWB_IPFS_API`); Pinata-only nodes reconcile public pins only. Set `=false` to disable.
 
 ## 5. Verify
 
@@ -141,31 +143,142 @@ During the cooldown your node still earns rewards if it keeps heartbeating.
 
 ---
 
-## Hardening: owner-only push
+## Owner-only push
 
-By default the node authenticates every `git-receive-pack` push (a valid RFC 9421
-`did:key` signature) but does **not** check that the pusher owns the repo, except
-on branches that are explicitly protected. Because `did:key` is self-certifying,
-any party can generate a key, derive its DID, sign, and push to an unprotected
-branch — authentication is not authorization.
+On the `git-receive-pack` POST — the push itself — the node requires the
+authenticated pusher to be the repo owner, or to present a UCAN whose proof chain
+roots at the owner and carries `git/push` for this repository (see *Delegating
+push to a CI agent* below). Anyone else is rejected with HTTP 403 before any ref
+update is applied, on **every** branch. The owner is matched in both the full
+`did:key:z6Mk…` form and its bare `z6Mk…` suffix.
 
-To require the authenticated pusher to be the repo owner on **every** branch, set:
+This is on by default, and the default is the point. The node authenticates every
+`git-receive-pack` push with a valid RFC 9421 `did:key` signature, but `did:key`
+is self-certifying: any party can generate a key, derive its DID and sign.
+Authentication is not authorization, so without this gate every signed caller can
+push to every repository — private ones included — on any branch that is not
+explicitly protected.
+
+A `git push` crosses two independent gates, and this section is about the second:
+
+1. **Read visibility**, enforced twice on a push: on the `info/refs` advertisement
+   that precedes every fetch *and* every push, and again on the `git-receive-pack`
+   POST itself, because a client can skip the advertisement entirely. The
+   owner always passes. A visibility rule that matches `/` is an allow-list:
+   only the DIDs in its reader list pass, on a public repository as much as on
+   a private one. With no matching rule the repository's own flag decides:
+   public admits everyone, private denies every non-reader with the same 404 a
+   missing repository gets. A UCAN plays no part here — a delegation grants
+   no read access.
+2. **Push authorization**, on the `git-receive-pack` POST: the owner, or an
+   owner-rooted, bounded, repository-scoped push delegation.
+
+Both must pass. With no `/` rule on a public repository the first is open to
+everyone, so a delegation alone is enough; with a `/` rule, or on a private
+repository, the delegate must also be a reader — see *Private repositories and
+`/` rules* below.
+
+### Turning it off
 
 ```bash
-GITLAWB_ENFORCE_OWNER_PUSH=true
+GITLAWB_ENFORCE_OWNER_PUSH=false
 ```
 
-- **Default `false`** — preserves current behavior so live nodes are unaffected by
-  an upgrade. Turn it on once you're ready for owner-only writes.
+Both the environment variable and `--enforce-owner-push false` disable it; the
+bare `--enforce-owner-push` flag still means `true`.
+
+Do this only for a rolling upgrade whose pushers are not yet the repo owner, and
+treat it as temporary: while it is off, your node accepts a push to any repository
+from anyone who can generate a keypair.
+
 - **When `true`** — a push whose authenticated DID is not the repo owner is
-  rejected (HTTP 403) before any ref update is applied. The owner is matched in
+  rejected (HTTP 403) before any ref update is applied, unless it carries a
+  valid delegation (the next bullet). The owner is matched in
   both the full `did:key:z6Mk…` form and its bare `z6Mk…` suffix.
-- **Caution: this blocks every non-owner pusher, including your own delegated and
-  CI agents.** Push authorization is owner-only today — a UCAN `git/push`
-  capability is verified but not yet honored for authorization, so delegated keys
-  cannot push while this is on. Don't enable it until every identity that pushes
-  to your repos is the owner, or you'll lock out your own automation. Scoped
-  collaborator / UCAN-delegated push rights are a planned follow-up.
+- **A delegated key can still push.** A non-owner clears this gate by presenting a
+  UCAN whose proof chain roots at the repo owner and which carries `git/push` for
+  this repository. See *Delegating push to a CI agent* below.
+
+### Delegating push to a CI agent
+
+The owner issues a capability, the agent stores it, and the git helper presents it
+automatically on every push:
+
+Before anything below, set `GITLAWB_KEY` to an **absolute** path to the
+identity PEM (`gl identity new` prints it). `gl ucan import` and
+`git-remote-gitlawb` both resolve the delegation store from that key's parent
+directory, so do not pass `import --dir` pointing anywhere else: an import that
+succeeds elsewhere leaves the push unsigned. The README and `.env.example`
+cover the layout.
+
+```bash
+# Owner, once per agent per repo:
+gl ucan delegate --to did:key:z6MkAgent… \
+  --cap gitlawb://repos/<owner-did>/<repo> --can git/push --expiry 168
+
+# Agent:
+gl ucan import <token-or-path>
+git push origin main          # git-remote-gitlawb attaches it as X-Ucan
+```
+
+`--expiry` is measured in hours: 168 is 7 days, 720 is 30.
+
+`<repo>` is the repository's canonical name: the record name without a `.git`
+suffix. A trailing `.git` in the capability (or pasted from the remote URL) is
+stripped the same way the git remote strips it, at most once, so
+`gitlawb://repos/<owner-did>/myrepo.git` delegates to `myrepo`.
+
+What the node requires, and why:
+
+| Requirement | Reason |
+|---|---|
+| The chain's **root issuer** is the repo owner | A `did:key` is self-certifying, so anyone can mint a chain. The owner is the only anchor the node holds independently of the token. |
+| **Every link** names this repository | A delegation's scope is fixed when it is issued. The node walks the whole proof chain, so a `*` resource authorizes nothing — not in the leaf and not in any proof behind it. Refusing only the leaf would not have been enough: attenuation permits narrowing a `*` parent to a concrete child, so one wildcard grant could otherwise reach every repository the owner has or later creates. `gl ucan delegate` therefore refuses to issue a push-class `*` at all. |
+| **Every link carries an expiry** | There is no revocation path yet. An unbounded delegation could never be withdrawn once leaked, so the node refuses one outright. `gl ucan delegate` defaults to 30 days. |
+| No `nb` constraints | Constraints are reserved but not yet interpreted, so a capability carrying them authorizes nothing rather than silently granting more than the owner intended. |
+| The token is addressed to the pusher | The node requires the proof's audience to equal the invocation's issuer, and `gl ucan import` refuses a token addressed to another identity rather than storing one that can only fail. |
+
+**Private repositories and `/` rules.** A delegation clears the push gate
+only. The `info/refs` advertisement that `git push` fetches first is read-gated,
+and a UCAN grants no read access, so on a private repository the delegate must
+also be a reader — and the same holds on a public repository that has a `/`
+rule, because a matching rule is an allow-list that replaces the public flag:
+
+```bash
+# Owner: check the existing rules first — a `/` rule you already set has a mode
+# you want to keep, and `set` replaces its reader list wholesale.
+gl visibility list --repo <repo>
+
+# Then grant read to the agent AND every existing reader on `/`. The mode
+# (`a`/`b`) must match what `list` showed; only reach for `b` when no `/`
+# rule exists yet.
+gl visibility set / --repo <repo> --mode <a|b> --readers did:key:z6MkReader1,did:key:z6MkAgent…
+```
+
+Without it the agent's push fails with a 404 — the same answer a stranger gets,
+because a private repository is not confirmed to exist for a non-reader. A
+normal `git push` sees it at the `info/refs` advertisement; a client that skips
+the advertisement sees the identical denial on the `git-receive-pack` POST
+itself. Either way the delegation is valid and would clear the push gate: the
+read gate is what refused it. On a public repository with no `/` rule this
+step is unnecessary. The two gates are
+independent in the other direction as well: a reader with no delegation is still
+refused on the push.
+
+**One repository per token.** `gl ucan delegate` issues one capability per token,
+and `gl ucan import` stores one repository per token. A hand-built token that
+names several repositories is refused at import rather than applied to some of
+them; ask the owner for one delegation per repository.
+
+**A delegation does not override branch protection.** A protected branch is your
+explicit marker that even routine writes should stop, so a delegate is still
+refused there and only the owner may push. That is deliberate: if a delegation
+overrode it, issuing any capability would weaken every protection you had set.
+
+**Withdrawal is by expiry only.** There is no revocation today. If a delegated
+token leaks, it remains valid until its `exp`, and the only faster remedy is
+rotating the owner DID the repository is keyed on. Choose `--expiry` accordingly —
+short lifetimes reissued often are safer than one long-lived grant.
 
 ---
 
@@ -177,7 +290,8 @@ GITLAWB_ENFORCE_OWNER_PUSH=true
 | Missed heartbeats | After 3 days without one, you're excluded from rewards until you beat again |
 | Operator key | Dedicated wallet, small ETH balance, not your main treasury |
 | Monitoring | Watch `lastHeartbeat` on-chain; alert if > 22h since last beat |
-| Public URL | Must resolve and serve `/health` — peers will ping it |
+| Public URL | Must resolve and serve `/health` for liveness and DB-aware `/ready` for peer readiness |
+| Rolling upgrade (advisory-lock algorithm) | The SHA-256 advisory-lock key swap (replacing `DefaultHasher`) re-keys every repo in the first release that carries it. During a shared-Postgres rolling upgrade, old nodes compute a different `i64` key than new nodes for the same repo, so PostgreSQL treats them as independent locks and cross-machine write-exclusion is lost. **Drain in-flight writes** or cut over through a **single node** before bringing new-binary nodes online. |
 
 ---
 
@@ -186,6 +300,8 @@ GITLAWB_ENFORCE_OWNER_PUSH=true
 **"insufficient $GITLAWB balance"** — fund the operator wallet with at least 10,000 $GITLAWB.
 
 **Node refuses to start with "strict-mode operator check failed"** — either `gl node register` first, or unset `GITLAWB_OPERATOR_STRICT_MODE`.
+
+**Node refuses to start with "GITLAWB_DB_MAX_CONNECTIONS (20) must be at least max_concurrent_git_pushes (32) + 8 headroom"**: raise `GITLAWB_DB_MAX_CONNECTIONS` to at least the push cap plus 8 (40 with the default cap of 32; 48 is the shipped default and the recommended value), or lower `GITLAWB_MAX_CONCURRENT_GIT_PUSHES`. This bites a node upgraded in place that still sets the old pool size of 20. The check is deliberate: each concurrent push pins one pooled connection for its whole receive-pack, so a pool that does not clear the push cap lets a burst of slow pushes starve every other database path.
 
 **Rewards are 0 after a week** — run `gl node onchain-status`. If `currentlyActive: false`, check your heartbeat loop (node logs for `operator heartbeat sent`).
 
