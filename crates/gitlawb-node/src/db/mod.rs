@@ -786,27 +786,27 @@ pub struct Db {
 }
 
 impl Db {
-    #[cfg(test)]
-    pub fn for_testing(pool: PgPool) -> Self {
-        Self { pool }
-    }
-
     /// Test-only: access the underlying Postgres connection pool.
     ///
     /// The production accessor was removed on main (ed76adf) once every
     /// production caller had migrated to typed `Db` methods; this restores
     /// it for tests only, for the raw-SQL fixtures and closed-pool cases in
     /// this change that have no typed equivalent.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-harness"))]
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    #[cfg(any(test, feature = "test-harness"))]
+    pub fn for_testing(pool: PgPool) -> Self {
+        Self { pool }
     }
 
     /// Test-only: apply the full schema to a fresh pool. `#[sqlx::test]`
     /// provisions an empty per-test database, so DB-backed tests must run this
     /// before seeding. Reuses the production `migrate()` path (the advisory lock
     /// is harmless on an isolated test DB and migrations are idempotent).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-harness"))]
     pub(crate) async fn run_migrations(&self) -> Result<()> {
         self.migrate().await
     }
@@ -15398,8 +15398,8 @@ mod peer_authority_tests {
 /// | `prune_non_public_peers` (db/mod.rs) | a delete keyed on a computed bad-DID array; cannot repoint; boot-only caller in main.rs |
 /// | `seed_local_peer` (sync.rs) | excluded by test-module location: a deliberate `upsert_peer` bypass for `file://` fixtures, which the public-URL gate rejects |
 /// | `a_legacy_row_can_still_refresh_its_liveness` (db/mod.rs) | test-only. Seeds a PRE-GATE row by raw SQL on purpose: `upsert_peer` cannot create one, since the gate it is testing refuses exactly that DID. The fixture models what a deployed table already holds |
-/// | `gossip_ping_round_requires_two_failures_before_persisting_unreachable` (main.rs) | test-only fixture seed. Raw SQL because the test drives the readiness HYSTERESIS, which needs a row already at `last_ping_ok = TRUE` before the round runs; it never exercises the announce gate |
 /// | `manual_ping_uses_readiness_without_mutating_federation_gate` (api/peers.rs) | test-only fixture seed, same shape and same reason: the row under test must pre-exist so the assertion is about what the ping does NOT rewrite |
+/// | `gossip_ping_round_requires_two_failures_before_persisting_unreachable` (lib.rs) | test-only fixture seed for the gossip hysteresis round; the row must pre-exist so the assertion is about when `mark_peer_ping` fires |
 /// | `seed_peer` (p2p/mod.rs) | test-only fixture seed. Raw SQL so the gossip ingest tests can drive the known-peer gate directly, including the did:web case `upsert_peer` would refuse |
 /// | `federated_peer_query_is_bounded` (api/repos.rs) | test-only fixture seed for the bounded federation query; inserts reachable rows without exercising peer admission |
 /// | `federated_route_annotates_peer_repos_on_real_200_body` (api/repos.rs) | test-only fixture seed; inserts the mock peer row the bounded federation query reads, so the response-envelope assertions run against a real HTTP 200 body |
@@ -15498,11 +15498,11 @@ mod peers_table_writer_guard {
             1,
         ),
         (
-            "gossip_ping_round_requires_two_failures_before_persisting_unreachable",
+            "manual_ping_uses_readiness_without_mutating_federation_gate",
             1,
         ),
         (
-            "manual_ping_uses_readiness_without_mutating_federation_gate",
+            "gossip_ping_round_requires_two_failures_before_persisting_unreachable",
             1,
         ),
         ("mark_peer_ping", 1),

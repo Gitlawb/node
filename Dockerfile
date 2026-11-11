@@ -26,11 +26,15 @@ COPY crates/icaptcha-client/Cargo.toml crates/icaptcha-client/
 # is what let it sit dead from the moment gl gained a path dependency on
 # icaptcha-client. A failure here should stop the build, not silently turn every
 # image build into a cold one.
+# gitlawb-node declares BOTH a [[bin]] and a [lib], so it needs both stubs:
+# cargo resolves every declared target before it fetches anything, and a
+# missing src/lib.rs aborts the layer with a target resolution error.
 RUN mkdir -p crates/gitlawb-core/src crates/gitlawb-node/src crates/gl/src \
         crates/git-remote-gitlawb/src crates/gitlawb-attest/src crates/icaptcha-client/src && \
     echo 'fn main() {}' > crates/gitlawb-node/src/main.rs && \
     echo 'fn main() {}' > crates/gl/src/main.rs && \
     echo 'fn main() {}' > crates/git-remote-gitlawb/src/main.rs && \
+    echo '' > crates/gitlawb-node/src/lib.rs && \
     echo '' > crates/gitlawb-core/src/lib.rs && \
     echo '' > crates/gitlawb-attest/src/lib.rs && \
     echo '' > crates/icaptcha-client/src/lib.rs && \
