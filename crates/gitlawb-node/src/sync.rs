@@ -432,8 +432,12 @@ async fn process_batch(
                 // The lag is push-to-visible: sample at registration, before
                 // the encrypted-blob tail and mark_sync_done. A quarantined
                 // mirror is admitted but withheld from readers, so it reports
-                // no visibility lag.
-                if mirror_visible && !quarantined {
+                // no visibility lag. The gate reads the PERSISTED flag, not the
+                // attempt-local one: on a re-sync `quarantined` is false while
+                // `upsert_mirror_repo` preserves an existing quarantine, and
+                // sampling then would record visibility the readers still deny.
+                let withheld = db.is_repo_quarantined(&item.repo).await.unwrap_or(true);
+                if mirror_visible && !withheld {
                     if let Some(lag) =
                         sync_lag_from_origin_timestamp(item.origin_timestamp.as_deref(), Utc::now())
                     {

@@ -306,8 +306,9 @@ impl IngestLimiters {
 ///
 /// 0 is the versionless form: the field set this struct shipped with, before
 /// `v` existed. It is not a placeholder for "unset", it is a real version whose
-/// wire encoding happens to omit the key.
-pub(crate) const CURRENT_REF_UPDATE_VERSION: u32 = 0;
+/// wire encoding happens to omit the key. 1 adds `lag_origin`, the first
+/// version-gated field: it is emitted and verified only under v1.
+pub(crate) const CURRENT_REF_UPDATE_VERSION: u32 = 1;
 
 /// True for the version whose key is omitted from the wire form. Free function
 /// because `skip_serializing_if` takes a path, not a closure.
@@ -1198,6 +1199,14 @@ pub(crate) async fn ingest_ref_update(
             "unsupported ref-update event version {}; this build understands version {}",
             event.v, CURRENT_REF_UPDATE_VERSION
         ));
+    }
+    // `lag_origin` is a v1 field: a v0 event carrying it is a protocol
+    // violation, not a newer peer's wire form, and refusing it keeps the field
+    // set inside each version's signing bytes exactly what that version means.
+    if event.v < 1 && event.lag_origin.is_some() {
+        return IngestOutcome::Rejected(
+            "v0 ref-update event must not carry the v1 field lag_origin".to_string(),
+        );
     }
 
     // The cheapest denial under enforcement, ahead of every gate that reads a
@@ -7206,7 +7215,7 @@ mod tests {
     #[test]
     fn ref_update_event_round_trip_with_owner_did() {
         let event = RefUpdateEvent {
-            v: 0,
+            v: CURRENT_REF_UPDATE_VERSION,
             node_did: "did:key:zNode".into(),
             pusher_did: "did:key:zPusher".into(),
             repo: "zOwner/myrepo".into(),
@@ -7270,7 +7279,7 @@ mod tests {
     /// field is Some so the serialized form exercises the widest field set.
     fn populated_event() -> RefUpdateEvent {
         RefUpdateEvent {
-            v: 0,
+            v: CURRENT_REF_UPDATE_VERSION,
             node_did: "did:key:zNode".into(),
             pusher_did: "did:key:zPusher".into(),
             repo: "zOwner/myrepo".into(),
@@ -7334,30 +7343,53 @@ mod tests {
             cid: Option<String>,
         }
 
-        let mut event = populated_event();
-        event.sig = Some("c2lnbmF0dXJl".into());
-        let bytes = serde_json::to_vec(&event).unwrap();
+        // The fleet rule this version split is built around:
+        //
+        // * A v0 event is the pre-change wire form: no `v` key, no `lag_origin`,
+        //   and it must still parse under the OLD struct verbatim.
+        // * A v1 event is for nodes that bumped with us. An un-upgraded peer
+        //   rejects it on the `v` key itself, which is the LOUD version drop the
+        //   ingest ceiling was designed to name, not a silent signature
+        //   mismatch against bytes it could never compute.
+        let mut v0_event = populated_event();
+        v0_event.v = 0;
+        v0_event.lag_origin = None;
+        v0_event.sig = Some("c2lnbmF0dXJl".into());
+        let bytes = serde_json::to_vec(&v0_event).unwrap();
 
         let legacy: LegacyRefUpdateEvent = serde_json::from_slice(&bytes)
-            .expect("new-code bytes must deserialize under the old field set");
+            .expect("v0 bytes must deserialize under the old field set");
         assert_eq!(legacy.repo, "zOwner/myrepo");
         assert_eq!(legacy.owner_did, Some("did:key:zOwner".into()));
 
-        // An UNSIGNED event carries no `sig` key at all, so it is byte-identical
+        // An UNSIGNED v0 event carries no `sig` key at all, so it is byte-identical
         // in shape to the pre-change wire form and parses even under the strict
         // reader. This is what `skip_serializing_if` buys; drop it and a
         // `"sig": null` key appears here and this goes red.
-        let unsigned_bytes = serde_json::to_vec(&populated_event()).unwrap();
+        v0_event.sig = None;
+        let unsigned_bytes = serde_json::to_vec(&v0_event).unwrap();
         let strict: StrictLegacyRefUpdateEvent = serde_json::from_slice(&unsigned_bytes)
-            .expect("an unsigned event must carry no field the pre-change reader did not know");
+            .expect("an unsigned v0 event must carry no field the pre-change reader did not know");
         assert_eq!(strict.repo, "zOwner/myrepo");
 
-        // A SIGNED event does carry the new key, and that is intentional, not a
-        // compatibility bug: the permissive reader above is what makes it
-        // harmless. Pinning the refusal here documents `sig` as the one added
-        // field, so a SECOND addition cannot slip in unnoticed.
-        serde_json::from_slice::<StrictLegacyRefUpdateEvent>(&bytes)
-            .expect_err("a signed event must be visibly carrying the added `sig` key");
+        // A SIGNED v0 event does carry the added `sig` key, and that is
+        // intentional, not a compatibility bug: the permissive reader above is
+        // what makes it harmless. Pinning the refusal here documents `sig` as
+        // an added field, so a SECOND unsigned-field addition cannot slip in
+        // unnoticed.
+        v0_event.sig = Some("c2lnbmF0dXJl".into());
+        serde_json::from_slice::<StrictLegacyRefUpdateEvent>(
+            &serde_json::to_vec(&v0_event).unwrap(),
+        )
+        .expect_err("a signed v0 event must be visibly carrying the added `sig` key");
+
+        // A v1 event is refused by the pre-change reader on the `v` key:
+        // refusing to parse IS the version drop old nodes perform, the same
+        // failure the ingest ceiling produces in the other direction.
+        serde_json::from_slice::<StrictLegacyRefUpdateEvent>(
+            &serde_json::to_vec(&populated_event()).unwrap(),
+        )
+        .expect_err("a v1 event must fail loudly on the `v` key for a pre-change reader");
     }
 
     #[test]
@@ -7414,7 +7446,7 @@ mod tests {
     /// this failure, and the emit-to-ingest round trip is structurally blind to
     /// it because both sides re-serialize the same new declaration order.
     const GOLDEN_SIGNING_BYTES: &str = concat!(
-        r#"{"node_did":"did:key:zNode","pusher_did":"did:key:zPusher","#,
+        r#"{"v":1,"node_did":"did:key:zNode","pusher_did":"did:key:zPusher","#,
         r#""repo":"zOwner/myrepo","owner_did":"did:key:zOwner","#,
         r#""ref_name":"refs/heads/main","#,
         r#""old_sha":"0000000000000000000000000000000000000000","#,
@@ -7465,6 +7497,9 @@ mod tests {
     /// The all-`None` optional shape: what the production publish site emits.
     fn all_none_optionals_event() -> RefUpdateEvent {
         RefUpdateEvent {
+            // v0 pins the versionless form: the key stays off the wire and the
+            // signing bytes are byte-identical to what a pre-version build emits.
+            v: 0,
             owner_did: None,
             cert_id: None,
             cid: None,
@@ -7695,8 +7730,11 @@ mod tests {
         let keypair = Keypair::generate();
 
         // Signed at v0, where the key is absent from the signing bytes.
-        // Raising it on the received copy makes the key appear.
+        // Raising it on the received copy makes the key appear. The v0 shape
+        // drops lag_origin too, since v0 may not carry the v1 field.
         let mut at_zero = event_for(&keypair);
+        at_zero.v = 0;
+        at_zero.lag_origin = None;
         sign_ref_update(&keypair, &mut at_zero).unwrap();
         verify_ref_update(&at_zero).expect("baseline must verify before tampering");
         let mut raised = at_zero.clone();
@@ -8001,7 +8039,14 @@ mod tests {
             &bytes_of(&event),
             "v1 event",
             Some((
-                "unsupported ref-update event version 1; this build understands version 0",
+                Box::leak(
+                    format!(
+                        "unsupported ref-update event version {}; this build understands version {}",
+                        CURRENT_REF_UPDATE_VERSION + 1,
+                        CURRENT_REF_UPDATE_VERSION
+                    )
+                    .into_boxed_str(),
+                ),
                 "an unknown version must be named as one, never reported as a signature failure",
             )),
         )

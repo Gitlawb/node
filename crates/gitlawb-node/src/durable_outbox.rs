@@ -1711,6 +1711,10 @@ fn spawn_deferred_tail_after_proof(
     }
     let repo_id = req.repo_id.clone();
     let pusher_did = req.pusher_did.clone();
+    // The request row was created when the push was accepted, so its
+    // created_at IS the push-land instant the lag origin should carry,
+    // not this deferred drain's Utc::now().
+    let push_landed_at = req.created_at.clone();
     let landed: Vec<(String, String, String)> = accepted
         .iter()
         .map(|c| (c.ref_name.clone(), c.old_sha.clone(), c.new_sha.clone()))
@@ -1751,6 +1755,7 @@ fn spawn_deferred_tail_after_proof(
             ref_updates,
             std::path::PathBuf::from(repo.disk_path.clone()),
             pusher_did,
+            Some(push_landed_at),
             None,
         )
         .await;

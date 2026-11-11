@@ -3321,6 +3321,7 @@ pub async fn git_receive_pack(
             landed_refs.clone(),
             disk_path.clone(),
             auth.0.to_string(),
+            Some(Utc::now().to_rfc3339()),
             None,
         ));
     }
@@ -3349,6 +3350,7 @@ pub async fn git_receive_pack(
                 landed_refs,
                 disk_path.clone(),
                 auth.0.to_string(),
+                Some(Utc::now().to_rfc3339()),
                 Some(publish_durability.arc()),
             ));
         }
@@ -3681,12 +3683,24 @@ async fn publish_durability_confirmed(
 /// complete without ever having a live tail (capability-free pushes whose
 /// landing reconcile proved). `pub(crate)` so the drain can call it; the
 /// live handler is the other caller.
+/// The lag origin the tail reports: the caller-supplied push-land instant when
+/// one exists (a deferred drain passes the request row's created_at), else the
+/// tail's own entry time for callers that never knew the landing instant.
+fn lag_origin_timestamp(push_landed_at: Option<String>) -> String {
+    push_landed_at.unwrap_or_else(|| Utc::now().to_rfc3339())
+}
+
 pub(crate) async fn post_receive_replication_tail(
     state: AppState,
     record: RepoRecord,
     ref_updates: Vec<RefUpdate>,
     disk_path: std::path::PathBuf,
     did: String,
+    // The instant the push landed, captured by the caller at acceptance so a
+    // deferred tail reports push-land lag rather than drain-time lag. Callers
+    // that cannot recover the landing instant pass None and the tail falls
+    // back to its own entry time, the pre-param behavior.
+    push_landed_at: Option<String>,
     publish_durability: Option<
         Arc<std::sync::Mutex<Option<crate::git::repo_store::ReleaseOutcome>>>,
     >,
@@ -3702,7 +3716,7 @@ pub(crate) async fn post_receive_replication_tail(
     // measures. Travels to receiving peers as RefUpdateEvent::lag_origin
     // (gossip) and the notify timestamp (HTTP) — never as the signed event's
     // own `timestamp`, which must stay at publish time for check_freshness.
-    let origin_timestamp = Utc::now().to_rfc3339();
+    let origin_timestamp = lag_origin_timestamp(push_landed_at);
 
     if !publish_durability_confirmed(&publish_durability, durability_wait).await {
         tracing::warn!(
@@ -13984,6 +13998,24 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn lag_origin_timestamp_prefers_the_caller_supplied_push_land() {
+        let landed = "2019-01-01T00:00:00Z".to_string();
+        assert_eq!(
+            lag_origin_timestamp(Some(landed.clone())),
+            landed,
+            "a deferred tail must report the request row's landing instant, not drain time"
+        );
+        let fallback = lag_origin_timestamp(None);
+        let parsed = chrono::DateTime::parse_from_rfc3339(&fallback)
+            .expect("the fallback must still be a valid RFC-3339 instant");
+        let skew = (chrono::Utc::now() - parsed.with_timezone(&chrono::Utc)).num_seconds();
+        assert!(
+            skew.abs() < 60,
+            "a caller that never knew the landing instant falls back to tail entry time"
+        );
+    }
+
     fn f2a_update(ref_name: &str, new_sha: &str) -> Vec<RefUpdate> {
         vec![RefUpdate {
             old_sha: ZERO_SHA.to_string(),
@@ -14016,6 +14048,7 @@ mod tests {
             f2a_update("refs/heads/main", &c1),
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
             Some(slot),
         )
         .await;
@@ -14062,6 +14095,7 @@ mod tests {
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
             None,
+            None,
         )
         .await;
         let after_first = f2a_walks(&log);
@@ -14082,6 +14116,7 @@ mod tests {
             f2a_update("refs/heads/second", &c1),
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
             None,
         )
         .await;
@@ -14158,6 +14193,7 @@ mod tests {
             f2a_update("refs/heads/main", &c2),
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
             None,
         )
         .await;
@@ -14240,6 +14276,7 @@ mod tests {
             f2a_update("refs/heads/main", &c2),
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
             None,
         ));
         f2a_wait_for(|| started.exists(), "the admitted push's walk to start").await;
@@ -14357,6 +14394,7 @@ mod tests {
             }],
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
             None,
         )
         .await;
@@ -15509,6 +15547,7 @@ exit 0
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
             None,
+            None,
         )
         .await;
 
@@ -15565,6 +15604,7 @@ exit 0
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
             None,
+            None,
         )
         .await;
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -15606,6 +15646,7 @@ exit 0
             }],
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
             None,
         )
         .await;
@@ -15705,6 +15746,7 @@ exit 0
             }],
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
             None,
         )
         .await;

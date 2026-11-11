@@ -13209,6 +13209,24 @@ mod icaptcha_quarantine_tests {
         );
     }
 
+    /// The sync-lag gate in `sync.rs` reads this flag rather than the
+    /// attempt-local one, so the preserved flag is the exact contract the
+    /// gate's "withheld mirrors never sample" rule depends on.
+    #[sqlx::test]
+    async fn resync_preserved_quarantine_is_visible_to_the_lag_gate(pool: PgPool) {
+        let db = db(pool).await;
+        db.upsert_mirror_repo("z6owner", "garbage", "/srv/g", None, true)
+            .await
+            .unwrap();
+        db.upsert_mirror_repo("z6owner", "garbage", "/srv/g", None, false)
+            .await
+            .unwrap();
+        assert!(
+            db.is_repo_quarantined("z6owner/garbage").await.unwrap(),
+            "the lag gate reads is_repo_quarantined: a re-sync that passes              quarantined=false must still read withheld here"
+        );
+    }
+
     /// Quarantined repos are withheld from the deduped listing surfaces.
     #[sqlx::test]
     async fn listings_exclude_quarantined(pool: PgPool) {
