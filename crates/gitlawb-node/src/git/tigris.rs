@@ -529,10 +529,23 @@ impl TigrisClient {
     /// [`delete_if_attempt_matches`](Self::delete_if_attempt_matches) cannot
     /// apply) while still needing the same moved-generation protection.
     /// Returns `true` when an archive was deleted.
-    pub async fn delete_current(&self, owner_slug: &str, repo_name: &str) -> Result<bool> {
+    /// Delete only if the object's generation still matches `expected` — the
+    /// generation the caller checked for emptiness. A PUT landing between that
+    /// check and this delete makes the generation move; deleting the newer
+    /// (possibly non-empty) archive is exactly the outcome the fence exists to
+    /// prevent, so a moved generation refuses rather than deletes.
+    pub async fn delete_current(
+        &self,
+        owner_slug: &str,
+        repo_name: &str,
+        expected: Option<&str>,
+    ) -> Result<bool> {
         let Some(generation) = self.head_generation(owner_slug, repo_name).await? else {
             return Ok(false);
         };
+        if generation.etag.as_deref() != expected {
+            return Ok(false);
+        }
         let key = Self::repo_key(owner_slug, repo_name);
         let mut req = self.s3.delete_object().bucket(&self.bucket).key(&key);
         if let Some(etag) = generation.etag.as_deref() {

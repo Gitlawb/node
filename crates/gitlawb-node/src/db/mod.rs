@@ -933,7 +933,7 @@ impl Db {
             .await
             .context("acquiring migration advisory lock")?;
 
-        let result = self.run_pending_migrations().await;
+        let result = self.run_pending_migrations(&mut *lock_conn).await;
 
         let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
             .bind(MIGRATION_ADVISORY_LOCK)
@@ -945,12 +945,14 @@ impl Db {
 
     /// Apply every migration whose version isn't yet recorded, in order.
     /// Must be called while holding the migration advisory lock.
-    async fn run_pending_migrations(&self) -> Result<()> {
+    /// Runs through the connection already holding the migration advisory
+    /// lock, so a pool of size 1 cannot deadlock against itself.
+    async fn run_pending_migrations(&self, conn: &mut sqlx::PgConnection) -> Result<()> {
         for m in MIGRATIONS {
             let existing: Option<String> =
                 sqlx::query("SELECT name FROM schema_migrations WHERE version = $1")
                     .bind(m.version)
-                    .fetch_optional(&self.pool)
+                    .fetch_optional(&mut *conn)
                     .await?
                     .map(|r| r.get::<String, _>("name"));
 
@@ -981,7 +983,7 @@ impl Db {
             // Run the migration body in a single transaction so a failure
             // mid-way leaves the database in its prior state rather than
             // partially mutated.
-            let mut tx = self.pool.begin().await?;
+            let mut tx = sqlx::Acquire::begin(&mut *conn).await?;
             for stmt in m.stmts {
                 sqlx::query(stmt).execute(&mut *tx).await.with_context(|| {
                     format!(

@@ -331,9 +331,9 @@ pub async fn create_repo(
     // Request is admissible — spend the proof now, immediately before the write.
     let verified_proof = proof.consume(&state.db).await?;
 
-    let disk_path = state
+    let (disk_path, create_upload) = state
         .repo_store
-        .init(&owner_did, &req.name)
+        .init_handle(&owner_did, &req.name)
         .await
         .map_err(|e| {
             // `{:#}` walks the anyhow chain to the leaf cause; the other git
@@ -358,6 +358,13 @@ pub async fn create_repo(
     };
 
     state.db.create_repo(&record).await?;
+
+    // Keep the initial archive upload inside the creation lock: a purge or
+    // retry that acquires the key after release must not find the row and dir
+    // while the create-only PUT is still in flight.
+    if let Some(upload) = create_upload {
+        let _ = upload.await;
+    }
 
     // Row + on-disk dir now both exist consistently; the race window is closed,
     // so release the per-repo lock before the proof recording below.
@@ -4809,11 +4816,23 @@ pub async fn fork_repo(
     // Request is admissible — spend the proof now, immediately before the write.
     let verified_proof = proof.consume(&state.db).await?;
 
+    // ONE identity for the whole workflow: the DB row id this request will
+    // insert is also the attempt id stamped into the object's metadata and onto
+    // the disk clone. That is what lets confirmation ask "is my row there" rather
+    // than "is a row there", and lets every cleanup ask "is this still mine"
+    // rather than "does this name resolve". Stamped BEFORE the clone so the
+    // guard's Drop cleans a partial mirror even when the request future is
+    // cancelled mid-clone, and only ever removes the dir this attempt owns.
+    let record_id = Uuid::new_v4().to_string();
+    let attempt = crate::git::publish::PublishAttemptId::from_owned(record_id.clone());
+    let mut clone_guard = ForkCloneGuard::new(disk_path.clone(), attempt.clone());
+
     // Clone the source repo as a mirror, bounded so a wedged clone cannot pin
     // the held target lock (and its lock-pool connection) indefinitely. Reuses
     // the served-git ceiling; source_path is local so a normal clone never
     // approaches it. `kill_on_drop` tears the child down when the timeout drops
-    // the future.
+    // the future; the clone guard removes any partial dest on every failure,
+    // timeout, or cancellation path.
     let clone_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
     let output = match tokio::time::timeout(
         clone_timeout,
@@ -4828,21 +4847,10 @@ pub async fn fork_repo(
     .await
     {
         Ok(Ok(output)) => output,
-        // Spawn/IO failure, or the clone exceeded the bound (child killed on
-        // drop). Clear any partial mirror and fail the fork before any
-        // RepoRecord exists; the lock guard's Drop frees the advisory lock.
         Ok(Err(e)) => {
-            if let Err(rm) = std::fs::remove_dir_all(&disk_path) {
-                tracing::warn!(fork = %fork_name, err = %rm,
-                    "failed to remove fork mirror after a failed clone spawn");
-            }
             return Err(AppError::Git(format!("git clone --mirror failed: {e}")));
         }
         Err(_elapsed) => {
-            if let Err(rm) = std::fs::remove_dir_all(&disk_path) {
-                tracing::warn!(fork = %fork_name, err = %rm,
-                    "failed to remove fork mirror after a clone timeout");
-            }
             return Err(AppError::Git(format!(
                 "git clone --mirror timed out after {}s for {fork_name}",
                 clone_timeout.as_secs()
@@ -4852,28 +4860,10 @@ pub async fn fork_repo(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // git clone --mirror can create the destination dir then exit non-zero
-        // (authz, corrupt/partial source), leaving a half-created mirror. Clear
-        // it best-effort, matching the timeout/spawn arms, so a retry is not
-        // blocked by an existing dest and a same-name create sees an empty path.
-        if let Err(rm) = std::fs::remove_dir_all(&disk_path) {
-            tracing::warn!(fork = %fork_name, err = %rm,
-                "failed to remove fork mirror after a non-zero clone exit");
-        }
         return Err(AppError::Git(format!(
             "git clone --mirror failed: {stderr}"
         )));
     }
-
-    // ONE identity for the whole workflow: the DB row id this request will
-    // insert is also the attempt id stamped into the object's metadata and onto
-    // the disk clone. That is what lets confirmation ask "is my row there" rather
-    // than "is a row there", and lets every cleanup ask "is this still mine"
-    // rather than "does this name resolve".
-    let record_id = Uuid::new_v4().to_string();
-    let attempt = crate::git::publish::PublishAttemptId::from_owned(record_id.clone());
-
-    let mut clone_guard = ForkCloneGuard::new(disk_path.clone(), attempt.clone());
 
     // Upload fork to Tigris. Create-only: a refused precondition means an orphan
     // archive already sits under this key (a failed create_repo or another

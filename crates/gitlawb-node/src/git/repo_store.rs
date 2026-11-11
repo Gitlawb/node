@@ -812,6 +812,18 @@ impl RepoStore {
 
     /// Initialize a new bare repo on local disk and upload to Tigris.
     pub async fn init(&self, owner_did: &str, repo_name: &str) -> Result<PathBuf> {
+        let (path, upload) = self.init_handle(owner_did, repo_name).await?;
+        drop(upload);
+        Ok(path)
+    }
+
+    /// [`init`](Self::init) plus the background archive upload's JoinHandle, so
+    /// callers holding a lock can keep the upload inside the lock's lifetime.
+    pub async fn init_handle(
+        &self,
+        owner_did: &str,
+        repo_name: &str,
+    ) -> Result<(PathBuf, Option<tokio::task::JoinHandle<()>>)> {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
 
         store::init_bare(&local_path).context("initializing bare repo")?;
@@ -822,12 +834,13 @@ impl RepoStore {
         clear_quarantine(&local_path, repo_name);
 
         // Upload to Tigris in background
+        let mut upload_handle = None;
         if let Some(ref tigris) = self.tigris {
             let tigris = tigris.clone();
             let owner_slug = owner_slug.clone();
             let repo_name = repo_name.to_string();
             let path = local_path.clone();
-            tokio::spawn(async move {
+            upload_handle = Some(tokio::spawn(async move {
                 // Create-only, and load-bearing: this uploads a freshly
                 // initialized EMPTY repo, so a user who pushes immediately
                 // after creating one would have their archive replaced by this
@@ -848,10 +861,10 @@ impl RepoStore {
                         warn!(repo = %repo_name, err = %e, "failed to upload new repo to tigris");
                     }
                 }
-            });
+            }));
         }
 
-        Ok(local_path.into_path_buf())
+        Ok((local_path.into_path_buf(), upload_handle))
     }
 
     /// Upload a repo to Tigris after a write operation (push, merge, fork, etc.).
@@ -941,15 +954,21 @@ impl RepoStore {
     ) -> Result<Option<RepoLockGuard>> {
         let (owner_slug, _local) = self.local_path(owner_did, repo_name)?;
         let lock_key = advisory_lock_key(&owner_slug, repo_name);
-        let mut conn = pool.acquire().await.context("acquiring lock connection")?;
-        let row: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
-            .bind(lock_key)
-            .fetch_one(&mut *conn)
+        let conn = pool.acquire().await.context("acquiring lock connection")?;
+        // Route through LockProbe so a cancellation racing the query cannot
+        // return a connection holding an acquired session lock to the pool:
+        // the probe's Drop closes the session unless take_conn hands it out.
+        let mut probe = LockProbe::new(conn);
+        if !probe
+            .try_lock(lock_key)
             .await
-            .context("try advisory lock")?;
-        if !row.0 {
+            .context("try advisory lock")?
+        {
             return Ok(None);
         }
+        let conn = probe
+            .take_conn()
+            .context("lock probe lost its connection after a confirmed acquire")?;
         Ok(Some(RepoLockGuard {
             conn: Some(conn),
             lock_key,
@@ -1103,6 +1122,12 @@ pub(crate) fn claim_fork_disk_path(disk_path: &Path, attempt: &PublishAttemptId)
     let Some(path) = fork_attempt_path(disk_path) else {
         return;
     };
+    // The stamp may be claimed BEFORE the mirror clone starts, when the owner
+    // directory does not exist yet; create it so the claim is not silently lost
+    // (a missing stamp makes every later ownership check refuse to clean).
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     if let Err(e) = std::fs::write(&path, attempt.as_str()) {
         warn!(
             path = %disk_path.display(),
@@ -1655,17 +1680,24 @@ impl RepoStore {
     /// the archive over the local path when it exists; a no-op when no object
     /// store is configured (single-machine). Errors propagate so the caller can
     /// fail closed rather than delete on a stale-local view.
-    pub async fn refresh_from_archive(&self, owner_did: &str, repo_name: &str) -> Result<()> {
+    /// Returns the archive generation the refresh verified (its ETag), so the
+    /// caller can fence a later delete on exactly the view it checked.
+    pub async fn refresh_from_archive(
+        &self,
+        owner_did: &str,
+        repo_name: &str,
+    ) -> Result<Option<String>> {
         let Some(ref store) = self.tigris else {
-            return Ok(());
+            return Ok(None);
         };
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
-        if store.exists(&owner_slug, repo_name).await? {
-            store
-                .download(&owner_slug, repo_name, &local_path, None)
-                .await?;
-        }
-        Ok(())
+        let Some(generation) = store.head_generation(&owner_slug, repo_name).await? else {
+            return Ok(None);
+        };
+        store
+            .download(&owner_slug, repo_name, &local_path, None)
+            .await?;
+        Ok(generation.etag)
     }
 
     /// Delete the object-store archive for a repo. A no-op when no object store
@@ -1674,15 +1706,25 @@ impl RepoStore {
     /// delete is fenced on the generation the store sees, so a cross-node
     /// publish racing the purge makes it fail rather than erasing the
     /// successor's archive.
-    pub async fn delete_archive(&self, owner_did: &str, repo_name: &str) -> Result<()> {
+    /// `expected` is the generation the caller verified empty (an ETag from
+    /// [`refresh_from_archive`]); a moved generation means a PUT landed after
+    /// the check and the archive must be kept, so `Ok(false)` is a skip.
+    pub async fn delete_archive(
+        &self,
+        owner_did: &str,
+        repo_name: &str,
+        expected: Option<&str>,
+    ) -> Result<bool> {
         let Some(ref store) = self.tigris else {
-            return Ok(());
+            return Ok(true);
         };
         let (owner_slug, _local_path) = self.local_path(owner_did, repo_name)?;
-        store
-            .delete_current(&owner_slug, repo_name)
-            .await
-            .map(|_| ())
+        store.delete_current(&owner_slug, repo_name, expected).await
+    }
+
+    /// The bound applied to transfers that run while a repo lock is held.
+    pub(crate) fn transfer_bound(&self) -> std::time::Duration {
+        self.lock_held_transfer_timeout
     }
 }
 

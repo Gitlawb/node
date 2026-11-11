@@ -324,7 +324,12 @@ pub async fn run_purge_spam(
     repos_dir: &Path,
     execute: bool,
 ) -> Result<PurgeSummary> {
-    let repos_dir: PathBuf = repos_dir.to_path_buf();
+    // Canonicalize once up front: the Config default `./repos` carries a
+    // CurDir component that validated_repo_disk_path rejects on every joined
+    // candidate, which would make local_refs_on_disk read every default-path
+    // repo as non-empty and silently select none.
+    let repos_dir: PathBuf = std::fs::canonicalize(repos_dir)
+        .with_context(|| format!("canonicalizing repos_dir {}", repos_dir.display()))?;
     let rows = db
         .list_repos_by_owner_did(SPAM_BURST_TARGET_DID)
         .await
@@ -429,13 +434,29 @@ pub async fn run_purge_spam(
         // can be stale, so an emptiness check against local alone could delete a
         // repo that has live remote refs. Fail closed on any store error — never
         // delete on an unverified view.
-        if let Err(e) = repo_store.refresh_from_archive(&c.owner_did, &c.name).await {
-            warn!(repo = %c.id, err = %e,
-                "purge-spam: could not consult the object store — skipped (fail-closed)");
-            summary.skipped_store_error += 1;
-            guard.release().await;
-            continue;
-        }
+        let bound = repo_store.transfer_bound();
+        let refreshed = match tokio::time::timeout(
+            bound,
+            repo_store.refresh_from_archive(&c.owner_did, &c.name),
+        )
+        .await
+        {
+            Ok(Ok(g)) => g,
+            Ok(Err(e)) => {
+                warn!(repo = %c.id, err = %e,
+                    "purge-spam: could not consult the object store — skipped (fail-closed)");
+                summary.skipped_store_error += 1;
+                guard.release().await;
+                continue;
+            }
+            Err(_) => {
+                warn!(repo = %c.id,
+                    "purge-spam: archive refresh exceeded the transfer bound — skipped (fail-closed)");
+                summary.skipped_store_error += 1;
+                guard.release().await;
+                continue;
+            }
+        };
         // Authoritative recheck UNDER the lock: a ref that landed before we locked
         // (or that the object-store refresh surfaced) makes the repo non-empty, so
         // it must not be deleted.
@@ -488,10 +509,31 @@ pub async fn run_purge_spam(
                 // configured), else it survives and can be downloaded into a
                 // later repo created with the same owner/name. Counted separately
                 // so a surviving archive never reads as a clean success.
-                if let Err(e) = repo_store.delete_archive(&c.owner_did, &c.name).await {
-                    warn!(repo = %c.id, err = %e,
-                        "purge-spam: deleted row + dir but could not delete the object-store archive");
-                    summary.archive_failed += 1;
+                // Fence on the generation refreshed above: a PUT landing after
+                // the emptiness check moves the archive generation, and a moved
+                // generation must read as skip, not delete-then-report.
+                match tokio::time::timeout(
+                    bound,
+                    repo_store.delete_archive(&c.owner_did, &c.name, refreshed.as_deref()),
+                )
+                .await
+                {
+                    Ok(Ok(true)) => {}
+                    Ok(Ok(false)) => {
+                        warn!(repo = %c.id,
+                            "purge-spam: archive generation moved after the emptiness check — kept");
+                        summary.archive_failed += 1;
+                    }
+                    Ok(Err(e)) => {
+                        warn!(repo = %c.id, err = %e,
+                            "purge-spam: deleted row + dir but could not delete the object-store archive");
+                        summary.archive_failed += 1;
+                    }
+                    Err(_) => {
+                        warn!(repo = %c.id,
+                            "purge-spam: archive delete exceeded the transfer bound — counted as failed");
+                        summary.archive_failed += 1;
+                    }
                 }
             }
             Err(e) => {
