@@ -16,8 +16,10 @@ with **today**. Anything the node does not ship yet is explicitly marked
 
 ## 2. Authentication (RFC 9421)
 
-- **Transport:** signed requests are expected over TLS; the node does not
-  terminate HTTP signatures over cleartext.
+- **Transport:** production deployments should run the node behind TLS
+  (typically a reverse proxy). The node itself has no scheme check: it verifies
+  RFC 9421 headers on whatever transport the request arrives over, so nothing
+  at the signature layer refuses a cleartext request.
 - **HTTP signatures:** `Signature-Input` covers `@method`, `@path`, and
   `content-digest`:
   `sig1=("@method" "@path" "content-digest");keyid="did:key:…";alg="ed25519";created=<unix>`
@@ -25,14 +27,17 @@ with **today**. Anything the node does not ship yet is explicitly marked
   rejected as `incomplete_signature`.
 - **`@path` value:** the node binds `@path` to the path *and* query string of
   the request, not to the path-only value RFC 9421 defines for `@path`. A
-  second implementation must sign `GET /r/info/refs?service=git-upload-pack`
-  including the `?service=…` part.
+  second implementation must sign the request exactly as it goes on the
+  wire, e.g. `GET /zOwner/myrepo.git/info/refs?service=git-upload-pack`
+  including the `?service=…` part (see §5 for the owner and `.git`
+  normalization).
 - **Signer identity:** `keyid` is the actor DID (`did:key` only, see §1).
 - **Integrity:** `Content-Digest` is SHA-256 over the request body and is
-  verified when the header is present. Because `content-digest` is a covered
-  component, every signed request signs a digest value: on a body-less
-  request the signed value is the SHA-256 of the empty body, which the node
-  also accepts when the header is absent entirely.
+  verified against it. Every signed request MUST send the header: a signed
+  request without it is refused `400 missing_content_digest` before routing.
+  On a body-less request the header still carries the SHA-256 digest of the
+  empty body (`sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:`),
+  it is never omitted.
 
 ## 3. Proof of Intelligence (iCaptcha)
 
@@ -41,11 +46,13 @@ with **today**. Anything the node does not ship yet is explicitly marked
 - **Scope:** the gate applies to a small set of write endpoints (agent
   registration and repo create/fork), not to all writes.
 - **Wire shape:** the client-supplied header is `x-icaptcha-proof` — that is
-  the only iCaptcha header a node reads from a request. When proof is
-  required and missing/invalid, the node answers
-  `403 icaptcha_proof_required` and sets `x-icaptcha-url` and
+  the only iCaptcha header a node reads from a request. When the gate is
+  `enforce` and a verifier public key is loaded, a missing or invalid proof
+  answers `403 icaptcha_proof_required` and sets `x-icaptcha-url` and
   `x-icaptcha-level` **on the response** (also mirrored as JSON fields) so
-  the client can go solve a challenge and retry.
+  the client can go solve a challenge and retry. Fail-safe: `enforce` with
+  no public key loaded (unset and unfetchable) stays inert and admits the
+  request rather than rejecting every request.
 
 ## 4. Ref-Update Certificate
 
@@ -81,6 +88,12 @@ they are documented with the node's HTTP API, not here.
 - **Object format:** bare repositories are created with
   `--object-format=sha1`; production OIDs are 40 hex chars. *Planned:*
   SHA-256 object format.
+- **Path normalization:** `{repo}` may carry one trailing `.git` suffix,
+  stripped before lookup (so `myrepo.git` resolves to `myrepo`; a repo
+  literally named `foo.git` addresses as `foo.git.git`). `{owner}` may be the
+  full `did:key:…` string or the bare multibase segment the `did:key:` prefix
+  implies; both resolve to the same owner. None of this changes `@path`:
+  sign the request path and query exactly as sent.
 - **Smart-HTTP endpoints:**
   - `GET /{owner}/{repo}/info/refs?service=git-upload-pack` — fetch
     advertisement.
