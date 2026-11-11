@@ -11,15 +11,16 @@ pub struct SubscriptionRoot;
 
 #[Subscription]
 impl SubscriptionRoot {
-    /// Live ref-update stream. `/graphql/ws` is mounted outside the
-    /// `optional_signature` layer, so this resolver has NO caller identity and
-    /// cannot gate per-subscriber — it relays whatever enters the broadcast
+    /// Live ref-update stream. `/graphql/ws` is mounted under the
+    /// `optional_signature` layer and carries optional caller identity, but this
+    /// resolver does not inspect it — it relays whatever enters the broadcast
     /// channel to any anonymous client. Its visibility safety therefore rests
     /// entirely on the WRITE side: the push handler only sends a
     /// `RefUpdateBroadcast` for repos the anonymous public may read (inside its
     /// `if announce` block, `api/repos.rs`). This is a single-point invariant —
     /// any new sender to `ref_update_tx` MUST be `announce`-gated, or private-repo
     /// ref metadata leaks here to unauthenticated subscribers (#112/#114 class).
+    #[graphql(complexity = "50 + child_complexity")]
     async fn ref_updates(
         &self,
         ctx: &Context<'_>,
@@ -46,6 +47,7 @@ impl SubscriptionRoot {
         })
     }
 
+    #[graphql(complexity = "50 + child_complexity")]
     async fn task_events(
         &self,
         ctx: &Context<'_>,

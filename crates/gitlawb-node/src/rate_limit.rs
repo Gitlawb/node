@@ -70,6 +70,14 @@ impl RateLimiter {
         self.window.min(Duration::from_secs(1))
     }
 
+    /// The configured window, exposed so a 429 can carry an honest
+    /// `retry-after`: a hardcoded value lies when the operator retunes the
+    /// window, and a client that honors the header would retry into another
+    /// 429 until the real window elapses.
+    pub fn window(&self) -> Duration {
+        self.window
+    }
+
     pub(crate) async fn check(&self, key: &str) -> bool {
         // max_requests == 0 means the limiter is disabled, not "block all".
         if self.max_requests == 0 {
@@ -121,11 +129,43 @@ impl RateLimiter {
         true
     }
 
-    /// Number of keys currently tracked. Tests use it to observe what a sweep
-    /// reclaimed; there is no production reader.
+    /// Non-consuming check: is this key ALREADY at its limit for the current window?
+    /// Unlike [`check`], it records nothing and never inserts a new key — used to shed
+    /// expensive preparatory work (e.g. the `/ipfs/{cid}` legacy scan's O(repos) DB
+    /// preload) BEFORE it runs, without perturbing the per-unit budget the consuming
+    /// `check` maintains (#173, F3). An unknown key or a disabled limiter is not
+    /// throttled. Prunes the key's expired timestamps as a side effect (keeps state
+    /// tidy) but adds none, so it cannot itself fill or grow the map.
+    pub(crate) async fn is_throttled(&self, key: &str) -> bool {
+        if self.max_requests == 0 {
+            return false;
+        }
+        let now = Instant::now();
+        let mut state = self.state.lock().await;
+        if let Some(window) = state.get_mut(key) {
+            window
+                .timestamps
+                .retain(|t| now.duration_since(*t) < self.window);
+            return window.timestamps.len() >= self.max_requests;
+        }
+        false
+    }
+
+    /// The configured key ceiling. Tests use it to assert that a limiter a
+    /// production factory builds is actually bounded, which flooding the real
+    /// ceiling in distinct keys would be far too slow to show.
     #[cfg(test)]
-    pub async fn tracked_keys(&self) -> usize {
-        self.state.lock().await.len()
+    pub fn max_keys(&self) -> usize {
+        self.max_keys
+    }
+
+    /// The configured per-key request cap. Tests use it to assert that a
+    /// limiter a production factory builds carries the cap it is documented
+    /// with; re-asserting the constant on its own cannot tell whether the
+    /// factory passed that constant or a different one.
+    #[cfg(test)]
+    pub fn max_requests(&self) -> usize {
+        self.max_requests
     }
 
     pub async fn cleanup(&self) {
@@ -136,6 +176,14 @@ impl RateLimiter {
                 .retain(|t| now.duration_since(*t) < self.window);
             !w.timestamps.is_empty()
         });
+    }
+
+    /// Number of distinct keys currently tracked. Test-only introspection so a
+    /// cross-module test can assert that a sweep actually evicted expired entries
+    /// and observe what it reclaimed. There is no production reader.
+    #[cfg(test)]
+    pub(crate) async fn tracked_keys(&self) -> usize {
+        self.state.lock().await.len()
     }
 }
 
@@ -253,12 +301,7 @@ pub async fn rate_limit_by_did(request: Request, next: Next) -> Response {
 
     if let (Some(limiter), Some(did)) = (limiter, did) {
         if !limiter.check(&did).await {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                [("retry-after", "60")],
-                "rate limit exceeded — try again later",
-            )
-                .into_response();
+            return too_many_requests(limiter.window().as_secs());
         }
     }
 
@@ -361,16 +404,70 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerAddr {
     }
 }
 
+/// The message every per-IP brake answers with, shared so the GraphQL surface
+/// (which cannot return a 429 status inside a 200 GraphQL envelope) says the
+/// same thing as the REST routes.
+pub const RATE_LIMIT_MESSAGE: &str = "rate limit exceeded — try again later";
+
 /// The shared 429 response for the per-IP flood brakes. Route-agnostic: this
 /// middleware now serves the push path AND the peer-sync routes, so the message
 /// stays generic (the offending path is recorded in the warn log below).
-pub fn too_many_requests() -> Response {
+pub fn too_many_requests(retry_after_secs: u64) -> Response {
     (
         StatusCode::TOO_MANY_REQUESTS,
-        [("retry-after", "60")],
-        "rate limit exceeded — try again later",
+        [("retry-after", retry_after_secs.to_string())],
+        RATE_LIMIT_MESSAGE,
     )
         .into_response()
+}
+
+/// The per-IP task-read brake carried as GraphQL request data: the limiter plus
+/// the client key the transport already resolved.
+///
+/// `/graphql` is a single POST endpoint, so this brake cannot sit in middleware
+/// the way `task_read_routes` mounts `rate_limit_by_ip`: that would charge every
+/// unrelated query and every mutation against the task-read bucket. The two task
+/// resolvers debit it instead, which also prices an aliased query honestly — ten
+/// aliased `tasks` fields run the visibility gate ten times and pay ten slots,
+/// where one request-scoped debit would pay one (#327 review).
+/// Default cap on the number of task read fields (across all aliases) permitted
+/// in a single GraphQL request before rejecting further field executions (#327 review).
+pub const MAX_GRAPHQL_TASK_READS_PER_REQUEST: usize = 5;
+
+#[derive(Clone)]
+pub struct TaskReadBrake {
+    pub limiter: RateLimiter,
+    /// `None` when no key could be resolved at all (no trusted header and no
+    /// `ConnectInfo`, e.g. a synthetic test request). Never braked, matching
+    /// [`rate_limit_by_ip`].
+    pub key: Option<String>,
+    pub request_count: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl TaskReadBrake {
+    /// Debit one slot for one task-read field. `true` = proceed.
+    pub async fn check(&self, field: &str) -> bool {
+        let Some(key) = self.key.as_deref() else {
+            return true;
+        };
+        let count = self
+            .request_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count >= MAX_GRAPHQL_TASK_READS_PER_REQUEST {
+            tracing::warn!(
+                key = %key,
+                field = %field,
+                count = count + 1,
+                "per-request GraphQL task field limit exceeded"
+            );
+            return false;
+        }
+        if self.limiter.check(key).await {
+            return true;
+        }
+        tracing::warn!(key = %key, field = %field, "per-IP rate limit exceeded");
+        false
+    }
 }
 
 /// Throttle the git push path by resolved client IP. The socket peer address is
@@ -387,7 +484,7 @@ pub async fn rate_limit_by_ip(request: Request, next: Next) -> Response {
         if let Some(key) = client_key(request.headers(), peer, limiter.trust) {
             if !limiter.limiter.check(&key).await {
                 tracing::warn!(key = %key, path = %request.uri().path(), "per-IP rate limit exceeded");
-                return too_many_requests();
+                return too_many_requests(limiter.limiter.window().as_secs());
             }
         }
     }

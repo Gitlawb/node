@@ -30,8 +30,62 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # Decide which checks this event needs. On pull_request, each job below runs
+  # only when the PR touches the surface it validates, and the cargo test /
+  # release-build jobs are scoped to the touched crates plus their reverse
+  # dependencies (scripts/ci-surfaces.sh). Every other event (push to main,
+  # merge_group, the release flow's workflow_dispatch) runs the full suite, so
+  # main and the merge queue keep whole-workspace coverage and main-red-alert
+  # still sees a complete run. A skipped job reports as "skipped", not green.
+  changes:
+    name: changed surfaces
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.surfaces.outputs.rust }}
+      rust_packages: ${{ steps.surfaces.outputs.rust_packages }}
+      windows: ${{ steps.surfaces.outputs.windows }}
+      windows_packages: ${{ steps.surfaces.outputs.windows_packages }}
+      docker: ${{ steps.surfaces.outputs.docker }}
+      audit: ${{ steps.surfaces.outputs.audit }}
+      core_deps: ${{ steps.surfaces.outputs.core_deps }}
+      release_versioning: ${{ steps.surfaces.outputs.release_versioning }}
+      release_tag: ${{ steps.surfaces.outputs.release_tag }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          # The pull_request checkout is the test-merge commit; depth 2 brings
+          # its first parent (the base tip) so the diff is exactly this PR.
+          fetch-depth: 2
+
+      # Every job's gate comes from the mapper, so pin its mapping first; a
+      # failure here fails this job and the run is red, not silently narrowed.
+      - name: Test the surface mapper
+        run: scripts/test-ci-surfaces.sh
+
+      - name: Map changed paths to surfaces
+        id: surfaces
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            # -z: literal paths; plain --name-only C-quotes unusual names.
+            git diff -z --name-only --no-renames HEAD^1 HEAD > changed-paths
+            tr '\0' '\n' < changed-paths >&2
+            scripts/ci-surfaces.sh < changed-paths > surfaces.out
+          else
+            scripts/ci-surfaces.sh --all > surfaces.out
+          fi
+          cat surfaces.out
+          cat surfaces.out >> "$GITHUB_OUTPUT"
+
   fmt-clippy:
     name: fmt + clippy
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -57,6 +111,8 @@ jobs:
 
   release-tag-validation:
     name: release tag validation
+    needs: changes
+    if: needs.changes.outputs.release_tag == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -68,8 +124,26 @@ jobs:
       - name: Test release tag resolver
         run: scripts/test-resolve-release-tag.sh
 
+  triage-detector:
+    name: triage detector matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # pr-triage.yml runs on pull_request_target and never checks out PR
+      # code, so its inline detector can only be exercised here, where the
+      # proposed workflow body IS the checked-out one.
+      - name: Test inline-test detector
+        run: node scripts/test-pr-triage-detect.mjs
+
   test:
     name: test (${{ matrix.toolchain }})
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
@@ -114,10 +188,17 @@ jobs:
       - name: cargo test
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/gitlawb_test
-        run: cargo test --locked --workspace
+          # `--workspace`, or `-p <crate>...` for the crates a PR touches plus
+          # every crate that depends on them.
+          PACKAGES: ${{ needs.changes.outputs.rust_packages }}
+        run: |
+          # shellcheck disable=SC2086 # PACKAGES is a word list by design
+          cargo test --locked $PACKAGES
 
   build-release:
     name: build --release
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -137,10 +218,20 @@ jobs:
           key: release
 
       - name: cargo build --release
-        run: cargo build --locked --release --workspace
+        env:
+          PACKAGES: ${{ needs.changes.outputs.rust_packages }}
+        run: |
+          # shellcheck disable=SC2086 # PACKAGES is a word list by design
+          cargo build --locked --release $PACKAGES
 
   audit:
     name: cargo audit
+    # cargo audit reads only Cargo.lock (+ .cargo/audit.toml), so a PR that
+    # leaves both unchanged cannot change its verdict; a newly published
+    # advisory against main is caught by the push-to-main run and the weekly
+    # Scheduled Audit instead of turning every unrelated PR red.
+    needs: changes
+    if: needs.changes.outputs.audit == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -200,6 +291,8 @@ jobs:
 
   msrv:
     name: MSRV (Rust 1.91)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -223,6 +316,12 @@ jobs:
 
   docker-build:
     name: Docker build smoke test
+    # Runs when the image's own inputs change: the Dockerfile, the manifests
+    # its dependency layer copies, the lockfile, bootstrap-peers.json. A
+    # source-only Rust change is already compiled by `build --release` (stable)
+    # and `MSRV` (1.91, the image's toolchain); push to main still runs this.
+    needs: changes
+    if: needs.changes.outputs.docker == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -239,6 +338,8 @@ jobs:
 
   test-windows:
     name: test (windows, non-blocking)
+    needs: changes
+    if: needs.changes.outputs.windows == 'true'
     runs-on: windows-latest
     timeout-minutes: 45
     # Non-blocking, mirroring the informational `beta` lane above. We ship `gl`
@@ -266,7 +367,13 @@ jobs:
           key: windows
 
       - name: cargo test (shipped Windows crates)
-        run: cargo test --locked -p gl -p git-remote-gitlawb
+        shell: bash
+        env:
+          # `-p gl -p git-remote-gitlawb`, or whichever of the two a PR affects.
+          PACKAGES: ${{ needs.changes.outputs.windows_packages }}
+        run: |
+          # shellcheck disable=SC2086 # PACKAGES is a word list by design
+          cargo test --locked $PACKAGES
 
   # gitlawb-core is embedded by every consumer (gl, git-remote-gitlawb, the node
   # daemon), so it must stay lean. This gate fails if gitlawb-core's normal
@@ -276,6 +383,8 @@ jobs:
   # cannot do. Regen instructions live in the allowlist header.
   core-deps-purity:
     name: gitlawb-core dependency purity
+    needs: changes
+    if: needs.changes.outputs.core_deps == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -308,6 +417,8 @@ jobs:
   # not its author knew this gate existed.
   release-versioning:
     name: release versioning coverage
+    needs: changes
+    if: needs.changes.outputs.release_versioning == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

@@ -1,10 +1,10 @@
 <#
 .SYNOPSIS
-  gitlawb installer for Windows - downloads pre-built binaries from GitHub Releases.
+  Twigpine installer for Windows - downloads pre-built binaries from GitHub Releases.
 .EXAMPLE
-  irm https://gitlawb.com/install.ps1 | iex
+  irm https://twigpine.com/install.ps1 | iex
 .EXAMPLE
-  & ([scriptblock]::Create((irm https://gitlawb.com/install.ps1))) -Version v0.3.9
+  & ([scriptblock]::Create((irm https://twigpine.com/install.ps1))) -Version v0.3.9
 #>
 [CmdletBinding()]
 param(
@@ -16,7 +16,7 @@ $ErrorActionPreference = "Stop"
 # Windows PowerShell 5.1 may default to TLS 1.0; GitHub requires TLS 1.2+.
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-$Repo = if ($env:GITLAWB_RELEASE_REPO) { $env:GITLAWB_RELEASE_REPO } else { "Gitlawb/node" }
+$Repo = if ($env:GITLAWB_RELEASE_REPO) { $env:GITLAWB_RELEASE_REPO } else { "Twigpine/node" }
 $InstallDir = if ($env:GITLAWB_INSTALL_DIR) { $env:GITLAWB_INSTALL_DIR } else { "$env:LOCALAPPDATA\Programs\gitlawb" }
 
 $arch = if ($env:PROCESSOR_ARCHITEW6432) {
@@ -43,7 +43,7 @@ $ver = $tag.TrimStart("v")
 $archive = "gitlawb-node-$ver-$target.zip"
 $url = "https://github.com/$Repo/releases/download/$tag/$archive"
 
-Write-Host "Installing gitlawb $tag for windows/x64"
+Write-Host "Installing Twigpine $tag for windows/x64"
 Write-Host "  Archive: $archive"
 Write-Host "  Into:    $InstallDir"
 
@@ -100,7 +100,7 @@ try {
   }
 
   Write-Host ""
-  Write-Host "Installed gitlawb $tag"
+  Write-Host "Installed Twigpine $tag"
   foreach ($bin in $installed) { Write-Host "  $bin -> $InstallDir\$bin" }
 }
 finally {
