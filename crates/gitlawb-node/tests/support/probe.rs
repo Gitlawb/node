@@ -697,13 +697,15 @@ async fn seed_private_push_and_cert(
     use super::signing::signed_request;
     use std::process::Command;
 
-    let work = std::env::temp_dir().join(format!(
-        "gl-u3-certpush-{}-{}",
-        std::process::id(),
-        server_main_tip
-    ));
-    let _ = std::fs::remove_dir_all(&work);
-    std::fs::create_dir_all(&work).expect("create cert-push workdir");
+    // A unique per-call directory: parallel fixtures seeding within the same
+    // second produce the same server_main_tip, so a pid+tip path collides and
+    // one fixture's cleanup can delete another's in-progress tree. TempDir
+    // also removes the directory on the panic path.
+    let work_dir = tempfile::Builder::new()
+        .prefix("gl-u3-certpush-")
+        .tempdir()
+        .expect("create cert-push workdir");
+    let work = work_dir.path().to_path_buf();
     let run = |args: &[&str], cwd: &std::path::Path| -> String {
         let out = Command::new("git")
             .args(args)
@@ -797,7 +799,7 @@ async fn seed_private_push_and_cert(
         "seeding: owner push to a non-protected feature branch must return 200 so a cert issues"
     );
 
-    let _ = std::fs::remove_dir_all(&work);
+    // work_dir drops here and removes the tree, including on the panic path.
 
     // Read the issued cert id back from the owner's list_certs on the private repo.
     let certs_path = format!("/api/v1/repos/{owner_did}/{repo}/certs");

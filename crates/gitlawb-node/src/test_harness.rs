@@ -108,6 +108,9 @@ enum ServeTeardown {
     /// The task did not finish within the timeout and was aborted (cancelled)
     /// and reaped.
     TimedOutAborted,
+    /// The serve task panicked. The payload is carried out so the caller can
+    /// resume unwinding only AFTER the pool is closed and the temp dir removed.
+    Panicked(Box<dyn std::any::Any + Send>),
 }
 
 /// Join `handle` within `timeout`; on expiry `abort()` it and await the aborted
@@ -122,7 +125,12 @@ async fn join_or_abort(
     timeout: Duration,
 ) -> ServeTeardown {
     match tokio::time::timeout(timeout, &mut *handle).await {
-        Ok(join_result) => ServeTeardown::Graceful(join_result.expect("serve task must not panic")),
+        // A panic in the serve task is carried, not unwound here: the caller
+        // must close the pool and remove the repos dir before resuming it.
+        Ok(join_result) => match join_result {
+            Ok(result) => ServeTeardown::Graceful(result),
+            Err(e) => ServeTeardown::Panicked(e.into_panic()),
+        },
         Err(_elapsed) => {
             handle.abort();
             match handle.await {
@@ -130,9 +138,7 @@ async fn join_or_abort(
                 // the abort landing — honor its result, not a false wedge.
                 Ok(result) => ServeTeardown::Graceful(result),
                 Err(e) if e.is_cancelled() => ServeTeardown::TimedOutAborted,
-                // A genuine panic in the serve task surfaces here, mirroring the
-                // in-time arm's `.expect("serve task must not panic")`.
-                Err(e) => std::panic::resume_unwind(e.into_panic()),
+                Err(e) => ServeTeardown::Panicked(e.into_panic()),
             }
         }
     }
@@ -328,6 +334,7 @@ impl TestNode {
                      signal (wedged graceful shutdown)"
                 );
             }
+            Some(ServeTeardown::Panicked(payload)) => std::panic::resume_unwind(payload),
             None => {}
         }
     }
