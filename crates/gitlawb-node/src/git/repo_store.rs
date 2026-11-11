@@ -82,17 +82,9 @@ pub struct RepoStore {
 }
 
 impl RepoStore {
-    /// Derives its own lock pool from `pool`, so callers that only have the main
-    /// pool (tests, `for_testing` sites in other modules) still get the
-    /// `after_release` semantics `acquire_write` depends on.
     #[cfg(any(test, feature = "test-harness"))]
-    pub fn for_testing(repos_dir: PathBuf, pool: PgPool) -> Self {
-        Self::new(
-            repos_dir,
-            None,
-            build_lock_pool(&pool, 8, Duration::from_secs(5)),
-            Duration::from_secs(300),
-        )
+    pub fn for_testing(repos_dir: PathBuf, lock_pool: PgPool) -> Self {
+        Self::new(repos_dir, None, lock_pool, Duration::from_secs(300))
     }
 
     /// Same as [`RepoStore::for_testing`] but with Tigris enabled, so the paths
