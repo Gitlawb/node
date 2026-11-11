@@ -1439,6 +1439,7 @@ async fn run_effect_bundle(
                     crate::webhooks::fire_event_occurrence(
                         state.db.clone(),
                         state.http_client.clone(),
+                        state.webhook_secret_key.clone(),
                         &repo.id,
                         "push",
                         payload,
@@ -1470,6 +1471,7 @@ async fn run_effect_bundle(
                 crate::webhooks::fire_event_occurrence_with_claimed_hooks(
                     state.db.clone(),
                     state.http_client.clone(),
+                    state.webhook_secret_key.clone(),
                     &repo.id,
                     "push",
                     payload,

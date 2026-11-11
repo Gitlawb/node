@@ -95,6 +95,7 @@ pub async fn create_pr(
     webhooks::fire_event(
         std::sync::Arc::clone(&state.db),
         std::sync::Arc::clone(&state.http_client),
+        std::sync::Arc::clone(&state.webhook_secret_key),
         &record.id,
         "pull_request.opened",
         serde_json::json!({
@@ -246,6 +247,7 @@ pub async fn merge_pr(
     webhooks::fire_event(
         std::sync::Arc::clone(&state.db),
         std::sync::Arc::clone(&state.http_client),
+        std::sync::Arc::clone(&state.webhook_secret_key),
         &record.id,
         "pull_request.merged",
         serde_json::json!({
@@ -294,6 +296,7 @@ pub async fn close_pr(
     webhooks::fire_event(
         std::sync::Arc::clone(&state.db),
         std::sync::Arc::clone(&state.http_client),
+        std::sync::Arc::clone(&state.webhook_secret_key),
         &record.id,
         "pull_request.closed",
         serde_json::json!({
@@ -344,6 +347,7 @@ pub async fn create_review(
     webhooks::fire_event(
         std::sync::Arc::clone(&state.db),
         std::sync::Arc::clone(&state.http_client),
+        std::sync::Arc::clone(&state.webhook_secret_key),
         &record.id,
         "pull_request.reviewed",
         serde_json::json!({

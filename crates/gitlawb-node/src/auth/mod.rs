@@ -724,6 +724,7 @@ mod tests {
 
         let keypair = Keypair::generate();
         let scan_token_key = crate::state::AppState::derive_scan_token_key(&keypair);
+        let webhook_secret_key = crate::state::AppState::derive_webhook_secret_key(&keypair);
         let (ref_tx, _) = tokio::sync::broadcast::channel(1);
         let (task_tx, _) = tokio::sync::broadcast::channel(1);
         let pool = sqlx::postgres::PgPoolOptions::new()
@@ -763,6 +764,7 @@ mod tests {
             ipfs_max_legacy_scan_rule_bytes:
                 crate::api::ipfs::MAX_LEGACY_SCAN_RULE_BYTES_PER_REQUEST,
             ipfs_scan_token_key: Arc::new(scan_token_key),
+            webhook_secret_key: Arc::new(webhook_secret_key),
             ipfs_max_served_object_bytes: crate::api::ipfs::MAX_SERVED_OBJECT_BYTES,
             push_limiter_trust: crate::rate_limit::TrustedProxy::None,
             sync_trigger_rate_limiter: RateLimiter::new(60, Duration::from_secs(3600)),
