@@ -3697,6 +3697,13 @@ pub(crate) async fn post_receive_replication_tail(
             .lock_held_transfer_timeout_secs
             .saturating_add(5),
     );
+    // The sync-lag origin: the instant this push landed, captured BEFORE the
+    // durability wait so a slow publish does not shrink the lag a mirror
+    // measures. Travels to receiving peers as RefUpdateEvent::lag_origin
+    // (gossip) and the notify timestamp (HTTP) — never as the signed event's
+    // own `timestamp`, which must stay at publish time for check_freshness.
+    let origin_timestamp = Utc::now().to_rfc3339();
+
     if !publish_durability_confirmed(&publish_durability, durability_wait).await {
         tracing::warn!(
             repo = %record.id,
@@ -3704,11 +3711,6 @@ pub(crate) async fn post_receive_replication_tail(
         );
         return;
     }
-
-    // Capture this before the asynchronous replication work below. The same
-    // origin time travels over gossip and HTTP so receiving peers can measure
-    // push-to-visible lag rather than notification-to-visible lag.
-    let origin_timestamp = Utc::now().to_rfc3339();
 
     // Replication enforcement (Phase 2): decide once per push whether the public
     // may read this repo at all and, if so, which blob OIDs must not leave the
@@ -4049,7 +4051,8 @@ pub(crate) async fn post_receive_replication_tail(
                             ref_name: ref_name.clone(),
                             old_sha: old_sha.clone(),
                             new_sha: new_sha.clone(),
-                            timestamp: origin_timestamp_for_announce.clone(),
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                            lag_origin: Some(origin_timestamp_for_announce.clone()),
                             cert_id: None,
                             cid: cid.map(|s| s.to_string()),
                             sig: None,

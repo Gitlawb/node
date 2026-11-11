@@ -14153,7 +14153,7 @@ mod ref_certificate_tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("DELETE FROM schema_migrations WHERE version = 47")
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 18")
             .execute(&pool)
             .await
             .unwrap();

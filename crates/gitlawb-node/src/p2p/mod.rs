@@ -376,8 +376,15 @@ pub struct RefUpdateEvent {
     pub old_sha: String,
     /// SHA after the push
     pub new_sha: String,
-    /// RFC-3339 timestamp
+    /// RFC-3339 timestamp of the publish, freshness-checked at ingest
     pub timestamp: String,
+    /// RFC-3339 instant the origin push landed, for sync-lag measurement only.
+    /// Kept out of `timestamp` so `check_freshness` still sees the publish
+    /// instant: a push whose durability wait ran long would otherwise sign an
+    /// already-stale event. Optional for older peers; ingest falls back to
+    /// `timestamp` when it is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lag_origin: Option<String>,
     /// Certificate ID (from the ref certificate, if issued)
     pub cert_id: Option<String>,
     /// IPFS CID of the latest commit object (set after pinning completes)
@@ -1498,7 +1505,12 @@ pub(crate) async fn ingest_ref_update(
                 &event.ref_name,
                 &event.new_sha,
                 event.cid.as_deref(),
-                Some(event.timestamp.as_str()),
+                Some(
+                    event
+                        .lag_origin
+                        .as_deref()
+                        .unwrap_or(event.timestamp.as_str()),
+                ),
             )
             .await
         {
@@ -7203,6 +7215,7 @@ mod tests {
             old_sha: "0000000000000000000000000000000000000000".into(),
             new_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
             timestamp: "2026-07-02T12:00:00Z".into(),
+            lag_origin: Some("2026-07-02T11:59:30Z".into()),
             cert_id: None,
             cid: None,
             sig: None,
@@ -7214,6 +7227,7 @@ mod tests {
 
         let deserialized: RefUpdateEvent = serde_json::from_value(json).unwrap();
         assert_eq!(deserialized.owner_did, Some("did:key:zOwner".into()));
+        assert_eq!(deserialized.lag_origin, Some("2026-07-02T11:59:30Z".into()));
     }
 
     #[test]
@@ -7265,6 +7279,7 @@ mod tests {
             old_sha: "0000000000000000000000000000000000000000".into(),
             new_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
             timestamp: "2026-07-02T12:00:00Z".into(),
+            lag_origin: Some("2026-07-02T11:59:30Z".into()),
             cert_id: Some("cert-1".into()),
             cid: Some("bafycid".into()),
             sig: None,
@@ -7404,7 +7419,8 @@ mod tests {
         r#""ref_name":"refs/heads/main","#,
         r#""old_sha":"0000000000000000000000000000000000000000","#,
         r#""new_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","#,
-        r#""timestamp":"2026-07-02T12:00:00Z","cert_id":"cert-1","cid":"bafycid"}"#,
+        r#""timestamp":"2026-07-02T12:00:00Z","lag_origin":"2026-07-02T11:59:30Z","#,
+        r#""cert_id":"cert-1","cid":"bafycid"}"#,
     );
 
     #[test]
@@ -7452,6 +7468,9 @@ mod tests {
             owner_did: None,
             cert_id: None,
             cid: None,
+            // None skips the key entirely, so the production-shape golden stays
+            // byte-identical even though lag_origin exists.
+            lag_origin: None,
             ..populated_event()
         }
     }
