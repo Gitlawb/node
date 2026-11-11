@@ -16,12 +16,23 @@ with **today**. Anything the node does not ship yet is explicitly marked
 
 ## 2. Authentication (RFC 9421)
 
+- **Transport:** signed requests are expected over TLS; the node does not
+  terminate HTTP signatures over cleartext.
 - **HTTP signatures:** `Signature-Input` covers `@method`, `@path`, and
   `content-digest`:
   `sig1=("@method" "@path" "content-digest");keyid="did:key:…";alg="ed25519";created=<unix>`
+  All three components are mandatory: a `Signature-Input` missing one is
+  rejected as `incomplete_signature`.
+- **`@path` value:** the node binds `@path` to the path *and* query string of
+  the request, not to the path-only value RFC 9421 defines for `@path`. A
+  second implementation must sign `GET /r/info/refs?service=git-upload-pack`
+  including the `?service=…` part.
 - **Signer identity:** `keyid` is the actor DID (`did:key` only, see §1).
 - **Integrity:** `Content-Digest` is SHA-256 over the request body and is
-  verified when the header is present.
+  verified when the header is present. Because `content-digest` is a covered
+  component, every signed request signs a digest value: on a body-less
+  request the signed value is the SHA-256 of the empty body, which the node
+  also accepts when the header is absent entirely.
 
 ## 3. Proof of Intelligence (iCaptcha)
 
@@ -37,6 +48,15 @@ with **today**. Anything the node does not ship yet is explicitly marked
   the client can go solve a challenge and retry.
 
 ## 4. Ref-Update Certificate
+
+*Planned:* the `gitlawb/ref-update/v1` schema below is defined in code, but no
+shipped endpoint serves or verifies these certificates today; nothing in
+sections 2-3 produces one on the wire. It is documented here so a second
+implementation shares the type vocabulary ahead of the wire surface.
+
+The hash fields reserve 64 hex characters for the SHA-256 object format; the
+repositories the node serves are sha1 with 40-hex OIDs (see §5), so the field
+width is a forward reservation, not what a current push produces.
 
 Two distinct certificate-shaped payloads exist; this section documents the
 **core signing schema**, which is what `gitlawb/ref-update/v1` names:
@@ -62,11 +82,20 @@ they are documented with the node's HTTP API, not here.
   `--object-format=sha1`; production OIDs are 40 hex chars. *Planned:*
   SHA-256 object format.
 - **Smart-HTTP endpoints:**
-  - `GET /{owner}/{repo}/info/refs` — ref advertisement (fetch and push
-    service discovery).
-  - `POST /{owner}/{repo}/git-upload-pack` — clone/fetch.
+  - `GET /{owner}/{repo}/info/refs?service=git-upload-pack` — fetch
+    advertisement.
+  - `GET /{owner}/{repo}/info/refs?service=git-receive-pack` — push
+    advertisement.
+    The `?service=` parameter is mandatory and takes exactly those two
+    values; a missing parameter is a `400`, not an omitted-service default.
+  - `POST /{owner}/{repo}/git-upload-pack` — clone/fetch. Request and
+    response bodies are pkt-line framed; the result content type is
+    `application/x-git-upload-pack-result`.
   - `POST /{owner}/{repo}/git-receive-pack` — push. **Authentication is
-    mandatory**: an unsigned push is refused with `401`.
+    mandatory**: an unsigned push is refused with `401`. Same pkt-line
+    framing; the result content type is
+    `application/x-git-receive-pack-result`.
+    Signed requests on this path follow §2, including TLS transport.
 - **Fetch vs push auth split:** fetch-side requests against a withheld or
   private repo answer `404` (existence is not confirmed to unauthorized
   callers), while the push path answers `401` for missing/invalid
