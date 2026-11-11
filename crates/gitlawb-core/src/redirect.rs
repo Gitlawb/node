@@ -1,4 +1,4 @@
-//! Redirect policy shared by every gitlawb HTTP client that signs its requests.
+//! Redirect policy shared by every Twigpine HTTP client that signs its requests.
 //!
 //! Both `gl` (async) and `git-remote-gitlawb` (blocking) attach RFC 9421
 //! `Signature` and `Signature-Input` headers, and reqwest strips only
@@ -50,7 +50,7 @@ pub const MAX_REDIRECTS: usize = 10;
 /// signed and unsigned callers alike, for the same reason the predicate is shared:
 /// two rules would drift.
 ///
-/// The clause pins `@path`, and only `@path`. A gitlawb signature also covers
+/// The clause pins `@path`, and only `@path`. A Twigpine signature also covers
 /// `@method` and `content-digest`, and both of those are still open on a followed
 /// hop: on a 301, 302 or 303, reqwest 0.12.28 delegates to tower-http's
 /// `FollowRedirect`, which rewrites a POST to a GET and empties the body
@@ -188,7 +188,7 @@ mod tests {
                 "the node's name pushed into the fragment: the host is the attacker's",
             ),
             // The request-target clause, both directions. `@path` is the only thing a
-            // gitlawb signature binds the request to, so a hop that rewrites it hands
+            // Twigpine signature binds the request to, so a hop that rewrites it hands
             // the node a signature over a target it never received.
             (
                 "https://node.example/a?x=1",
