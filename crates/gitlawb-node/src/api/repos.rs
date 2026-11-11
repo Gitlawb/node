@@ -2201,7 +2201,13 @@ async fn notify_peer_of_ref(
         "node_did": node_did,
         "pusher_did": pusher_did,
         "old_sha": old_sha,
-        "timestamp": origin_timestamp,
+        // Publish semantics, matching what gossip ingest stores on the feed
+        // row: the send instant, freshness-window meaningful. Land time travels
+        // separately in lag_origin (also an Option<String> on the receiver);
+        // stamping land here would put a different clock on HTTP rows than on
+        // gossip rows for the same logical update.
+        "timestamp": Utc::now().to_rfc3339(),
+        "lag_origin": origin_timestamp,
         "owner_did": owner_did,
     });
     let body_bytes = match serde_json::to_vec(&body) {
@@ -3321,7 +3327,10 @@ pub async fn git_receive_pack(
             landed_refs.clone(),
             disk_path.clone(),
             auth.0.to_string(),
-            Some(Utc::now().to_rfc3339()),
+            // The acceptance instant from the request row insert, matching the
+            // deferred drain's land definition — a fresh clock here would
+            // understate live push-to-mirror lag by the whole receive-pack run.
+            Some(now.clone()),
             None,
         ));
     }
@@ -3350,7 +3359,8 @@ pub async fn git_receive_pack(
                 landed_refs,
                 disk_path.clone(),
                 auth.0.to_string(),
-                Some(Utc::now().to_rfc3339()),
+                // Same acceptance instant as the carve-out spawn above.
+                Some(now.clone()),
                 Some(publish_durability.arc()),
             ));
         }
