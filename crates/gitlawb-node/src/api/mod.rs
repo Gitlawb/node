@@ -69,16 +69,9 @@ pub(crate) async fn authorize_repo_read(
 /// `did:web` / `did:gitlawb` share the base58 space with `did:key`, so a
 /// trailing-segment compare would treat `did:key:X` and `did:gitlawb:X` as equal.
 pub(crate) fn did_matches(a: &str, b: &str) -> bool {
-    if a == b {
-        return true;
-    }
-    fn key_id(d: &str) -> &str {
-        d.strip_prefix("did:key:").unwrap_or(d)
-    }
-    let (ka, kb) = (key_id(a), key_id(b));
-    // After stripping `did:key:`, a value still containing ':' is a non-key full
-    // DID — do not let it match a bare `did:key` id.
-    !ka.contains(':') && !kb.contains(':') && ka == kb
+    // One implementation, shared with `gl` and `git-remote-gitlawb` through core:
+    // every boundary that compares a DID applies the same collapse rule.
+    gitlawb_core::ucan::push::did_key_eq(a, b)
 }
 
 /// Client-facing denial shared by every repo-owner gate copy. `require_repo_owner`
@@ -185,17 +178,20 @@ mod authz_guard {
         .unwrap_or(rest.len());
         // Strip block comments too: a marker surviving only inside /* */ would
         // otherwise satisfy a row with the real gate deleted.
-        let mut body = rest[..end].to_string();
+        // Line comments first: a `//` line containing `/*` must not open a
+        // block range or real code (and gate markers) gets stripped with it.
+        let mut body = rest[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
         while let Some(open) = body.find("/*") {
             match body[open..].find("*/").map(|i| open + i + 2) {
                 Some(close) => body.replace_range(open..close, ""),
                 None => break,
             }
         }
-        body.lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n")
+        body
     }
 
     #[test]

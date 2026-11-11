@@ -56,7 +56,14 @@ pub async fn create_webhook(
         id: Uuid::new_v4().to_string(),
         repo_id: record.id,
         url: req.url,
-        secret: req.secret,
+        // Seal the secret before it touches the database (#506): the column and
+        // any dump/backup of it hold ciphertext, never the caller's signing key.
+        secret: req.secret.map(|plain| {
+            crate::webhook_secret::WebhookSecret::new(crate::webhook_secret::seal(
+                state.webhook_secret_key.as_ref(),
+                &plain,
+            ))
+        }),
         events,
         created_by_did,
         created_at: Utc::now().to_rfc3339(),
@@ -93,19 +100,11 @@ pub async fn list_webhooks(
     crate::api::require_repo_owner(&record, &caller)?;
 
     let hooks = state.db.list_webhooks(&record.id).await?;
-    // Redact secrets in list response
-    let redacted: Vec<_> = hooks
-        .into_iter()
-        .map(|mut h| {
-            if h.secret.is_some() {
-                h.secret = Some("***".into());
-            }
-            h
-        })
-        .collect();
-
+    // `WebhookSecret` redacts itself on serialize, so a set secret is emitted as
+    // "***" and the signing material never appears in the body (see webhook_secret).
+    let count = hooks.len();
     Ok(Json(
-        serde_json::json!({ "webhooks": redacted, "count": redacted.len() }),
+        serde_json::json!({ "webhooks": hooks, "count": count }),
     ))
 }
 
@@ -149,6 +148,7 @@ mod tests {
     use crate::db::RepoRecord;
     use crate::error::AppError;
     use crate::test_support::test_state;
+    use rand::Rng;
 
     // create_webhook gates req.url through is_public_http_url. Pin the exact
     // SSRF targets from issue #81 so the webhook path can never regress to the
@@ -224,6 +224,139 @@ mod tests {
         assert!(
             state.db.list_webhooks(&repo_id).await.unwrap().is_empty(),
             "a rejected .localhost webhook must leave no row behind"
+        );
+    }
+
+    /// The startup re-encryption pass must seal any webhook secret still resting
+    /// as plaintext (a row written before at-rest encryption shipped), and leave
+    /// a second pass with nothing to do.
+    #[sqlx::test]
+    async fn reencrypt_legacy_secrets_encrypts_existing_cleartext(pool: PgPool) {
+        let state = test_state(pool).await;
+
+        // Seed a webhook the way a pre-encryption node would have: plaintext
+        // secret written straight into the row, bypassing the handler's seal.
+        let hook = crate::db::Webhook {
+            id: Uuid::new_v4().to_string(),
+            repo_id: "owner/legacy-repo".to_string(),
+            url: "https://hooks.example.com/legacy".to_string(),
+            secret: Some(crate::webhook_secret::WebhookSecret::new(
+                "legacy-plaintext".to_string(),
+            )),
+            events: vec!["*".to_string()],
+            created_by_did: "did:key:zLEGACYOWNER".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            active: true,
+        };
+        state.db.create_webhook(&hook).await.unwrap();
+
+        let rewritten = state
+            .db
+            .reencrypt_legacy_webhook_secrets(state.webhook_secret_key.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(rewritten, 1, "exactly the one plaintext row is rewritten");
+
+        let stored = state.db.get_webhook(&hook.id).await.unwrap().unwrap();
+        let secret = stored.secret.expect("secret retained after re-encryption");
+        assert!(secret.is_sealed(), "re-encrypted secret must be sealed");
+        assert_eq!(
+            crate::webhook_secret::open(state.webhook_secret_key.as_ref(), secret.as_str())
+                .as_deref(),
+            Some("legacy-plaintext"),
+            "the node-held key must recover the original secret"
+        );
+
+        // Idempotent: a second pass finds nothing left to rewrite.
+        let again = state
+            .db
+            .reencrypt_legacy_webhook_secrets(state.webhook_secret_key.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(again, 0);
+    }
+
+    /// A legacy plaintext secret that literally begins with the seal prefix is
+    /// not ciphertext: prefix-matching alone would skip it forever while
+    /// `reveal` fails to open it, wedging the hook. Classification is by
+    /// `open`, so the pass seals it and the literal secret survives.
+    #[sqlx::test]
+    async fn reencrypt_seals_a_prefixed_plaintext_secret(pool: PgPool) {
+        let state = test_state(pool).await;
+        let literal = format!(
+            "{}not-a-real-ciphertext",
+            crate::webhook_secret::SEAL_PREFIX
+        );
+        let hook = crate::db::Webhook {
+            id: Uuid::new_v4().to_string(),
+            repo_id: "owner/prefixed-repo".to_string(),
+            url: "https://hooks.example.com/prefixed".to_string(),
+            secret: Some(crate::webhook_secret::WebhookSecret::new(literal.clone())),
+            events: vec!["*".to_string()],
+            created_by_did: "did:key:zLEGACYOWNER".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            active: true,
+        };
+        state.db.create_webhook(&hook).await.unwrap();
+
+        let rewritten = state
+            .db
+            .reencrypt_legacy_webhook_secrets(state.webhook_secret_key.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(rewritten, 1, "the prefixed plaintext row is rewritten");
+
+        let stored = state.db.get_webhook(&hook.id).await.unwrap().unwrap();
+        let secret = stored.secret.unwrap();
+        assert!(secret.is_sealed());
+        assert_eq!(
+            crate::webhook_secret::reveal(state.webhook_secret_key.as_ref(), &secret).as_deref(),
+            Some(literal.as_str()),
+            "the literal plaintext, prefix included, is the recovered secret"
+        );
+    }
+
+    /// A well-formed sealed payload that does not open under this node's key
+    /// (foreign or rotated ciphertext) must survive the re-encrypt pass
+    /// untouched: re-wrapping it would make `reveal` return the outer blob as
+    /// a signing secret and flip a broken hook from withheld into garbage
+    /// signatures.
+    #[sqlx::test]
+    async fn reencrypt_leaves_foreign_ciphertext_untouched(pool: PgPool) {
+        let state = test_state(pool).await;
+        let foreign_key: [u8; 32] = chacha20poly1305::aead::OsRng.gen();
+        let foreign_ciphertext = crate::webhook_secret::seal(&foreign_key, "owner-real-secret");
+        let hook = crate::db::Webhook {
+            id: Uuid::new_v4().to_string(),
+            repo_id: "owner/foreign-repo".to_string(),
+            url: "https://hooks.example.com/foreign".to_string(),
+            secret: Some(crate::webhook_secret::WebhookSecret::new(
+                foreign_ciphertext.clone(),
+            )),
+            events: vec!["*".to_string()],
+            created_by_did: "did:key:zLEGACYOWNER".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            active: true,
+        };
+        state.db.create_webhook(&hook).await.unwrap();
+
+        let rewritten = state
+            .db
+            .reencrypt_legacy_webhook_secrets(state.webhook_secret_key.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(rewritten, 0, "foreign ciphertext is left unchanged");
+
+        let stored = state.db.get_webhook(&hook.id).await.unwrap().unwrap();
+        let secret = stored.secret.unwrap();
+        assert_eq!(
+            secret.as_str(),
+            foreign_ciphertext,
+            "the stored value is still the unopenable ciphertext, not a re-wrap"
+        );
+        assert!(
+            crate::webhook_secret::reveal(state.webhook_secret_key.as_ref(), &secret).is_none(),
+            "delivery still withholds: reveal cannot open the foreign blob"
         );
     }
 }

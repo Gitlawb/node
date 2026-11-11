@@ -594,10 +594,11 @@ pub async fn get_tree(
 // ── Git smart HTTP endpoints ──────────────────────────────────────────────
 
 fn smart_http_repo_name(repo: &str) -> Result<&str> {
-    // Strip at most one ".git" suffix: trim_end_matches strips repeatedly,
-    // which would misdirect a repo literally named "foo.git" (creatable via
-    // the peer mirror path, which skips API name validation) to repo "foo".
-    let name = repo.strip_suffix(".git").unwrap_or(repo);
+    // Strip at most one ".git" suffix — shared with the UCAN push matcher
+    // (`canonical_repo_name`), so a delegation and a remote URL name a
+    // repository the same way. At-most-once matters: a repo literally named
+    // "foo.git" is addressed as "foo.git.git".
+    let name = gitlawb_core::ucan::push::canonical_repo_name(repo);
     if name.is_empty() {
         return Err(AppError::BadRequest("missing repository name".into()));
     }
@@ -2074,14 +2075,21 @@ fn owner_push_rejection(
     enforce: bool,
     record: &crate::db::RepoRecord,
     caller: Option<&str>,
+    verified: Option<&crate::auth::VerifiedUcan>,
 ) -> Option<AppError> {
     if !enforce {
         return None;
     }
     match caller {
-        Some(did) if caller_authorized_to_push(record, did) => None,
+        Some(did) if caller_authorized_to_push(record, did, verified) => None,
+        // One message for every refusal. It must not say whether a delegation was
+        // presented, was expired, or named another repository: varying it would turn
+        // the denial into an oracle for which capabilities exist. It only has to be
+        // TRUE in all of those cases, which the previous owner-only wording no
+        // longer was once a delegation could authorize a push.
         _ => Some(AppError::Forbidden(
-            "push rejected — only the repo owner may push to this repository \
+            "push rejected — you must be the repo owner, or hold a valid \
+             owner-issued git/push delegation for this repository \
              (GITLAWB_ENFORCE_OWNER_PUSH is enabled)"
                 .into(),
         )),
@@ -2264,6 +2272,10 @@ pub async fn git_receive_pack(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
     Extension(auth): Extension<AuthenticatedDid>,
+    // `X-Ucan` is optional, so the extension may be absent: axum extracts that as
+    // `None` rather than rejecting the request. Present only when the middleware
+    // validated a chain.
+    verified: Option<Extension<crate::auth::VerifiedUcan>>,
     crate::rate_limit::PeerAddr(peer): crate::rate_limit::PeerAddr,
     headers: axum::http::HeaderMap,
     body: Bytes,
@@ -2294,6 +2306,25 @@ pub async fn git_receive_pack(
         return Err(AppError::RepoNotFound(format!("{owner}/{name}")));
     }
 
+    // The reader gate applies to the write path too, and the POST cannot lean
+    // on info/refs having checked it: a caller can skip the advertisement and
+    // hit this route directly. Without the check here a delegate (or any signed
+    // caller with a valid signature) could write to a private repo it cannot
+    // read, which is precisely the "delegates must also be readers" rule the
+    // advertisement already enforces.
+    let rules = state.db.list_visibility_rules(&record.id).await?;
+    if visibility_check(
+        &rules,
+        record.is_public,
+        &record.owner_did,
+        Some(auth.0.as_str()),
+        "/",
+    ) == Decision::Deny
+    {
+        tracing::debug!(repo = %name, caller = %auth.0, "receive-pack denied by visibility");
+        return Err(AppError::RepoNotFound(format!("{owner}/{name}")));
+    }
+
     // Parse ref updates from pkt-line body before handing to git. The count
     // cap and duplicate-refusal live inside `parse_ref_updates`, so both fire
     // before any per-request materialization, gate, or durable write below.
@@ -2313,6 +2344,7 @@ pub async fn git_receive_pack(
         state.config.enforce_owner_push,
         &record,
         Some(auth.0.as_str()),
+        verified.as_ref().map(|Extension(v)| v),
     ) {
         tracing::warn!(
             repo = %name,
@@ -2324,31 +2356,52 @@ pub async fn git_receive_pack(
     }
 
     // ── Branch protection check ──────────────────────────────────────────
-    // Uses the same verified identity as the owner-push gate above. (When that
-    // gate is enabled a non-owner never reaches here; this still applies when it
-    // is off, gating only the branches an owner has explicitly protected.)
+    // Uses the same verified identity as the owner-push gate above, but a STRICTER
+    // predicate: owner-only, deliberately not `caller_authorized_to_push`.
+    //
+    // A delegate can therefore clear the gate above and still be refused here. That
+    // is the intended policy, not an oversight: a protected branch is the owner's
+    // explicit marker that even routine writes should stop, so a `git/push`
+    // delegation must not silently override it. Widening this to accept a
+    // delegation would make every existing protection weaker the moment the owner
+    // issues any capability.
+    //
+    // `delegated_push_is_still_refused_on_a_protected_branch` pins this.
     for update in &ref_updates {
         // Strip refs/heads/ prefix to get plain branch name
         let branch = update
             .ref_name
             .strip_prefix("refs/heads/")
             .unwrap_or(&update.ref_name);
-        if state
-            .db
-            .is_branch_protected(&record.id, branch)
-            .await
-            .unwrap_or(false)
-            && !crate::api::did_matches(&auth.0, &record.owner_did)
-        {
-            tracing::warn!(
-                branch = %branch,
-                pusher = %auth.0,
-                owner_did = %record.owner_did,
-                "branch protection: rejecting push from non-owner"
-            );
-            return Err(AppError::Forbidden(format!(
-                "branch '{branch}' is protected — only the repo owner can push to it"
-            )));
+        if !crate::api::did_matches(&auth.0, &record.owner_did) {
+            // A non-owner (delegated pusher included) must fail closed when the
+            // protection lookup errors: treating Err as unprotected lets a
+            // protected branch be pushed through a database hiccup.
+            match state.db.is_branch_protected(&record.id, branch).await {
+                Ok(true) => {
+                    tracing::warn!(
+                        branch = %branch,
+                        pusher = %auth.0,
+                        owner_did = %record.owner_did,
+                        "branch protection: rejecting push from non-owner"
+                    );
+                    return Err(AppError::Forbidden(format!(
+                        "branch '{branch}' is protected — only the repo owner can push to it"
+                    )));
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        branch = %branch,
+                        pusher = %auth.0,
+                        err = %e,
+                        "branch protection lookup failed; refusing non-owner push"
+                    );
+                    return Err(AppError::Internal(anyhow::anyhow!(
+                        "failed to check branch protection: {e}"
+                    )));
+                }
+            }
         }
     }
 
@@ -6719,7 +6772,7 @@ mod tests {
     #[test]
     fn enforced_allows_owner_full_did() {
         let repo = repo_owned_by(OWNER_DID);
-        assert!(owner_push_rejection(true, &repo, Some(OWNER_DID)).is_none());
+        assert!(owner_push_rejection(true, &repo, Some(OWNER_DID), None).is_none());
     }
 
     #[test]
@@ -6727,28 +6780,84 @@ mod tests {
         // Owners are accepted in bare-multibase form, matching the rest of the
         // codebase's owner comparisons.
         let repo = repo_owned_by(OWNER_DID);
-        assert!(owner_push_rejection(true, &repo, Some(OWNER_SHORT)).is_none());
+        assert!(owner_push_rejection(true, &repo, Some(OWNER_SHORT), None).is_none());
     }
 
     #[test]
     fn enforced_rejects_non_owner_with_forbidden() {
         let repo = repo_owned_by(OWNER_DID);
-        assert_forbidden(owner_push_rejection(true, &repo, Some(STRANGER_DID)));
+        assert_forbidden(owner_push_rejection(true, &repo, Some(STRANGER_DID), None));
     }
 
     #[test]
     fn enforced_rejects_missing_did_with_forbidden() {
         // Fail closed: an absent authenticated identity is rejected, not allowed.
         let repo = repo_owned_by(OWNER_DID);
-        assert_forbidden(owner_push_rejection(true, &repo, None));
+        assert_forbidden(owner_push_rejection(true, &repo, None, None));
     }
 
     #[test]
     fn disabled_allows_non_owner_and_missing_did() {
         // Flag off → legacy behavior: authentication-only, no owner gate.
         let repo = repo_owned_by(OWNER_DID);
-        assert!(owner_push_rejection(false, &repo, Some(STRANGER_DID)).is_none());
-        assert!(owner_push_rejection(false, &repo, None).is_none());
+        assert!(owner_push_rejection(false, &repo, Some(STRANGER_DID), None).is_none());
+        assert!(owner_push_rejection(false, &repo, None, None).is_none());
+    }
+
+    /// Build a VerifiedUcan whose chain roots at `root_did` and which carries
+    /// `git/push` for `repo`. The token's own issuer and audience do not matter
+    /// here: the middleware has already bound them before this gate is reached.
+    fn push_delegation(root_did: &str, repo: &crate::db::RepoRecord) -> crate::auth::VerifiedUcan {
+        let agent = gitlawb_core::identity::Keypair::generate();
+        let node = gitlawb_core::identity::Keypair::generate();
+        let ucan = gitlawb_core::ucan::Ucan::issue(
+            &agent,
+            node.did(),
+            vec![gitlawb_core::ucan::Capability::new(
+                format!("gitlawb://repos/{}/{}", repo.owner_did, repo.name),
+                gitlawb_core::ucan::caps::GIT_PUSH,
+            )],
+            // Finite: a write capability that never lapses is refused, since there
+            // is no revocation path to withdraw a leaked one.
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        )
+        .expect("issue delegation");
+        crate::auth::VerifiedUcan {
+            ucan,
+            root: root_did.parse().expect("root DID must parse"),
+        }
+    }
+
+    #[test]
+    fn enforced_allows_a_non_owner_holding_an_owner_rooted_push_capability() {
+        // The regression owner-only push introduced: a CI or delegated key with a
+        // valid capability was refused exactly like a stranger.
+        let repo = repo_owned_by(OWNER_DID);
+        let verified = push_delegation(OWNER_DID, &repo);
+        assert!(
+            owner_push_rejection(true, &repo, Some(STRANGER_DID), Some(&verified)).is_none(),
+            "a delegation rooted at the owner must let a non-owner push"
+        );
+    }
+
+    #[test]
+    fn enforced_rejects_a_delegation_rooted_at_a_stranger() {
+        // Anchoring is the whole point: a chain nobody the repo trusts started
+        // grants nothing, even carrying a perfectly formed push capability.
+        let repo = repo_owned_by(OWNER_DID);
+        let verified = push_delegation(STRANGER_DID, &repo);
+        assert_forbidden(owner_push_rejection(
+            true,
+            &repo,
+            Some(STRANGER_DID),
+            Some(&verified),
+        ));
+    }
+
+    #[test]
+    fn enforced_still_rejects_a_non_owner_with_no_capability() {
+        let repo = repo_owned_by(OWNER_DID);
+        assert_forbidden(owner_push_rejection(true, &repo, Some(STRANGER_DID), None));
     }
 
     /// Policy 2 carve-out: replication/Tigris follows landed report
@@ -6819,9 +6928,9 @@ mod tests {
     #[test]
     fn caller_authorized_to_push_is_owner_only_in_phase_1() {
         let repo = repo_owned_by(OWNER_DID);
-        assert!(caller_authorized_to_push(&repo, OWNER_DID));
-        assert!(caller_authorized_to_push(&repo, OWNER_SHORT));
-        assert!(!caller_authorized_to_push(&repo, STRANGER_DID));
+        assert!(caller_authorized_to_push(&repo, OWNER_DID, None));
+        assert!(caller_authorized_to_push(&repo, OWNER_SHORT, None));
+        assert!(!caller_authorized_to_push(&repo, STRANGER_DID, None));
     }
 
     // ── fork_withheld_blocks (#98 path-scoped fork gate) ──
@@ -9342,6 +9451,7 @@ mod tests {
             State(state.clone()),
             Path(("z6rp4wr".to_string(), "rp4".to_string())),
             Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            None,
             crate::rate_limit::PeerAddr(Some(capped)),
             axum::http::HeaderMap::new(),
             axum::body::Bytes::from_static(b"0000"),
@@ -9360,6 +9470,7 @@ mod tests {
             State(state.clone()),
             Path(("z6rp4wr".to_string(), "rp4".to_string())),
             Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            None,
             crate::rate_limit::PeerAddr(Some(other)),
             axum::http::HeaderMap::new(),
             axum::body::Bytes::from_static(b"0000"),
@@ -9466,6 +9577,7 @@ mod tests {
                 State(state_for_task),
                 Path((owner.to_string(), name.to_string())),
                 Extension(crate::auth::AuthenticatedDid(did.to_string())),
+                None,
                 crate::rate_limit::PeerAddr(Some(peer)),
                 axum::http::HeaderMap::new(),
                 axum::body::Bytes::from_static(b"0000"),
@@ -9553,6 +9665,7 @@ mod tests {
             State(state.clone()),
             Path((owner.to_string(), name.to_string())),
             Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            None,
             crate::rate_limit::PeerAddr(Some("203.0.113.62:5000".parse().unwrap())),
             axum::http::HeaderMap::new(),
             axum::body::Bytes::from_static(b"0000"),
@@ -9617,6 +9730,7 @@ mod tests {
             State(state.clone()),
             Path((owner.to_string(), name.to_string())),
             Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            None,
             crate::rate_limit::PeerAddr(Some(peer)),
             axum::http::HeaderMap::new(),
             ref_update_body("1111111111111111111111111111111111111111"),
@@ -9817,6 +9931,7 @@ mod tests {
                     State(state.clone()),
                     Path((owner.to_string(), name.to_string())),
                     Extension(crate::auth::AuthenticatedDid("did:key:z6disc".to_string())),
+                    None,
                     crate::rate_limit::PeerAddr(Some(
                         "203.0.113.81:5000".parse::<SocketAddr>().unwrap(),
                     )),
@@ -9975,6 +10090,7 @@ mod tests {
                     State(state.clone()),
                     Path((owner.to_string(), name.to_string())),
                     Extension(crate::auth::AuthenticatedDid("did:key:z6succ".to_string())),
+                    None,
                     crate::rate_limit::PeerAddr(Some(
                         "203.0.113.83:5000".parse::<SocketAddr>().unwrap(),
                     )),
@@ -10069,6 +10185,7 @@ mod tests {
             State(state.clone()),
             Path((owner.to_string(), name.to_string())),
             Extension(crate::auth::AuthenticatedDid(pusher.to_string())),
+            None,
             crate::rate_limit::PeerAddr(Some("203.0.113.84:5000".parse::<SocketAddr>().unwrap())),
             axum::http::HeaderMap::new(),
             ref_update_body("5555555555555555555555555555555555555555"),
@@ -10164,6 +10281,7 @@ mod tests {
             State(state.clone()),
             Path((owner.to_string(), name.to_string())),
             Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            None,
             crate::rate_limit::PeerAddr(Some(peer)),
             axum::http::HeaderMap::new(),
             axum::body::Bytes::from_static(b"0000"),
@@ -10182,6 +10300,7 @@ mod tests {
             State(state.clone()),
             Path((owner.to_string(), name.to_string())),
             Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            None,
             crate::rate_limit::PeerAddr(Some("203.0.113.72:5000".parse().unwrap())),
             axum::http::HeaderMap::new(),
             axum::body::Bytes::from_static(b"0000"),
@@ -10847,6 +10966,7 @@ mod tests {
             State(state.clone()),
             Path((owner.to_string(), name.to_string())),
             Extension(crate::auth::AuthenticatedDid(pusher.to_string())),
+            None,
             crate::rate_limit::PeerAddr(Some(peer)),
             axum::http::HeaderMap::new(),
             ref_update_body_many(MAX_REF_UPDATES + 1),
@@ -10916,6 +11036,7 @@ mod tests {
             State(state.clone()),
             Path((owner.to_string(), name.to_string())),
             Extension(crate::auth::AuthenticatedDid(pusher.to_string())),
+            None,
             crate::rate_limit::PeerAddr(Some(peer)),
             axum::http::HeaderMap::new(),
             ref_update_body_many(MAX_REF_UPDATES),
@@ -10996,6 +11117,7 @@ mod tests {
             State(state.clone()),
             Path((owner.to_string(), name.to_string())),
             Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            None,
             crate::rate_limit::PeerAddr(Some(peer)),
             axum::http::HeaderMap::new(),
             ref_update_body_cmds(&[
@@ -11071,6 +11193,7 @@ mod tests {
             Extension(crate::auth::AuthenticatedDid(
                 "did:key:z6noreport".to_string(),
             )),
+            None,
             crate::rate_limit::PeerAddr(Some(peer)),
             axum::http::HeaderMap::new(),
             ref_update_body("3333333333333333333333333333333333333333"),
@@ -11172,6 +11295,7 @@ mod tests {
             State(state.clone()),
             Path(("z6empty".to_string(), "e1".to_string())),
             Extension(crate::auth::AuthenticatedDid("did:key:z6empty".to_string())),
+            None,
             crate::rate_limit::PeerAddr(Some(peer)),
             axum::http::HeaderMap::new(),
             axum::body::Bytes::from_static(b"0000"),
@@ -11275,6 +11399,7 @@ mod tests {
             Extension(crate::auth::AuthenticatedDid(
                 "did:key:z6unpack".to_string(),
             )),
+            None,
             crate::rate_limit::PeerAddr(Some(peer)),
             axum::http::HeaderMap::new(),
             ref_update_body("4444444444444444444444444444444444444444"),
@@ -11405,6 +11530,7 @@ mod tests {
                     State(state),
                     Path((owner.to_string(), name.to_string())),
                     Extension(crate::auth::AuthenticatedDid(format!("did:key:{owner}"))),
+                    None,
                     crate::rate_limit::PeerAddr(Some(peer.parse::<SocketAddr>().unwrap())),
                     axum::http::HeaderMap::new(),
                     ref_update_body(new_sha),
@@ -11499,6 +11625,7 @@ mod tests {
                 Extension(crate::auth::AuthenticatedDid(
                     "did:key:z6f4fast".to_string(),
                 )),
+                None,
                 crate::rate_limit::PeerAddr(Some(peer)),
                 axum::http::HeaderMap::new(),
                 axum::body::Bytes::from_static(b"0000"),
@@ -11559,6 +11686,7 @@ mod tests {
                 Extension(crate::auth::AuthenticatedDid(
                     "did:key:z6f4park".to_string(),
                 )),
+                None,
                 crate::rate_limit::PeerAddr(Some(peer)),
                 axum::http::HeaderMap::new(),
                 ref_update_body("2222222222222222222222222222222222222222"),
@@ -12784,6 +12912,7 @@ mod tests {
             State(state.clone()),
             Path(("z6f3repo".to_string(), "r1".to_string())),
             Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            None,
             crate::rate_limit::PeerAddr(Some("203.0.113.81:5000".parse::<SocketAddr>().unwrap())),
             axum::http::HeaderMap::new(),
             axum::body::Bytes::from_static(b"0000"),
@@ -12812,6 +12941,7 @@ mod tests {
                 State(state_b),
                 Path(("z6f3repo".to_string(), "r1".to_string())),
                 Extension(crate::auth::AuthenticatedDid(did.to_string())),
+                None,
                 crate::rate_limit::PeerAddr(Some(
                     "203.0.113.82:5000".parse::<SocketAddr>().unwrap(),
                 )),
@@ -12908,6 +13038,7 @@ mod tests {
                     State(st),
                     Path(("z6f3clean".to_string(), "c1".to_string())),
                     Extension(crate::auth::AuthenticatedDid(did.to_string())),
+                    None,
                     crate::rate_limit::PeerAddr(Some(peer.parse::<SocketAddr>().unwrap())),
                     axum::http::HeaderMap::new(),
                     axum::body::Bytes::from_static(b"0000"),
@@ -13001,6 +13132,7 @@ mod tests {
             State(state.clone()),
             Path(("z6f3dos".to_string(), "d1".to_string())),
             Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            None,
             crate::rate_limit::PeerAddr(Some("203.0.113.71:5000".parse::<SocketAddr>().unwrap())),
             axum::http::HeaderMap::new(),
             axum::body::Bytes::from_static(b"0000"),
@@ -13028,6 +13160,7 @@ mod tests {
                 State(state_b),
                 Path(("z6f3dos".to_string(), "d1".to_string())),
                 Extension(crate::auth::AuthenticatedDid(did.to_string())),
+                None,
                 crate::rate_limit::PeerAddr(Some(
                     "203.0.113.72:5000".parse::<SocketAddr>().unwrap(),
                 )),
@@ -13212,6 +13345,7 @@ mod tests {
                     State(st),
                     Path(("z6u2key".to_string(), "k1".to_string())),
                     Extension(crate::auth::AuthenticatedDid(did)),
+                    None,
                     crate::rate_limit::PeerAddr(Some(peer)),
                     axum::http::HeaderMap::new(),
                     axum::body::Bytes::from_static(b"0000"),
@@ -13285,6 +13419,7 @@ mod tests {
             Extension(crate::auth::AuthenticatedDid(
                 "did:key:z6ovflow".to_string(),
             )),
+            None,
             crate::rate_limit::PeerAddr(Some("203.0.113.90:5000".parse::<SocketAddr>().unwrap())),
             axum::http::HeaderMap::new(),
             ref_update_body("1111111111111111111111111111111111111111"),
@@ -13339,6 +13474,7 @@ mod tests {
                     State(st),
                     Path(("z6u1cap".to_string(), "c1".to_string())),
                     Extension(crate::auth::AuthenticatedDid(did)),
+                    None,
                     crate::rate_limit::PeerAddr(Some(peer)),
                     axum::http::HeaderMap::new(),
                     axum::body::Bytes::from_static(b"0000"),
@@ -13444,6 +13580,7 @@ mod tests {
                     State(st),
                     Path(("z6u1two".to_string(), repo.to_string())),
                     Extension(crate::auth::AuthenticatedDid(did)),
+                    None,
                     crate::rate_limit::PeerAddr(Some(src)),
                     axum::http::HeaderMap::new(),
                     axum::body::Bytes::from_static(b"0000"),
@@ -13534,6 +13671,7 @@ mod tests {
                     State(st),
                     Path((owner.to_string(), repo.to_string())),
                     Extension(crate::auth::AuthenticatedDid(format!("did:key:{owner}"))),
+                    None,
                     crate::rate_limit::PeerAddr(Some(edge)),
                     axum::http::HeaderMap::new(),
                     axum::body::Bytes::from_static(b"0000"),
@@ -13627,6 +13765,7 @@ mod tests {
                     State(st),
                     Path(("z6f1key".to_string(), repo.to_string())),
                     Extension(crate::auth::AuthenticatedDid(did.to_string())),
+                    None,
                     crate::rate_limit::PeerAddr(Some(peer)),
                     axum::http::HeaderMap::new(),
                     axum::body::Bytes::from_static(b"0000"),
@@ -13687,6 +13826,7 @@ mod tests {
             Extension(crate::auth::AuthenticatedDid(
                 "did:key:z6f1none".to_string(),
             )),
+            None,
             crate::rate_limit::PeerAddr(None),
             axum::http::HeaderMap::new(),
             axum::body::Bytes::from_static(b"0000"),
@@ -13731,6 +13871,7 @@ mod tests {
                     State(state.clone()),
                     Path(("z6f1seq".to_string(), "s1".to_string())),
                     Extension(crate::auth::AuthenticatedDid(did.to_string())),
+                    None,
                     crate::rate_limit::PeerAddr(Some(src)),
                     axum::http::HeaderMap::new(),
                     axum::body::Bytes::from_static(b"0000"),
@@ -14311,6 +14452,7 @@ mod tests {
             State(state.clone()),
             Path((owner.to_string(), name.to_string())),
             Extension(crate::auth::AuthenticatedDid(format!("did:key:{owner}"))),
+            None,
             crate::rate_limit::PeerAddr(Some("203.0.113.90:5000".parse::<SocketAddr>().unwrap())),
             axum::http::HeaderMap::new(),
             body,

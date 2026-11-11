@@ -8,6 +8,8 @@ use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use tracing::info;
 use uuid::Uuid;
 
+use crate::webhook_secret::WebhookSecret;
+
 /// Maximum visible repositories per page, plus one internal look-ahead row.
 pub(crate) const MAX_VISIBLE_REPO_PAGE_SIZE: usize = 200;
 
@@ -297,7 +299,10 @@ pub struct Webhook {
     pub id: String,
     pub repo_id: String,
     pub url: String,
-    pub secret: Option<String>,
+    /// At rest this holds the sealed ciphertext (`enc:v1:…`) produced by
+    /// [`crate::webhook_secret::seal`]; the newtype redacts `Debug` and
+    /// `Serialize` so the signing secret never reaches a log line or a body.
+    pub secret: Option<WebhookSecret>,
     pub events: Vec<String>,
     pub created_by_did: String,
     pub created_at: String,
@@ -3878,7 +3883,7 @@ impl Db {
         .bind(&hook.id)
         .bind(&hook.repo_id)
         .bind(&hook.url)
-        .bind(&hook.secret)
+        .bind(hook.secret.as_ref().map(|s| s.as_str()))
         .bind(&events_json)
         .bind(&hook.created_by_did)
         .bind(&hook.created_at)
@@ -3928,6 +3933,67 @@ impl Db {
             .into_iter()
             .filter(|h| h.active && h.events.iter().any(|e| e == "*" || e == event))
             .collect())
+    }
+
+    /// One-time re-encryption of webhook secrets that still rest as plaintext
+    /// (rows written before at-rest encryption shipped). Runs once at startup; a
+    /// schema migration cannot do this because the node-held key never reaches
+    /// Postgres. Returns the number of rows rewritten.
+    ///
+    /// "Already sealed" means "opens under the node key", not "has the prefix":
+    /// a plaintext secret that literally begins with the `enc:v1:` prefix, or a
+    /// value sealed under another identity, fails `open` and is re-sealed raw,
+    /// which preserves whatever the stored value was rather than wedging it.
+    /// A prefixed value that does not open is also warned on, since it is more
+    /// likely corrupt ciphertext than a colliding plaintext.
+    pub async fn reencrypt_legacy_webhook_secrets(&self, key: &[u8; 32]) -> Result<usize> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, secret FROM webhooks WHERE secret IS NOT NULL")
+                .fetch_all(&self.pool)
+                .await?;
+
+        let mut rewritten = 0usize;
+        for (id, stored) in rows {
+            if crate::webhook_secret::open(key, &stored).is_some() {
+                continue; // already sealed under this node's key
+            }
+            if crate::webhook_secret::has_seal_shape(&stored) {
+                // Well-formed sealed payload that does not open under this
+                // node's key: foreign or rotated ciphertext. Re-wrapping the
+                // outer blob as plaintext would make `reveal` return it as a
+                // signing secret and flip Withhold into a garbage signature,
+                // so leave the row unchanged: delivery keeps withholding.
+                tracing::warn!(
+                    webhook_id = %id,
+                    "webhook secret is well-formed ciphertext but does not open under the node key; leaving it unchanged"
+                );
+                continue;
+            }
+            if stored.starts_with(crate::webhook_secret::SEAL_PREFIX) {
+                tracing::warn!(
+                    webhook_id = %id,
+                    "webhook secret has the sealed prefix but is not well-formed ciphertext; sealing the raw value as plaintext"
+                );
+            }
+            let sealed = crate::webhook_secret::seal(key, &stored);
+            // Compare-and-set on the value read above: a concurrent secret
+            // update between SELECT and UPDATE must not be clobbered.
+            let result =
+                sqlx::query("UPDATE webhooks SET secret = $2 WHERE id = $1 AND secret = $3")
+                    .bind(&id)
+                    .bind(sealed)
+                    .bind(&stored)
+                    .execute(&self.pool)
+                    .await?;
+            if result.rows_affected() == 0 {
+                tracing::warn!(
+                    webhook_id = %id,
+                    "webhook secret changed between read and re-encrypt; skipping"
+                );
+            }
+            rewritten += result.rows_affected() as usize;
+        }
+        Ok(rewritten)
     }
 }
 
@@ -9164,7 +9230,7 @@ fn row_to_webhook(r: sqlx::postgres::PgRow) -> Webhook {
         id: r.get("id"),
         repo_id: r.get("repo_id"),
         url: r.get("url"),
-        secret: r.get("secret"),
+        secret: r.get::<Option<String>, _>("secret").map(WebhookSecret::new),
         events,
         created_by_did: r.get("created_by_did"),
         created_at: r.get("created_at"),

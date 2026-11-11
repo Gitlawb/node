@@ -3473,10 +3473,13 @@ name = "git-remote-gitlawb"
 version = "0.7.1"
 dependencies = [
  "anyhow",
+ "chrono",
+ "dirs",
  "gitlawb-core",
  "libc",
  "mockito",
  "reqwest",
+ "serde_json",
  "tempfile",
  "tracing",
  "tracing-subscriber",
@@ -3542,6 +3545,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
+ "chacha20poly1305",
  "chrono",
  "cid",
  "clap",

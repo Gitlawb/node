@@ -342,9 +342,11 @@ pub fn record_sync_processed(status: &str) {
 }
 
 /// Record one webhook delivery attempt outcome. `result` ∈
-/// {ok, http_error, network_error, skipped, invalid_url}.
+/// {ok, http_error, network_error, skipped, invalid_url, secret_unopenable}.
 /// `invalid_url` is a policy skip: the stored hook URL failed the public-URL
-/// check at delivery time and the POST was never sent.
+/// check at delivery time and the POST was never sent. `secret_unopenable` is
+/// a withheld delivery: the hook carries a secret the node could not open, so
+/// the POST was never sent rather than going out unsigned.
 pub fn record_webhook_delivery(result: &str) {
     if let Some(c) = WEBHOOK_DELIVERIES.get() {
         c.with_label_values(&[result]).inc();
