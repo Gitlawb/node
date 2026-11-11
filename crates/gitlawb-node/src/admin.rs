@@ -51,6 +51,10 @@ pub struct PurgeSummary {
     /// transitions still have in-flight work on the repo; deleting its
     /// storage would strand that work mid-effect.
     pub skipped_unsettled: usize,
+    /// Candidates skipped because the unsettled-work PROBE itself failed —
+    /// fail-closed like skipped_store_error, but bucketed separately so an
+    /// operator can tell "work in flight" apart from "could not even check".
+    pub skipped_unsettled_probe: usize,
     /// Rows deleted whose on-disk dir removal FAILED (or was refused by the
     /// containment guard) — DB/disk drift the operator must reconcile.
     pub disk_failed: usize,
@@ -486,6 +490,7 @@ pub async fn run_purge_spam(
             Err(e) => {
                 warn!(repo = %c.id, err = %e,
                     "purge-spam: could not check for unsettled work — skipped (fail-closed)");
+                summary.skipped_unsettled_probe += 1;
                 guard.release().await;
                 continue;
             }
@@ -512,29 +517,35 @@ pub async fn run_purge_spam(
                 // A disk-removal failure is counted separately, NOT folded into the
                 // deleted total, so the summary never reports a clean success while
                 // an on-disk dir survives (DB/disk drift the operator must fix).
-                let path = match crate::git::repo_store::validated_repo_disk_path(
+                // Disk removal is best-effort and NEVER gates the archive
+                // delete below: a failed or refused local removal must not
+                // strand the object-store copy of a row we just deleted.
+                let path = crate::git::repo_store::validated_repo_disk_path(
                     &repos_dir,
                     &c.owner_did,
                     &c.name,
-                ) {
-                    Ok(p) => p.into_path_buf(),
+                )
+                .map(|p| p.into_path_buf());
+                match &path {
+                    Ok(p) if !path_within(p, &repos_dir) => {
+                        warn!(repo = %c.id, path = %p.display(),
+                            "purge-spam: on-disk path escapes repos_dir — refusing to remove");
+                        summary.disk_failed += 1;
+                    }
+                    Ok(p) => {
+                        if let Err(e) = std::fs::remove_dir_all(p) {
+                            warn!(repo = %c.id, path = %p.display(), err = %e,
+                                "purge-spam: deleted DB row but could not remove on-disk repo dir");
+                            summary.disk_failed += 1;
+                        } else {
+                            info!(repo = %c.id, rows = n, "purge-spam: deleted repo row + on-disk dir");
+                        }
+                    }
                     Err(e) => {
                         warn!(repo = %c.id, err = %e,
                             "purge-spam: could not validate repo path — refusing to remove");
                         summary.disk_failed += 1;
-                        continue;
                     }
-                };
-                if !path_within(&path, &repos_dir) {
-                    warn!(repo = %c.id, path = %path.display(),
-                        "purge-spam: on-disk path escapes repos_dir — refusing to remove");
-                    summary.disk_failed += 1;
-                } else if let Err(e) = std::fs::remove_dir_all(&path) {
-                    warn!(repo = %c.id, path = %path.display(), err = %e,
-                        "purge-spam: deleted DB row but could not remove on-disk repo dir");
-                    summary.disk_failed += 1;
-                } else {
-                    info!(repo = %c.id, rows = n, "purge-spam: deleted repo row + on-disk dir");
                 }
                 // Delete the object-store archive too (a no-op when no store is
                 // configured), else it survives and can be downloaded into a
@@ -574,11 +585,13 @@ pub async fn run_purge_spam(
         guard.release().await;
     }
     println!(
-        "purge-spam: deleted {} repo row(s); skipped {} (no longer empty), {} (locked by a live writer), {} (object store unreachable); {} on-disk removal(s) failed, {} archive removal(s) failed.",
+        "purge-spam: deleted {} repo row(s); skipped {} (no longer empty), {} (locked by a live writer), {} (object store unreachable), {} (unsettled work in flight), {} (unsettled probe failed); {} on-disk removal(s) failed, {} archive removal(s) failed.",
         summary.deleted,
         summary.skipped_not_empty,
         summary.skipped_locked,
         summary.skipped_store_error,
+        summary.skipped_unsettled,
+        summary.skipped_unsettled_probe,
         summary.disk_failed,
         summary.archive_failed
     );

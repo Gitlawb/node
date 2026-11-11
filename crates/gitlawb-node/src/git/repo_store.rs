@@ -817,7 +817,7 @@ impl RepoStore {
         &self,
         owner_did: &str,
         repo_name: &str,
-    ) -> Result<(PathBuf, Option<tokio::task::JoinHandle<()>>)> {
+    ) -> Result<(PathBuf, Option<tokio::task::JoinHandle<Result<()>>>)> {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
 
         store::init_bare(&local_path).context("initializing bare repo")?;
@@ -845,14 +845,20 @@ impl RepoStore {
                     .upload(&owner_slug, &repo_name, &path, UploadPrecondition::IfAbsent)
                     .await
                 {
-                    Ok(_) => {}
-                    // Distinct from the warn arm: the fence refusing is the
-                    // design working, not a storage failure.
+                    Ok(_) => Ok(()),
+                    // Distinct from the error arm: the fence refusing means
+                    // someone else already published this key, so the empty
+                    // bytes dropped — but for a create caller the archive then
+                    // belongs to another writer, which IS a creation failure.
                     Err(UploadError::PreconditionLost { status }) => {
                         info!(repo = %repo_name, status, "dropped the empty-repo upload: another writer already published this repo");
+                        Err(anyhow::anyhow!(
+                            "empty-repo upload fenced: key already published (status {status})"
+                        ))
                     }
                     Err(e) => {
                         warn!(repo = %repo_name, err = %e, "failed to upload new repo to tigris");
+                        Err(anyhow::anyhow!("empty-repo upload failed: {e}"))
                     }
                 }
             }));

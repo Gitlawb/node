@@ -275,7 +275,7 @@ pub struct Config {
 
     /// Tigris (S3-compatible) bucket for repo storage.
     /// Leave empty to disable Tigris and use local-only storage.
-    #[arg(long, env = "GITLAWB_TIGRIS_BUCKET", default_value = "")]
+    #[arg(long, env = "GITLAWB_TIGRIS_BUCKET", default_value = "", global = true)]
     pub tigris_bucket: String,
 
     /// Maximum pack body size for git-receive-pack and git-upload-pack, in bytes.

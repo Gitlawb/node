@@ -361,9 +361,28 @@ pub async fn create_repo(
 
     // Keep the initial archive upload inside the creation lock: a purge or
     // retry that acquires the key after release must not find the row and dir
-    // while the create-only PUT is still in flight.
+    // while the create-only PUT is still in flight. Its OUTCOME also gates the
+    // 201: a failed or fenced upload leaves the row's storage inconsistent, so
+    // roll the create back (row + dir) and surface the error instead of
+    // reporting success.
     if let Some(upload) = create_upload {
-        let _ = upload.await;
+        let landed = match upload.await {
+            Ok(inner) => inner,
+            Err(e) => Err(anyhow::anyhow!("empty-repo upload task failed: {e}")),
+        };
+        if let Err(e) = landed {
+            tracing::warn!(repo = %req.name, err = %e,
+                "create: initial archive upload failed — rolling back row and dir");
+            if let Err(dbe) = state.db.delete_repo_by_id(&record.id).await {
+                tracing::warn!(repo = %req.name, err = %dbe,
+                    "create rollback: could not delete the repo row");
+            }
+            let _ = std::fs::remove_dir_all(&disk_path);
+            repo_lock.release().await;
+            return Err(AppError::Git(format!(
+                "repo created but initial archive upload failed and was rolled back: {e}"
+            )));
+        }
     }
 
     // Row + on-disk dir now both exist consistently; the race window is closed,

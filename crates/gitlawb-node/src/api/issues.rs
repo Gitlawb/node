@@ -452,10 +452,19 @@ pub async fn close_issue(
             let deadline = std::time::Instant::now()
                 + std::time::Duration::from_secs(state.config.git_service_timeout_secs);
             let issue_id_for_comp = issue_id.clone();
-            let _ = (git_bin, deadline); // rollback is JSON-level, not git-cli
             guard
                 .release_compensating(true, move |path| {
-                    git_issues::create_issue(path, &issue_id_for_comp, &json)
+                    // Same bounded-write strategy create_issue's compensator
+                    // uses: the rollback rewrites the ref with the pre-close
+                    // content through the deadline-aware runner, so a hung git
+                    // cannot stall the guard past git_service_timeout.
+                    git_issues::create_issue_bounded(
+                        &git_bin,
+                        path,
+                        &issue_id_for_comp,
+                        &json,
+                        deadline,
+                    )
                 })
                 .await
                 .into_result()
