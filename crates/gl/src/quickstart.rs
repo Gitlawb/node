@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use crate::http::NodeClient;
+use crate::http::{sanitize_node_msg, NodeClient};
 use crate::identity::load_keypair_from_dir;
 
 const PUBLIC_NODE: &str = "https://node.twigpine.com";
@@ -23,7 +23,7 @@ pub struct QuickstartArgs {
     #[arg(long, default_value = PUBLIC_NODE, env = "GITLAWB_NODE")]
     pub node: String,
 
-    /// Identity directory (default: ~/.gitlawb)
+    /// Identity directory (default: the parent of $GITLAWB_KEY, else ~/.gitlawb)
     #[arg(long)]
     pub dir: Option<PathBuf>,
 
@@ -39,19 +39,25 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
     println!("and create your first repository.");
     println!();
 
-    let dir = args.dir.clone().unwrap_or_else(|| {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".gitlawb")
-    });
+    // The wizard generates the identity AND stores the bootstrap UCAN, so it has to
+    // land where every later command reads from — the parent of `GITLAWB_KEY`, not
+    // an unconditional `~/.gitlawb`.
+    let dir = crate::identity::gitlawb_dir(args.dir.clone())?;
 
     // ── Step 1: Identity ──────────────────────────────────────────────────
     println!("── Step 1: Identity ─────────────────────────────────────────────────");
     println!();
 
-    let pem_path = dir.join("identity.pem");
+    let pem_path = crate::identity::key_path_for(args.dir.as_deref())?;
     let keypair = if pem_path.exists() {
-        match load_keypair_from_dir(Some(&dir)) {
+        // `args.dir.as_deref()`, not `Some(&dir)`. Passing the DIRECTORY made the
+        // loader re-derive the basename as `identity.pem`, so with
+        // `GITLAWB_KEY=/data/keys/ci-agent.pem` the check above found `ci-agent.pem`
+        // while the load looked for a sibling that need not exist. The load must
+        // target the file that was actually selected, and a file that exists but
+        // fails to load is refused below, never regenerated over: `pem_path` can
+        // name any file, and repository ownership and delegations are tied to its DID.
+        match load_keypair_from_dir(args.dir.as_deref()) {
             Ok(kp) => {
                 let did = kp.did();
                 println!("  ✓  Identity already exists");
@@ -59,14 +65,17 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
                 println!();
                 kp
             }
-            Err(_) => {
-                println!("  Identity file exists but is unreadable. Regenerating...");
-                generate_identity(&dir)?
+            Err(e) => {
+                anyhow::bail!(
+                    "identity at {} could not be loaded: {e}. Fix or move the file, \
+                     or run `gl identity new --force` to replace it deliberately.",
+                    pem_path.display()
+                );
             }
         }
     } else {
         println!("  No identity found. Generating a new Ed25519 keypair...");
-        generate_identity(&dir)?
+        generate_identity(&dir, &pem_path)?
     };
 
     let did = keypair.did().to_string();
@@ -99,7 +108,14 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
             Ok(resp) if resp.status().is_success() => {
                 let payload: Value = resp.json().await.unwrap_or_default();
                 let ucan = payload["ucan"].as_str().unwrap_or("");
-                if !ucan.is_empty() {
+                // The messaging below derives from what was actually persisted, not
+                // from the 2xx: a success response carrying no `ucan` skips the write,
+                // and saying "UCAN saved" anyway sends the operator looking for a file
+                // that was never created - then resurfaces later as a push rejection
+                // with nothing pointing back here.
+                let saved = if ucan.is_empty() {
+                    false
+                } else {
                     crate::secret_file::create_dir(&dir)?;
                     let record = json!({
                         "ucan": ucan,
@@ -111,17 +127,21 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
                         &ucan_path,
                         serde_json::to_string_pretty(&record)?.as_bytes(),
                     )?;
+                    true
+                };
+                if saved {
+                    // Success belongs to the saved branch: a 2xx without a
+                    // usable ucan is not a registration — the response may not
+                    // even be JSON, and saying success would also leave a
+                    // stale ucan.json from another node in place.
                     let trust = payload["trust_score"].as_f64().unwrap_or(0.0);
                     println!("  ✓  Registered successfully");
                     println!("     Trust score: {trust:.2}");
                     println!("     UCAN saved to {}", ucan_path.display());
                 } else {
-                    // A 2xx without a usable ucan is not a registration; the
-                    // response may not even be JSON. Saying success here would
-                    // also leave a stale ucan.json from another node in place.
-                    println!("  ✗  Registration returned no UCAN (unexpected response body)");
-                    // No retry hint here: a `gl register` instruction without
-                    // this invocation's --dir would load a different identity.
+                    println!(
+                        "  \u{00d7}  Registration returned no UCAN (unexpected response body)"
+                    );
                 }
                 println!();
             }
@@ -129,7 +149,10 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
                 let status = resp.status();
                 let body: Value = resp.json().await.unwrap_or_default();
                 let msg = body["message"].as_str().unwrap_or("unknown");
-                println!("  ✗  Registration failed ({status}): {msg}");
+                println!(
+                    "  ✗  Registration failed ({status}): {}",
+                    sanitize_node_msg(msg)
+                );
                 println!("     You can retry with: gl register --node {}", args.node);
                 println!();
                 // Non-fatal — continue to repo creation
@@ -215,7 +238,10 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
             let status = resp.status();
             let payload: Value = resp.json().await.unwrap_or_default();
             let msg = payload["message"].as_str().unwrap_or("unknown");
-            println!("  ✗  Repo creation failed ({status}): {msg}");
+            println!(
+                "  ✗  Repo creation failed ({status}): {}",
+                sanitize_node_msg(msg)
+            );
             println!(
                 "     Try manually: gl repo create {repo_name} --node {}",
                 args.node
@@ -236,15 +262,27 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-fn generate_identity(dir: &std::path::Path) -> Result<gitlawb_core::identity::Keypair> {
+fn generate_identity(
+    dir: &std::path::Path,
+    path: &std::path::Path,
+) -> Result<gitlawb_core::identity::Keypair> {
     crate::secret_file::create_dir(dir)
         .with_context(|| format!("failed to create {}", dir.display()))?;
 
     let keypair = gitlawb_core::identity::Keypair::generate();
     let pem = keypair.to_pem()?;
-    let path = dir.join("identity.pem");
 
-    crate::secret_file::write(&path, pem.as_bytes())?;
+    crate::secret_file::write_new(path, pem.as_bytes()).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            anyhow::anyhow!(
+                "identity key already exists at {}: refusing to overwrite; \
+                 pass --dir for a fresh location or move the existing key",
+                path.display()
+            )
+        } else {
+            anyhow::anyhow!(e)
+        }
+    })?;
 
     let did = keypair.did();
     println!("  ✓  Generated new identity");

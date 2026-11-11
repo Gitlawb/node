@@ -168,16 +168,8 @@ pub async fn run(args: NameArgs) -> Result<()> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn identity_dir(dir: Option<PathBuf>) -> PathBuf {
-    dir.unwrap_or_else(|| {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".gitlawb")
-    })
-}
-
 fn load_did(dir: Option<PathBuf>) -> Result<String> {
-    let path = identity_dir(dir).join("identity.pem");
+    let path = crate::identity::key_path_for(dir.as_deref())?;
     let pem = std::fs::read_to_string(&path).with_context(|| {
         format!(
             "No identity at {} — run `gl identity new` first",
@@ -190,7 +182,7 @@ fn load_did(dir: Option<PathBuf>) -> Result<String> {
 }
 
 fn load_did_and_document(dir: Option<PathBuf>) -> Result<(String, String)> {
-    let path = identity_dir(dir).join("identity.pem");
+    let path = crate::identity::key_path_for(dir.as_deref())?;
     let pem = std::fs::read_to_string(&path).with_context(|| {
         format!(
             "No identity at {} — run `gl identity new` first",

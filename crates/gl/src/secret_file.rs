@@ -30,6 +30,38 @@ pub(crate) fn write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Write `contents` to a `path` that must not already exist.
+///
+/// `create_new` makes the existence check and the create one atomic open, so
+/// there is no check-then-write window where an attacker or a second `gl init`
+/// could slip a file in between. Same owner-only mode and `O_NOFOLLOW` as
+/// [`write`]. `AlreadyExists` means the key was present, never that it was
+/// touched.
+pub(crate) fn write_new(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        f.write_all(contents)?;
+    }
+    #[cfg(not(unix))]
+    {
+        if path.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "refusing to overwrite existing file",
+            ));
+        }
+        std::fs::write(path, contents)?;
+    }
+    Ok(())
+}
+
 /// Create `path` (and missing parents) as an owner-only directory.
 ///
 /// An existing directory is also re-pinned: a `~/.gitlawb` created before
