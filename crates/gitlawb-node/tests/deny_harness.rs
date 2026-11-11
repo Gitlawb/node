@@ -1339,6 +1339,14 @@ mod completeness {
         /// A global list-FILTER: returns 200 with unreadable rows removed, never a
         /// 404, so it is not a deny-bearing read at all.
         GlobalListFilter,
+        /// A repo-scoped read whose deny is already driven as a NON-ReadGate
+        /// registry row — the handler read-gates for reach, but the deny the
+        /// sweep must prove is the other gate's status, not a 404.
+        DrivenByOtherGate,
+        /// A repo-scoped read whose repo selector arrives as a QUERY parameter
+        /// (`?repo=`), not a mounted path segment — a `deny_bearing_routes()` row
+        /// can only name a mounted path, so the sweep cannot express its 404.
+        QueryScopedRead,
         /// The owner-2xx twin needs a live external dependency the harness lacks:
         /// `get_encrypted_blob` reads through `ipfs_pin::cat` with no harness stub,
         /// so it cannot be driven as a 2xx twin here. An honest exclusion, not a
@@ -1379,6 +1387,40 @@ mod completeness {
         ("fork_repo", NotDrivenReason::ReadGatingMutation),
         ("star_repo", NotDrivenReason::ReadGatingMutation),
         ("unstar_repo", NotDrivenReason::ReadGatingMutation),
+        // merge_pr authorize_repo_reads before the owner check, but it is a POST
+        // merge mutation, not a 404-deny GET — its deny is already driven as the
+        // OwnerGate row in deny_bearing_routes().
+        ("merge_pr", NotDrivenReason::ReadGatingMutation),
+        // Mutations that gained the authorize_repo_read quarantine pre-check on
+        // main after the table froze: each read-gates for reach, then denies
+        // under the gate its registry row already drives (Owner / MultiPrincipal
+        // / SignerSelf). None is a 404-deny GET.
+        ("add_label", NotDrivenReason::ReadGatingMutation),
+        ("remove_label", NotDrivenReason::ReadGatingMutation),
+        ("approve_bounty", NotDrivenReason::ReadGatingMutation),
+        ("cancel_bounty", NotDrivenReason::ReadGatingMutation),
+        ("dispute_bounty", NotDrivenReason::ReadGatingMutation),
+        ("submit_bounty", NotDrivenReason::ReadGatingMutation),
+        ("close_issue", NotDrivenReason::ReadGatingMutation),
+        ("close_pr", NotDrivenReason::ReadGatingMutation),
+        ("create_webhook", NotDrivenReason::ReadGatingMutation),
+        ("delete_webhook", NotDrivenReason::ReadGatingMutation),
+        ("set_visibility", NotDrivenReason::ReadGatingMutation),
+        ("remove_visibility", NotDrivenReason::ReadGatingMutation),
+        ("protect_branch", NotDrivenReason::ReadGatingMutation),
+        ("unprotect_branch", NotDrivenReason::ReadGatingMutation),
+        ("register_replica", NotDrivenReason::ReadGatingMutation),
+        ("unregister_replica", NotDrivenReason::ReadGatingMutation),
+        // Smart-HTTP push: read-gates the repo before accepting pack objects; its
+        // denies are driven by the dedicated signed_* tests.
+        ("git_receive_pack", NotDrivenReason::ReadGatingMutation),
+        // list_visibility is a GET, but its deny is the owner gate's 403, already
+        // driven by the OwnerGate row — not a 404-deny read.
+        ("list_visibility", NotDrivenReason::DrivenByOtherGate),
+        // list_anchors scopes its repo via ?repo= (a query param), which a
+        // mounted-path row cannot express — a suite coverage gap to drive
+        // separately, not a 404-deny GET on the path table.
+        ("list_anchors", NotDrivenReason::QueryScopedRead),
         // Content-addressed read: driven by the U5b/U8 anon_ipfs/clone cases via
         // the internal `gate_and_serve` helper (marker moved off `get_by_cid`).
         ("gate_and_serve", NotDrivenReason::ContentAddressedRead),
@@ -1486,7 +1528,174 @@ mod completeness {
         out
     }
 
-    /// Like [`handlers_with_marker`] but selects handlers whose body satisfies a
+    /// Replaces the CONTENTS of comments and string/char literals with spaces,
+    /// preserving byte length and delimiters. A `fn`-shaped or marker-shaped token
+    /// inside a literal must not read as a real decl boundary or gate marker:
+    /// api/mod.rs's `resolver_body` fixture (`fn helper() { … did_matches … }` in a
+    /// test string) claimed a 20KB segment and swept the marker tables that
+    /// followed it, false-orphaning as `helper`. Interior newlines are masked too,
+    /// so `"\nfn "` inside a string cannot fake a declaration start. This is also
+    /// what makes [`strip_test_modules`]' brace matching sound: a `}` inside a
+    /// `///` doc comment (authz_guard has one) otherwise closes the mod early and
+    /// leaves the tail — and its fixture `fn`s — in the scan.
+    fn mask_noncode(src: &str) -> String {
+        let b = src.as_bytes();
+        let n = b.len();
+        let mut out = b.to_vec();
+        let mut i = 0;
+        while i < n {
+            if b[i] == b'/' && i + 1 < n && b[i + 1] == b'/' {
+                let start = i;
+                while i < n && b[i] != b'\n' {
+                    i += 1;
+                }
+                out[start..i].fill(b' ');
+                continue;
+            }
+            if b[i] == b'/' && i + 1 < n && b[i + 1] == b'*' {
+                let start = i;
+                i += 2;
+                let mut depth = 1i32;
+                while i + 1 < n && depth > 0 {
+                    if b[i] == b'/' && b[i + 1] == b'*' {
+                        depth += 1;
+                        i += 2;
+                    } else if b[i] == b'*' && b[i + 1] == b'/' {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                out[start..i.min(n)].fill(b' ');
+                continue;
+            }
+            // Raw string: `r"`, `r#"`, `r##"…` or the `br…` byte forms.
+            let raw = if b[i] == b'r' {
+                Some(i + 1)
+            } else if b[i] == b'b' && i + 1 < n && b[i + 1] == b'r' {
+                Some(i + 2)
+            } else {
+                None
+            };
+            if let Some(mut p) = raw {
+                let mut hashes = 0usize;
+                while p < n && b[p] == b'#' {
+                    hashes += 1;
+                    p += 1;
+                }
+                if p < n && b[p] == b'"' {
+                    let inner = p + 1;
+                    let mut j = inner;
+                    while j < n {
+                        if b[j] == b'"' {
+                            let mut k = 0;
+                            while k < hashes && j + 1 + k < n && b[j + 1 + k] == b'#' {
+                                k += 1;
+                            }
+                            if k == hashes {
+                                break;
+                            }
+                        }
+                        j += 1;
+                    }
+                    out[inner..j.min(n)].fill(b' ');
+                    i = (j + 1 + hashes).min(n);
+                    continue;
+                }
+            }
+            // Cooked string or byte string: `"` or `b"`.
+            let cooked = if b[i] == b'"' {
+                Some(i + 1)
+            } else if b[i] == b'b' && i + 1 < n && b[i + 1] == b'"' {
+                Some(i + 2)
+            } else {
+                None
+            };
+            if let Some(inner) = cooked {
+                let mut j = inner;
+                while j < n && b[j] != b'"' {
+                    if b[j] == b'\\' {
+                        j += 1;
+                    }
+                    j += 1;
+                }
+                out[inner..j.min(n)].fill(b' ');
+                i = (j + 1).min(n);
+                continue;
+            }
+            // Char literal `'x'` / `'\e'` (a bare `'a` is a lifetime — skip it).
+            if b[i] == b'\'' {
+                if i + 3 < n && b[i + 1] == b'\\' && b[i + 3] == b'\'' {
+                    out[i + 1] = b' ';
+                    out[i + 2] = b' ';
+                    i += 4;
+                    continue;
+                }
+                if i + 2 < n && b[i + 2] == b'\'' {
+                    out[i + 1] = b' ';
+                    i += 3;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        String::from_utf8(out).expect("masking writes only ASCII spaces")
+    }
+
+    /// The source a handler scan should see: string/comment contents masked, then
+    /// `#[cfg(test)] mod … { … }` blocks removed.
+    fn scan_src(src: &str) -> String {
+        strip_test_modules(&mask_noncode(src))
+    }
+
+    /// Removes `#[cfg(test)] mod <name> { … }` blocks (attribute + `mod` header +
+    /// the whole braced body) before the handler scans run. Unit-test modules are
+    /// never mounted handlers. Run it on [`mask_noncode`] output: its brace
+    /// matching is only sound once literal and comment braces are gone.
+    fn strip_test_modules(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let mut rest = src;
+        // Line-anchored: a `#[cfg(test)]` inside a comment or string literal must
+        // not strip the next real `mod` and hide real handlers from the scan.
+        while let Some(attr) = rest.find("\n#[cfg(test)]").map(|p| p + 1) {
+            let after = &rest[attr + "#[cfg(test)]".len()..];
+            // Only strip when the attribute applies directly to a `mod`; a
+            // `#[cfg(test)]` on a bare fn leaves real decls reachable.
+            let Some(mod_kw) = after.find("mod ") else {
+                break;
+            };
+            if !after[..mod_kw].trim().is_empty() {
+                break;
+            }
+            out.push_str(&rest[..attr]);
+            let Some(brace) = after[mod_kw..].find('{') else {
+                rest = after;
+                break;
+            };
+            let open = mod_kw + brace;
+            let bytes = after.as_bytes();
+            let mut depth = 0i32;
+            let mut j = open;
+            while j < after.len() {
+                match bytes[j] {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            rest = if j < after.len() { &after[j + 1..] } else { "" };
+        }
+        out.push_str(rest);
+        out
+    }
+
     /// PREDICATE rather than a substring — used for the inline owner-gate
     /// did_matches idiom (F3), whose "first arg is the caller, second is
     /// owner_did" shape a plain substring cannot express. Same fn-segmentation as
@@ -1724,7 +1933,7 @@ mod completeness {
         for entry in std::fs::read_dir(api_dir).expect("read api dir") {
             let path = entry.expect("dir entry").path();
             if path.extension().is_some_and(|e| e == "rs") {
-                let src = std::fs::read_to_string(&path).expect("read api file");
+                let src = scan_src(&std::fs::read_to_string(&path).expect("read api file"));
                 owner_marked.extend(handlers_with_marker(
                     &src,
                     &["require_repo_owner(", "require_owner("],
@@ -1749,6 +1958,13 @@ mod completeness {
         // substrate); drop it so the owner-orphan assert does not misflag a route
         // whose owner gate is already driven.
         owner_marked.remove("git_receive_pack");
+        // create_task (tasks.rs) carries a CONDITIONAL owner gate (#496): only when
+        // the caller-supplied repo_id names a hosted, non-quarantined repo. Its
+        // primary gate is the delegator signer-self binding, already driven as the
+        // SignerSelfGate row, and the repo-owner arm is driven by the dedicated
+        // `create_task_rejects_foreign_repo_id` handler test — same driven-
+        // elsewhere class as git_receive_pack, not an orphan.
+        owner_marked.remove("create_task");
         // Non-vacuous floor: if the marker scan silently found nothing (a parser
         // regression), the orphan loop below would pass by checking zero handlers.
         // The tree has 10 owner-marker handlers today; 6 trips only on a real break.
@@ -1797,7 +2013,7 @@ mod completeness {
         for entry in std::fs::read_dir(api_dir).expect("read api dir") {
             let path = entry.expect("dir entry").path();
             if path.extension().is_some_and(|e| e == "rs") {
-                let src = std::fs::read_to_string(&path).expect("read api file");
+                let src = scan_src(&std::fs::read_to_string(&path).expect("read api file"));
                 signer_self_marked.extend(handlers_matching(&src, has_signer_self_did_matches));
             }
         }
@@ -1806,6 +2022,12 @@ mod completeness {
         signer_self_marked.remove("did_matches");
         signer_self_marked.remove("require_owner");
         signer_self_marked.remove("require_repo_owner");
+        // task_claimable (tasks.rs) is a `pub(crate)` eligibility predicate, not a
+        // mounted handler: its `did_matches(caller, trim_assignee_did(assignee))`
+        // is the assignee arm that `claim_task`'s driven SignerSelfGate row already
+        // exercises through the real route. Same helper class as the removals
+        // above, not a SIGNER_SELF_NOT_DRIVEN REST gate.
+        signer_self_marked.remove("task_claimable");
 
         // Non-vacuous floor PINNED to the exact caller-self handler count (close_pr,
         // close_issue, dispute/submit/approve/cancel_bounty, create/claim/complete/
@@ -1857,7 +2079,7 @@ mod completeness {
         for entry in std::fs::read_dir(api_dir).expect("read api dir") {
             let path = entry.expect("dir entry").path();
             if path.extension().is_some_and(|e| e == "rs") {
-                let src = std::fs::read_to_string(&path).expect("read api file");
+                let src = scan_src(&std::fs::read_to_string(&path).expect("read api file"));
                 inline_mp.extend(handlers_matching(&src, has_claimant_inline_gate));
             }
         }
@@ -1917,7 +2139,7 @@ mod completeness {
                 continue;
             }
             if path.extension().is_some_and(|e| e == "rs") {
-                let src = std::fs::read_to_string(&path).expect("read api file");
+                let src = scan_src(&std::fs::read_to_string(&path).expect("read api file"));
                 // Comment-stripped scan: the read-gate markers appear in several
                 // docstrings, and a raw scan would allowlist phantom non-handlers.
                 read_marked.extend(handlers_with_code_marker(

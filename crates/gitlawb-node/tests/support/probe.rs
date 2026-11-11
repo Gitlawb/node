@@ -264,9 +264,16 @@ impl Fixture {
         // completable and failable tasks are claimed by the assignee, so
         // complete_task / fail_task reach their assignee actor gate against a
         // "claimed" task.
-        let claimable_task_id = seed_pending_task(node, &owner).await;
-        let completable_task_id = seed_claimed_task(node, &owner, &assignee).await;
-        let failable_task_id = seed_claimed_task(node, &owner, &assignee).await;
+        let claimable_task_id = seed_pending_task(node, &owner, None).await;
+        // completable/failable tasks sit on the PUBLIC repo: post-#327
+        // get_visible_task hides a repo-less task from any caller who is not the
+        // delegator/assignee, so a stranger hostile would 404 before the assignee
+        // gate. A public-repo task keeps the stranger visible so the hostile
+        // reaches the assignee 403 the rows drive.
+        let completable_task_id =
+            seed_claimed_task(node, &owner, &assignee, Some(&public_repo_id)).await;
+        let failable_task_id =
+            seed_claimed_task(node, &owner, &assignee, Some(&public_repo_id)).await;
 
         Fixture {
             owner,
@@ -347,14 +354,18 @@ async fn seed_authored_issue(
 /// handler and return its minted id. `create_task` binds `delegator_did` to the
 /// signer, so the body names the signer's DID. Task write routes sit behind
 /// `add_auth_layers` only (no icaptcha), so a signed create reaches the handler.
-async fn seed_pending_task(node: &TestNode, delegator: &Keypair) -> String {
+async fn seed_pending_task(node: &TestNode, delegator: &Keypair, repo_id: Option<&str>) -> String {
     use super::signing::signed_request;
 
     let client = super::bounded_client();
     let delegator_did = delegator.did().to_string();
-    let body =
-        format!(r#"{{"kind":"review","capability":"read","delegator_did":"{delegator_did}"}}"#)
-            .into_bytes();
+    let repo_field = repo_id
+        .map(|id| format!(r#","repo_id":"{id}""#))
+        .unwrap_or_default();
+    let body = format!(
+        r#"{{"kind":"review","capability":"read","delegator_did":"{delegator_did}"{repo_field}}}"#
+    )
+    .into_bytes();
     let resp = signed_request(
         &client,
         reqwest::Method::POST,
@@ -382,10 +393,15 @@ async fn seed_pending_task(node: &TestNode, delegator: &Keypair) -> String {
 /// Create a "pending" task (delegated by `owner`), then claim it as `assignee`
 /// (`claim_task` binds `assignee_did` to the signer), leaving it "claimed" so
 /// `complete_task` / `fail_task` reach their assignee actor gate. Returns the id.
-async fn seed_claimed_task(node: &TestNode, owner: &Keypair, assignee: &Keypair) -> String {
+async fn seed_claimed_task(
+    node: &TestNode,
+    owner: &Keypair,
+    assignee: &Keypair,
+    repo_id: Option<&str>,
+) -> String {
     use super::signing::signed_request;
 
-    let id = seed_pending_task(node, owner).await;
+    let id = seed_pending_task(node, owner, repo_id).await;
 
     let client = super::bounded_client();
     let assignee_did = assignee.did().to_string();

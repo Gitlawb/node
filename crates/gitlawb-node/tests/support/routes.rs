@@ -420,7 +420,11 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             path: "/api/v1/repos/{owner}/{repo}/visibility",
             gate: GateClass::OwnerGate,
             handler: "visibility::set_visibility",
-            body: Some(r#"{"path_glob":"/","reader_dids":[]}"#),
+            // The twin really sets this rule on the shared prober-pub repo, so the
+            // glob must stay off "/": the visibility handlers now authorize_repo_read
+            // before the owner check, and a "/"-withholding rule would 404 every
+            // later stranger probe on this repo instead of reaching their gates.
+            body: Some(r#"{"path_glob":"/swept-scope","reader_dids":[]}"#),
             needs: NO_ENTITY,
             reach: Reach::None,
             principals: NO_PRINCIPAL,
@@ -432,7 +436,8 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             path: "/api/v1/repos/{owner}/{repo}/visibility",
             gate: GateClass::OwnerGate,
             handler: "visibility::remove_visibility",
-            body: Some(r#"{"path_glob":"/"}"#),
+            // Removes the rule the set_visibility twin created above.
+            body: Some(r#"{"path_glob":"/swept-scope"}"#),
             needs: NO_ENTITY,
             reach: Reach::None,
             principals: NO_PRINCIPAL,
