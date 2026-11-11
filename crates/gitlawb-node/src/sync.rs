@@ -437,7 +437,18 @@ async fn process_batch(
                 // `upsert_mirror_repo` preserves an existing quarantine, and
                 // sampling then would record visibility the readers still deny.
                 let withheld = db.is_repo_quarantined(&item.repo).await.unwrap_or(true);
-                if mirror_visible && !withheld {
+                // Only sample when the queued outcome is what the mirror now
+                // shows: if the origin advanced the same ref past this row
+                // before the fetch ran, the mirror carries the newer tip and
+                // this row's visibility was never real. Deletions confirm when
+                // the ref is absent.
+                let tip = mirror_ref_tip(&local_path, &item.ref_name).await;
+                let outcome_visible = if item.new_sha.bytes().all(|b| b == b'0') {
+                    tip.is_none()
+                } else {
+                    tip.as_deref() == Some(item.new_sha.as_str())
+                };
+                if mirror_visible && !withheld && outcome_visible {
                     if let Some(lag) =
                         sync_lag_from_origin_timestamp(item.origin_timestamp.as_deref(), Utc::now())
                     {
@@ -686,6 +697,32 @@ async fn git_run(args: &[&str]) -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("git {args:?} failed: {stderr}"));
     }
     Ok(())
+}
+
+/// The sha `ref_name` resolves to inside `repo`, or `None` when the ref is
+/// absent or the read fails. Used by the lag observation gate to confirm the
+/// queued outcome is what the mirror actually carries before sampling.
+async fn mirror_ref_tip(repo: &std::path::Path, ref_name: &str) -> Option<String> {
+    // allow-unbounded-git: bounded by the tokio::time::timeout wrapping this
+    // read below, plus kill_on_drop; rev-parse is a metadata lookup, not a
+    // transfer, so the 10s cap is generous.
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.kill_on_drop(true);
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        cmd.args(["-C"])
+            .arg(repo)
+            .args(["rev-parse", "--verify", ref_name])
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!sha.is_empty()).then_some(sha)
 }
 
 /// Run a git subprocess, ignoring a non-zero exit. Used for idempotent

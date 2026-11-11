@@ -1711,10 +1711,15 @@ fn spawn_deferred_tail_after_proof(
     }
     let repo_id = req.repo_id.clone();
     let pusher_did = req.pusher_did.clone();
-    // The request row was created when the push was accepted, so its
-    // created_at IS the push-land instant the lag origin should carry,
-    // not this deferred drain's Utc::now().
-    let push_landed_at = req.created_at.clone();
+    // The truest landing instant available: the applied_at stamp on the
+    // accepted transitions (written when the refs actually moved), with the
+    // request row's created_at (push acceptance) as the fallback. Either is
+    // truer than this deferred drain's Utc::now().
+    let push_landed_at = accepted
+        .iter()
+        .filter_map(|t| t.applied_at.clone())
+        .max()
+        .unwrap_or_else(|| req.created_at.clone());
     let landed: Vec<(String, String, String)> = accepted
         .iter()
         .map(|c| (c.ref_name.clone(), c.old_sha.clone(), c.new_sha.clone()))
