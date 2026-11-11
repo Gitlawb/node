@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build the Gitlawb Node macOS menu bar app.
+# Build the Twigpine Node macOS menu bar app.
 # Usage: ./scripts/build-macos-app.sh [--sign IDENTITY]
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -9,7 +9,7 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 APP_DIR="$ROOT_DIR/macos-app"
 BUILD_DIR="$APP_DIR/.build/release"
 OUTPUT_DIR="$ROOT_DIR/dist"
-APP_NAME="Gitlawb Node"
+APP_NAME="Twigpine Node"
 APP_BUNDLE="$OUTPUT_DIR/${APP_NAME}.app"
 
 SIGN_IDENTITY=""
@@ -27,7 +27,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-echo "==> Building Gitlawb Node macOS app..."
+echo "==> Building Twigpine Node macOS app..."
 
 # Ensure docker-compose.yml resource is up to date
 mkdir -p "$APP_DIR/Sources/GitlawbNode/Resources"
@@ -101,7 +101,7 @@ mkdir -p "$DMG_STAGING"
 cp -R "$APP_BUNDLE" "$DMG_STAGING/"
 ln -s /Applications "$DMG_STAGING/Applications"
 
-hdiutil create -volname "Gitlawb Node" \
+hdiutil create -volname "Twigpine Node" \
     -srcfolder "$DMG_STAGING" \
     -ov -format UDZO \
     "$DMG_PATH"

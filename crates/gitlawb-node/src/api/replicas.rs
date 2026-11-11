@@ -39,11 +39,11 @@ pub async fn register_replica(
 ) -> Result<(StatusCode, Json<serde_json::Value>)> {
     validate_replica_url(&req.url)?;
 
-    let record = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+    // The mutation response carries repo metadata (name, replica count), so
+    // registration applies the same read-visibility decision as the listing:
+    // a caller who may not read the repo gets the same 404 as a missing one.
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, Some(auth.0.as_str()), "/").await?;
 
     let replica_did = &auth.0;
 
@@ -93,11 +93,10 @@ pub async fn unregister_replica(
     Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, repo)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+    // Same gate as register_replica: removal mutates repo-scoped metadata and
+    // its response discloses the replica count.
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, Some(auth.0.as_str()), "/").await?;
 
     let replica_did = &auth.0;
     state.db.unregister_replica(&record.id, replica_did).await?;
@@ -113,16 +112,17 @@ pub async fn unregister_replica(
 }
 
 /// GET /api/v1/repos/:owner/:repo/replicas
-/// Public — returns the list of replicas (DID + URL + registration timestamp).
+/// Read-visibility-gated: a PUBLIC repo's replica list stays anonymously
+/// listable (mirror-discovery), but a PRIVATE repo's replica URLs are hidden
+/// (404) from anyone who cannot read the repo at its root.
 pub async fn list_replicas(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, caller, "/").await?;
 
     let replicas = state.db.list_replicas(&record.id).await?;
 

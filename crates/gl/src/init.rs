@@ -1,7 +1,7 @@
 //! `gl init` — zero-to-push in one command.
 //!
 //! Detects or initializes a git repo, ensures an identity exists,
-//! registers with the node, creates a remote repo, adds the gitlawb
+//! registers with the node, creates a remote repo, adds the Twigpine
 //! remote, and pushes.
 
 use anyhow::{Context, Result};
@@ -19,10 +19,14 @@ pub struct InitArgs {
     pub name: Option<String>,
 
     /// Node URL to register with
-    #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+    #[arg(
+        long,
+        default_value = "https://node.twigpine.com",
+        env = "GITLAWB_NODE"
+    )]
     pub node: String,
 
-    /// Identity directory (default: ~/.gitlawb)
+    /// Identity directory (default: the parent of $GITLAWB_KEY, else ~/.gitlawb)
     #[arg(long)]
     pub dir: Option<PathBuf>,
 
@@ -38,13 +42,23 @@ pub async fn run(args: InitArgs) -> Result<()> {
     let git_dir = cwd.join(".git");
     if !git_dir.exists() {
         println!("Initializing git repository...");
+        // -b main: the push flow targets `main`; without it a fresh repo uses
+        // the user's init.defaultBranch (often `master`). Older git (<2.28)
+        // lacks the flag, so fall back to a plain init.
         let status = std::process::Command::new("git")
-            .args(["init"])
+            .args(["init", "-b", "main"])
             .current_dir(&cwd)
             .status()
             .context("failed to run git init")?;
         if !status.success() {
-            anyhow::bail!("git init failed");
+            let status = std::process::Command::new("git")
+                .args(["init"])
+                .current_dir(&cwd)
+                .status()
+                .context("failed to run git init")?;
+            if !status.success() {
+                anyhow::bail!("git init failed");
+            }
         }
     } else {
         println!("Git repository detected.");
@@ -91,20 +105,17 @@ pub async fn run(args: InitArgs) -> Result<()> {
     // Save UCAN if returned
     if let Some(ucan) = payload.get("ucan").and_then(|v| v.as_str()) {
         if !ucan.is_empty() {
-            let ucan_dir = args
-                .dir
-                .clone()
-                .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".gitlawb"));
-            std::fs::create_dir_all(&ucan_dir)?;
+            let ucan_dir = crate::identity::gitlawb_dir(args.dir.clone())?;
+            crate::secret_file::create_dir(&ucan_dir)?;
             let record = json!({
                 "ucan": ucan,
                 "node": args.node,
                 "did": did.to_string(),
                 "saved_at": chrono::Utc::now().to_rfc3339(),
             });
-            std::fs::write(
-                ucan_dir.join("ucan.json"),
-                serde_json::to_string_pretty(&record)?,
+            crate::secret_file::write(
+                &ucan_dir.join("ucan.json"),
+                serde_json::to_string_pretty(&record)?.as_bytes(),
             )?;
         }
     }
@@ -141,7 +152,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
         println!("  Repository created.");
     }
 
-    // 5. Add gitlawb remote
+    // 5. Add Twigpine remote
     let did_short = did.to_string();
     let did_short = did_short.split(':').next_back().unwrap_or(&did_short);
     let remote_url = format!("gitlawb://{did_short}/{repo_name}");
@@ -165,37 +176,72 @@ pub async fn run(args: InitArgs) -> Result<()> {
         }
     }
 
+    // The hint must match the repo's actual state: with no commits yet, a bare
+    // `git push` fails with "src refspec ... does not match any" — exactly the
+    // trap a zero-to-push command must not set.
+    let has_commits = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD"])
+        .current_dir(&cwd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    // symbolic-ref succeeds on a branch (including an unborn one) and fails
+    // on a detached HEAD — where guessing "main" could push the wrong ref.
+    let branch = std::process::Command::new("git")
+        .args(["symbolic-ref", "--short", "HEAD"])
+        .current_dir(&cwd)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
     println!();
-    println!("Ready! Push with:");
-    println!("  git push gitlawb main");
+    match (branch, has_commits) {
+        (Some(branch), true) => {
+            println!("Ready! Push with:");
+            println!("  git push gitlawb {branch}");
+        }
+        (Some(branch), false) => {
+            println!("Ready! Nothing is committed yet — commit, then push:");
+            println!("  git add -A && git commit -m \"initial commit\"");
+            println!("  git push gitlawb {branch}");
+        }
+        (None, _) => {
+            println!("Ready! HEAD is detached — create or switch to a branch, then push:");
+            println!("  git switch -c main");
+            println!("  git push gitlawb main");
+        }
+    }
 
     Ok(())
 }
 
 fn generate_identity(dir: Option<&std::path::Path>) -> Result<gitlawb_core::identity::Keypair> {
-    let base = if let Some(d) = dir {
-        d.to_path_buf()
-    } else {
-        dirs::home_dir()
-            .context("could not determine home directory")?
-            .join(".gitlawb")
-    };
-    std::fs::create_dir_all(&base)?;
+    let path = crate::identity::key_path_for(dir)?;
+    let base = path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    crate::secret_file::create_dir(&base)?;
 
     let keypair = gitlawb_core::identity::Keypair::generate();
     let pem = keypair.to_pem()?;
-    let path = base.join("identity.pem");
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(&path, pem.as_bytes())?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&path, pem.as_bytes())?;
-    }
+    crate::secret_file::write_new(&path, pem.as_bytes()).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            anyhow::anyhow!(
+                "identity key already exists at {} — refusing to overwrite; pass --dir for a fresh location or move the key",
+                path.display()
+            )
+        } else {
+            anyhow::anyhow!(e)
+        }
+    })?;
 
     Ok(keypair)
 }

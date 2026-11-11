@@ -4,9 +4,31 @@ on:
   push:
     branches:
       - main
+  # Manual backfill: republish an already-cut release to a channel that
+  # missed it. Fill in only the channel(s) you want — an empty input leaves
+  # that channel's jobs skipped. npm reuses the existing release's binary
+  # assets; docker rebuilds the image from the tag and re-tags the manifest.
+  workflow_dispatch:
+    inputs:
+      npm_backfill_tag:
+        description: "Existing release tag to publish to npm (e.g. v0.6.0)"
+        required: false
+        type: string
+      docker_backfill_tag:
+        description: "Existing release tag to publish to ghcr (e.g. v0.6.0)"
+        required: false
+        type: string
 
 concurrency:
-  group: release-${{ github.ref }}
+  # Not keyed on the ref: two runs racing `imagetools create` on the same
+  # moving tags could interleave, so runs of this workflow serialize outright.
+  # GitHub keeps at most one running and one pending run per group; a newer
+  # queued run replaces the pending one, and cancel-in-progress: false
+  # protects only the run already executing. So a backfill dispatched while a
+  # release is running, followed by a push to main, is replaced silently: the
+  # remedy is to re-dispatch it once the running release completes, which the
+  # push-only gate on the moving-tag step makes safe in any ordering.
+  group: release
   cancel-in-progress: false
 
 # Least privilege by default; every job opts in to exactly what it needs.
@@ -14,16 +36,21 @@ permissions: {}
 
 jobs:
   release-please:
-    if: ${{ github.repository == 'Gitlawb/node' }}
+    # Skipped on manual dispatch: a backfill must never create or advance a
+    # release PR as a side effect (npm-publish tolerates the skipped need via
+    # !cancelled(), and every other job gates on release_created == 'true').
+    if: ${{ github.repository == 'Twigpine/node' && github.event_name != 'workflow_dispatch' }}
     name: Release Please
     runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: write
+    environment: release
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
       version: ${{ steps.release.outputs.version }}
+      pr: ${{ steps.release.outputs.pr }}
     steps:
       - name: Run release-please
         id: release
@@ -31,23 +58,201 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-  docker:
-    name: Build & Push Docker Image
+  # The release PR bumps the workspace crate versions in the Cargo.tomls but
+  # release-please cannot update Cargo.lock, so without this job every release
+  # merge ships a tag whose lockfile disagrees with its manifests (a --locked
+  # build from the tag fails, and pr-checks builds --locked). Sync the lock on
+  # the release branch so the tagged tree is internally consistent.
+  #
+  # Runs on every push-triggered release run, not only when release-please
+  # reports the PR: the `pr` output is set only on runs that CREATE or UPDATE
+  # the release PR, so gating on it would leave an already-open release PR
+  # (opened before this job existed, or untouched by a non-releasable push)
+  # permanently without the sync and without check runs. The resolve step
+  # discovers any open release-please PR itself and no-ops when there is none.
+  sync-release-lock:
+    name: Sync Cargo.lock on the release PR
     needs: release-please
-    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    if: ${{ !cancelled() && github.repository == 'Twigpine/node' && github.event_name != 'workflow_dispatch' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+      # actions: write lets the final step dispatch pr-checks on the release
+      # branch. Note this grant is repo-wide dispatch rights (GitHub cannot
+      # scope it to one workflow); acceptable here because reaching this job's
+      # steps already requires write to main. Needed because every push to the
+      # release branch (release-please's and the lock sync below) is made with
+      # GITHUB_TOKEN, which triggers no workflow runs, so without an explicit
+      # dispatch the release PR's head carries no check runs and the --locked
+      # gate never validates it.
+      actions: write
+    environment: release
+    steps:
+      # Prefer the fresh `pr` output when this run just created/updated the
+      # release PR; otherwise fall back to querying for an open release-please
+      # branch (prefix match: the branch carries `--components--` suffixes).
+      - name: Resolve the open release PR branch
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          BRANCH_FROM_OUTPUT: ${{ needs.release-please.outputs.pr && fromJSON(needs.release-please.outputs.pr).headBranchName || '' }}
+        run: |
+          branch="$BRANCH_FROM_OUTPUT"
+          if [ -z "$branch" ]; then
+            # The branch name alone is not a trust signal. `gh pr list` includes
+            # fork PRs, and a fork's headRefName is bare (no owner prefix), so a
+            # prefix match by itself lets any fork nominate the branch this job
+            # checks out, commits to, and dispatches checks on. Require the head
+            # repo to be THIS repository and the author to be the release-please
+            # app, so neither a fork nor a same-repo human branch named
+            # `release-please--*` can be selected. Then take the highest PR
+            # number: `[0]` depended on gh's default ordering, which is not a
+            # documented guarantee, and picking a stable one keeps a second
+            # (component) release PR from making the choice flap between runs.
+            branch=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
+              --json headRefName,headRepositoryOwner,number,author \
+              --jq '[ .[]
+                      | select(.headRepositoryOwner.login == env.OWNER)
+                      | select(.author.login == "app/github-actions")
+                      | select(.headRefName | startswith("release-please--"))
+                    ] | max_by(.number).headRefName // empty')
+          fi
+          if [ -z "$branch" ]; then
+            echo "no open release PR; nothing to sync"
+          fi
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout release branch
+        if: ${{ steps.resolve.outputs.branch != '' }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ steps.resolve.outputs.branch }}
+
+      # Resolve on a declared toolchain instead of whatever Rust the runner
+      # image happens to ship, so the lock this job writes comes off the same
+      # stable channel the other cargo jobs use. Not a claim of identical
+      # resolution: `stable` still moves between runs, and the MSRV gate
+      # checks this same lock on 1.91 (pr-checks.yml). It only removes the
+      # runner image as an undeclared input.
+      - name: Install Rust toolchain
+        if: ${{ steps.resolve.outputs.branch != '' }}
+        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b # stable
+        with:
+          toolchain: stable
+
+      - name: Sync workspace crate versions into Cargo.lock
+        if: ${{ steps.resolve.outputs.branch != '' }}
+        run: cargo update --workspace
+
+      - name: Commit and push when the lock changed
+        if: ${{ steps.resolve.outputs.branch != '' }}
+        run: |
+          if git diff --quiet Cargo.lock; then
+            echo "Cargo.lock already in sync"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git commit -m "chore: sync Cargo.lock with the release version bump"
+          git push
+
+      # Every push to the release branch is made with GITHUB_TOKEN (release-
+      # please's own pushes and the lock sync above), and events created by
+      # GITHUB_TOKEN start no workflow runs. workflow_dispatch is the documented
+      # exception GITHUB_TOKEN may trigger, so dispatch pr-checks at the release
+      # branch to attach check runs to its current head. Unconditional (also on
+      # the already-in-sync path) because the branch's ORIGINAL head has the
+      # same no-runs problem. Loud on failure by design: a silent fallback
+      # would recreate the checkless-head problem, and a job rerun is safe
+      # (sync no-ops, dispatch retries). Loop-safe: pr-checks is read-only and
+      # dispatches nothing. Runs after the push ack, so the dispatched ref tip
+      # is the sync commit. Merge-queue note: this validates the branch tip;
+      # the enforced merge queue's merge_group run still re-validates the true
+      # merged result before landing.
+      - name: Dispatch PR checks on the release branch
+        if: ${{ steps.resolve.outputs.branch != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.resolve.outputs.branch }}
+        run: |
+          # Every dispatch failure fails the job, including the 422 a release
+          # branch cut before pr-checks gained its workflow_dispatch trigger
+          # returns ("does not have a workflow_dispatch trigger", reported
+          # against the dispatched ref's copy of the file). An earlier revision
+          # tolerated exactly that 422 on the theory that release-please would
+          # rewrite the branch and heal it, but a rewrite only happens when a
+          # later releasable commit lands: an open release PR nobody touches is
+          # never rewritten. Tolerating it therefore left the lock-sync commit
+          # this job had just pushed sitting on the release head with no
+          # --locked validation, which is the precise state this workflow exists
+          # to prevent. The tolerance is also no longer needed: once this lands,
+          # every release branch is cut from a main that already carries the
+          # trigger, so the only branch that could 422 is one open at merge time
+          # (there is none), and a job rerun after a manual rebase is safe (the
+          # sync no-ops, the dispatch retries).
+          gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/pr-checks.yml/dispatches" \
+            -f "ref=$BRANCH"
+
+  # Each architecture builds NATIVELY (amd64 on ubuntu-latest, arm64 on
+  # ubuntu-24.04-arm) and pushes by digest; docker-manifest below stitches the
+  # digests into the tagged multi-arch image. No QEMU: emulating the arm64
+  # Rust release build wedged the v0.6.0 run for 3+ hours and, via the
+  # workflow concurrency group, blocked every queued release run behind it.
+  docker:
+    name: Build & Push Docker Image (${{ matrix.arch }})
+    needs: release-please
+    # Runs on a fresh release, or on manual dispatch for an existing tag
+    # (release-please is skipped on dispatch, hence !cancelled()).
+    if: >-
+      ${{ !cancelled() && (
+        needs.release-please.outputs.release_created == 'true' ||
+        (github.event_name == 'workflow_dispatch' && inputs.docker_backfill_tag != '')
+      ) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            os: ubuntu-latest
+            platform: linux/amd64
+          - arch: arm64
+            os: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: read
       packages: write
+    environment: release
     steps:
+      - name: Check out workflow scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Resolve release tag
+        id: rel
+        env:
+          DISPATCH_TAG: ${{ inputs.docker_backfill_tag }}
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          scripts/resolve-release-tag.sh "${DISPATCH_TAG:-$RELEASE_TAG}"
+          # ghcr requires a lowercase repository path, and unlike metadata-action,
+          # buildx's `--output name=` does no lowercasing — a mixed-case owner
+          # makes the digest push fail with "invalid reference format".
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
       - name: Checkout release tag
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
+          # Pin the commit the resolver verified; a tag ref re-resolved here
+          # could have been moved between resolve and checkout.
+          ref: ${{ steps.rel.outputs.tag_commit || format('refs/tags/{0}', steps.rel.outputs.tag) }}
           persist-credentials: false
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
@@ -59,45 +264,192 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@902fa8ec7d6ecbf8d84d538b9b233a880e428804 # v5.7.0
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=semver,pattern={{version}},value=${{ needs.release-please.outputs.version }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release-please.outputs.version }}
-            type=raw,value=latest
-
       - name: Build and load locally (smoke)
         uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c1 # v6.16.0
         with:
           context: .
+          platforms: ${{ matrix.platform }}
           load: true
           tags: gitlawb-node:smoke
-          cache-from: type=gha
+          cache-from: type=gha,scope=docker-${{ matrix.arch }}
 
+      # Native runner on both arches, so the built image can always execute.
+      # Assert the released version so a stale artifact fails here, not in prod.
       - name: Smoke test
-        run: docker run --rm gitlawb-node:smoke --version
+        env:
+          VERSION: ${{ steps.rel.outputs.version }}
+        run: |
+          set -euo pipefail
+          out="$(docker run --rm gitlawb-node:smoke --version)"
+          echo "$out"
+          grep -qF "$VERSION" <<<"$out" || {
+            echo "::error::image --version did not report expected version $VERSION (got: $out)"
+            exit 1
+          }
 
-      - name: Build and push (multi-arch)
+      # Push by digest only — tags are applied once by docker-manifest so a
+      # half-finished matrix can never publish a partially-tagged image.
+      # provenance:false keeps each push a plain single-arch manifest, which is
+      # what imagetools create expects to merge.
+      - name: Build and push by digest
+        id: push
         uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c1 # v6.16.0
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          outputs: type=image,name=${{ steps.rel.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=docker-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=docker-${{ matrix.arch }}
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: docker-digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  docker-manifest:
+    name: Publish Docker manifest
+    needs: [release-please, docker]
+    if: ${{ !cancelled() && needs.docker.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    environment: release
+    steps:
+      - name: Check out workflow scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Resolve release tag
+        id: rel
+        env:
+          DISPATCH_TAG: ${{ inputs.docker_backfill_tag }}
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          scripts/resolve-release-tag.sh "${DISPATCH_TAG:-$RELEASE_TAG}"
+          # ghcr requires a lowercase repository path, and unlike metadata-action,
+          # buildx's `--output name=` does no lowercasing, so a mixed-case owner
+          # makes the digest push fail with "invalid reference format".
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Download digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: docker-digest-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifest
+        id: manifest
+        env:
+          VERSION: ${{ steps.rel.outputs.version }}
+          IMAGE: ${{ steps.rel.outputs.image }}
+        run: |
+          set -euo pipefail
+          # The docker matrix pushes one digest per arch leg; anything else is
+          # a broken set, not a smaller multi-arch image.
+          count="$(find /tmp/digests -maxdepth 1 -type f | wc -l)"
+          if [ "$count" -ne 2 ]; then
+            echo "::error::expected 2 arch digests in /tmp/digests, found $count"
+            exit 1
+          fi
+          digests=""
+          for f in /tmp/digests/*; do
+            d="$(basename "$f")"
+            case "$d" in
+              *[!0-9a-f]*)
+                echo "::error::digest filename is not lowercase sha256 hex: $d"
+                exit 1
+                ;;
+            esac
+            if [ "${#d}" -ne 64 ]; then
+              echo "::error::digest is not 64 hex chars: $d"
+              exit 1
+            fi
+            digests="$digests $IMAGE@sha256:$d"
+          done
+          # The immutable tag always publishes. The moving tags are applied by
+          # the gated step below, which never runs on workflow_dispatch.
+          # shellcheck disable=SC2086
+          docker buildx imagetools create -t "$IMAGE:$VERSION" $digests
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
+          echo "digests=${digests# }" >> "$GITHUB_OUTPUT"
+
+      - name: Move floating tags
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        env:
+          VERSION: ${{ steps.rel.outputs.version }}
+          IMAGE: ${{ steps.rel.outputs.image }}
+          DIGESTS: ${{ steps.manifest.outputs.digests }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          MAJOR_MINOR="${VERSION%.*}"
+          # :latest and :X.Y track the newest release. Only a push to main
+          # carries a release-please-cut version, and release-please versions
+          # are monotonic, so on this path the tags only ever advance. A
+          # workflow_dispatch backfill republishes an existing tag and must
+          # never move a pointer, so this step skips on dispatch. After a
+          # backfill that is genuinely newest in its minor line, advance :X.Y
+          # by hand: docker buildx imagetools create -t "$IMAGE:X.Y" <digests>.
+          # The event gate alone does not bound a stale run: re-running an
+          # older push run replays its stored needs outputs under the
+          # original event and ref, and would move the pointers backward to
+          # that run's version. Floor against live state instead: this run's
+          # release already exists by now, so VERSION must be the newest
+          # published release or the run is stale and the tags stay put. The
+          # releases list is ordered by creation, not semver, so read every
+          # page and take the semver maximum, not the first page's.
+          tags="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            -q '.[] | select(.draft == false) | .tag_name')" || {
+            echo "::error::could not list releases to bound the moving tags"
+            exit 1
+          }
+          floor="$(printf '%s\n' "$tags" \
+            | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } \
+            | sed 's/^v//' | sort -V | tail -n 1)"
+          if [ -n "$floor" ] && [ "$floor" != "$VERSION" ]; then
+            echo "::error::release v$floor is newer than this run's v$VERSION; refusing to move the moving tags backward (stale re-run?)"
+            exit 1
+          fi
+          # shellcheck disable=SC2086
+          docker buildx imagetools create -t "$IMAGE:latest" -t "$IMAGE:$MAJOR_MINOR" $DIGESTS
 
       - name: Release summary
+        env:
+          VERSION: ${{ steps.rel.outputs.version }}
+          TAG: ${{ steps.rel.outputs.tag }}
         run: |
           {
-            echo "## Released ${{ needs.release-please.outputs.tag_name }}"
+            echo "## Released $TAG"
             echo
-            echo "- Image: \`ghcr.io/${{ github.repository }}:${{ needs.release-please.outputs.version }}\`"
-            echo "- GitHub: https://github.com/${{ github.repository }}/releases/tag/${{ needs.release-please.outputs.tag_name }}"
+            echo "- Image: \`ghcr.io/${GITHUB_REPOSITORY,,}:$VERSION\` (linux/amd64 + linux/arm64)"
+            echo "- GitHub: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
           } >> "$GITHUB_STEP_SUMMARY"
 
   release-binaries:
@@ -110,6 +462,7 @@ jobs:
     continue-on-error: ${{ startsWith(matrix.target, 'x86_64-pc-windows') }}
     permissions:
       contents: write
+    environment: release
     strategy:
       fail-fast: false
       matrix:
@@ -129,10 +482,27 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
     steps:
+      - name: Check out workflow scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Resolve release tag
+        id: rel
+        env:
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash # matrix includes windows-latest, where run: defaults to pwsh
+        run: |
+          set -euo pipefail
+          scripts/resolve-release-tag.sh "$RELEASE_TAG"
+
       - name: Checkout release tag
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
+          # Pin the commit the resolver verified; a tag ref re-resolved here
+          # could have been moved between resolve and checkout.
+          ref: ${{ steps.rel.outputs.tag_commit || format('refs/tags/{0}', steps.rel.outputs.tag) }}
           persist-credentials: false
 
       - name: Set up Rust toolchain
@@ -169,7 +539,7 @@ jobs:
           set -euo pipefail
           args=""
           for b in $BINS; do args="$args -p $b"; done
-          cargo build --release --target ${{ matrix.target }} $args
+          cargo build --release --locked --target ${{ matrix.target }} $args
 
       # Run each packaged binary's --version so a broken release artifact fails the
       # build instead of shipping. Every target builds on a matching-arch runner,
@@ -178,7 +548,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          VERSION="${{ needs.release-please.outputs.version }}"
+          VERSION="${{ steps.rel.outputs.version }}"
           BIN_DIR="target/${{ matrix.target }}/release"
           EXE=""
           case "${{ matrix.target }}" in *windows*) EXE=".exe" ;; esac
@@ -198,7 +568,7 @@ jobs:
         run: |
           set -euo pipefail
           TARGET="${{ matrix.target }}"
-          NAME="gitlawb-node-${{ needs.release-please.outputs.version }}-${TARGET}"
+          NAME="gitlawb-node-${{ steps.rel.outputs.version }}-${TARGET}"
           BIN_DIR="target/${TARGET}/release"
           EXE=""
           case "$TARGET" in *windows*) EXE=".exe" ;; esac
@@ -239,7 +609,7 @@ jobs:
       - name: Attach to release
         uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
         with:
-          tag_name: ${{ needs.release-please.outputs.tag_name }}
+          tag_name: ${{ steps.rel.outputs.tag }}
           files: |
             dist/*.tar.gz
             dist/*.zip
@@ -248,37 +618,76 @@ jobs:
   npm-publish:
     name: Publish to npm
     needs: [release-please, release-binaries]
-    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    # Runs on a fresh release, or on manual dispatch for an existing tag
+    # (release-binaries is skipped on dispatch, hence !cancelled()). Publishing
+    # auth is npm Trusted Publishing (GitHub OIDC) — no NPM_TOKEN. Each
+    # @gitlawb package must have this repo + workflow (release.yml) configured
+    # as its trusted publisher on npmjs.com, scoped to the release environment
+    # so a dispatched copy of this file on another ref cannot mint a token, or
+    # publish fails loudly here —
+    # deliberately loud: the silent secret-guard skip is how 0.4.x–0.6.0
+    # never reached npm.
+    if: >-
+      ${{ !cancelled() && (
+        (needs.release-please.outputs.release_created == 'true' && needs.release-binaries.result == 'success') ||
+        (github.event_name == 'workflow_dispatch' && inputs.npm_backfill_tag != '')
+      ) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write # npm provenance
+      id-token: write # npm trusted publishing (OIDC) + provenance
+    environment: release
     steps:
-      - name: Guard on secret
-        id: guard
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          if [ -z "${NPM_TOKEN:-}" ]; then
-            echo "::warning::NPM_TOKEN is not set — skipping npm publish."
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Checkout release tag
-        if: ${{ steps.guard.outputs.enabled == 'true' }}
+      - name: Check out workflow scripts
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
           persist-credentials: false
 
+      - name: Resolve release tag
+        id: rel
+        env:
+          DISPATCH_TAG: ${{ inputs.npm_backfill_tag }}
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          scripts/resolve-release-tag.sh "${DISPATCH_TAG:-$RELEASE_TAG}"
+
+      - name: Checkout release tag
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # Pin the commit the resolver verified; a tag ref re-resolved here
+          # could have been moved between resolve and checkout.
+          ref: ${{ steps.rel.outputs.tag_commit || format('refs/tags/{0}', steps.rel.outputs.tag) }}
+          persist-credentials: false
+
+      # npm >= 11.5.1 performs the OIDC token exchange automatically when the
+      # package has a trusted publisher configured; older npm silently falls
+      # back to (absent) token auth and fails confusingly.
+      - name: Set up Node 24 + OIDC-capable npm
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: "24"
+      - name: Ensure npm supports trusted publishing
+        run: |
+          set -euo pipefail
+          npm install -g npm@11.19.1
+          # Assert the pin took, so an accidental unpin or a drift off 11.19.1
+          # fails loudly here instead of silently running a different npm on
+          # the OIDC path.
+          installed="$(npm --version)"
+          echo "npm installed: $installed"
+          if [ "$installed" != "11.19.1" ]; then
+            echo "::error::npm is not the pinned 11.19.1 (got: $installed)"
+            exit 1
+          fi
+
       - name: Lay in release binaries
-        if: ${{ steps.guard.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.release-please.outputs.version }}
-          TAG: ${{ needs.release-please.outputs.tag_name }}
+          VERSION: ${{ steps.rel.outputs.version }}
+          TAG: ${{ steps.rel.outputs.tag }}
+          ASSETS: ${{ steps.rel.outputs.assets }}
         run: |
           set -euo pipefail
           # npm platform package -> Rust target triple (unix only; Windows is not
@@ -295,8 +704,18 @@ jobs:
             target="${entry#*:}"
             archive="gitlawb-node-${VERSION}-${target}.tar.gz"
             echo "==> $pkg <- $archive"
-            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --pattern "$archive" --dir _dl --clobber
+            # Download by the asset id the resolver captured and uploader-
+            # checked, not by name: release assets are mutable, and an id can
+            # only ever point at the exact blob captured at resolve time.
+            # The map keys are base64-encoded asset names.
+            want="$(printf '%s' "$archive" | base64 -w0)"
+            asset_id="$(printf '%s\n' "$ASSETS" | awk -v n="$want" '$1 == n {print $2; exit}')"
+            if [ -z "$asset_id" ]; then
+              echo "::error::release $TAG has no asset $archive captured at resolve time"
+              exit 1
+            fi
+            gh api "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+              -H 'Accept: application/octet-stream' > "_dl/$archive"
             tar -xzf "_dl/$archive" -C _dl
             src="_dl/gitlawb-node-${VERSION}-${target}"
             cp "$src/gl" "npm/packages/$pkg/gl"
@@ -305,9 +724,8 @@ jobs:
           done
 
       - name: Set versions
-        if: ${{ steps.guard.outputs.enabled == 'true' }}
         env:
-          VERSION: ${{ needs.release-please.outputs.version }}
+          VERSION: ${{ steps.rel.outputs.version }}
         run: |
           set -euo pipefail
           node -e '
@@ -327,24 +745,48 @@ jobs:
           '
 
       - name: Publish
-        if: ${{ steps.guard.outputs.enabled == 'true' }}
         env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-          VERSION: ${{ needs.release-please.outputs.version }}
+          VERSION: ${{ steps.rel.outputs.version }}
         run: |
           set -euo pipefail
-          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
+          # No token: npm exchanges this job's GitHub OIDC identity with the
+          # registry (trusted publishing); provenance is attested automatically.
           # Platform packages first, then the wrapper (so its optionalDependencies resolve).
           # Skip versions already on the registry so a rerun after a partial publish
           # is idempotent instead of erroring on the first existing package.
+          # npm publish moves the latest dist-tag to whatever it publishes, so a
+          # backfilled older version would hand :latest to stale code. Decide
+          # the dist-tag per package from that package's own registry latest:
+          # a partial publish can leave the platform packages ahead of the
+          # wrapper. E404 means the package has never been published, so this
+          # release gets latest; any other lookup failure must fail closed
+          # rather than guess at the dist-tag and risk moving latest backward.
+          # stderr goes to a file so a warning on a successful lookup cannot
+          # leak into registry_latest; it is read only when the lookup fails.
+          npm_err="$(mktemp)"
+          trap 'rm -f -- "$npm_err"' EXIT
           for pkg in gl-darwin-arm64 gl-darwin-x64 gl-linux-arm64 gl-linux-x64 gl; do
             name="@gitlawb/$pkg"
             if npm view "$name@$VERSION" version >/dev/null 2>&1; then
               echo "==> $name@$VERSION already published, skipping"
               continue
             fi
-            echo "==> npm publish $name@$VERSION"
-            npm publish "npm/packages/$pkg" --provenance --access public
+            registry_latest="$(npm view "$name" dist-tags.latest 2>"$npm_err")" || {
+              if ! grep -q E404 "$npm_err"; then
+                cat "$npm_err" >&2
+                echo "::error::npm dist-tags lookup failed for $name; not guessing the dist-tag"
+                exit 1
+              fi
+              registry_latest=""
+            }
+            dist_tag="latest"
+            if [ -n "$registry_latest" ] && \
+               [ "$VERSION" != "$(printf '%s\n%s\n' "$registry_latest" "$VERSION" | sort -V | tail -1)" ]; then
+              dist_tag="backfill"
+              echo "::notice::$VERSION is older than $name@$registry_latest; publishing under dist-tag backfill"
+            fi
+            echo "==> npm publish $name@$VERSION (dist-tag $dist_tag)"
+            npm publish "npm/packages/$pkg" --provenance --access public --tag "$dist_tag"
           done
 
   homebrew-bump:
@@ -354,6 +796,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read # GITHUB_TOKEN downloads release assets; the tap push uses HOMEBREW_TAP_PAT
+    environment: release
     steps:
       - name: Guard on secret
         id: guard
@@ -367,11 +810,27 @@ jobs:
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Check out workflow scripts
+        if: ${{ steps.guard.outputs.enabled == 'true' }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Resolve release tag
+        if: ${{ steps.guard.outputs.enabled == 'true' }}
+        id: rel
+        env:
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          scripts/resolve-release-tag.sh "$RELEASE_TAG"
+
       - name: Checkout tap repo
         if: ${{ steps.guard.outputs.enabled == 'true' }}
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: Gitlawb/homebrew-tap
+          repository: Twigpine/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_PAT }}
           path: tap
           persist-credentials: false
@@ -380,15 +839,32 @@ jobs:
         if: ${{ steps.guard.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.release-please.outputs.version }}
-          TAG: ${{ needs.release-please.outputs.tag_name }}
+          VERSION: ${{ steps.rel.outputs.version }}
+          TAG: ${{ steps.rel.outputs.tag }}
+          ASSETS: ${{ steps.rel.outputs.assets }}
         run: |
           set -euo pipefail
           base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
           mkdir -p _sums
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
-            --pattern '*.tar.gz.sha256' --dir _sums --clobber
-          sha() { awk '{print $1}' "_sums/gitlawb-node-${VERSION}-$1.tar.gz.sha256"; }
+          # Hash the tarballs themselves, fetched by the asset id the resolver
+          # captured and uploader-checked. The *.sha256 sidecars are mutable
+          # release assets too; trusting them would trust the same surface.
+          sha() {
+            archive="gitlawb-node-${VERSION}-$1.tar.gz"
+            want="$(printf '%s' "$archive" | base64 -w0)"
+            asset_id="$(printf '%s\n' "$ASSETS" | awk -v n="$want" '$1 == n {print $2; exit}')"
+            if [ -z "$asset_id" ]; then
+              echo "::error::release $TAG has no asset $archive captured at resolve time" >&2
+              exit 1
+            fi
+            # errexit is off inside the $(...) this runs under, so a failed
+            # download must exit the function itself instead of hashing a
+            # truncated file.
+            gh api "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+              -H 'Accept: application/octet-stream' > "_sums/$archive" \
+              || exit 1
+            sha256sum "_sums/$archive" | awk '{print $1}'
+          }
           SHA_MAC_ARM="$(sha aarch64-apple-darwin)"
           SHA_MAC_X64="$(sha x86_64-apple-darwin)"
           SHA_LNX_ARM="$(sha aarch64-unknown-linux-musl)"
@@ -397,8 +873,8 @@ jobs:
           mkdir -p tap/Formula
           cat > tap/Formula/gl.rb <<EOF
           class Gl < Formula
-            desc "Gitlawb CLI — decentralized git for AI agents and developers"
-            homepage "https://gitlawb.com"
+            desc "Twigpine CLI — decentralized git for AI agents and developers"
+            homepage "https://twigpine.com"
             version "${VERSION}"
             license "MIT OR Apache-2.0"
 
@@ -429,6 +905,15 @@ jobs:
               bin.install "git-remote-gitlawb"
             end
 
+            def caveats
+              <<~CAVEATS
+                oh-my-zsh's git plugin aliases gl='git pull', which shadows this
+                binary in interactive shells. If \`gl\` prints "fatal: not a git
+                repository", run:
+                  echo 'unalias gl 2>/dev/null' >> ~/.zshrc && source ~/.zshrc
+              CAVEATS
+            end
+
             test do
               assert_match version.to_s, shell_output("#{bin}/gl --version")
             end
@@ -440,7 +925,7 @@ jobs:
         working-directory: tap
         env:
           HOMEBREW_TAP_PAT: ${{ secrets.HOMEBREW_TAP_PAT }}
-          VERSION: ${{ needs.release-please.outputs.version }}
+          VERSION: ${{ steps.rel.outputs.version }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -453,7 +938,7 @@ jobs:
           fi
           git commit -m "gl ${VERSION}"
           # Credentials are not persisted in .git/config; supply the token only for the push.
-          git push "https://x-access-token:${HOMEBREW_TAP_PAT}@github.com/Gitlawb/homebrew-tap.git" HEAD:main
+          git push "https://x-access-token:${HOMEBREW_TAP_PAT}@github.com/Twigpine/homebrew-tap.git" HEAD:main
 
   web-sync:
     name: Sync web (install scripts + version)
@@ -462,6 +947,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read # GITHUB_TOKEN checks out node; the web PR uses WEB_SYNC_PAT
+    environment: release
     steps:
       - name: Guard on secret
         id: guard
@@ -475,11 +961,29 @@ jobs:
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Check out workflow scripts
+        if: ${{ steps.guard.outputs.enabled == 'true' }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Resolve release tag
+        if: ${{ steps.guard.outputs.enabled == 'true' }}
+        id: rel
+        env:
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          scripts/resolve-release-tag.sh "$RELEASE_TAG"
+
       - name: Checkout node (release tag)
         if: ${{ steps.guard.outputs.enabled == 'true' }}
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
+          # Pin the commit the resolver verified; a tag ref re-resolved here
+          # could have been moved between resolve and checkout.
+          ref: ${{ steps.rel.outputs.tag_commit || format('refs/tags/{0}', steps.rel.outputs.tag) }}
           path: node
           persist-credentials: false
 
@@ -487,7 +991,7 @@ jobs:
         if: ${{ steps.guard.outputs.enabled == 'true' }}
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: Gitlawb/web
+          repository: Twigpine/web
           token: ${{ secrets.WEB_SYNC_PAT }}
           path: web
           persist-credentials: false
@@ -499,8 +1003,8 @@ jobs:
         if: ${{ steps.guard.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.release-please.outputs.version }}
-          TAG: ${{ needs.release-please.outputs.tag_name }}
+          VERSION: ${{ steps.rel.outputs.version }}
+          TAG: ${{ steps.rel.outputs.tag }}
         run: |
           set -euo pipefail
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
@@ -518,8 +1022,8 @@ jobs:
         if: ${{ steps.guard.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.WEB_SYNC_PAT }}
-          VERSION: ${{ needs.release-please.outputs.version }}
-          TAG: ${{ needs.release-please.outputs.tag_name }}
+          VERSION: ${{ steps.rel.outputs.version }}
+          TAG: ${{ steps.rel.outputs.tag }}
         run: |
           set -euo pipefail
           # Canonical install scripts (source of truth lives in the node repo).
@@ -530,7 +1034,7 @@ jobs:
           # One-time, idempotent drift fixes: drop orphaned binaries, fix stale link.
           rm -rf web/public/bin
           if [ -f web/public/skill.md ]; then
-            sed -i 's#github.com/gitlawb/releases#github.com/Gitlawb/node/releases#g' web/public/skill.md
+            sed -i 's#github.com/gitlawb/releases#github.com/Twigpine/node/releases#g' web/public/skill.md
           fi
 
           cd web
@@ -544,16 +1048,16 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch"
-          git commit -m "chore: sync gitlawb ${TAG} (install scripts + version)"
+          git commit -m "chore: sync Twigpine ${TAG} (install scripts + version)"
           # Credentials are not persisted in .git/config; supply the token only for the push.
-          git push --force "https://x-access-token:${GH_TOKEN}@github.com/Gitlawb/web.git" "HEAD:$branch"
-          gh pr create --repo Gitlawb/web --head "$branch" \
-            --title "Sync gitlawb ${TAG}" \
-            --body "Automated sync from Gitlawb/node ${TAG}: install.sh, install.ps1, public/version.json, and one-time drift fixes (removed orphaned public/bin, fixed skill.md releases link). Review and merge to deploy via Vercel." \
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/Twigpine/web.git" "HEAD:$branch"
+          gh pr create --repo Twigpine/web --head "$branch" \
+            --title "Sync Twigpine ${TAG}" \
+            --body "Automated sync from Twigpine/node ${TAG}: install.sh, install.ps1, public/version.json, and one-time drift fixes (removed orphaned public/bin, fixed skill.md releases link). Review and merge to deploy via Vercel." \
             || {
               # Only swallow the "PR already exists" case; surface auth/API failures
               # (a failed gh pr list must not be misread as "PR exists").
-              pr_count="$(gh pr list --repo Gitlawb/web --head "$branch" --state open --json number --jq 'length')" || exit 1
+              pr_count="$(gh pr list --repo Twigpine/web --head "$branch" --state open --json number --jq 'length')" || exit 1
               if [ "$pr_count" != "0" ]; then
                 echo "PR for $branch already exists; branch was updated."
               else

@@ -17,8 +17,38 @@ use gitlawb_core::did::Did;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::AuthenticatedDid;
+use crate::db::{PeerWriteAuthority, PeerWriteDenied};
 use crate::error::{AppError, Result};
 use crate::state::AppState;
+
+/// Map an `upsert_peer` failure onto its response class.
+///
+/// The boundary's denials arrive inside an anyhow chain, so they are downcast
+/// back out the way `From<anyhow::Error> for AppError` already recovers sqlx
+/// errors. Without this a refusal renders as a 500, which is the mis-rendered
+/// denial this gate exists to avoid. An authority refusal is 403; naming a DID
+/// method that can never authenticate, or a DID whose verifying key cannot be
+/// resolved, is a fact about the input's form, so both are the 400 validation
+/// class, and the unresolvable one carries its own code so it reads the same to
+/// a client as the auth middleware's answer for an unresolvable keyid. The match
+/// stays exhaustive with no wildcard: the compile error a new denial causes here
+/// is what finds every mapping site.
+fn peer_write_error(err: anyhow::Error) -> AppError {
+    match err.downcast::<PeerWriteDenied>() {
+        Ok(denied) => match &denied {
+            PeerWriteDenied::UnsupportedDidMethod { .. } => {
+                AppError::BadRequest(denied.to_string())
+            }
+            PeerWriteDenied::UnresolvableDid { .. } => {
+                AppError::UnresolvableDid(denied.to_string())
+            }
+            PeerWriteDenied::UnprovenRepoint { .. } | PeerWriteDenied::ProofDidMismatch { .. } => {
+                AppError::Forbidden(denied.to_string())
+            }
+        },
+        Err(other) => AppError::from(other),
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct AnnounceRequest {
@@ -40,6 +70,8 @@ pub struct PeerResponse {
     pub reachable: bool,
 }
 
+pub(crate) const PUBLIC_HTTP_URL_REQUIREMENT: &str = "must be a public http(s) URL (no loopback, private, localhost, .localhost, .internal, or .local hosts)";
+
 /// Extract an IPv4 address embedded in an IPv6 literal across the transition
 /// formats that carry one: IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible
 /// (`::a.b.c.d`), 6to4 (`2002:WWXX:YYZZ::/16`), and the NAT64 well-known prefix
@@ -52,7 +84,7 @@ pub struct PeerResponse {
 /// sits at a prefix-length-dependent offset (RFC 6052 §2.2) — so they return
 /// `None`. Any caller that needs them blocked must reject the wider
 /// `64:ff9b::/32` itself; `is_public_http_url` does this in its native-v6 arm.
-fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+pub(crate) fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
     if let Some(v4) = v6.to_ipv4_mapped().or_else(|| v6.to_ipv4()) {
         return Some(v4);
     }
@@ -72,10 +104,120 @@ fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
     None
 }
 
+/// Whether an IP literal is outside the local/private ranges that an
+/// attacker-controlled outbound URL must never reach. Kept separate from URL
+/// parsing so callers that resolve a DNS name themselves can apply the same
+/// classification to every answer and then pin the approved addresses.
+pub(crate) fn is_public_ip(ip: std::net::IpAddr) -> bool {
+    // Reject loopback/unspecified on the literal as given — catches `::1` and
+    // `::` before the IPv4-folding below (`::1`.to_ipv4() would otherwise map
+    // to a non-loopback `0.0.0.1`).
+    if ip.is_loopback() || ip.is_unspecified() {
+        return false;
+    }
+    // Fold any IPv6 literal that embeds an IPv4 address (mapped, compatible,
+    // 6to4, NAT64) down to that IPv4 so the v4 range checks catch
+    // loopback/private addresses smuggled in via an IPv6 encoding, then
+    // re-check loopback/unspecified.
+    let ip = match ip {
+        std::net::IpAddr::V6(v6) => embedded_ipv4(v6).map(std::net::IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    };
+    if ip.is_loopback() || ip.is_unspecified() {
+        return false;
+    }
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            // RFC1918 private, link-local, CGNAT (100.64.0.0/10), or the
+            // RFC1122 "this host" block 0.0.0.0/8 (never a valid destination;
+            // 0.0.0.0 itself is already caught by the is_unspecified check).
+            if v4.is_private()
+                || v4.is_link_local()
+                || (o[0] == 100 && (o[1] & 0xc0) == 64)
+                || o[0] == 0
+            {
+                return false;
+            }
+        }
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments();
+            // fc00::/7 (unique-local), fe80::/10 (link-local), or fec0::/10
+            // (site-local, deprecated by RFC 3879; the link-local mask does
+            // not cover it).
+            if (s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80 || (s[0] & 0xffc0) == 0xfec0 {
+                return false;
+            }
+            // Any NAT64 address (64:ff9b::/32) that is not the cleanly
+            // decodable well-known /96 — e.g. the RFC 8215 local-use
+            // 64:ff9b:1::/48 — carries a translated target whose embedded v4
+            // sits at a prefix-length-dependent offset (RFC 6052 §2.2).
+            // Rather than risk a wrong decode across every prefix length we
+            // reject the whole NAT64 space here. The well-known /96 was already
+            // folded to its v4 above and never reaches this arm.
+            if s[0] == 0x0064 && s[1] == 0xff9b {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Mirror-upstream variant of [`is_public_ip`]: in addition to the shared
+/// peer classification, rejects IANA special-purpose ranges that are
+/// non-global, locally meaningful, or unsafe as owner-controlled outbound
+/// fetch endpoints. For IP-literal upstreams, configure-time URL validation
+/// and the fetch-time egress policy share this classifier, so a stored
+/// literal can never fail the worker it is scheduled for. Hostname upstreams
+/// are only shape-checked at configure time: each fetch resolves DNS and
+/// applies this classifier to the answers, so a hostname whose answers turn
+/// non-public still fails at fetch time.
+pub(crate) fn mirror_upstream_ip_permitted(ip: std::net::IpAddr) -> bool {
+    if !is_public_ip(ip) {
+        return false;
+    }
+    let classified = match ip {
+        std::net::IpAddr::V6(v6) => embedded_ipv4(v6).map(std::net::IpAddr::V4).unwrap_or(ip),
+        _ => ip,
+    };
+    match classified {
+        std::net::IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            // IANA special-purpose ranges that are not globally reachable but
+            // may be routed inside labs, clouds, or operator networks. They are
+            // unsuitable for an owner-controlled outbound fetch even though
+            // `Ipv4Addr::is_private` does not classify them as RFC1918.
+            !(a >= 224
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 192 && b == 0 && c == 2)
+                || (a == 192 && b == 88 && c == 99)
+                || (a == 198 && matches!(b, 18 | 19))
+                || (a == 198 && b == 51 && c == 100)
+                || (a == 203 && b == 0 && c == 113))
+        }
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments();
+            // IANA special-purpose ranges that are non-global, locally
+            // meaningful, or unsafe to treat as ordinary forge endpoints.
+            // Reject the complete IETF protocol-assignment /23 rather than
+            // trying to maintain its narrow globally reachable exceptions;
+            // a public forge has no reason to depend on those anycast ranges.
+            !(v6.is_multicast()
+                || (s[0] & 0xffc0) == 0xfec0
+                || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
+                || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 1)
+                || (s[0] == 0x2001 && (s[1] & 0xfe00) == 0)
+                || (s[0] == 0x2001 && s[1] == 0x0db8)
+                || (s[0] == 0x3fff && (s[1] & 0xf000) == 0)
+                || s[0] == 0x5f00)
+        }
+    }
+}
+
 /// Whether a peer `http_url` is a public http(s) endpoint safe to register.
 /// Rejects non-http(s) schemes, loopback/unspecified/private/link-local IPs,
-/// and `localhost` / `.local` / `.internal` hostnames. Used at announce time
-/// and by the boot-time prune of already-poisoned rows.
+/// and `localhost` / `.localhost` / `.local` / `.internal` hostnames. Used at
+/// announce time and by the boot-time prune of already-poisoned rows.
 pub fn is_public_http_url(raw: &str) -> bool {
     let url = match reqwest::Url::parse(raw) {
         Ok(u) => u,
@@ -88,13 +230,14 @@ pub fn is_public_http_url(raw: &str) -> bool {
         Some(h) => h.to_ascii_lowercase(),
         None => return false,
     };
-    // Drop a single trailing dot (FQDN root): `localhost.` resolves the same as
+    // Drop trailing dots (FQDN root): `localhost.` resolves the same as
     // `localhost`, so normalize before the suffix/equality checks below.
-    if let Some(stripped) = host.strip_suffix('.') {
-        host = stripped.to_string();
-    }
+    // Strip to fixation rather than once, or `localhost..` reduces to
+    // `localhost.` and matches neither the equality nor the suffix check.
+    host.truncate(host.trim_end_matches('.').len());
     if host.is_empty()
         || host == "localhost"
+        || host.ends_with(".localhost")
         || host.ends_with(".local")
         || host.ends_with(".internal")
     {
@@ -104,55 +247,16 @@ pub fn is_public_http_url(raw: &str) -> bool {
     // before parsing as an IP.
     let ip_candidate = host.trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = ip_candidate.parse::<std::net::IpAddr>() {
-        // Reject loopback/unspecified on the literal as given — catches `::1`
-        // and `::` before the IPv4-folding below (`::1`.to_ipv4() would
-        // otherwise map to a non-loopback `0.0.0.1`).
-        if ip.is_loopback() || ip.is_unspecified() {
-            return false;
-        }
-        // Fold any IPv6 literal that embeds an IPv4 address (mapped, compatible,
-        // 6to4, NAT64) down to that IPv4 so the v4 range checks catch
-        // loopback/private addresses smuggled in via an IPv6 encoding, then
-        // re-check loopback/unspecified.
-        let ip = match ip {
-            std::net::IpAddr::V6(v6) => embedded_ipv4(v6).map(std::net::IpAddr::V4).unwrap_or(ip),
-            v4 => v4,
-        };
-        if ip.is_loopback() || ip.is_unspecified() {
-            return false;
-        }
-        match ip {
-            std::net::IpAddr::V4(v4) => {
-                let o = v4.octets();
-                // RFC1918 private, link-local, CGNAT (100.64.0.0/10), or the
-                // RFC1122 "this host" block 0.0.0.0/8 (never a valid destination;
-                // 0.0.0.0 itself is already caught by the is_unspecified check).
-                if v4.is_private()
-                    || v4.is_link_local()
-                    || (o[0] == 100 && (o[1] & 0xc0) == 64)
-                    || o[0] == 0
-                {
-                    return false;
-                }
-            }
-            std::net::IpAddr::V6(v6) => {
-                let s = v6.segments();
-                // fc00::/7 (unique-local) or fe80::/10 (link-local)
-                if (s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80 {
-                    return false;
-                }
-                // Any NAT64 address (64:ff9b::/32) that is not the cleanly
-                // decodable well-known /96 — e.g. the RFC 8215 local-use
-                // 64:ff9b:1::/48 — carries a translated target whose embedded v4
-                // sits at a prefix-length-dependent offset (RFC 6052 §2.2).
-                // Rather than risk a wrong decode across every prefix length we
-                // reject the whole NAT64 space here. The well-known /96 was
-                // already folded to its v4 above and never reaches this arm.
-                if s[0] == 0x0064 && s[1] == 0xff9b {
-                    return false;
-                }
-            }
-        }
+        // IP literals share the single DNS/literal classification in
+        // `is_public_ip`; hostname-only rules stay local to this function.
+        return is_public_ip(ip);
+    } else if !host.contains('.') {
+        // A name with no dot at all. The `.local` / `.internal` rules above are
+        // suffix checks, so a single label slips both, and the resolver decides
+        // what it means by appending a search domain we cannot see from here.
+        // Only reachable when the host did not parse as an IP literal, which is
+        // what keeps bracketed IPv6 (also dotless) on the accepting path.
+        return false;
     }
     true
 }
@@ -187,18 +291,30 @@ pub async fn announce(
         .did
         .parse()
         .map_err(|e: gitlawb_core::Error| AppError::BadRequest(e.to_string()))?;
-    if let Some(Extension(auth)) = auth {
+    // The extension's DID is cryptographically derived, never body-supplied:
+    // auth/mod.rs resolves the verifying key FROM the keyid DID itself, so what
+    // is carried through to the upsert boundary below is a proof, not a claim.
+    let proven_did: Option<String> = if let Some(Extension(auth)) = auth {
+        // 403, not 400: this caller proved control of some DID and spent that
+        // proof on a different DID's row, which is a refusal of authority over
+        // the targeted row: the same denial as an unsigned repoint, and two
+        // callers denied for the same reason must not get different response
+        // classes. The 400 class stays for input-form failures: a malformed
+        // DID, a non-public URL, a self-announce, and a DID method that can
+        // never authenticate.
         if auth.0 != announced_did.to_string() {
-            return Err(AppError::BadRequest(
+            return Err(AppError::Forbidden(
                 "Signature keyid must match announced DID".into(),
             ));
         }
+        Some(auth.0)
     } else {
         tracing::warn!(
             did = %announced_did,
             "accepted unsigned peer announce; set GITLAWB_REQUIRE_SIGNED_PEER_WRITES=true after all peers upgrade"
         );
-    }
+        None
+    };
 
     // Validate the URL is a public http(s) endpoint. The announce route is
     // reachable unauthenticated (until all peers sign), so without this an
@@ -206,9 +322,9 @@ pub async fn announce(
     // and turn our outbound sync-notify fan-out into an SSRF probe — and bury
     // the real peers under junk so node-origin repos stop replicating.
     if !is_public_http_url(&req.http_url) {
-        return Err(AppError::BadRequest(
-            "http_url must be a public http(s) URL (no loopback, private, or .internal/.local hosts)".into(),
-        ));
+        return Err(AppError::BadRequest(format!(
+            "http_url {PUBLIC_HTTP_URL_REQUIREMENT}"
+        )));
     }
 
     // Reject self-announcements: a peer row whose http_url is our own public
@@ -228,7 +344,20 @@ pub async fn announce(
         ));
     }
 
-    state.db.upsert_peer(&req.did, &req.http_url).await?;
+    // The authority declaration, not a re-statement of the check above: the
+    // boundary carries the proven DID and re-checks it against the row itself,
+    // so the keyid comparison above is an early rejection rather than the only
+    // gate. The other writer (the bootstrap announce-back in main.rs) never
+    // reaches this handler at all.
+    let authority = match proven_did.as_deref() {
+        Some(did) => PeerWriteAuthority::Proven(did),
+        None => PeerWriteAuthority::Unproven,
+    };
+    state
+        .db
+        .upsert_peer(&req.did, &req.http_url, authority)
+        .await
+        .map_err(peer_write_error)?;
 
     tracing::info!(did = %req.did, url = %req.http_url, "peer announced");
 
@@ -347,6 +476,10 @@ pub struct NotifyRequest {
     pub timestamp: Option<String>,
     #[serde(default)]
     pub cert_id: Option<String>,
+    /// Full owner DID — added in #144 for DID-aware feed gating.
+    /// Optional for backward compat with older senders.
+    #[serde(default)]
+    pub owner_did: Option<String>,
 }
 
 pub async fn notify_sync(
@@ -377,6 +510,14 @@ pub async fn notify_sync(
         )));
     }
 
+    // #272: the slug reaches a PathBuf::join in the sync worker, where an extra
+    // separator or a traversal segment places the mirror outside repos_dir. Reject
+    // it here, before the queue row and the ref-update row are written. The message
+    // names the field and nothing about where repos live on disk.
+    if let Err(e) = crate::git::repo_store::validate_repo_slug(&req.repo) {
+        return Err(AppError::BadRequest(format!("invalid repo field: {e}")));
+    }
+
     state
         .db
         .enqueue_sync(&req.repo, &req.node_did, &req.ref_name, &req.new_sha, None)
@@ -391,6 +532,7 @@ pub async fn notify_sync(
         node_did: req.node_did.clone(),
         pusher_did: req.pusher_did.clone().unwrap_or_default(),
         repo: req.repo.clone(),
+        owner_did: req.owner_did.clone(),
         ref_name: req.ref_name.clone(),
         old_sha: req.old_sha.clone().unwrap_or_default(),
         new_sha: req.new_sha.clone(),
@@ -430,21 +572,15 @@ pub async fn ping_peer(
         .find(|p| p.did == did)
         .ok_or_else(|| AppError::RepoNotFound(format!("peer {did} not found")))?;
 
-    // Async ping
-    let url = format!("{}/health", peer.http_url.trim_end_matches('/'));
-    // Use the shared no-redirect client: bare `reqwest::get` follows redirects,
-    // so a peer could answer with `302 -> http://127.0.0.1/` and turn the ping
-    // into an SSRF probe.
-    let ok = state
-        .http_client
-        .get(&url)
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
+    // Use DB-aware readiness rather than process liveness: `/health` stays 200
+    // during a mid-life database outage, while `/ready` reports 503. A 404-only
+    // fallback keeps pre-readiness peers compatible. The shared helper also
+    // preserves the no-redirect SSRF guard on peer-controlled URLs.
+    let ok = crate::ping_peer_readiness(&state.http_client, &peer.http_url).await;
 
-    let _ = state.db.mark_peer_ping(&did, ok).await;
-
+    // This anonymous diagnostic endpoint is intentionally read-only. The
+    // periodic gossip loop owns the persisted federation-reachability gate and
+    // requires consecutive failures before marking a peer unreachable.
     Ok(Json(serde_json::json!({
         "did": did,
         "http_url": peer.http_url,
@@ -458,7 +594,7 @@ mod tests {
 
     #[test]
     fn accepts_public_https_and_http() {
-        assert!(is_public_http_url("https://node.gitlawb.com"));
+        assert!(is_public_http_url("https://node.twigpine.com"));
         assert!(is_public_http_url("https://manila.gitlawb.com/"));
         assert!(is_public_http_url("http://203.0.113.10:7545"));
     }
@@ -467,6 +603,7 @@ mod tests {
     fn rejects_loopback_private_and_internal() {
         for bad in [
             "http://localhost:7545",
+            "http://node.localhost:7545",
             "http://127.0.0.1:5432/",
             "http://localhost:22/",
             "http://0.0.0.0:7545",
@@ -482,7 +619,7 @@ mod tests {
             "http://[::1]:7545",
             "http://gitlawb-node.internal:7545",
             "http://my-node.local/",
-            "ftp://node.gitlawb.com",
+            "ftp://node.twigpine.com",
             "not-a-url",
             "",
             // Trailing-dot FQDN of an internal host.
@@ -510,6 +647,51 @@ mod tests {
             // Local-use NAT64 wrapping a *public* v4 (203.0.113.10) is still
             // rejected: the block is prefix-based, not payload-based.
             "http://[64:ff9b:1::cb00:710a]/",
+        ] {
+            assert!(!is_public_http_url(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_dotless_single_label_hosts() {
+        // `.local` and `.internal` are suffix checks, so a name with no dot at
+        // all never matches one. A single-label name is completed by whatever
+        // search domain the resolver is configured with, which is not a
+        // destination we can reason about from the URL.
+        for bad in [
+            "http://local/",
+            "http://internal/",
+            "http://intranet/",
+            "http://wpad/",
+            "http://metadata/",
+            "http://local./",
+            "http://internal.:7545",
+        ] {
+            assert!(!is_public_http_url(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_deprecated_site_local_v6() {
+        // fec0::/10, deprecated by RFC 3879. The link-local mask (0xffc0 ==
+        // 0xfe80) does not cover it: 0xfec0 & 0xffc0 is 0xfec0.
+        assert!(!super::is_public_ip("fec0::1".parse().unwrap()));
+        assert!(!super::is_public_ip("feff:ffff::1".parse().unwrap()));
+        for bad in ["http://[fec0::1]/", "http://[feff:ffff::1]:7545"] {
+            assert!(!is_public_http_url(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_repeated_trailing_root_dots() {
+        // Stripping a single root dot leaves `localhost.`, which matches
+        // neither the equality nor the suffix check. The subdomain form now
+        // exercises the `.localhost` suffix rejection together with the extra
+        // trailing dot.
+        for bad in [
+            "http://localhost../",
+            "http://localhost...:7545",
+            "http://node.localhost../",
         ] {
             assert!(!is_public_http_url(bad), "{bad:?} must be rejected");
         }
@@ -551,7 +733,7 @@ mod tests {
     use axum::body::Body;
     use axum::extract::ConnectInfo;
     use axum::http::{header, Method, Request, StatusCode};
-    use axum::routing::post;
+    use axum::routing::{get, post};
     use axum::{middleware, Extension, Router};
     use gitlawb_core::http_sig::sign_request;
     use gitlawb_core::identity::Keypair;
@@ -579,7 +761,9 @@ mod tests {
         state.config = Arc::new(cfg);
     }
 
-    const NOTIFY_BODY: &str = r#"{"repo":"demo","ref_name":"refs/heads/main","new_sha":"0000000000000000000000000000000000000000","node_did":"PEER_DID"}"#;
+    // The slug must be a well-formed owner/name (#272); these brake tests are about
+    // the rate limiter, so the body carries a valid slug and reaches the brake.
+    const NOTIFY_BODY: &str = r#"{"repo":"z6Mkfoo/hello","ref_name":"refs/heads/main","new_sha":"0000000000000000000000000000000000000000","node_did":"PEER_DID"}"#;
 
     // ── trigger: mandatory signature ──────────────────────────────────────────
 
@@ -755,10 +939,82 @@ mod tests {
         let did = Keypair::generate().did().to_string();
         state
             .db
-            .upsert_peer(&did, "https://peer.example.com")
+            .upsert_peer(
+                &did,
+                "https://peer.example.com",
+                crate::db::PeerWriteAuthority::Unproven,
+            )
             .await
             .unwrap();
         did
+    }
+
+    #[sqlx::test]
+    async fn manual_ping_uses_readiness_without_mutating_federation_gate(pool: PgPool) {
+        let mut server = mockito::Server::new_async().await;
+        let ready = server
+            .mock("GET", "/ready")
+            .with_status(503)
+            .expect(1)
+            .create_async()
+            .await;
+        let health = server
+            .mock("GET", "/health")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let mut state = test_state(pool.clone()).await;
+        state.http_client =
+            Arc::new(crate::build_http_client().expect("production HTTP client should build"));
+        let did = Keypair::generate().did().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO peers (did, http_url, last_seen, last_ping_ok, announced_at)
+             VALUES ($1, $2, $3, TRUE, $3)",
+        )
+        .bind(&did)
+        .bind(server.url())
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let response = Router::new()
+            .route("/api/v1/peers/{did}/ping", get(super::ping_peer))
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/v1/peers/{did}/ping"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["reachable"], false);
+        ready.assert_async().await;
+        health.assert_async().await;
+
+        let peer = state
+            .db
+            .list_peers()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|peer| peer.did == did)
+            .unwrap();
+        assert!(
+            peer.last_ping_ok,
+            "an anonymous manual sample must not rewrite the federation gate"
+        );
     }
 
     #[sqlx::test]
@@ -861,6 +1117,265 @@ mod tests {
         );
     }
 
+    // ── notify: repo slug validation (#272) ───────────────────────────────────
+    //
+    // An unsigned caller who has announced their own DID is a "known peer", so
+    // the slug they send reaches the sync worker's path join. `a//tmp/probe`
+    // resolved to /tmp/probe.git, outside repos_dir entirely. notify must reject
+    // anything that is not a well-formed owner/name slug before it is queued.
+
+    /// Every slug shape the boundary must refuse. `a//tmp/gitlawb-probe` is the
+    /// verified escape; the rest are the traversal and empty-half neighbours.
+    const MALFORMED_SLUGS: [&str; 9] = [
+        "a//tmp/gitlawb-probe",
+        "../hello",
+        "./hello",
+        "../../etc/evil",
+        "a/../../x",
+        "..",
+        "demo",
+        "/hello",
+        "z6Mkfoo/",
+    ];
+
+    fn notify_body(repo: &str, peer_did: &str) -> String {
+        serde_json::json!({
+            "repo": repo,
+            "ref_name": "refs/heads/main",
+            "new_sha": "0000000000000000000000000000000000000000",
+            "node_did": peer_did,
+        })
+        .to_string()
+    }
+
+    #[sqlx::test]
+    async fn sync_notify_rejects_malformed_repo_slugs(pool: PgPool) {
+        let state = test_state(pool).await;
+        let db = state.db.clone();
+        let peer_did = seed_peer(&state).await;
+        let router = crate::server::build_router(state);
+        for (i, slug) in MALFORMED_SLUGS.iter().enumerate() {
+            // Distinct source IPs so the per-IP brake never masks the 400.
+            let ip = format!("198.51.100.{}:5000", i + 1);
+            let resp = router
+                .clone()
+                .oneshot(unsigned_post(
+                    "/api/v1/sync/notify",
+                    &notify_body(slug, &peer_did),
+                    &ip,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "slug {slug:?} must be rejected"
+            );
+        }
+        let queued = db.dequeue_pending_syncs(100).await.unwrap();
+        assert!(
+            queued.is_empty(),
+            "no malformed slug may be queued, got {:?}",
+            queued.iter().map(|q| &q.repo).collect::<Vec<_>>()
+        );
+    }
+
+    #[sqlx::test]
+    async fn sync_notify_rejection_body_names_field_not_path(pool: PgPool) {
+        // R3: the client learns which field was bad, never where repos live on
+        // disk. A message carrying the resolved path would hand an unsigned
+        // caller the server's layout.
+        let state = test_state(pool).await;
+        let repos_dir = state.config.repos_dir.display().to_string();
+        let peer_did = seed_peer(&state).await;
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(unsigned_post(
+                "/api/v1/sync/notify",
+                &notify_body("a//tmp/gitlawb-probe", &peer_did),
+                "198.51.100.20:5000",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("repo"), "body must name the field: {body}");
+        assert!(
+            !body.contains(&repos_dir),
+            "body must not leak repos_dir ({repos_dir}): {body}"
+        );
+        for trimmed in repos_dir.trim_start_matches("./").split('/') {
+            assert!(
+                trimmed.is_empty() || !body.contains(trimmed),
+                "body must not leak a repos_dir segment ({trimmed}): {body}"
+            );
+        }
+        // A rooted path is a leading '/' with something after it. A bare quoted
+        // '/' is the separator the message is allowed to talk about.
+        assert!(
+            !body
+                .split(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+                .any(|tok| tok.starts_with('/') && tok.len() > 1),
+            "body must not contain a rooted filesystem path: {body}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn sync_notify_rejection_writes_no_ref_update(pool: PgPool) {
+        // The second half of R1: the ref-update feed row sits after enqueue_sync,
+        // so the early return must skip it too. Asserted, not argued.
+        let state = test_state(pool.clone()).await;
+        let peer_did = seed_peer(&state).await;
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(unsigned_post(
+                "/api/v1/sync/notify",
+                &notify_body("a//tmp/gitlawb-probe", &peer_did),
+                "198.51.100.21:5000",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM received_ref_updates")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "a rejected notify must not seed the ref-update feed"
+        );
+    }
+
+    #[sqlx::test]
+    async fn sync_notify_accepts_valid_slug_and_records_ref_update(pool: PgPool) {
+        // must-not-break, and the control that keeps the two negative assertions
+        // above from being vacuous: a well-formed slug still queues and still
+        // writes its ref-update row.
+        let state = test_state(pool.clone()).await;
+        let db = state.db.clone();
+        let peer_did = seed_peer(&state).await;
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(unsigned_post(
+                "/api/v1/sync/notify",
+                &notify_body("z6Mkfoo/hello", &peer_did),
+                "198.51.100.22:5000",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let queued = db.dequeue_pending_syncs(100).await.unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].repo, "z6Mkfoo/hello");
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM received_ref_updates WHERE repo = $1")
+                .bind("z6Mkfoo/hello")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            count, 1,
+            "the valid path must still write the ref-update row"
+        );
+    }
+
+    #[sqlx::test]
+    async fn sync_notify_unknown_peer_wins_over_malformed_slug(pool: PgPool) {
+        // Ordering: the slug check sits after the peer gate, so an unknown peer
+        // still gets the unknown-peer message rather than a slug complaint.
+        let state = test_state(pool).await;
+        let stranger = Keypair::generate().did().to_string();
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(unsigned_post(
+                "/api/v1/sync/notify",
+                &notify_body("a//tmp/gitlawb-probe", &stranger),
+                "198.51.100.23:5000",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("unknown peer DID"),
+            "peer gate must still fire first: {body}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn unsigned_announce_then_notify_cannot_queue_a_repos_dir_escape(pool: PgPool) {
+        // The reachability case for #272, committed in its attack form. Two
+        // unsigned requests through the shipped router, no signature and no
+        // config change: announce the attacker's own DID (which is what makes
+        // them a "known peer"), then notify with `a/<abs>/gitlawb-probe`. That
+        // slug used to reach PathBuf::join in the sync worker, where the
+        // absolute second component discarded repos_dir and planted a mirror at
+        // /<abs>/gitlawb-probe.git. The notify must now be refused outright.
+        //
+        // This has to run over crate::server::build_router rather than a
+        // directly mounted handler: the point of the test is that the default
+        // layer stack (optional_signature, not require_signature) leaves the
+        // route open, so mounting the handler alone would assert nothing about
+        // reachability.
+        let state = test_state(pool).await;
+        let db = state.db.clone();
+        let attacker = Keypair::generate().did().to_string();
+        let router = crate::server::build_router(state);
+
+        let announce =
+            format!(r#"{{"did":"{attacker}","http_url":"https://attacker.example.com"}}"#);
+        let resp = router
+            .clone()
+            .oneshot(unsigned_post(
+                "/api/v1/peers/announce",
+                &announce,
+                "198.51.100.40:5000",
+            ))
+            .await
+            .unwrap();
+        // Asserted, not assumed: this plan does not change announce, and the
+        // whole attack rests on an unsigned announce still succeeding.
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "unsigned announce still admits an attacker-generated DID"
+        );
+
+        let outside = tempfile::TempDir::new().unwrap();
+        let escape_dir = outside.path().join("gitlawb-probe");
+        let slug = format!("a/{}", escape_dir.display());
+        let resp = router
+            .oneshot(unsigned_post(
+                "/api/v1/sync/notify",
+                &notify_body(&slug, &attacker),
+                "198.51.100.41:5000",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "notify must refuse the escaping slug {slug:?}"
+        );
+
+        let queued = db.dequeue_pending_syncs(100).await.unwrap();
+        assert!(
+            queued.is_empty(),
+            "sync_queue must stay empty, got {:?}",
+            queued.iter().map(|q| &q.repo).collect::<Vec<_>>()
+        );
+        assert!(
+            !escape_dir.with_extension("git").exists(),
+            "nothing may be written at the escape target"
+        );
+    }
+
     #[sqlx::test]
     async fn announce_still_accepts_unsigned_in_default_mode(pool: PgPool) {
         // must-not-over-reach: adding the brake must not tighten announce's
@@ -879,6 +1394,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// U1 (#273). An unsigned announce must not repoint an existing peer's row.
+    ///
+    /// Kills the unconditional `ON CONFLICT(did) DO UPDATE SET http_url = $2` in
+    /// `Db::upsert_peer`. The failure message carries BOTH observed values,
+    /// because the gate is the observed rewrite (2xx AND the attacker URL
+    /// stored), not merely a failing assertion: a 429 from the peer-write brake,
+    /// a fixture URL `is_public_http_url` rejects, or a DB error would all read
+    /// as "assertion failed" while proving nothing about this defect.
+    #[sqlx::test]
+    async fn unsigned_announce_cannot_repoint_an_existing_peer(pool: PgPool) {
+        const HONEST: &str = "https://honest-peer.example.com";
+        const ATTACKER: &str = "https://attacker.example.com";
+
+        let state = test_state(pool).await;
+        let did = Keypair::generate().did().to_string();
+        state
+            .db
+            .upsert_peer(&did, HONEST, crate::db::PeerWriteAuthority::Unproven)
+            .await
+            .unwrap();
+
+        let stored_url = |peers: Vec<crate::db::PeerRecord>| {
+            peers.into_iter().find(|p| p.did == did).map(|p| p.http_url)
+        };
+        assert_eq!(
+            stored_url(state.db.list_peers().await.unwrap()).as_deref(),
+            Some(HONEST),
+            "seed did not take; the case below would pass vacuously"
+        );
+
+        // Clone before build_router consumes state, so the row can be read back.
+        let db = state.db.clone();
+        let body = format!(r#"{{"did":"{did}","http_url":"{ATTACKER}"}}"#);
+        let resp = crate::server::build_router(state)
+            .oneshot(unsigned_post(
+                "/api/v1/peers/announce",
+                &body,
+                "203.0.113.77:5000",
+            ))
+            .await
+            .unwrap();
+        let status = resp.status();
+        let stored = stored_url(db.list_peers().await.unwrap())
+            .expect("peer row vanished; neither the allowed nor the denied outcome");
+
+        assert_eq!(
+            stored, HONEST,
+            "unsigned announce repointed an existing peer (observed status {status}, stored http_url {stored})"
+        );
     }
 
     // Build a request carrying a REAL RFC 9421 signature (not just an injected
@@ -989,6 +1555,634 @@ mod tests {
         assert!(
             !s.contains("push"),
             "a 429 on a sync route must not say 'push': {s:?}"
+        );
+    }
+
+    // ── #273: the announce authority contract ─────────────────────────────────
+    //
+    // U4 drives the handler mounted alone, because signed_request_as injects an
+    // AuthenticatedDid extension without a real signature and require_signature
+    // would reject that on the full router. U5 then proves the same properties
+    // through build_router with REAL RFC 9421 signatures, where a signature can
+    // be pointed at a row it does not own.
+
+    const OWNER_URL: &str = "https://owner-peer.example.com";
+    const MOVED_URL: &str = "https://moved-peer.example.com";
+    const HIJACK_URL: &str = "https://hijacker.example.com";
+    const WEB_DID: &str = "did:web:squatter.example.com";
+    const KEYID_MISMATCH: &str = "Signature keyid must match announced DID";
+
+    /// Every column a consumer sees, so a case that claims "unchanged" compares
+    /// the whole row rather than the one field it happened to think of.
+    type PeerSnapshot = (String, String, Option<String>, bool, String);
+
+    async fn snapshot(db: &crate::db::Db, did: &str) -> Option<PeerSnapshot> {
+        db.list_peers()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.did == did)
+            .map(|p| {
+                (
+                    p.did,
+                    p.http_url,
+                    p.last_seen,
+                    p.last_ping_ok,
+                    p.announced_at,
+                )
+            })
+    }
+
+    /// Seed a peer row that has EARNED reachability, asserting the seed took,
+    /// so no case below can pass vacuously against a row that was never written
+    /// or against a flag that was already false. Without the granted ping a
+    /// "must be unreachable after this" assertion compares false to false and
+    /// stays green with the production code that clears the flag removed.
+    async fn seed_peer_row(state: &AppState, did: &str, url: &str) -> PeerSnapshot {
+        state
+            .db
+            .upsert_peer(did, url, crate::db::PeerWriteAuthority::Unproven)
+            .await
+            .expect("seed");
+        state.db.mark_peer_ping(did, true).await.expect("seed ping");
+        let seeded = snapshot(&state.db, did).await.expect("seed did not take");
+        assert_eq!(seeded.1, url, "seed did not take");
+        assert!(
+            seeded.3,
+            "the seeded row must start reachable, or a later unreachable assertion is vacuous"
+        );
+        seeded
+    }
+
+    /// Status, error code, and message together, so a denial is asserted by its
+    /// exact class and stated reason rather than by "not 2xx".
+    async fn status_and_error(resp: axum::response::Response) -> (StatusCode, String, String) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+            panic!(
+                "error body must be JSON: {}",
+                String::from_utf8_lossy(&bytes)
+            )
+        });
+        let field = |k: &str| v[k].as_str().unwrap_or_default().to_string();
+        (status, field("error"), field("message"))
+    }
+
+    fn announce_body(did: &str, url: &str) -> String {
+        format!(r#"{{"did":"{did}","http_url":"{url}"}}"#)
+    }
+
+    fn announce_only(state: AppState) -> Router {
+        Router::new()
+            .route("/api/v1/peers/announce", post(super::announce))
+            .with_state(state)
+    }
+
+    fn announce_as(did: &str, body: &str) -> Request<Body> {
+        signed_request_as(
+            did,
+            Method::POST,
+            "/api/v1/peers/announce",
+            Body::from(body.to_string()),
+        )
+    }
+
+    #[sqlx::test]
+    async fn announce_rejects_localhost_subdomains_with_an_accurate_error(pool: PgPool) {
+        let state = test_state(pool).await;
+        let did = Keypair::generate().did().to_string();
+        let resp = announce_only(state.clone())
+            .oneshot(announce_as(
+                &did,
+                &announce_body(&did, "https://node.localhost:7545"),
+            ))
+            .await
+            .unwrap();
+
+        let (status, error, message) = status_and_error(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error, "bad_request");
+        assert_eq!(
+            message,
+            "http_url must be a public http(s) URL (no loopback, private, localhost, .localhost, .internal, or .local hosts)"
+        );
+        assert!(
+            snapshot(&state.db, &did).await.is_none(),
+            "a rejected .localhost announce must leave no row behind"
+        );
+    }
+
+    /// U4 scenario 1, and the first test the keyid branch has ever had: a caller
+    /// who proved control of one DID must not announce another's. Kills
+    /// neutralizing the handler's keyid comparison, and kills demoting this
+    /// denial back to the 400 validation class where the unsigned repoint below
+    /// is a 403 for the same reason.
+    #[sqlx::test]
+    async fn announce_keyid_mismatch_is_a_403_denial(pool: PgPool) {
+        let state = test_state(pool).await;
+        let victim = Keypair::generate().did().to_string();
+        let hijacker = Keypair::generate().did().to_string();
+        let before = seed_peer_row(&state, &victim, OWNER_URL).await;
+
+        let resp = announce_only(state.clone())
+            .oneshot(announce_as(&hijacker, &announce_body(&victim, HIJACK_URL)))
+            .await
+            .unwrap();
+
+        let (status, code, message) = status_and_error(resp).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a proof spent on another DID's row is an authority refusal: {message}"
+        );
+        assert_eq!(code, "forbidden", "denial body must name the 403 class");
+        assert!(
+            message.contains(KEYID_MISMATCH),
+            "the denial must name the keyid mismatch, got {message:?}"
+        );
+        assert_eq!(
+            snapshot(&state.db, &victim).await.expect("row vanished"),
+            before,
+            "the stored row must be byte-identical after a refused announce"
+        );
+    }
+
+    /// U4 scenario 2: the allowed signed case. A caller whose keyid IS the row
+    /// repoints it. Kills a gate that refuses proven writes too.
+    #[sqlx::test]
+    async fn announce_with_matching_keyid_repoints_its_own_row(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = Keypair::generate().did().to_string();
+        seed_peer_row(&state, &owner, OWNER_URL).await;
+
+        let resp = announce_only(state.clone())
+            .oneshot(announce_as(&owner, &announce_body(&owner, MOVED_URL)))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let after = snapshot(&state.db, &owner).await.expect("row vanished");
+        assert_eq!(after.1, MOVED_URL, "a proven repoint must land");
+    }
+
+    /// U4 scenario 3: an unsigned caller cannot move an existing row, and the
+    /// refusal renders as a 403 with its reason, never as a 500 or as success.
+    #[sqlx::test]
+    async fn announce_unsigned_repoint_is_a_403_denial(pool: PgPool) {
+        let state = test_state(pool).await;
+        let victim = Keypair::generate().did().to_string();
+        let before = seed_peer_row(&state, &victim, OWNER_URL).await;
+
+        let resp = announce_only(state.clone())
+            .oneshot(unsigned_post(
+                "/api/v1/peers/announce",
+                &announce_body(&victim, HIJACK_URL),
+                "203.0.113.90:5000",
+            ))
+            .await
+            .unwrap();
+
+        let (status, code, message) = status_and_error(resp).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "an unproven repoint is an authority refusal: {message}"
+        );
+        assert_eq!(code, "forbidden", "denial body must name the 403 class");
+        assert!(
+            message.contains("unproven announce cannot change an existing peer"),
+            "the denial must name the repoint refusal, got {message:?}"
+        );
+        assert_eq!(
+            snapshot(&state.db, &victim).await.expect("row vanished"),
+            before,
+            "the stored row must be byte-identical after a refused repoint"
+        );
+    }
+
+    /// U4 scenarios 4 and 5, the allowed unsigned class: discovery of an unseen
+    /// did:key still inserts, and an honest peer re-announcing the IDENTICAL URL
+    /// still refreshes liveness. The URL is reused byte for byte because the
+    /// comparison is exact, so a trailing slash would make this pass as a
+    /// repoint rejection instead. Kills a gate widened until it breaks
+    /// discovery or honest re-announces.
+    #[sqlx::test]
+    async fn announce_unsigned_insert_and_identical_url_reannounce_are_accepted(pool: PgPool) {
+        let state = test_state(pool).await;
+        let did = Keypair::generate().did().to_string();
+        let body = announce_body(&did, OWNER_URL);
+
+        let resp = announce_only(state.clone())
+            .oneshot(unsigned_post(
+                "/api/v1/peers/announce",
+                &body,
+                "203.0.113.91:5000",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "discovery must stay open");
+        let before = snapshot(&state.db, &did).await.expect("row not inserted");
+        assert_eq!(before.1, OWNER_URL);
+        assert!(!before.3, "a never-probed peer inserts unreachable");
+
+        let resp = announce_only(state.clone())
+            .oneshot(unsigned_post(
+                "/api/v1/peers/announce",
+                &body,
+                "203.0.113.92:5000",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "an identical-URL re-announce is a liveness signal, not a repoint"
+        );
+        let after = snapshot(&state.db, &did).await.expect("row vanished");
+        assert_eq!(after.1, OWNER_URL, "URL untouched");
+        assert_eq!(after.3, before.3, "reachability untouched");
+        assert_eq!(after.4, before.4, "announced_at untouched");
+        let parse = |s: &Option<String>| {
+            chrono::DateTime::parse_from_rfc3339(s.as_deref().expect("last_seen is set")).unwrap()
+        };
+        assert!(
+            parse(&after.2) > parse(&before.2),
+            "a same-URL re-announce must advance last_seen"
+        );
+    }
+
+    /// U4 scenario 6 (R8): a DID method that can never authenticate is refused
+    /// in the 400 validation class, with nothing written. This one IS about the
+    /// input's form, not the caller's authority, which is why it is not a 403.
+    #[sqlx::test]
+    async fn announce_of_a_did_web_is_a_400_validation_failure(pool: PgPool) {
+        let state = test_state(pool).await;
+
+        let resp = announce_only(state.clone())
+            .oneshot(unsigned_post(
+                "/api/v1/peers/announce",
+                &announce_body(WEB_DID, OWNER_URL),
+                "203.0.113.93:5000",
+            ))
+            .await
+            .unwrap();
+
+        let (status, code, message) = status_and_error(resp).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an unsupported DID method is a validation failure: {message}"
+        );
+        assert_eq!(code, "bad_request");
+        assert!(
+            message.contains("methodNotSupported"),
+            "the rejection must carry the methodNotSupported shape, got {message:?}"
+        );
+        assert!(
+            snapshot(&state.db, WEB_DID).await.is_none(),
+            "a rejected announce must leave no row behind"
+        );
+    }
+
+    /// The sibling of the case above, and the one it must not swallow: the
+    /// method IS did:key, so methodNotSupported would be a false statement
+    /// about the input. The value is the W3C secp256k1 did:key test vector,
+    /// which decodes cleanly and is simply not an ed25519 key. Still the 400
+    /// validation class, still nothing written.
+    #[sqlx::test]
+    async fn announce_of_an_unresolvable_did_key_is_a_400_with_the_cause(pool: PgPool) {
+        let state = test_state(pool).await;
+        let did = "did:key:zQ3shokFTS3brHcDQrn82RUDfCZESWL1ZdCEJwekUDPQiYBme";
+
+        let resp = announce_only(state.clone())
+            .oneshot(unsigned_post(
+                "/api/v1/peers/announce",
+                &announce_body(did, OWNER_URL),
+                "203.0.113.99:5000",
+            ))
+            .await
+            .unwrap();
+
+        let (status, code, message) = status_and_error(resp).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an unresolvable did:key is a validation failure: {message}"
+        );
+        assert_eq!(
+            code, "unresolvable_did",
+            "the code must name the cause, the same way the signed path does for a keyid it \
+             cannot resolve; a client distinguishing this from the other 400s on this route \
+             must not have to substring-match the message: {message:?}"
+        );
+        assert!(
+            message.contains("cannot resolve DID"),
+            "the rejection must report resolution, not method support, got {message:?}"
+        );
+        assert!(
+            snapshot(&state.db, did).await.is_none(),
+            "a rejected announce must leave no row behind"
+        );
+    }
+
+    // ── U5: the same matrix through the production router, real signatures ────
+
+    /// An announce carrying a REAL RFC 9421 signature, signed AS `kp` while the
+    /// body names whatever DID the caller chooses. That split is the point: it
+    /// is what lets a valid signature be pointed at a row it does not own,
+    /// which is the RUSTSEC-2022-0009 shape.
+    fn real_signed_announce(kp: &Keypair, body: &str, peer: &str) -> Request<Body> {
+        let path = "/api/v1/peers/announce";
+        let s = sign_request(kp, "POST", path, body.as_bytes());
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("content-digest", s.content_digest)
+            .header("signature-input", s.signature_input)
+            .header("signature", s.signature)
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+        req
+    }
+
+    /// U5 scenario 1: the lowest-privilege caller there is, fully
+    /// unauthenticated, still seeds an unseen did:key row through the whole
+    /// production stack.
+    #[sqlx::test]
+    async fn router_unsigned_announce_inserts_an_unseen_did(pool: PgPool) {
+        let state = test_state(pool).await;
+        let did = Keypair::generate().did().to_string();
+        let db = state.db.clone();
+
+        let resp = crate::server::build_router(state)
+            .oneshot(unsigned_post(
+                "/api/v1/peers/announce",
+                &announce_body(&did, OWNER_URL),
+                "203.0.113.94:5000",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let row = snapshot(&db, &did).await.expect("row not inserted");
+        assert_eq!(row.1, OWNER_URL);
+    }
+
+    /// U5 scenario 2: the defect this change closes, driven end to end. An
+    /// unsigned repoint is refused with its reason and the row does not move.
+    /// Kills reverting the unproven arm to an unconditional DO UPDATE.
+    #[sqlx::test]
+    async fn router_unsigned_announce_cannot_repoint_an_existing_row(pool: PgPool) {
+        let state = test_state(pool).await;
+        let victim = Keypair::generate().did().to_string();
+        let before = seed_peer_row(&state, &victim, OWNER_URL).await;
+        let db = state.db.clone();
+
+        let resp = crate::server::build_router(state)
+            .oneshot(unsigned_post(
+                "/api/v1/peers/announce",
+                &announce_body(&victim, HIJACK_URL),
+                "203.0.113.95:5000",
+            ))
+            .await
+            .unwrap();
+
+        // The row assertion leads: the property is that the row does not move.
+        // A response-class regression is a second, separate failure below.
+        let (status, code, message) = status_and_error(resp).await;
+        assert_eq!(
+            snapshot(&db, &victim).await.expect("row vanished"),
+            before,
+            "the stored row must be byte-identical after a refused unsigned repoint \
+             (observed status {status})"
+        );
+        assert_eq!(status, StatusCode::FORBIDDEN, "observed body: {message}");
+        assert_eq!(code, "forbidden");
+    }
+
+    /// U5 scenario 3: the allowed signed case through the real verification
+    /// middleware. The row was seeded under this keypair's own did:key, so the
+    /// signature names the row it moves.
+    #[sqlx::test]
+    async fn router_signature_from_the_rows_own_did_repoints_it(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        seed_peer_row(&state, &owner_did, OWNER_URL).await;
+        let db = state.db.clone();
+
+        let resp = crate::server::build_router(state)
+            .oneshot(real_signed_announce(
+                &owner,
+                &announce_body(&owner_did, MOVED_URL),
+                "203.0.113.96:5000",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a real signature from the row's own DID must be admitted"
+        );
+        let row = snapshot(&db, &owner_did).await.expect("row vanished");
+        assert_eq!(row.1, MOVED_URL, "a proven repoint must land");
+        assert!(
+            !row.3,
+            "a repointed peer must re-earn reachability even when the repoint is signed"
+        );
+    }
+
+    /// U5 scenario 4, the RUSTSEC-2022-0009 shape: a signature that verifies
+    /// perfectly, spent on a row it does not own. The key must be bound to the
+    /// ROW, not to anything the request carries. The assertion names the keyid
+    /// denial specifically, because the boundary's own DID comparison would
+    /// also refuse this write, so a status-only assertion would stay green with
+    /// the handler branch neutralized.
+    #[sqlx::test]
+    async fn router_signature_from_another_did_cannot_repoint_this_row(pool: PgPool) {
+        let state = test_state(pool).await;
+        let victim = Keypair::generate().did().to_string();
+        let hijacker = Keypair::generate();
+        let before = seed_peer_row(&state, &victim, OWNER_URL).await;
+        let db = state.db.clone();
+
+        let resp = crate::server::build_router(state)
+            .oneshot(real_signed_announce(
+                &hijacker,
+                &announce_body(&victim, HIJACK_URL),
+                "203.0.113.97:5000",
+            ))
+            .await
+            .unwrap();
+
+        let (status, code, message) = status_and_error(resp).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a valid signature over another DID's row must be refused: {message}"
+        );
+        assert_eq!(code, "forbidden");
+        assert!(
+            message.contains(KEYID_MISMATCH),
+            "the denial must name the keyid mismatch, got {message:?}"
+        );
+        assert_eq!(
+            snapshot(&db, &victim).await.expect("row vanished"),
+            before,
+            "the stored row must be byte-identical after a mismatched signature"
+        );
+    }
+
+    /// U5 scenario 5: an honest unsigned peer re-announcing the identical URL
+    /// through the full stack refreshes last_seen and moves nothing else. The
+    /// seeded string is reused byte for byte, since the comparison is exact.
+    #[sqlx::test]
+    async fn router_unsigned_identical_url_reannounce_refreshes_last_seen(pool: PgPool) {
+        let state = test_state(pool).await;
+        let did = Keypair::generate().did().to_string();
+        let before = seed_peer_row(&state, &did, OWNER_URL).await;
+        let db = state.db.clone();
+
+        let resp = crate::server::build_router(state)
+            .oneshot(unsigned_post(
+                "/api/v1/peers/announce",
+                &announce_body(&did, OWNER_URL),
+                "203.0.113.98:5000",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let after = snapshot(&db, &did).await.expect("row vanished");
+        assert_eq!(after.1, OWNER_URL, "URL untouched");
+        assert_eq!(after.3, before.3, "reachability untouched");
+        assert_eq!(after.4, before.4, "announced_at untouched");
+        let parse = |s: &Option<String>| {
+            chrono::DateTime::parse_from_rfc3339(s.as_deref().expect("last_seen is set")).unwrap()
+        };
+        assert!(
+            parse(&after.2) > parse(&before.2),
+            "a same-URL re-announce must advance last_seen"
+        );
+    }
+
+    /// U5 scenario 6 (R8) through the full stack: a did:web announce is refused
+    /// in the validation class and writes nothing. Such a row could never be
+    /// corrected by anyone, since only a did:key can ever satisfy the proven
+    /// path. Kills neutralizing the method gate on the unproven arm.
+    #[sqlx::test]
+    async fn router_unsigned_announce_of_a_did_web_is_refused(pool: PgPool) {
+        let state = test_state(pool).await;
+        let db = state.db.clone();
+
+        let resp = crate::server::build_router(state)
+            .oneshot(unsigned_post(
+                "/api/v1/peers/announce",
+                &announce_body(WEB_DID, OWNER_URL),
+                "203.0.113.99:5000",
+            ))
+            .await
+            .unwrap();
+
+        let (status, code, message) = status_and_error(resp).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an unsupported DID method must be refused: {message}"
+        );
+        assert_eq!(code, "bad_request");
+        assert!(
+            message.contains("methodNotSupported"),
+            "the rejection must carry the methodNotSupported shape, got {message:?}"
+        );
+        assert!(
+            snapshot(&db, WEB_DID).await.is_none(),
+            "a rejected announce must leave no row behind"
+        );
+    }
+
+    /// U5, flag-on mode: with require_signed_peer_writes the write group moves
+    /// under add_auth_layers, so the unsigned caller dies at the auth layer with
+    /// a 401 instead of reaching the handler's 403. The authority rules
+    /// themselves do not change: a signature over another DID's row is still
+    /// refused, and the row's own key still moves it. The flag is applied BEFORE
+    /// build_router, which reads it at build time.
+    #[sqlx::test]
+    async fn announce_authority_matrix_in_signed_writes_mode(pool: PgPool) {
+        let mut state = test_state(pool).await;
+        require_signed_peer_writes(&mut state);
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let hijacker = Keypair::generate();
+        let before = seed_peer_row(&state, &owner_did, OWNER_URL).await;
+        let db = state.db.clone();
+        let router = crate::server::build_router(state);
+
+        let resp = router
+            .clone()
+            .oneshot(unsigned_post(
+                "/api/v1/peers/announce",
+                &announce_body(&owner_did, HIJACK_URL),
+                "203.0.113.100:5000",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "with the flag on, an unsigned announce dies at the auth layer"
+        );
+        assert_eq!(
+            snapshot(&db, &owner_did).await.expect("row vanished"),
+            before,
+            "the row must be byte-identical after the 401"
+        );
+
+        let resp = router
+            .clone()
+            .oneshot(real_signed_announce(
+                &hijacker,
+                &announce_body(&owner_did, HIJACK_URL),
+                "203.0.113.101:5000",
+            ))
+            .await
+            .unwrap();
+        let (status, _, message) = status_and_error(resp).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a signature over another DID's row is still refused: {message}"
+        );
+        assert!(message.contains(KEYID_MISMATCH), "got {message:?}");
+        assert_eq!(
+            snapshot(&db, &owner_did).await.expect("row vanished"),
+            before,
+            "the row must be byte-identical after the mismatched signature"
+        );
+
+        let resp = router
+            .oneshot(real_signed_announce(
+                &owner,
+                &announce_body(&owner_did, MOVED_URL),
+                "203.0.113.102:5000",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the row's own key still moves it with the flag on"
+        );
+        assert_eq!(
+            snapshot(&db, &owner_did).await.expect("row vanished").1,
+            MOVED_URL
         );
     }
 }

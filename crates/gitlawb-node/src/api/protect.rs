@@ -17,11 +17,8 @@ pub async fn protect_branch(
     Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, repo, branch)): Path<(String, String, String)>,
 ) -> Result<(StatusCode, Json<serde_json::Value>)> {
-    let record = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, Some(auth.0.as_str()), "/").await?;
 
     // Only the repo owner can protect branches (DID-safe match, shared idiom).
     let caller = &auth.0;
@@ -51,11 +48,8 @@ pub async fn unprotect_branch(
     Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, repo, branch)): Path<(String, String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, Some(auth.0.as_str()), "/").await?;
 
     let caller = &auth.0;
     if !crate::api::did_matches(caller, &record.owner_did) {
@@ -79,12 +73,14 @@ pub async fn unprotect_branch(
 pub async fn list_protected_branches(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+    // Read-visibility-gated (INV-2 root listing): a public repo's protected
+    // branches stay anonymously listable; a private repo's branch names are
+    // hidden (404) from anyone who cannot read it at the root.
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, caller, "/").await?;
 
     let branches = state.db.list_protected_branches(&record.id).await?;
 

@@ -50,6 +50,17 @@ pub async fn create_pr(
     let target_branch = req
         .target_branch
         .unwrap_or_else(|| record.default_branch.clone());
+
+    // Validate both refs before they are stored, since both are later
+    // interpolated into git argv (git diff / worktree add / merge). Validate the
+    // RESOLVED target, not just a caller-supplied one: create_repo also gates
+    // default_branch, but validating here as well means a PR can never feed the
+    // git sink an unchecked ref even if a default was poisoned by an older row
+    // or a future path that skips create_repo's gate.
+    crate::api::validate_git_ref_with_git(&state.git_bin, &req.source_branch)
+        .map_err(crate::api::map_git_ref_validation_error)?;
+    crate::api::validate_git_ref_with_git(&state.git_bin, &target_branch)
+        .map_err(crate::api::map_git_ref_validation_error)?;
     let number = state.db.next_pr_number(&record.id).await?;
     let now = Utc::now().to_rfc3339();
 
@@ -84,6 +95,7 @@ pub async fn create_pr(
     webhooks::fire_event(
         std::sync::Arc::clone(&state.db),
         std::sync::Arc::clone(&state.http_client),
+        std::sync::Arc::clone(&state.webhook_secret_key),
         &record.id,
         "pull_request.opened",
         serde_json::json!({
@@ -188,11 +200,8 @@ pub async fn merge_pr(
     Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, name, number)): Path<(String, String, i64)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, Some(auth.0.as_str()), "/").await?;
 
     // Owner-only merge (N7). Merging writes the served tree, so this is the same
     // trust boundary as owner-only push; it subsumes branch protection (a
@@ -213,7 +222,7 @@ pub async fn merge_pr(
         .repo_store
         .acquire_write(&record.owner_did, &record.name)
         .await
-        .map_err(|e| AppError::Git(e.to_string()))?;
+        .map_err(|e| crate::api::repos::acquire_write_app_error(&e, &name))?;
     let disk_path = guard.path().to_path_buf();
     let merger_did = auth.0;
     let merge_result = store::merge_branch(
@@ -225,7 +234,10 @@ pub async fn merge_pr(
     );
 
     // Always release the advisory lock — even on error; upload to Tigris only on success.
-    guard.release(merge_result.is_ok()).await;
+    // Short-circuit on a refused publish before the PR is marked merged and
+    // before the webhook fires. Both are irreversible announcements of a merge
+    // commit that only exists on this node's disk.
+    guard.release(merge_result.is_ok()).await.into_result()?;
 
     let merge_sha = merge_result.map_err(|e| AppError::Git(e.to_string()))?;
 
@@ -235,6 +247,7 @@ pub async fn merge_pr(
     webhooks::fire_event(
         std::sync::Arc::clone(&state.db),
         std::sync::Arc::clone(&state.http_client),
+        std::sync::Arc::clone(&state.webhook_secret_key),
         &record.id,
         "pull_request.merged",
         serde_json::json!({
@@ -260,11 +273,8 @@ pub async fn close_pr(
     Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, name, number)): Path<(String, String, i64)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, Some(auth.0.as_str()), "/").await?;
 
     let pr = state
         .db
@@ -286,6 +296,7 @@ pub async fn close_pr(
     webhooks::fire_event(
         std::sync::Arc::clone(&state.db),
         std::sync::Arc::clone(&state.http_client),
+        std::sync::Arc::clone(&state.webhook_secret_key),
         &record.id,
         "pull_request.closed",
         serde_json::json!({
@@ -336,6 +347,7 @@ pub async fn create_review(
     webhooks::fire_event(
         std::sync::Arc::clone(&state.db),
         std::sync::Arc::clone(&state.http_client),
+        std::sync::Arc::clone(&state.webhook_secret_key),
         &record.id,
         "pull_request.reviewed",
         serde_json::json!({
@@ -423,4 +435,106 @@ pub async fn list_comments(
 
     let comments = state.db.list_pr_comments(&pr.id).await?;
     Ok(Json(serde_json::json!({ "comments": comments })))
+}
+
+/// #173 F1 follow-up: merge holds no admission permit, so an exhausted write-lock
+/// pool must shed 503 + Retry-After.
+#[cfg(test)]
+mod lock_pool_shed_tests {
+    use super::*;
+    use axum::response::IntoResponse;
+    use sqlx::PgPool;
+
+    fn seed_repo(owner_did: &str, name: &str) -> crate::db::RepoRecord {
+        let now = Utc::now();
+        crate::db::RepoRecord {
+            id: Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            owner_did: owner_did.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: now,
+            updated_at: now,
+            disk_path: format!("/tmp/{name}"),
+            forked_from: None,
+            machine_id: None,
+        }
+    }
+
+    #[sqlx::test]
+    async fn merge_pr_lock_pool_exhaustion_sheds_503_not_500(pool: PgPool) {
+        let owner = "did:key:zMERGELOCKPOOLOWNERAAAAAAAAAAAAAAAAAAAAA";
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.repo_store = crate::git::repo_store::RepoStore::new(
+            std::path::PathBuf::from("/tmp/gitlawb-pulls-lockpool"),
+            None,
+            crate::git::repo_store::build_lock_pool(&pool, 1, std::time::Duration::from_secs(1)),
+            std::time::Duration::from_secs(300),
+        );
+
+        let repo = seed_repo(owner, "lp-merge");
+        let repo_id = repo.id.clone();
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let now = Utc::now().to_rfc3339();
+        state
+            .db
+            .create_pr(&PullRequest {
+                id: Uuid::new_v4().to_string(),
+                repo_id: repo_id.clone(),
+                number: 1,
+                title: "lp".to_string(),
+                body: None,
+                author_did: owner.to_string(),
+                source_branch: "feature".to_string(),
+                target_branch: "main".to_string(),
+                status: "open".to_string(),
+                merged_by_did: None,
+                merged_at: None,
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .await
+            .expect("seed open PR");
+
+        let held = state
+            .repo_store
+            .acquire_write(owner, "other-repo")
+            .await
+            .expect("the first write takes the only lock-pool connection");
+
+        let shed = merge_pr(
+            State(state.clone()),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((owner.to_string(), "lp-merge".to_string(), 1)),
+        )
+        .await;
+        let err = shed.expect_err("an exhausted lock pool must fail the call");
+        let resp = err.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "merge_pr: an exhausted write-lock pool must shed 503, not a 500 git error"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .map(|v| v.to_str().unwrap()),
+            Some("1"),
+            "merge_pr: a capacity shed must tell the client when to retry"
+        );
+
+        let _ = held.release(false).await;
+        let admitted = merge_pr(
+            State(state.clone()),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((owner.to_string(), "lp-merge".to_string(), 1)),
+        )
+        .await;
+        assert!(
+            !matches!(admitted, Err(AppError::Overloaded(_))),
+            "with the lock pool free, merge_pr must not be shed as capacity; got {:?}",
+            admitted.err()
+        );
+    }
 }
