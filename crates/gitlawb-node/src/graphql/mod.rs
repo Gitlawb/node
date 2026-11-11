@@ -14,6 +14,11 @@ use subscription::SubscriptionRoot;
 
 pub type GitlawbSchema = Schema<QueryRoot, MutationRoot, SubscriptionRoot>;
 
+/// No mutations: the /graphql/ws transport keeps queries and subscriptions but
+/// has no mutation root, so the socket can never be used to run a write and
+/// sidestep the write-brake bucket the HTTP route pays.
+pub type GitlawbWsSchema = Schema<QueryRoot, async_graphql::EmptyMutation, SubscriptionRoot>;
+
 // Keep ordinary schema discovery and application queries usable while
 // bounding validation work and the number of resolver selections per request.
 const GRAPHQL_MAX_COMPLEXITY: usize = 400;
@@ -169,6 +174,29 @@ pub fn build_schema(
         .data(task_cursor_key)
         .extension(TaskReadBrakeExtension)
         .finish()
+}
+
+/// Build the subscriptions-only schema served over /graphql/ws. Carries the
+/// same broadcast senders the subscription resolvers consume; no query or
+/// mutation root exists on this type, so the transport cannot be used to
+/// execute either kind of operation.
+pub fn build_ws_schema(
+    db: Arc<Db>,
+    ref_update_tx: tokio::sync::broadcast::Sender<RefUpdateBroadcast>,
+    task_event_tx: tokio::sync::broadcast::Sender<TaskEventBroadcast>,
+    task_cursor_key: crate::api::task_cursor::TaskCursorKey,
+) -> GitlawbWsSchema {
+    apply_query_limits(Schema::build(
+        QueryRoot,
+        async_graphql::EmptyMutation,
+        SubscriptionRoot,
+    ))
+    .data(db)
+    .data(ref_update_tx)
+    .data(task_event_tx)
+    .data(task_cursor_key)
+    .extension(TaskReadBrakeExtension)
+    .finish()
 }
 
 #[cfg(test)]

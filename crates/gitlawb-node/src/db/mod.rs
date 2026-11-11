@@ -933,7 +933,7 @@ impl Db {
             .await
             .context("acquiring migration advisory lock")?;
 
-        let result = self.run_pending_migrations(&mut *lock_conn).await;
+        let result = self.run_pending_migrations(&mut lock_conn).await;
 
         let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
             .bind(MIGRATION_ADVISORY_LOCK)
@@ -947,6 +947,29 @@ impl Db {
     /// Must be called while holding the migration advisory lock.
     /// Runs through the connection already holding the migration advisory
     /// lock, so a pool of size 1 cannot deadlock against itself.
+    /// True while receive-pack requests or pending ref transitions still have
+    /// in-flight work on this repo. Purge checks this under the repo lock
+    /// before deleting storage: a row whose effects have not settled must not
+    /// be stranded against a repo that no longer exists. Settled receive-pack
+    /// states are 'complete' and 'rejected_at_git'; a 'quarantined' row stays
+    /// unsettled because the operator resolves it against the live repo. A
+    /// transition counts settled only once 'applied'.
+    pub(crate) async fn has_unsettled_repo_work(&self, repo_id: &str) -> Result<bool> {
+        let unsettled: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM receive_pack_requests
+                  WHERE repo_id = $1 AND state NOT IN ('complete', 'rejected_at_git')
+                 UNION ALL
+                 SELECT 1 FROM pending_ref_transitions
+                  WHERE repo_id = $1 AND state <> 'applied'
+             )",
+        )
+        .bind(repo_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(unsettled)
+    }
+
     async fn run_pending_migrations(&self, conn: &mut sqlx::PgConnection) -> Result<()> {
         for m in MIGRATIONS {
             let existing: Option<String> =

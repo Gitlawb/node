@@ -94,6 +94,13 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         task_tx.clone(),
         task_cursor_key.clone(),
     ));
+
+    let ws_schema = Arc::new(graphql::build_ws_schema(
+        db.clone(),
+        ref_tx.clone(),
+        task_tx.clone(),
+        task_cursor_key.clone(),
+    ));
     AppState {
         config: Arc::new(Config::parse_from(["gitlawb-node"])),
         db,
@@ -104,6 +111,7 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         ref_update_tx: ref_tx,
         task_event_tx: task_tx,
         graphql_schema: schema,
+        graphql_ws_schema: ws_schema,
         task_cursor_key,
         machine_id: None,
         repo_store: crate::git::repo_store::RepoStore::for_testing(PathBuf::from("/tmp"), pool),

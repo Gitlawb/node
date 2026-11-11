@@ -47,6 +47,10 @@ pub struct PurgeSummary {
     /// authoritative emptiness recheck (fail-closed: never delete on a store
     /// error rather than risk deleting a repo with live remote refs).
     pub skipped_store_error: usize,
+    /// Candidates skipped because receive-pack requests or pending ref
+    /// transitions still have in-flight work on the repo; deleting its
+    /// storage would strand that work mid-effect.
+    pub skipped_unsettled: usize,
     /// Rows deleted whose on-disk dir removal FAILED (or was refused by the
     /// containment guard) — DB/disk drift the operator must reconcile.
     pub disk_failed: usize,
@@ -463,6 +467,25 @@ pub async fn run_purge_spam(
         if ref_count_on_disk(&repos_dir, &c.owner_did, &c.name) != 0 {
             warn!(repo = %c.id, "purge-spam: repo no longer empty under lock — skipped (TOCTOU)");
             summary.skipped_not_empty += 1;
+            guard.release().await;
+            continue;
+        }
+        // Never delete storage under work still settling: receive-pack requests
+        // and pending ref transitions keyed by this repo would otherwise be
+        // stranded mid-effect. Fail closed on a check error.
+        let unsettled = match db.has_unsettled_repo_work(&c.id).await {
+            Ok(u) => u,
+            Err(e) => {
+                warn!(repo = %c.id, err = %e,
+                    "purge-spam: could not check for unsettled work — skipped (fail-closed)");
+                guard.release().await;
+                continue;
+            }
+        };
+        if unsettled {
+            warn!(repo = %c.id,
+                "purge-spam: repo has unsettled receive-pack or transition work — skipped");
+            summary.skipped_unsettled += 1;
             guard.release().await;
             continue;
         }

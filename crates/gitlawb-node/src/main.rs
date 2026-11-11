@@ -328,6 +328,12 @@ async fn main() -> Result<()> {
         task_event_tx.clone(),
         task_cursor_key.clone(),
     ));
+    let graphql_ws_schema = Arc::new(graphql::build_ws_schema(
+        Arc::clone(&db),
+        ref_update_tx.clone(),
+        task_event_tx.clone(),
+        task_cursor_key.clone(),
+    ));
 
     let machine_id = std::env::var("FLY_MACHINE_ID").ok();
     if let Some(ref mid) = machine_id {
@@ -466,6 +472,7 @@ async fn main() -> Result<()> {
         ref_update_tx,
         task_event_tx,
         graphql_schema,
+        graphql_ws_schema,
         machine_id,
         repo_store,
         rate_limiter,

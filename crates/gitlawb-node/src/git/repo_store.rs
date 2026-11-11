@@ -811,6 +811,9 @@ impl RepoStore {
     }
 
     /// Initialize a new bare repo on local disk and upload to Tigris.
+    /// Test-only convenience over `init_handle`; every
+    /// production caller keeps the upload inside its lock.
+    #[cfg(test)]
     pub async fn init(&self, owner_did: &str, repo_name: &str) -> Result<PathBuf> {
         let (path, upload) = self.init_handle(owner_did, repo_name).await?;
         drop(upload);

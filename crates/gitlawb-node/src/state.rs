@@ -72,6 +72,7 @@ pub struct AppState {
     pub task_event_tx: tokio::sync::broadcast::Sender<TaskEventBroadcast>,
     /// GraphQL schema (queries + mutations + subscriptions)
     pub graphql_schema: Arc<crate::graphql::GitlawbSchema>,
+    pub graphql_ws_schema: Arc<crate::graphql::GitlawbWsSchema>,
     /// MAC key for task-list continuation tokens, derived from the node
     /// keypair seed. Held here (and handed to the GraphQL schema) so REST and
     /// GraphQL mint and accept the same tokens.

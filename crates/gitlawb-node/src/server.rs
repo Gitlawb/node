@@ -67,7 +67,7 @@ async fn graphql_ws_handler(
         key: rate_limit::client_key(&headers, peer, state.push_limiter_trust),
         request_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     });
-    let schema = state.graphql_schema.as_ref().clone();
+    let schema = state.graphql_ws_schema.as_ref().clone();
     upgrade
         .protocols(ALL_WEBSOCKET_PROTOCOLS)
         .on_upgrade(move |stream| {
