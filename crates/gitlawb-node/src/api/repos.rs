@@ -5423,7 +5423,7 @@ const MAX_REF_UPDATES: usize = 8192;
 /// replication tail at the durability boundary while the certificate and webhook
 /// loops below still iterate their own copy (#174 U5).
 #[derive(Clone, Debug)]
-pub(crate) struct RefUpdate {
+pub struct RefUpdate {
     pub(crate) old_sha: String,
     pub(crate) new_sha: String,
     pub(crate) ref_name: String,

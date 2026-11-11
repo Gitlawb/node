@@ -54,6 +54,7 @@ pub(crate) async fn test_state(pool: PgPool) -> AppState {
 /// `config::tests::enforce_owner_push_is_declared_true_independent_of_the_environment`,
 /// which reads the declaration off the parser. Splitting the two keeps a parser
 /// question and an authorization question from sharing one failure mode.
+#[allow(dead_code)]
 pub(crate) async fn test_state_with(
     pool: PgPool,
     configure: impl FnOnce(&mut crate::config::Config),
@@ -172,6 +173,7 @@ pub(crate) async fn app(pool: PgPool) -> Router {
 /// Sets `Content-Type: application/json` — the API is JSON throughout, and
 /// without it axum's `Json` extractor returns 415 before the handler runs
 /// (which would make any JSON-body authz assertion a false pass).
+#[allow(dead_code)]
 pub(crate) fn signed_request_as(did: &str, method: Method, uri: &str, body: Body) -> Request<Body> {
     Request::builder()
         .method(method)
@@ -189,6 +191,7 @@ pub(crate) fn signed_request_as(did: &str, method: Method, uri: &str, body: Body
 /// test pass for the wrong reason.) The accepted sockets are parked in the
 /// spawned task, which dies with the test's runtime, so the peer never sees a
 /// close mid-test.
+#[allow(dead_code)]
 pub(crate) async fn silent_http_endpoint() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
