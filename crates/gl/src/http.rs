@@ -429,7 +429,19 @@ pub(crate) async fn json_or_denial<T: serde::de::DeserializeOwned>(
                     .and_then(|m| m.as_str())
                     .map(str::to_string)
             })
-            .unwrap_or(capped.text);
+            .unwrap_or_else(|| match (capped.read_failed, capped.truncated) {
+                (true, _) if capped.text.is_empty() => {
+                    "(response body could not be read)".to_string()
+                }
+                (true, _) => {
+                    format!(
+                        "(response body cut short by a read failure) {}",
+                        capped.text
+                    )
+                }
+                (false, true) => format!("{} (truncated)", capped.text),
+                (false, false) => capped.text,
+            });
         anyhow::bail!("{what} failed ({status}): {}", sanitize_node_msg(&msg));
     }
     resp.json::<T>()

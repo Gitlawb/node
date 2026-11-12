@@ -18415,6 +18415,37 @@ mod tests {
         );
     }
 
+    /// The periodic cleanup task must sweep the signed-write limiter too.
+    /// Mirrors `sweep_rate_limiters_includes_ipfs_limiter`: drive
+    /// `sweep_rate_limiters` and assert the expired entry is evicted. Dropping
+    /// the `signed_write_rate_limiter.cleanup()` call leaves it in place
+    /// (`tracked_keys` stays 1): the RED proof the sweep covers it.
+    #[sqlx::test]
+    async fn sweep_rate_limiters_includes_signed_write_limiter(pool: PgPool) {
+        let mut state = test_state(pool).await;
+        state.signed_write_rate_limiter =
+            crate::rate_limit::RateLimiter::new(5, Duration::from_millis(50));
+
+        assert!(
+            state.signed_write_rate_limiter.check("1.2.3.4").await,
+            "record a hit on the signed-write limiter"
+        );
+        assert_eq!(
+            state.signed_write_rate_limiter.tracked_keys().await,
+            1,
+            "the source-IP key is tracked before the sweep"
+        );
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        state.sweep_rate_limiters().await;
+
+        assert_eq!(
+            state.signed_write_rate_limiter.tracked_keys().await,
+            0,
+            "the periodic sweep must evict the signed-write limiter's expired entries"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Issue #120 — repo-scoped read surfaces visibility gate
     // ---------------------------------------------------------------------------

@@ -398,6 +398,7 @@ impl AppState {
         self.peer_write_rate_limiter.cleanup().await;
         self.task_read_rate_limiter.cleanup().await;
         self.federated_rate_limiter.cleanup().await;
+        self.signed_write_rate_limiter.cleanup().await;
     }
 
     /// Trigger graceful shutdown. Idempotent — calling more than once
