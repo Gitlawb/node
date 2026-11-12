@@ -134,7 +134,7 @@ fn init_inner(version: &str, node_did: &str) {
     let push_duration = Histogram::with_opts(
         HistogramOpts::new(
             "gitlawb_push_duration_seconds",
-            "Wall time of a successful git push (receive-pack) request in seconds, from handler entry to the point its effects are recorded",
+            "Wall time of a successful git push (receive-pack) request in seconds, from handler entry to its response, including claim-loser returns where another worker owns the effects",
         )
         .buckets(operation_duration_buckets()),
     )

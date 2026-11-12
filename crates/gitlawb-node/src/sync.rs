@@ -436,7 +436,7 @@ async fn process_batch(
                     false
                 };
                 // Register in DB so git smart HTTP can serve the mirrored repo
-                let mirror_visible = db
+                let mirror_visible = match db
                     .upsert_mirror_repo(
                         owner_short,
                         repo_name,
@@ -445,7 +445,13 @@ async fn process_batch(
                         quarantined,
                     )
                     .await
-                    .is_ok();
+                {
+                    Ok(_) => true,
+                    Err(e) => {
+                        warn!(repo = %item.repo, err = %e, "failed to register mirror repo");
+                        false
+                    }
+                };
                 // The lag is push-to-visible: sample at registration, before
                 // the encrypted-blob tail and mark_sync_done. A quarantined
                 // mirror is admitted but withheld from readers, so it reports

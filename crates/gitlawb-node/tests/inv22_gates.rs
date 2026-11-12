@@ -582,10 +582,19 @@ fn inv22_replication_tail_spawns_at_the_durability_boundary() {
         );
         let call_end = production[pos..].find(");").unwrap() + pos;
         let call = &production[pos..call_end];
-        // `landed` is the in-scope alias for `landed_refs` in the carve-out
-        // spawn; either name is the proven-landed set, `ref_updates` is not.
+        // Match the ref-set ARGUMENT (third positional), not a substring of the
+        // call: `landed` is the in-scope alias for `landed_refs` in the
+        // carve-out spawn and either name is the proven-landed set, but a bare
+        // `call.contains("landed")` is also satisfied by the `push_landed_at`
+        // timestamp argument, which would let a call feeding unfiltered
+        // `ref_updates` pass.
+        let refset_arg = call
+            .split(',')
+            .nth(2)
+            .map(str::trim)
+            .expect("U5 gate stale: tail call no longer takes a third argument");
         assert!(
-            call.contains("landed"),
+            refset_arg == "landed" || refset_arg == "landed_refs",
             "U5 gate bypassed: tail #{i} must carry the proven-landed ref set, not unfiltered ref_updates"
         );
     }
