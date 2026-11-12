@@ -5406,6 +5406,25 @@ impl Db {
     /// this once and processes each row by re-deriving the push event,
     /// the per-ref cert, and the anchor handoff.
     #[allow(dead_code)] // wired by the handler refactor in the next slice
+    /// The instant this request's refs actually moved: the latest `applied_at`
+    /// stamp across its applied transitions, or `None` when none are applied
+    /// yet. Shared definition of "push landed" for the live replication tail,
+    /// which must match the deferred drain's `max(applied_at) ?? created_at`
+    /// rule so live and deferred pushes report one lag origin.
+    pub async fn request_push_landed_at(&self, request_id: &str) -> Result<Option<String>> {
+        let row = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT MAX(applied_at) FROM pending_ref_transitions              WHERE request_id = $1 AND state = 'applied'",
+        )
+        .bind(request_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Test-only: the drain callers that used this moved to the request-scoped
+    /// `request_push_landed_at` and count helpers; kept for the transition-state
+    /// tests below.
+    #[cfg(test)]
     pub async fn list_pending_ref_transitions_applied(
         &self,
         limit: i64,
@@ -16707,5 +16726,49 @@ mod policy_fence_tests {
                 .unwrap(),
             "the unfenced sentinel skips the epoch comparison"
         );
+    }
+    /// The live replication tail reads its land instant through the same rule
+    /// the deferred drain uses: max applied_at across the request's applied
+    /// transitions, or None so the caller falls back to created_at.
+    #[sqlx::test]
+    async fn request_push_landed_at_returns_max_applied_or_none(pool: PgPool) {
+        let db = db(pool).await;
+        let repo_id = seed_repo(&db).await;
+        db.insert_pending_ref_transitions(
+            "req-live",
+            &repo_id,
+            "did:key:zNode",
+            "did:key:zPusher",
+            &[
+                crate::api::repos::RefUpdate {
+                    ref_name: "refs/heads/main".into(),
+                    old_sha: "0".repeat(40),
+                    new_sha: "a".repeat(40),
+                },
+                crate::api::repos::RefUpdate {
+                    ref_name: "refs/heads/dev".into(),
+                    old_sha: "0".repeat(40),
+                    new_sha: "b".repeat(40),
+                },
+            ],
+            "sig",
+            "sigin",
+            "digest",
+        )
+        .await
+        .unwrap();
+        // Nothing applied yet: the caller must fall back to created_at.
+        assert_eq!(db.request_push_landed_at("req-live").await.unwrap(), None);
+
+        db.mark_pending_ref_transitions_applied("req-live")
+            .await
+            .unwrap();
+        let landed = db.request_push_landed_at("req-live").await.unwrap();
+        assert!(
+            landed.is_some(),
+            "an applied request must report a land instant"
+        );
+        // A different request's rows never leak into this request's instant.
+        assert_eq!(db.request_push_landed_at("req-other").await.unwrap(), None);
     }
 }

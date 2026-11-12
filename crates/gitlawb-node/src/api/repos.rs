@@ -3327,10 +3327,18 @@ pub async fn git_receive_pack(
             landed_refs.clone(),
             disk_path.clone(),
             auth.0.to_string(),
-            // The acceptance instant from the request row insert, matching the
-            // deferred drain's land definition — a fresh clock here would
-            // understate live push-to-mirror lag by the whole receive-pack run.
-            Some(now.clone()),
+            // Same rule the deferred drain uses: the truest land instant is the
+            // latest applied_at on this request's landed transitions, with the
+            // request row's created_at (`now`) as the fallback.
+            Some(
+                state
+                    .db
+                    .request_push_landed_at(&request_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| now.clone()),
+            ),
             None,
         ));
     }
@@ -3359,8 +3367,17 @@ pub async fn git_receive_pack(
                 landed_refs,
                 disk_path.clone(),
                 auth.0.to_string(),
-                // Same acceptance instant as the carve-out spawn above.
-                Some(now.clone()),
+                // Same max(applied_at) ?? created_at rule as the carve-out
+                // spawn and the deferred drain.
+                Some(
+                    state
+                        .db
+                        .request_push_landed_at(&request_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| now.clone()),
+                ),
                 Some(publish_durability.arc()),
             ));
         }
