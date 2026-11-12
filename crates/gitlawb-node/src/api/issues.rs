@@ -183,11 +183,9 @@ pub async fn create_issue_comment(
     // placement close_issue uses for its brake). The route group carries no
     // outer brake for exactly this reason.
     if let Some(key) = crate::rate_limit::client_key(&headers, peer, state.push_limiter_trust) {
-        if !state.write_rate_limiter.check(&key).await {
+        if let Some(retry_after) = state.write_rate_limiter.check_retry(&key).await {
             tracing::warn!(repo = %repo, key = %key, "create_issue_comment rate limited");
-            return Err(AppError::TooManyRequests(
-                "rate limit exceeded — try again later".into(),
-            ));
+            return Err(AppError::RateLimited(retry_after));
         }
     }
 
@@ -291,15 +289,18 @@ pub async fn close_issue(
         // per-IP write brake — the route group deliberately carries no outer
         // brake — and this route's own close budget.
         //
-        // Decide on the non-consuming probe first, so a close refused by one
-        // cap spends nothing from the other bucket. The consuming checks run
-        // only once both buckets have room; a concurrent request landing in
-        // between can still fail one of them, which is a 429 like any other.
-        if state.write_rate_limiter.is_throttled(&key).await
-            || state.close_issue_rate_limiter.is_throttled(&key).await
-            || !state.write_rate_limiter.check(&key).await
-            || !state.close_issue_rate_limiter.check(&key).await
-        {
+        // A close refused by either cap spends nothing from the other bucket.
+        // The write bucket is debited first, and refunded when the close cap
+        // then refuses, so the guarantee holds even when a concurrent close
+        // takes the last close slot between the two checks. A write-bucket
+        // refusal advertises its window's Retry-After; the close-cap refusal
+        // keeps the plain 429 it has always returned.
+        if let Some(retry_after) = state.write_rate_limiter.check_retry(&key).await {
+            tracing::warn!(repo = %repo, key = %key, "close_issue rate limited");
+            return Err(AppError::RateLimited(retry_after));
+        }
+        if !state.close_issue_rate_limiter.check(&key).await {
+            state.write_rate_limiter.refund(&key).await;
             tracing::warn!(repo = %repo, key = %key, "close_issue rate limited");
             return Err(AppError::TooManyRequests(
                 "rate limit exceeded — try again later".into(),
@@ -1374,14 +1375,117 @@ mod lock_pool_shed_tests {
             crate::rate_limit::PeerAddr(Some(peer)),
         )
         .await;
-        assert!(
-            matches!(res, Err(AppError::TooManyRequests(_))),
-            "write cap exhausted must 429: {:?}",
-            res
+        let resp = res
+            .expect_err("write cap exhausted must refuse")
+            .into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "write cap exhausted must 429"
         );
         assert!(
             state.close_issue_rate_limiter.check(&key).await,
             "a close refused by the write cap must leave the close bucket untouched"
+        );
+    }
+
+    /// 429 from the shared write bucket must advertise a window-derived
+    /// Retry-After, as the outer-middleware 429s on the other write routes do.
+    fn assert_429_with_window_retry_after(err: AppError, what: &str) {
+        let resp = err.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "{what}: an exhausted write bucket must 429"
+        );
+        let secs: u64 = resp
+            .headers()
+            .get("retry-after")
+            .unwrap_or_else(|| panic!("{what}: the write-bucket 429 must carry retry-after"))
+            .to_str()
+            .unwrap()
+            .parse()
+            .expect("retry-after must be integer seconds");
+        assert!(
+            (1..=3600).contains(&secs),
+            "{what}: retry-after {secs}s must fall inside the 3600s window, not a constant"
+        );
+    }
+
+    #[sqlx::test]
+    async fn close_issue_write_cap_429_carries_retry_after(pool: PgPool) {
+        use std::net::SocketAddr;
+        use std::time::Duration;
+
+        let owner = "did:key:zCLOSERETRYOWNERAAAAAAAAAAAAAAAAAAAAAA";
+        let mut state = crate::test_support::test_state(pool).await;
+        state.write_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1, Duration::from_secs(3600));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "retry-close"))
+            .await
+            .expect("seed repo");
+
+        let peer: SocketAddr = "203.0.113.61:7000".parse().unwrap();
+        assert!(state.write_rate_limiter.check(&peer.ip().to_string()).await);
+
+        let res = close_issue(
+            State(state),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((
+                owner.to_string(),
+                "retry-close".to_string(),
+                "1".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            crate::rate_limit::PeerAddr(Some(peer)),
+        )
+        .await;
+        assert_429_with_window_retry_after(
+            res.expect_err("write cap exhausted must refuse"),
+            "close_issue",
+        );
+    }
+
+    #[sqlx::test]
+    async fn create_issue_comment_write_cap_429_carries_retry_after(pool: PgPool) {
+        use std::net::SocketAddr;
+        use std::time::Duration;
+
+        let owner = "did:key:zCOMMENTRETRYOWNERAAAAAAAAAAAAAAAAAAAA";
+        let mut state = crate::test_support::test_state(pool).await;
+        state.write_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1, Duration::from_secs(3600));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "retry-comment"))
+            .await
+            .expect("seed repo");
+
+        let peer: SocketAddr = "203.0.113.62:7000".parse().unwrap();
+        assert!(state.write_rate_limiter.check(&peer.ip().to_string()).await);
+
+        let res = create_issue_comment(
+            State(state),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((
+                owner.to_string(),
+                "retry-comment".to_string(),
+                "1".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            crate::rate_limit::PeerAddr(Some(peer)),
+            Json(CreateIssueCommentRequest {
+                body: "x".to_string(),
+            }),
+        )
+        .await;
+        assert_429_with_window_retry_after(
+            res.expect_err("write cap exhausted must refuse"),
+            "create_issue_comment",
         );
     }
 

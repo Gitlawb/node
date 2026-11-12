@@ -151,6 +151,22 @@ impl RateLimiter {
         None
     }
 
+    /// Give back one slot a prior [`check`](Self::check) took for `key`, for a
+    /// caller that debits two buckets and must undo the first when the second
+    /// refuses. Drops the newest timestamp: the count is what the cap reads, so
+    /// that is equivalent to dropping the caller's own even if another request
+    /// landed in between. An unknown key is a no-op, and a key left with no
+    /// timestamps is removed so a refund never holds a map entry.
+    pub(crate) async fn refund(&self, key: &str) {
+        let mut state = self.state.lock().await;
+        if let Some(window) = state.get_mut(key) {
+            window.timestamps.pop();
+            if window.timestamps.is_empty() {
+                state.remove(key);
+            }
+        }
+    }
+
     /// Non-consuming check: is this key ALREADY at its limit for the current window?
     /// Unlike [`check`], it records nothing and never inserts a new key — used to shed
     /// expensive preparatory work (e.g. the `/ipfs/{cid}` legacy scan's O(repos) DB
@@ -1116,5 +1132,30 @@ mod tests {
             retry <= 2,
             "with 99s of a 100s window elapsed, the remaining delay is ~1s, got {retry}"
         );
+    }
+
+    /// `refund` gives back exactly one slot a prior `check` took, so a caller
+    /// that debits two buckets can undo the first when the second refuses.
+    #[tokio::test]
+    async fn refund_returns_one_slot_and_is_a_no_op_for_an_unknown_key() {
+        let limiter = RateLimiter::new(2, Duration::from_secs(60));
+        assert!(limiter.check("k").await);
+        assert!(limiter.check("k").await);
+        assert!(!limiter.check("k").await, "bucket is full");
+
+        limiter.refund("k").await;
+        assert!(limiter.check("k").await, "one slot came back");
+        assert!(!limiter.check("k").await, "and only one");
+
+        // An unknown key must neither panic nor create an entry.
+        limiter.refund("never-seen").await;
+        assert!(limiter.state.lock().await.get("never-seen").is_none());
+
+        // Refunding the only slot drops the key, so a refunded key does not
+        // hold a map entry (the limiter's key cap bounds its own state).
+        let single = RateLimiter::new(1, Duration::from_secs(60));
+        assert!(single.check("solo").await);
+        single.refund("solo").await;
+        assert!(single.state.lock().await.get("solo").is_none());
     }
 }
