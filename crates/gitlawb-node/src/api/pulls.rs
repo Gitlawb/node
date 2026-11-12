@@ -306,6 +306,12 @@ pub async fn close_pr(
         ));
     }
 
+    // Same refusal merge_pr gives, before the head is resolved: a repeated close
+    // must not store the branch's current tip on a historical pull request.
+    if pr.status != "open" {
+        return Err(AppError::BadRequest(format!("PR is already {}", pr.status)));
+    }
+
     // Freeze the head this close decided against, the same snapshot merge_pr
     // takes on its path: a closed pull request's rollup serves only the stored
     // head, so a PR closed before its first status read would report

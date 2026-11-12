@@ -8583,6 +8583,10 @@ mod tests {
             let out = std::process::Command::new("git")
                 .args(args)
                 .current_dir(dir.path())
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
                 .output()
                 .expect("git runs");
             assert!(

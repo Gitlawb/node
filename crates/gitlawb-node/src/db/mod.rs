@@ -4144,7 +4144,7 @@ impl Db {
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             "UPDATE pull_requests SET status='closed', updated_at=$1, \
-             head_commit=COALESCE($3, head_commit) WHERE id=$2",
+             head_commit=COALESCE($3, head_commit) WHERE id=$2 AND status='open'",
         )
         .bind(&now)
         .bind(pr_id)
@@ -12373,6 +12373,29 @@ mod migration_tests {
             Some(SHA_A.to_string()),
             "an unresolvable close keeps the stored head"
         );
+    }
+
+    /// A repeated close must not re-freeze a head onto a pull request that is
+    /// already closed: the handler resolves the head from the branch as it is
+    /// now, so applying it would retarget a historical status after the fact.
+    #[sqlx::test]
+    async fn close_pr_leaves_an_already_closed_pull_request_untouched(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        let pr = sample_pr("repo-1", 1);
+        db.create_pr(&pr).await.unwrap();
+        db.close_pr(&pr.id, None).await.unwrap();
+        let first = db.get_pr("repo-1", 1).await.unwrap().unwrap();
+        assert_eq!(first.head_commit, None, "closed with no resolvable head");
+
+        db.close_pr(&pr.id, Some(SHA_B)).await.unwrap();
+        let second = db.get_pr("repo-1", 1).await.unwrap().unwrap();
+        assert_eq!(
+            second.head_commit, None,
+            "a second close must not store a head on a closed pull request"
+        );
+        assert_eq!(second.updated_at, first.updated_at);
     }
 
     /// A same-named branch is the common case across repos, so a missing repo
