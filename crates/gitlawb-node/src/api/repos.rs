@@ -3321,26 +3321,37 @@ pub async fn git_receive_pack(
         Vec::new()
     };
     if disposition.spawn_tail && !push_succeeded && !landed_refs.is_empty() {
-        tokio::spawn(post_receive_replication_tail(
-            state.clone(),
-            record.clone(),
-            landed_refs.clone(),
-            disk_path.clone(),
-            auth.0.to_string(),
-            // Same rule the deferred drain uses: the truest land instant is the
-            // latest applied_at on this request's landed transitions, with the
-            // request row's created_at (`now`) as the fallback.
-            Some(
-                state
-                    .db
-                    .request_push_landed_at(&request_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| now.clone()),
-            ),
-            None,
-        ));
+        let state = state.clone();
+        let record = record.clone();
+        let landed = landed_refs.clone();
+        let disk_path = disk_path.clone();
+        let did = auth.0.to_string();
+        let db = state.db.clone();
+        let request_id = request_id.clone();
+        let fallback = now.clone();
+        tokio::spawn(async move {
+            // Resolve inside the owned task: awaiting the lookup in the handler
+            // would hold the reclaimed write lease during a DB wait and leave
+            // the tail un-owned on a disconnect. Same land rule as the deferred
+            // drain — max applied_at across this request's landed transitions,
+            // else the request row's created_at.
+            let push_landed_at = db
+                .request_push_landed_at(&request_id)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(fallback);
+            post_receive_replication_tail(
+                state,
+                record,
+                landed,
+                disk_path,
+                did,
+                Some(push_landed_at),
+                None,
+            )
+            .await;
+        });
     }
 
     // Always release the advisory lock — even on error — to prevent stale locks
@@ -3361,25 +3372,35 @@ pub async fn git_receive_pack(
         // than by the mere fact that release was entered.
         publish_durability.arm_for_release(reclaimed.publish_stage());
         if disposition.spawn_tail && !landed_refs.is_empty() {
-            tokio::spawn(post_receive_replication_tail(
-                state.clone(),
-                record.clone(),
-                landed_refs,
-                disk_path.clone(),
-                auth.0.to_string(),
-                // Same max(applied_at) ?? created_at rule as the carve-out
-                // spawn and the deferred drain.
-                Some(
-                    state
-                        .db
-                        .request_push_landed_at(&request_id)
-                        .await
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| now.clone()),
-                ),
-                Some(publish_durability.arc()),
-            ));
+            let state = state.clone();
+            let record = record.clone();
+            let disk_path = disk_path.clone();
+            let did = auth.0.to_string();
+            let db = state.db.clone();
+            let request_id = request_id.clone();
+            let fallback = now.clone();
+            let durability_slot = publish_durability.arc();
+            tokio::spawn(async move {
+                // Same in-task resolution and land rule as the carve-out spawn
+                // above — the handler must not await the lookup while it still
+                // holds the reclaimed write lease.
+                let push_landed_at = db
+                    .request_push_landed_at(&request_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(fallback);
+                post_receive_replication_tail(
+                    state,
+                    record,
+                    landed_refs,
+                    disk_path,
+                    did,
+                    Some(push_landed_at),
+                    Some(durability_slot),
+                )
+                .await;
+            });
         }
     }
     // Short-circuit on a refused publish BEFORE anything downstream observes
@@ -3741,8 +3762,9 @@ pub(crate) async fn post_receive_replication_tail(
     // The sync-lag origin: the instant this push landed, captured BEFORE the
     // durability wait so a slow publish does not shrink the lag a mirror
     // measures. Travels to receiving peers as RefUpdateEvent::lag_origin
-    // (gossip) and the notify timestamp (HTTP) — never as the signed event's
-    // own `timestamp`, which must stay at publish time for check_freshness.
+    // (gossip) and the notify lag_origin field (HTTP) — never as the signed
+    // event's own `timestamp` or the notify `timestamp`, which both stay at
+    // publish time for check_freshness and feed-row parity.
     let origin_timestamp = lag_origin_timestamp(push_landed_at);
 
     if !publish_durability_confirmed(&publish_durability, durability_wait).await {
@@ -8120,8 +8142,10 @@ mod tests {
                 mockito::Matcher::PartialJsonString(
                     r#"{"owner_did":"did:key:zOwner"}"#.to_string(),
                 ),
+                // Land time rides lag_origin after the publish/land split;
+                // timestamp is a live send instant and cannot be pinned.
                 mockito::Matcher::PartialJsonString(
-                    r#"{"timestamp":"2026-08-16T00:00:00Z"}"#.to_string(),
+                    r#"{"lag_origin":"2026-08-16T00:00:00Z"}"#.to_string(),
                 ),
             ]))
             .with_status(200)
