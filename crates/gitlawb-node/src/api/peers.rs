@@ -439,6 +439,7 @@ pub async fn trigger_sync(State(state): State<AppState>) -> Result<Json<serde_js
                     "refs/heads/main",
                     "0000000000000000000000000000000000000000",
                     None,
+                    None,
                 )
                 .await;
             enqueued += 1;
@@ -474,6 +475,13 @@ pub struct NotifyRequest {
     pub old_sha: Option<String>,
     #[serde(default)]
     pub timestamp: Option<String>,
+    /// The instant the origin push landed, for sync-lag measurement only —
+    /// mirrors RefUpdateEvent::lag_origin on the gossip transport. `timestamp`
+    /// stays publish semantics to match what gossip ingest stores on the feed
+    /// row; when an older sender omits this field the enqueue falls back to
+    /// `timestamp`, which was the pre-split approximation of land time.
+    #[serde(default)]
+    pub lag_origin: Option<String>,
     #[serde(default)]
     pub cert_id: Option<String>,
     /// Full owner DID — added in #144 for DID-aware feed gating.
@@ -520,7 +528,14 @@ pub async fn notify_sync(
 
     state
         .db
-        .enqueue_sync(&req.repo, &req.node_did, &req.ref_name, &req.new_sha, None)
+        .enqueue_sync(
+            &req.repo,
+            &req.node_did,
+            &req.ref_name,
+            &req.new_sha,
+            None,
+            req.lag_origin.as_deref().or(req.timestamp.as_deref()),
+        )
         .await?;
 
     // Mirror the gossipsub-receive handler: insert the same record we'd
@@ -1279,6 +1294,52 @@ mod tests {
         assert_eq!(
             count, 1,
             "the valid path must still write the ref-update row"
+        );
+    }
+
+    #[sqlx::test]
+    async fn sync_notify_preserves_origin_timestamp_for_sync_lag(pool: PgPool) {
+        let state = test_state(pool).await;
+        let db = state.db.clone();
+        let peer_did = seed_peer(&state).await;
+        // Distinct publish and land instants: the feed row must carry publish
+        // semantics while only the queue row sees lag_origin.
+        let timestamp = "2026-08-16T00:00:00Z";
+        let lag_origin = "2026-08-15T23:59:00Z";
+        let body = serde_json::json!({
+            "repo": "z6Mkfoo/timestamped",
+            "ref_name": "refs/heads/main",
+            "new_sha": "0000000000000000000000000000000000000000",
+            "node_did": peer_did,
+            "timestamp": timestamp,
+            "lag_origin": lag_origin,
+        })
+        .to_string();
+        let router = crate::server::build_router(state);
+
+        let resp = router
+            .oneshot(unsigned_post(
+                "/api/v1/sync/notify",
+                &body,
+                "198.51.100.23:5000",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let queued = db.dequeue_pending_syncs(100).await.unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].origin_timestamp.as_deref(), Some(lag_origin));
+        let feed = db
+            .list_ref_updates_keyset(Some("z6Mkfoo/timestamped"), 10, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            feed.iter()
+                .find(|u| u.repo == "z6Mkfoo/timestamped")
+                .map(|u| u.timestamp.as_str()),
+            Some(timestamp),
+            "the feed row must keep publish semantics, matching gossip ingest"
         );
     }
 

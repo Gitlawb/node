@@ -16,7 +16,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use gitlawb_core::identity::Keypair;
 use tracing::{error, info, warn};
 
@@ -46,6 +48,23 @@ enum PromisorProbe {
     /// The key is absent (git exit 1) or set to a non-`true` value.
     NotPromisor,
     /// The probe itself failed (git spawn error or other non-zero exit).
+    Unknown,
+}
+
+/// The result of reading a ref's tip from a local mirror, three-valued so a
+/// failed read is not mistaken for a confirmed-absent ref. `rev-parse` exits
+/// non-zero for both "ref missing" and "read failed", and classifying only on
+/// success/failure lets a transient error satisfy the deletion arm of the lag
+/// observation gate, and the mirror would then report a deletion it never
+/// proved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TipProbe {
+    /// `rev-parse --verify` resolved the ref to this sha.
+    Tip(String),
+    /// The read completed and the ref definitively does not resolve.
+    Absent,
+    /// The read itself failed (spawn error, timeout, or an exit status that is
+    /// neither "resolved" nor "absent"); nothing about the ref was proven.
     Unknown,
 }
 
@@ -178,6 +197,27 @@ fn resolve_origin_url(peers: &[crate::db::PeerRecord], node_did: &str) -> Option
         .iter()
         .find(|p| p.did == node_did)
         .map(|p| p.http_url.trim_end_matches('/').to_string())
+}
+
+/// Convert a sender-supplied RFC-3339 ref-update timestamp into an observable
+/// lag. Missing, malformed, and future timestamps are deliberately ignored:
+/// older peers and clock-skewed peers must not create fabricated observations.
+const MAX_SYNC_LAG_OBSERVATION: Duration = Duration::from_secs(86_400);
+
+fn sync_lag_from_origin_timestamp(
+    origin_timestamp: Option<&str>,
+    visible_at: DateTime<Utc>,
+) -> Option<Duration> {
+    let origin = DateTime::parse_from_rfc3339(origin_timestamp?).ok()?;
+    let lag = visible_at
+        .signed_duration_since(origin.with_timezone(&Utc))
+        .to_std()
+        .ok()?;
+    // The origin timestamp is unauthenticated input from a known-but-not-proofed
+    // peer: an absurd age (a 1970 date, a stale clock) would park a fabricated
+    // observation in the histogram's tail buckets, so past a day the value is
+    // ignored rather than sampled.
+    (lag <= MAX_SYNC_LAG_OBSERVATION).then_some(lag)
 }
 
 async fn process_batch(
@@ -396,7 +436,7 @@ async fn process_batch(
                     false
                 };
                 // Register in DB so git smart HTTP can serve the mirrored repo
-                let _ = db
+                let mirror_visible = match db
                     .upsert_mirror_repo(
                         owner_short,
                         repo_name,
@@ -404,6 +444,23 @@ async fn process_batch(
                         machine_id,
                         quarantined,
                     )
+                    .await
+                {
+                    Ok(_) => true,
+                    Err(e) => {
+                        warn!(repo = %item.repo, err = %e, "failed to register mirror repo");
+                        false
+                    }
+                };
+                // The lag is push-to-visible: sample at registration, before
+                // the encrypted-blob tail and mark_sync_done. A quarantined
+                // mirror is admitted but withheld from readers, so it reports
+                // no visibility lag. The gate reads the PERSISTED flag, not the
+                // attempt-local one: on a re-sync `quarantined` is false while
+                // `upsert_mirror_repo` preserves an existing quarantine, and
+                // sampling then would record visibility the readers still deny.
+                let withheld = db.is_repo_quarantined(&item.repo).await.unwrap_or(true);
+                observe_sync_lag_if_outcome_visible(&local_path, &item, mirror_visible, withheld)
                     .await;
                 // Option B2: carry the encrypted withheld-blob envelopes too, so an
                 // authorized reader can recover private content from this mirror if
@@ -647,6 +704,77 @@ async fn git_run(args: &[&str]) -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("git {args:?} failed: {stderr}"));
     }
     Ok(())
+}
+
+/// Observe `gitlawb_sync_lag_seconds` for one dequeued row, but only when the
+/// mirror provably shows the queued outcome. If the origin advanced the same
+/// ref past this row before the fetch ran, the mirror carries the newer tip
+/// and this row's visibility was never real; a deletion confirms only when the
+/// ref is proven absent. A failed tip read proves nothing in either direction,
+/// so it never samples: on a delete-sentinel row a read error must not satisfy
+/// the absence arm the way a bare `Option` once allowed.
+async fn observe_sync_lag_if_outcome_visible(
+    local_path: &Path,
+    item: &crate::db::SyncQueueItem,
+    mirror_visible: bool,
+    withheld: bool,
+) {
+    if !mirror_visible || withheld {
+        return;
+    }
+    let outcome_visible = match mirror_ref_tip(local_path, &item.ref_name).await {
+        TipProbe::Tip(sha) => sha == item.new_sha,
+        // `new_sha` is the all-zero sentinel on a delete row: the queued
+        // outcome is visible only once the mirror proves the ref is gone.
+        TipProbe::Absent => item.new_sha.bytes().all(|b| b == b'0'),
+        TipProbe::Unknown => false,
+    };
+    if !outcome_visible {
+        return;
+    }
+    if let Some(lag) = sync_lag_from_origin_timestamp(item.origin_timestamp.as_deref(), Utc::now())
+    {
+        crate::metrics::observe_sync_lag(lag);
+    }
+}
+
+/// Resolve `ref_name` inside `repo` as a three-valued [`TipProbe`] for the lag
+/// observation gate: the sha it points to, a confirmed-absent ref, or a read
+/// that proved nothing. `rev-parse --verify --quiet` exits 0 with the sha on
+/// stdout when the ref resolves, 1 when it definitively does not, and any
+/// other status (128 on a path that is not a repo, a signal, a usage error)
+/// means the read failed. A spawn error or the 10s timeout firing is also
+/// [`TipProbe::Unknown`].
+async fn mirror_ref_tip(repo: &std::path::Path, ref_name: &str) -> TipProbe {
+    // allow-unbounded-git: bounded by the tokio::time::timeout wrapping this
+    // read below, plus kill_on_drop; rev-parse is a metadata lookup, not a
+    // transfer, so the 10s cap is generous.
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.kill_on_drop(true);
+    let out = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        cmd.args(["-C"])
+            .arg(repo)
+            .args(["rev-parse", "--verify", "--quiet", ref_name])
+            .output(),
+    )
+    .await
+    {
+        Ok(Ok(out)) => out,
+        _ => return TipProbe::Unknown,
+    };
+    match out.status.code() {
+        Some(0) => {
+            let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if sha.is_empty() {
+                TipProbe::Unknown
+            } else {
+                TipProbe::Tip(sha)
+            }
+        }
+        Some(1) => TipProbe::Absent,
+        _ => TipProbe::Unknown,
+    }
 }
 
 /// Run a git subprocess, ignoring a non-zero exit. Used for idempotent
@@ -1582,9 +1710,150 @@ mod tests {
     }
 
     async fn enqueue(db: &Db, repo: &str, did: &str) {
-        db.enqueue_sync(repo, did, "refs/heads/main", &"0".repeat(40), None)
+        db.enqueue_sync(repo, did, "refs/heads/main", &"0".repeat(40), None, None)
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn sync_lag_uses_origin_timestamp_only_when_it_is_in_the_past() {
+        let visible_at = chrono::DateTime::parse_from_rfc3339("2026-08-16T00:00:12Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        assert_eq!(
+            sync_lag_from_origin_timestamp(Some("2026-08-16T00:00:00Z"), visible_at),
+            Some(Duration::from_secs(12))
+        );
+        assert_eq!(sync_lag_from_origin_timestamp(None, visible_at), None);
+        assert_eq!(
+            sync_lag_from_origin_timestamp(Some("not-a-timestamp"), visible_at),
+            None
+        );
+        assert_eq!(
+            sync_lag_from_origin_timestamp(Some("2026-08-16T00:00:13Z"), visible_at),
+            None
+        );
+    }
+
+    fn lag_item(
+        ref_name: &str,
+        new_sha: &str,
+        origin_timestamp: Option<&str>,
+    ) -> crate::db::SyncQueueItem {
+        crate::db::SyncQueueItem {
+            id: "row".to_string(),
+            repo: "o/r".to_string(),
+            node_did: "did:key:x".to_string(),
+            ref_name: ref_name.to_string(),
+            new_sha: new_sha.to_string(),
+            cid: None,
+            origin_timestamp: origin_timestamp.map(str::to_string),
+            status: "pending".to_string(),
+            enqueued_at: String::new(),
+        }
+    }
+
+    /// The tip probe is three-valued: a resolved ref, a confirmed-absent ref
+    /// (git exits 1 under `--verify --quiet`), and a failed read (exit 128 on a
+    /// path that is not a repo) must not collapse into each other.
+    #[tokio::test]
+    async fn tip_probe_reports_tip_absent_and_unknown_distinctly() {
+        let (td, _url) = bare_remote(&[("a.txt", b"hi\n")]);
+        let repo = td.path().join("bare.git");
+        let expected = {
+            let out = Command::new("git")
+                .args(["-C"])
+                .arg(&repo)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        assert_eq!(mirror_ref_tip(&repo, "HEAD").await, TipProbe::Tip(expected));
+        assert_eq!(
+            mirror_ref_tip(&repo, "refs/heads/never-pushed").await,
+            TipProbe::Absent
+        );
+        // A failed read proves nothing about the ref; it is not absent.
+        assert_eq!(
+            mirror_ref_tip(
+                Path::new("/nonexistent/gitlawb-tip-probe-xyz"),
+                "refs/heads/main"
+            )
+            .await,
+            TipProbe::Unknown
+        );
+    }
+
+    /// Regression for the #580 review finding: a zero `new_sha` is the delete
+    /// sentinel, and a FAILED tip read must not satisfy the deletion arm. The
+    /// mirror never proved the ref is gone, so no `gitlawb_sync_lag_seconds`
+    /// sample may be emitted. `git -C` on a path that is not a repo exits 128
+    /// (Unknown); under the old `tip.is_none()` gate that read satisfied the
+    /// arm and sampled a deletion nobody proved.
+    #[tokio::test]
+    async fn lag_gate_skips_the_sample_when_the_tip_read_fails() {
+        crate::metrics::init("0.0.0-test", "did:key:test");
+        let ts = (Utc::now() - Duration::from_secs(60)).to_rfc3339();
+        let item = lag_item("refs/heads/main", &"0".repeat(40), Some(&ts));
+
+        let before = crate::metrics::sync_lag_sample_count_for_test();
+        observe_sync_lag_if_outcome_visible(
+            Path::new("/nonexistent/gitlawb-tip-probe-xyz"),
+            &item,
+            true,
+            false,
+        )
+        .await;
+        assert_eq!(
+            crate::metrics::sync_lag_sample_count_for_test(),
+            before,
+            "a failed tip read must not emit a lag sample for a delete row"
+        );
+    }
+
+    /// The live controls around the skip: a confirmed-absent ref on a delete
+    /// row does sample (the skip above is not vacuously green), while a
+    /// still-resolving ref and a hidden or unregistered mirror do not.
+    #[tokio::test]
+    async fn lag_gate_samples_only_when_the_queued_outcome_is_proven() {
+        crate::metrics::init("0.0.0-test", "did:key:test");
+        let (td, _url) = bare_remote(&[("a.txt", b"hi\n")]);
+        let repo = td.path().join("bare.git");
+        let ts = (Utc::now() - Duration::from_secs(60)).to_rfc3339();
+        let mut count = crate::metrics::sync_lag_sample_count_for_test();
+
+        // Confirmed absent on a delete-sentinel row: samples.
+        let gone = lag_item("refs/heads/never-pushed", &"0".repeat(40), Some(&ts));
+        observe_sync_lag_if_outcome_visible(&repo, &gone, true, false).await;
+        count += 1;
+        assert_eq!(crate::metrics::sync_lag_sample_count_for_test(), count);
+
+        // The ref still resolves, so the mirror carries a different state than
+        // the queued deletion: no sample.
+        let still_there = lag_item("HEAD", &"0".repeat(40), Some(&ts));
+        observe_sync_lag_if_outcome_visible(&repo, &still_there, true, false).await;
+        assert_eq!(crate::metrics::sync_lag_sample_count_for_test(), count);
+
+        // A non-delete row samples only when the tip equals the queued sha.
+        let tip = match mirror_ref_tip(&repo, "HEAD").await {
+            TipProbe::Tip(sha) => sha,
+            other => panic!("expected a resolved tip, got {other:?}"),
+        };
+        let landed = lag_item("HEAD", &tip, Some(&ts));
+        observe_sync_lag_if_outcome_visible(&repo, &landed, true, false).await;
+        count += 1;
+        assert_eq!(crate::metrics::sync_lag_sample_count_for_test(), count);
+        let wrong_sha = lag_item("HEAD", &"f".repeat(40), Some(&ts));
+        observe_sync_lag_if_outcome_visible(&repo, &wrong_sha, true, false).await;
+        assert_eq!(crate::metrics::sync_lag_sample_count_for_test(), count);
+
+        // A quarantined or unregistered mirror never samples.
+        observe_sync_lag_if_outcome_visible(&repo, &gone, false, false).await;
+        observe_sync_lag_if_outcome_visible(&repo, &gone, true, true).await;
+        assert_eq!(crate::metrics::sync_lag_sample_count_for_test(), count);
     }
 
     fn dir_entries(dir: &Path) -> Vec<String> {
@@ -2808,6 +3077,7 @@ mod tests {
             cid: None,
             status: "pending".to_string(),
             enqueued_at: chrono::Utc::now().to_rfc3339(),
+            origin_timestamp: None,
         };
         async fn status_of(pool: &sqlx::PgPool, id: &str) -> String {
             let row: (String,) = sqlx::query_as("SELECT status FROM sync_queue WHERE id = $1")
