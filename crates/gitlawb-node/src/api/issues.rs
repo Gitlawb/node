@@ -458,7 +458,17 @@ pub async fn close_issue(
     // the close back on local disk, mirroring create_issue. Best-effort: if the
     // snapshot read fails we proceed without a rollback closure (the close still
     // applies and a failed upload still surfaces as a 5xx below).
-    let prior_json = git_issues::get_issue(&disk_path, &issue_id).ok().flatten();
+    //
+    // Resolve first so the compensating rewrite below lands on the SAME ref the
+    // close mutates. The path id may be an 8-char prefix, and rewriting
+    // refs/gitlawb/issues/{prefix} with the pre-close content would leave the
+    // canonical {full_id} ref closed while the client saw a 5xx.
+    let full_issue_id = git_issues::resolve_issue_id(&disk_path, &issue_id)
+        .ok()
+        .flatten();
+    let prior_json = full_issue_id
+        .as_deref()
+        .and_then(|id| git_issues::get_issue(&disk_path, id).ok().flatten());
 
     let close_result = git_issues::close_issue(&disk_path, &issue_id);
 
@@ -466,25 +476,18 @@ pub async fn close_issue(
     // Same short-circuit as create_issue, and before the 200 body below. With a
     // snapshot in hand, a failed upload rewrites the ref back to the pre-close
     // content instead of leaving the local repo closed while the client saw 5xx.
-    let release_result = match (close_result.is_ok(), prior_json) {
-        (true, Some(json)) => {
+    let release_result = match (close_result.is_ok(), prior_json, full_issue_id) {
+        (true, Some(json), Some(resolved_id)) => {
             let git_bin = state.git_bin.clone();
             let deadline = std::time::Instant::now()
                 + std::time::Duration::from_secs(state.config.git_service_timeout_secs);
-            let issue_id_for_comp = issue_id.clone();
             guard
                 .release_compensating(true, move |path| {
                     // Same bounded-write strategy create_issue's compensator
                     // uses: the rollback rewrites the ref with the pre-close
                     // content through the deadline-aware runner, so a hung git
                     // cannot stall the guard past git_service_timeout.
-                    git_issues::create_issue_bounded(
-                        &git_bin,
-                        path,
-                        &issue_id_for_comp,
-                        &json,
-                        deadline,
-                    )
+                    git_issues::create_issue_bounded(&git_bin, path, &resolved_id, &json, deadline)
                 })
                 .await
                 .into_result()
@@ -1371,6 +1374,178 @@ mod lock_pool_shed_tests {
             "the local issue ref must be rolled back after a refused publish, got {issues:?}"
         );
 
+        server.abort();
+    }
+
+    /// The compensating rewrite after a refused publish must land on the ref the
+    /// close actually mutated. A close addressed by an 8-char prefix resolves to
+    /// the full id and closes `refs/gitlawb/issues/{full_id}`; a compensator
+    /// that rewrites the path id verbatim mints `refs/gitlawb/issues/{prefix}`
+    /// with the pre-close content and leaves the canonical ref closed while the
+    /// client saw a 5xx.
+    ///
+    /// Reaching the compensator observably takes one contrivance: a definite
+    /// refusal invalidates (deletes) the live tree BEFORE the closure runs, so
+    /// the ref it writes exists only when that deletion cannot complete. The
+    /// fixture makes the tree read-only except the two directories the close
+    /// and its rollback write (`refs/gitlawb/issues/` and its reflog), and
+    /// pre-stores the closed blob so the mutation's `hash-object -w` needs no
+    /// write either. Without the contrivance the compensator runs against a
+    /// path that is already gone and there is nothing to assert on.
+    #[sqlx::test]
+    #[cfg(unix)]
+    async fn close_via_prefix_restores_the_full_ref_when_publish_refuses(pool: PgPool) {
+        use axum::response::IntoResponse;
+        use std::os::unix::fs::PermissionsExt;
+
+        // Nothing is stored under the key (404 on HEAD: no under-lock download,
+        // a create-only publish fence) and the PUT is refused outright (a 4xx
+        // classifies as provably never dispatched), so release reaches the
+        // definite-refusal arm that invalidates the tree and runs the
+        // compensator.
+        let app = axum::Router::new().route(
+            "/{*key}",
+            axum::routing::any(|method: axum::http::Method| async move {
+                if method == axum::http::Method::HEAD {
+                    axum::http::StatusCode::NOT_FOUND.into_response()
+                } else {
+                    axum::http::StatusCode::FORBIDDEN.into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let owner = "did:key:zISSUECLOSEROLLBACKBBBBBBBBBBBBBBB";
+        let repo_name = "rollback-close-prefix";
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let disk = tempfile::TempDir::new().unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing_with_tigris(
+            disk.path().to_path_buf(),
+            crate::git::repo_store::build_lock_pool(&pool, 2, std::time::Duration::from_secs(1)),
+            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint),
+        );
+        state
+            .db
+            .create_repo(&seed_repo(owner, repo_name))
+            .await
+            .expect("seed repo");
+
+        // Seed the live tree at the path the store resolves, with the issue
+        // under its full id so the route can be addressed by the 8-char prefix.
+        let live = state
+            .repo_store
+            .acquire(owner, repo_name)
+            .await
+            .expect("resolve live path");
+        crate::git::store::init_bare(&live).expect("init bare repo");
+        let full_id = "abc12345-0000-0000-0000-000000000000";
+        let prefix = "abc12345";
+        let open_json = serde_json::to_string(&IssueRecord {
+            id: full_id.to_string(),
+            title: "seeded".to_string(),
+            body: Some(String::new()),
+            author: Some(owner.to_string()),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            status: "open".to_string(),
+            signed_payload: None,
+        })
+        .expect("serialize seeded issue");
+        git_issues::create_issue(&live, full_id, &open_json).expect("seed issue blob");
+
+        // Pre-store the blob `git_issues::close_issue` will write: the same
+        // parse/set-status/serialize sequence, so the bytes are identical and
+        // the mutation's `hash-object -w` is a no-op against read-only objects/.
+        let mut closed_value: serde_json::Value =
+            serde_json::from_str(&open_json).expect("parse seeded issue");
+        closed_value["status"] = serde_json::Value::String("closed".into());
+        let closed_json = serde_json::to_string(&closed_value).expect("closed issue json");
+        {
+            use std::io::Write;
+            let mut child = std::process::Command::new("git")
+                .args(["hash-object", "--stdin", "-w"])
+                .current_dir(&live)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn hash-object");
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(closed_json.as_bytes())
+                .expect("write blob");
+            assert!(
+                child.wait().expect("hash-object").success(),
+                "pre-storing the closed blob must succeed"
+            );
+        }
+
+        // Stand the tree through the refusal's remove_dir_all: read-only
+        // everywhere, then write restored only where the close mutation and its
+        // rollback actually land (the ref and its reflog).
+        fn make_readonly(path: &std::path::Path) -> std::io::Result<()> {
+            let mut p = path.metadata()?.permissions();
+            p.set_readonly(true);
+            std::fs::set_permissions(path, p)?;
+            if path.is_dir() {
+                for entry in std::fs::read_dir(path)? {
+                    make_readonly(&entry?.path())?;
+                }
+            }
+            Ok(())
+        }
+        make_readonly(&live).expect("make the live tree unremovable");
+        for dir in [
+            live.join("refs/gitlawb/issues"),
+            live.join("logs/refs/gitlawb/issues"),
+        ] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+                .expect("restore write where the rollback lands");
+        }
+
+        let shed = close_issue(
+            State(state.clone()),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((owner.to_string(), repo_name.to_string(), prefix.to_string())),
+            axum::http::HeaderMap::new(),
+            crate::rate_limit::PeerAddr(None),
+        )
+        .await;
+        let err = shed.expect_err("a refused publish must not report a closed issue");
+        assert!(
+            err.into_response().status().is_server_error(),
+            "a definite publish refusal must surface as a 5xx"
+        );
+
+        let restored = git_issues::get_issue(&live, full_id).expect("read the full ref");
+        assert_eq!(
+            restored.as_deref(),
+            Some(open_json.as_str()),
+            "the compensator must restore the pre-close content on the FULL ref, \
+             not on refs/gitlawb/issues/{prefix}"
+        );
+        assert_eq!(
+            git_issues::resolve_issue_id(&live, prefix).expect("resolve the prefix"),
+            Some(full_id.to_string()),
+            "no stray refs/gitlawb/issues/{{prefix}} may be minted beside the \
+             canonical ref: the prefix must still resolve to the full id"
+        );
+        let issues = git_issues::list_issues(&live).expect("list issues");
+        assert_eq!(
+            issues.len(),
+            1,
+            "exactly one issue ref may survive the rollback: {issues:?}"
+        );
+
+        // Restore writability so the TempDir can clean itself up.
+        let _ = std::process::Command::new("chmod")
+            .args(["-R", "u+w"])
+            .arg(&live)
+            .output();
         server.abort();
     }
     /// INV-12 ordering: both issue write routes debit the shared write bucket

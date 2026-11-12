@@ -3437,7 +3437,7 @@ mod tests {
         run(&["commit", "-q", "-m", "seed"], &src);
         // The tag that shadows the missing target branch: "release" resolves via
         // DWIM but refs/heads/release never exists.
-        run(&["tag", "release"], &src);
+        run(&["tag", "-m", "release", "release"], &src);
         run(&["checkout", "-q", "-b", "feature"], &src);
         std::fs::write(src.join("feature.txt"), b"feature-only").unwrap();
         run(&["add", "feature.txt"], &src);
@@ -3597,7 +3597,7 @@ mod tests {
         // moves past it. Revision DWIM prefers refs/tags/ over refs/heads/ for
         // an ambiguous short name, so this fixture is the strongest shadowing
         // shape: a naive resolution would merge onto the stale tag commit.
-        run(&["tag", "release"], &src);
+        run(&["tag", "-m", "release", "release"], &src);
         run(&["checkout", "-q", "-b", "release"], &src);
         std::fs::write(src.join("release.txt"), b"release-only").unwrap();
         run(&["add", "release.txt"], &src);

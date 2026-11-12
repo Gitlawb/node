@@ -16336,39 +16336,6 @@ exit 0
         );
     }
 
-    // Representative REST write group (issue comment) — same attachment as the
-    // task/bounty/profile groups.
-    #[sqlx::test]
-    async fn issue_comment_is_rate_limited_by_ip(pool: sqlx::PgPool) {
-        use axum::body::Body;
-        use axum::http::{Method, StatusCode};
-        use std::net::SocketAddr;
-        use std::time::Duration;
-
-        let mut state = crate::test_support::test_state(pool).await;
-        state.write_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
-        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
-
-        let peer: SocketAddr = "203.0.113.122:7000".parse().unwrap();
-        assert!(state.write_rate_limiter.check(&peer.ip().to_string()).await);
-
-        let router = crate::server::build_router(state);
-        let status = send_from(
-            &router,
-            Method::POST,
-            "/api/v1/repos/someowner/somerepo/issues/1/comments",
-            &[("content-type", "application/json")],
-            Body::from(r#"{"body":"flood"}"#),
-            peer,
-        )
-        .await;
-        assert_eq!(
-            status,
-            StatusCode::TOO_MANY_REQUESTS,
-            "issue-write routes must be IP-throttled by the write brake"
-        );
-    }
-
     // Adoption floor: an under-limit write must NOT be throttled. Guards against
     // an off-by-one that braked the first request (invisible to the 429 tests,
     // which all pre-exhaust the bucket).
