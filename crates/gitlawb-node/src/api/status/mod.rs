@@ -37,7 +37,14 @@ const MAX_CONTEXTS_PER_COMMIT: i64 = 50;
 const MAX_CLAIMS_PER_REPO_PER_WINDOW: i64 = 10_000;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateStatusRequest {
+    /// Payload format version. The signature covers these bytes, so the
+    /// field set is the signed format: `deny_unknown_fields` keeps a future
+    /// producer's claim from silently reading as this one, and `v` names the
+    /// version explicitly so a later revision has somewhere to live. Absent
+    /// means 1.
+    pub v: Option<u32>,
     pub state: String,
     pub context: String,
     pub target_url: Option<String>,
@@ -88,8 +95,6 @@ const MAX_DESCRIPTION_CHARS: usize = 1024;
 #[derive(Serialize)]
 pub struct CreatedStatus {
     pub id: String,
-    /// The database-assigned ordering key, so the client can name its own row.
-    pub seq: i64,
     pub repo_id: String,
     pub commit_sha: String,
     pub state: String,
@@ -101,10 +106,9 @@ pub struct CreatedStatus {
 }
 
 impl CreatedStatus {
-    fn from_claim(claim: StatusClaim, seq: i64) -> Self {
+    fn from_claim(claim: StatusClaim) -> Self {
         Self {
             id: claim.id,
-            seq,
             repo_id: claim.repo_id,
             commit_sha: claim.commit_sha,
             state: claim.state,
@@ -137,6 +141,11 @@ pub async fn create_status(
     crate::api::require_repo_owner(&record, &auth.0)?;
 
     let commit_sha = normalize_sha(&sha)?;
+    if req.v.is_some_and(|v| v != 1) {
+        return Err(AppError::BadRequest(
+            "unsupported status payload version".into(),
+        ));
+    }
     let claim_state = validate_state(&req.state)?;
     let context = validate_context(&req.context)?;
     let target_url = validate_target_url(req.target_url.as_deref())?;
@@ -223,19 +232,14 @@ pub async fn create_status(
         per_repo_window: MAX_CLAIMS_PER_REPO_PER_WINDOW,
     };
     match state.db.insert_status_claim_capped(&claim, &caps).await? {
-        crate::db::ClaimInsert::Inserted(seq) => Ok((
-            StatusCode::CREATED,
-            Json(CreatedStatus::from_claim(claim, seq)),
-        )),
+        crate::db::ClaimInsert::Inserted(_) => {
+            Ok((StatusCode::CREATED, Json(CreatedStatus::from_claim(claim))))
+        }
         // Already recorded, so 200 and the original row rather than 201 and a
-        // second one. The claim the caller gets back is the stored one, id and
-        // seq included, which is what makes a retry safe to treat as success.
+        // second one. The claim the caller gets back is the stored one, id
+        // included, which is what makes a retry safe to treat as success.
         crate::db::ClaimInsert::AlreadyRecorded(existing) => {
-            let seq = existing.seq;
-            Ok((
-                StatusCode::OK,
-                Json(CreatedStatus::from_claim(*existing, seq)),
-            ))
+            Ok((StatusCode::OK, Json(CreatedStatus::from_claim(*existing))))
         }
         crate::db::ClaimInsert::CapExceeded(which) => Err(AppError::TooManyRequests(format!(
             "claim limit reached for {which}"

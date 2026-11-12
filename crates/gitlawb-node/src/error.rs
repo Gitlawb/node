@@ -309,6 +309,7 @@ impl IntoResponse for AppError {
                 | AppError::RepoBusy
                 | AppError::RepoUnavailable
                 | AppError::RepoWriteFenced
+                | AppError::TooManyRequests(_)
         ) {
             resp.headers_mut().insert(
                 axum::http::header::RETRY_AFTER,

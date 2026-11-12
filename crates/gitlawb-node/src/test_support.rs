@@ -363,6 +363,49 @@ pub(crate) async fn status_and_bytes(
     (status, bytes)
 }
 
+/// A `PendingRefTransition` test row in `applied` state: the fields the
+/// commit-status effect writers read (`ref_name`, `new_sha`, `ordinal`,
+/// `repo_id`) are the parameters, the rest is inert filler matching the
+/// shape `insert_pending_ref_transitions` writes. `applied_at` stays None
+/// so the recorded event falls back to the per-push timestamp the writer
+/// computes once for the whole batch — the shape a real push produces.
+#[allow(dead_code)] // commit-status surface tests across api modules
+pub(crate) fn pending_child(
+    request_id: &str,
+    repo_id: &str,
+    ref_name: &str,
+    old_sha: &str,
+    new_sha: &str,
+    ordinal: i32,
+) -> crate::db::PendingRefTransition {
+    crate::db::PendingRefTransition {
+        id: crate::db::deterministic_id(&[
+            "pending_ref_transition",
+            request_id,
+            repo_id,
+            ref_name,
+            old_sha,
+            new_sha,
+        ]),
+        request_id: request_id.to_string(),
+        repo_id: repo_id.to_string(),
+        ref_name: ref_name.to_string(),
+        old_sha: old_sha.to_string(),
+        new_sha: new_sha.to_string(),
+        pusher_did: "did:key:z6pusher".to_string(),
+        node_did: "did:key:z6node".to_string(),
+        signature_header: String::new(),
+        signature_input: String::new(),
+        content_digest: String::new(),
+        state: crate::db::pending_state::APPLIED.to_string(),
+        created_at: "2026-01-01T00:00:00Z".to_string(),
+        applied_at: None,
+        cancelled_at: None,
+        ordinal,
+        git_target_kind: Some("update".to_string()),
+    }
+}
+
 /// Body of the `for-each-ref` arm of a fake-git fixture in the
 /// COLUMN SHAPE `blob_paths` phase 2 parses. The caller is
 /// responsible for wrapping this in a full `case "$1" in ... esac`

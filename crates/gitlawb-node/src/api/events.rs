@@ -1924,16 +1924,17 @@ mod push_events_tests {
             .to_string();
 
         // The push happens. The webhook fires into the void.
-        crate::api::repos::record_push_events(
-            &state.db,
+        let child = crate::test_support::pending_child(
+            "req-ae6",
             "r-ae6",
-            &[crate::api::repos::RefUpdate {
-                old_sha: "0".repeat(40),
-                new_sha: SHA_A.into(),
-                ref_name: "refs/heads/main".into(),
-            }],
-        )
-        .await;
+            "refs/heads/main",
+            &"0".repeat(40),
+            SHA_A,
+            0,
+        );
+        crate::api::repos::record_push_events(&state.db, "req-ae6", &[&child])
+            .await
+            .unwrap();
         crate::webhooks::fire_event(
             state.db.clone(),
             state.http_client.clone(),
@@ -1989,23 +1990,25 @@ mod push_events_tests {
             .await
             .unwrap();
 
-        crate::api::repos::record_push_events(
-            &state.db,
+        let c_main = crate::test_support::pending_child(
+            "req-tie",
             "r-tie",
-            &[
-                crate::api::repos::RefUpdate {
-                    old_sha: "0".repeat(40),
-                    new_sha: SHA_A.into(),
-                    ref_name: "refs/heads/main".into(),
-                },
-                crate::api::repos::RefUpdate {
-                    old_sha: "0".repeat(40),
-                    new_sha: SHA_B.into(),
-                    ref_name: "refs/heads/other".into(),
-                },
-            ],
-        )
-        .await;
+            "refs/heads/main",
+            &"0".repeat(40),
+            SHA_A,
+            0,
+        );
+        let c_other = crate::test_support::pending_child(
+            "req-tie",
+            "r-tie",
+            "refs/heads/other",
+            &"0".repeat(40),
+            SHA_B,
+            1,
+        );
+        crate::api::repos::record_push_events(&state.db, "req-tie", &[&c_main, &c_other])
+            .await
+            .unwrap();
 
         let all = body_json(poll(&state, Some(OWNER), &poll_uri("widget", "")).await).await;
         let stamps: Vec<&str> = all["events"]
@@ -2644,16 +2647,17 @@ mod push_events_tests {
             .await
             .unwrap();
 
-        crate::api::repos::record_push_events(
-            &state.db,
+        let child = crate::test_support::pending_child(
+            "req-contain",
             "r-contain",
-            &[crate::api::repos::RefUpdate {
-                old_sha: "0".repeat(40),
-                new_sha: SHA_A.into(),
-                ref_name: "refs/heads/main".into(),
-            }],
-        )
-        .await;
+            "refs/heads/main",
+            &"0".repeat(40),
+            SHA_A,
+            0,
+        );
+        crate::api::repos::record_push_events(&state.db, "req-contain", &[&child])
+            .await
+            .unwrap();
 
         let anon = Request::builder()
             .method(Method::GET)
@@ -2699,16 +2703,17 @@ mod push_events_tests {
             .await
             .unwrap();
 
-        crate::api::repos::record_push_events(
-            &state.db,
+        let child = crate::test_support::pending_child(
+            "req-del",
             "r-del",
-            &[crate::api::repos::RefUpdate {
-                old_sha: SHA_A.into(),
-                new_sha: "0".repeat(40),
-                ref_name: "refs/heads/gone".into(),
-            }],
-        )
-        .await;
+            "refs/heads/gone",
+            SHA_A,
+            &"0".repeat(40),
+            0,
+        );
+        crate::api::repos::record_push_events(&state.db, "req-del", &[&child])
+            .await
+            .unwrap();
 
         let body = body_json(poll(&state, Some(OWNER), &poll_uri("widget", "")).await).await;
         assert!(

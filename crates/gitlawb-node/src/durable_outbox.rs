@@ -1285,6 +1285,38 @@ async fn run_effect_bundle(
         }
     }
 
+    // 7a. Commit-status surfaces: the stored pull-request heads and the
+    //     catch-up poll feed are durable accounting like everything else
+    //     in this bundle, so they ride the same proven-landing authority —
+    //     derived from the accepted transition rows, never from a live
+    //     parse, and a landing reconcile proves only later still emits
+    //     them here on the drain pass. Head writes check each branch's
+    //     current tip before moving it: this executor runs after the repo
+    //     write lock is released, so a newer push may already have moved
+    //     the branch and only the still-current landing may win the head.
+    let landed: Vec<crate::api::repos::RefUpdate> = accepted_children
+        .iter()
+        .map(|c| crate::api::repos::RefUpdate {
+            old_sha: c.old_sha.clone(),
+            new_sha: c.new_sha.clone(),
+            ref_name: c.ref_name.clone(),
+        })
+        .collect();
+    let heads =
+        crate::api::repos::heads_still_at_tip(std::path::Path::new(&repo.disk_path), &landed)?;
+    if let Err(e) = crate::api::repos::update_open_pr_heads(&state.db, &req.repo_id, &heads).await {
+        return Ok(EffectsOutcome::Retry {
+            last_error: format!("stored pr heads: {e}"),
+        });
+    }
+    if let Err(e) =
+        crate::api::repos::record_push_events(&state.db, &req.id, accepted_children).await
+    {
+        return Ok(EffectsOutcome::Retry {
+            last_error: format!("push events: {e}"),
+        });
+    }
+
     // 8. Per-ref certs and anchor jobs. Each accepted child gets one
     //    of each. Failures are accumulated; the first one is
     //    returned as the Retry reason. Anchor identity is by occurrence

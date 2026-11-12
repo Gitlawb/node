@@ -717,6 +717,15 @@ pub fn push_event_id_for(request_id: &str, ordinal: i32) -> String {
     deterministic_id(&["push_event", request_id, &ordinal.to_string()])
 }
 
+/// Deterministic id for a `repo_push_events` row. Same derivation as
+/// [`push_event_id_for`] but namespaced apart so the poll-feed row and the
+/// trust-scoring row can never collide: a recovery pass re-firing the same
+/// accepted transition re-derives this id and the `ON CONFLICT` collapses
+/// to a no-op instead of delivering one landing to pollers twice.
+pub fn repo_push_event_id_for(request_id: &str, ordinal: i32) -> String {
+    deterministic_id(&["repo_push_event", request_id, &ordinal.to_string()])
+}
+
 /// Deterministic id for a ref certificate row. Derived from
 /// `(request_id, ordinal)` for the same idempotency reason as
 /// `push_event_id_for`. The certificate's `id` column is the primary
@@ -12329,6 +12338,40 @@ mod migration_tests {
             db.get_pr("repo-1", 4).await.unwrap().unwrap().head_commit,
             Some(SHA_A.to_string()),
             "a merged PR's head is frozen"
+        );
+    }
+
+    /// Closing a pull request freezes the source head the close decided
+    /// against. Both arms: a snapshot the handler resolved is persisted, and a
+    /// `None` (head unresolvable) keeps whatever the push path last recorded —
+    /// the same fall-back-to-stored trade `merge_pr` makes.
+    #[sqlx::test]
+    async fn close_pr_freezes_the_resolved_head_and_preserves_a_stored_one(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        // #1 has no stored head; the close supplies the resolved snapshot.
+        let pr = sample_pr("repo-1", 1);
+        db.create_pr(&pr).await.unwrap();
+        db.close_pr(&pr.id, Some(SHA_B)).await.unwrap();
+        let closed = db.get_pr("repo-1", 1).await.unwrap().unwrap();
+        assert_eq!(closed.status, "closed");
+        assert_eq!(
+            closed.head_commit,
+            Some(SHA_B.to_string()),
+            "the close must freeze the head it resolved against"
+        );
+
+        // #2 already has a stored head; a close that resolves nothing must not
+        // null it out.
+        let pr2 = sample_pr("repo-1", 2);
+        db.create_pr(&pr2).await.unwrap();
+        set_head_directly(&db, &pr2.id, SHA_A).await;
+        db.close_pr(&pr2.id, None).await.unwrap();
+        assert_eq!(
+            db.get_pr("repo-1", 2).await.unwrap().unwrap().head_commit,
+            Some(SHA_A.to_string()),
+            "an unresolvable close keeps the stored head"
         );
     }
 

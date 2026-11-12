@@ -730,7 +730,6 @@ async fn create_response_carries_no_signature_material(pool: PgPool) {
             "id",
             "producer_did",
             "repo_id",
-            "seq",
             "state",
             "target_url",
         ],
@@ -742,8 +741,8 @@ async fn create_response_carries_no_signature_material(pool: PgPool) {
     assert_eq!(body["commit_sha"], SHA_A);
     assert_eq!(body["producer_did"], OWNER);
     assert!(
-        body["seq"].as_i64().unwrap() > 0,
-        "the response must report the seq the database assigned"
+        body["id"].as_str().unwrap().len() > 8,
+        "the response must name the stored row by id"
     );
 }
 
@@ -1228,8 +1227,8 @@ async fn a_replayed_signed_write_returns_the_original_claim_and_writes_no_second
     let replay_body = body_json(replay).await;
     assert_eq!(
         replay_body, first_body,
-        "the replay must answer with the claim the first request wrote, id and \
-         seq included"
+        "the replay must answer with the claim the first request wrote, id \
+         included"
     );
 
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM status_claims WHERE repo_id = $1")

@@ -3302,19 +3302,13 @@ pub async fn git_receive_pack(
     } else {
         Vec::new()
     };
-    // Keep the stored head of every open PR fed by this push in step with the
-    // branch, and record the catch-up poll row for each accepted ref, INSIDE
-    // the write lock so the database order equals the git order (released
-    // first, two accepted pushes for one branch could publish these out of
-    // order and pin the rollup to the older tip). Only the landed set counts:
-    // a ref receive-pack answered `ng` did not land, and on an absent or
-    // unreadable report `landed_refs` is empty, which is exactly the
-    // "cannot prove what landed" case where recording anything would lie.
-    if !landed_refs.is_empty() {
-        update_open_pr_heads(&state.db, &record.id, &landed_refs).await;
-        record_push_events(&state.db, &record.id, &landed_refs).await;
-    }
-
+    // The stored-head and poll-feed writes are durable accounting, so they
+    // do not run here: `apply_request_effects` below writes them from the
+    // request's accepted transition rows, after the publish verdict, under
+    // the same proof rules every other durable effect obeys. Writing them
+    // pre-release would leave rows claiming a landing a refused publish
+    // then deleted, and a landing reconcile proves only later would emit
+    // nothing at all.
     if disposition.spawn_tail && !push_succeeded && !landed_refs.is_empty() {
         tokio::spawn(post_receive_replication_tail(
             state.clone(),
@@ -3704,22 +3698,35 @@ fn branch_from_ref(ref_name: &str) -> Option<&str> {
         .filter(|branch| !branch.is_empty())
 }
 
-/// Point every open pull request fed by this push at the branch's new tip.
+/// The `(branch, tip)` pairs a proven landing still leaves at its ref's
+/// current target.
 ///
-/// One UPDATE per chunk of branches, keyed on (repo, source branch, open): no
-/// per-PR probing, no repo listing, no filesystem access, and the cost grows
-/// with neither the number of open pull requests nor, per statement, the number
-/// of refs pushed. A failure is logged and skipped: the push itself already
-/// succeeded and the objects are on disk, so refusing the response over a stale
-/// rollup target would be the worse trade.
-async fn update_open_pr_heads(db: &crate::db::Db, repo_id: &str, ref_updates: &[RefUpdate]) {
-    let mut heads: Vec<(String, String)> = Vec::new();
-    // Position of each branch already in `heads`, so the dedupe below is a
-    // lookup rather than a scan. A linear scan per ref was fine while the input
-    // was capped at one chunk; over an uncapped push it is quadratic in the
-    // number of refs the pusher chose to send.
-    let mut at: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for update in ref_updates {
+/// Each candidate is checked against the ref on disk, not applied blindly:
+/// the effect executor that calls this runs after the repository write
+/// lock is released, so a later push may already have moved the branch
+/// past this landing. Writing a superseded tip would pin the rollup to a
+/// commit the branch has moved past, and a stale non-NULL head is not
+/// self-healing — `set_pr_head_if_absent` only fills absent heads. A
+/// check that fails (moved past, deleted, or unreadable because the repo
+/// is not on this node's disk) skips the write rather than inventing a
+/// head: the newest proven landing's own pass covers the update, and the
+/// read-side fallback fills an absent head from `repo_push_events`.
+///
+/// A repo that is not on this node's disk at all yields no candidates: the
+/// drain replays effects for pushes whose objects live only in cold storage,
+/// and a missing repo dir is that case, not a failure the pass should retry.
+/// `read_ref` errors inside a repo that IS present (the `git` subprocess
+/// itself failed) propagate: the caller treats them as transient and retries
+/// the effect.
+pub(crate) fn heads_still_at_tip(
+    disk_path: &std::path::Path,
+    updates: &[RefUpdate],
+) -> anyhow::Result<Vec<(String, String)>> {
+    if !disk_path.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut heads = Vec::new();
+    for update in updates {
         // A deletion carries an all-zero new SHA. Storing it would hand the
         // rollup a target that resolves to no commit, so leave the last real
         // head standing.
@@ -3729,127 +3736,122 @@ async fn update_open_pr_heads(db: &crate::db::Db, repo_id: &str, ref_updates: &[
         let Some(branch) = branch_from_ref(&update.ref_name) else {
             continue;
         };
-        // Last write wins, as the per-ref loop this replaced did. A single
-        // request naming one branch twice is not something git produces, but a
-        // `VALUES` join over duplicate branches would pick a row arbitrarily,
-        // and an arbitrary head is worse than a deterministic one.
-        match at.get(branch) {
-            Some(&i) => heads[i].1 = update.new_sha.clone(),
+        if crate::git::store::read_ref(disk_path, &update.ref_name)?.as_deref()
+            == Some(update.new_sha.as_str())
+        {
+            heads.push((branch.to_string(), update.new_sha.clone()));
+        }
+    }
+    Ok(heads)
+}
+
+/// Point every open pull request fed by this push at the branch's new tip.
+///
+/// `heads` is the `(branch, tip)` set the caller has already proven still
+/// sits at each ref's target (see [`heads_still_at_tip`]); this function
+/// writes what it is given and never resolves refs itself.
+///
+/// One UPDATE per chunk of branches, keyed on (repo, source branch, open): no
+/// per-PR probing, no repo listing, and the cost grows with neither the
+/// number of open pull requests nor, per statement, the number of refs
+/// pushed. The error propagates: the effect executor turns it into a
+/// `Retry`, so a transient failure waits for the next pass rather than
+/// silently freezing a stale head — a stale head is not self-healing, since
+/// `set_pr_head_if_absent` only fills NULL heads.
+pub(crate) async fn update_open_pr_heads(
+    db: &crate::db::Db,
+    repo_id: &str,
+    heads: &[(String, String)],
+) -> anyhow::Result<()> {
+    let mut dedup: Vec<(String, String)> = Vec::new();
+    // Position of each branch already in `dedup`, so the merge below is a
+    // lookup rather than a scan. Last write wins, as the per-ref loop this
+    // replaced did: a `VALUES` join over duplicate branches would pick a row
+    // arbitrarily, and an arbitrary head is worse than a deterministic one.
+    let mut at: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (branch, sha) in heads {
+        match at.get(branch.as_str()) {
+            Some(&i) => dedup[i].1 = sha.clone(),
             None => {
-                at.insert(branch, heads.len());
-                heads.push((branch.to_string(), update.new_sha.clone()));
+                at.insert(branch, dedup.len());
+                dedup.push((branch.clone(), sha.clone()));
             }
         }
     }
 
     // Chunked for the same reason the push events are: bounded per statement,
     // and every branch git accepted still gets its head moved.
-    for chunk in heads.chunks(PUSH_WRITE_CHUNK) {
-        let mut outcome = db.set_open_pr_heads_batch(repo_id, chunk).await;
-        if let Err(first) = &outcome {
-            if crate::db::is_transient_db_write(first) {
-                tracing::warn!(
-                    err = %first,
-                    repo_id = %repo_id,
-                    branches = chunk.len(),
-                    "stored-head update hit a transient failure; retrying once"
-                );
-                outcome = db.set_open_pr_heads_batch(repo_id, chunk).await;
-            }
-        }
-        if let Err(e) = outcome {
-            // Error, not a warning, and it names the rows: a stale head is not
-            // self-healing — `set_pr_head_if_absent` only fills NULL heads — so
-            // the missed update is permanent until the next push to that
-            // branch, and the SHAs are what make it repairable by hand.
-            let lost = chunk
-                .iter()
-                .map(|(branch, sha)| format!("{branch}@{sha}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            tracing::error!(
-                err = %e,
-                repo_id = %repo_id,
-                branches = chunk.len(),
-                lost = %lost,
-                "stored pull request heads lost; rollups will serve a stale tip"
-            );
-        }
+    for chunk in dedup.chunks(PUSH_WRITE_CHUNK) {
+        db.set_open_pr_heads_batch(repo_id, chunk)
+            .await
+            .map_err(|e| {
+                let rows = chunk
+                    .iter()
+                    .map(|(branch, sha)| format!("{branch}@{sha}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                anyhow::anyhow!("stored-head update failed for {repo_id} ({rows}): {e}")
+            })?;
     }
+    Ok(())
 }
 
+/// Write the catch-up poll row for each proven landing.
+///
+/// The events derive from the request's accepted transition rows — the
+/// durable record of what landed — not from the live handler's in-memory
+/// parse, so the live path and the recovery drain record the same rows.
+/// `id` is deterministic on `(request_id, ordinal)`: a recovery replay
+/// inserts the same id and the `ON CONFLICT` collapses it to a no-op
+/// instead of delivering one landing to pollers twice.
+///
+/// `created_at` prefers the transition's own `applied_at` — the moment the
+/// landing was durably committed — over this pass's run time, so an event
+/// the drain writes stamps when the push landed, not when the node
+/// restarted. It is display metadata, not the ordering key: the cursor
+/// pages on the database-assigned `seq`.
+///
+/// The error propagates: the effect executor turns it into a `Retry`, so a
+/// transient failure waits for the next pass rather than dropping a row the
+/// poll surface can never re-derive.
 pub(crate) async fn record_push_events(
     db: &crate::db::Db,
-    repo_id: &str,
-    ref_updates: &[RefUpdate],
-) {
-    // Canonical UTC rfc3339 with a fixed sub-second width and a `Z` offset, not
-    // the default `+00:00`. This is display metadata now, not the ordering key:
-    // the cursor pages on the database-assigned `seq`, so neither the fixed
-    // width nor the offset is load-bearing for paging any more. Kept canonical
-    // anyway so the value a poller reads back sorts and compares the way a
-    // reader expects, and so a literal `+` never reaches a query string, where
-    // it would decode to a space.
-    let created_at =
-        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, /* use_z */ true);
-    let events: Vec<crate::db::RepoPushEvent> = ref_updates
+    request_id: &str,
+    children: &[&crate::db::PendingRefTransition],
+) -> anyhow::Result<()> {
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    let events: Vec<crate::db::RepoPushEvent> = children
         .iter()
         // A deletion carries an all-zero new SHA. Recording it would hand a
         // poller a target that resolves to no commit.
-        .filter(|update| update.new_sha != ZERO_SHA)
-        .map(|update| crate::db::RepoPushEvent {
-            id: uuid::Uuid::new_v4().to_string(),
+        .filter(|c| c.new_sha != ZERO_SHA)
+        .map(|c| crate::db::RepoPushEvent {
+            id: crate::db::repo_push_event_id_for(request_id, c.ordinal),
             // Ignored on insert; the database assigns the ordering key.
             seq: 0,
-            repo_id: repo_id.to_string(),
-            ref_name: update.ref_name.clone(),
-            after_sha: update.new_sha.clone(),
-            created_at: created_at.clone(),
+            repo_id: c.repo_id.clone(),
+            ref_name: c.ref_name.clone(),
+            after_sha: c.new_sha.clone(),
+            created_at: c.applied_at.clone().unwrap_or_else(|| now.clone()),
         })
         .collect();
 
     // One statement per chunk, never one per ref: a per-ref loop would put a
-    // database round trip for every ref onto the push response, and a single
-    // unbounded statement would let the pusher choose its parameter count. Every
-    // event is written either way, because receive-pack has already accepted
-    // them.
+    // database round trip for every ref on the effect pass, and a single
+    // unbounded statement would let the pusher choose its parameter count.
+    // One request is one repo, so the first row names it for the error below.
+    let repo_id = events.first().map(|e| e.repo_id.as_str()).unwrap_or("");
     for chunk in events.chunks(PUSH_WRITE_CHUNK) {
-        let mut outcome = db.insert_repo_push_events(chunk).await;
-        if let Err(first) = &outcome {
-            // One retry, only for the transient classes the write itself can
-            // outlive: a lock wait that expired, or a pool acquire that timed
-            // out behind the queue. A permanent error's second run is a
-            // guaranteed re-failure that only adds latency to the push.
-            if crate::db::is_transient_db_write(first) {
-                tracing::warn!(
-                    err = %first,
-                    repo_id = %repo_id,
-                    refs = chunk.len(),
-                    "recording push events hit a transient failure; retrying once"
-                );
-                outcome = db.insert_repo_push_events(chunk).await;
-            }
-        }
-        if let Err(e) = outcome {
-            // Error, not a warning, and it names the rows. receive-pack has
-            // already told the client it took these refs, and no later poll asks
-            // for an event that was never written, so this is permanent loss on
-            // a surface whose whole purpose is that nothing is missed. The refs
-            // and SHAs are what make it recoverable by hand.
-            let lost = chunk
+        db.insert_repo_push_events(chunk).await.map_err(|e| {
+            let rows = chunk
                 .iter()
-                .map(|e| format!("{}@{}", e.ref_name, e.after_sha))
+                .map(|ev| format!("{}@{}", ev.ref_name, ev.after_sha))
                 .collect::<Vec<_>>()
                 .join(" ");
-            tracing::error!(
-                err = %e,
-                repo_id = %repo_id,
-                refs = chunk.len(),
-                lost = %lost,
-                "push events lost; the catch-up poll surface will never deliver them"
-            );
-        }
+            anyhow::anyhow!("push-event write failed for {repo_id} ({rows}): {e}")
+        })?;
     }
+    Ok(())
 }
 
 /// The detached post-receive replication tail (#174 F2): everything a landed push
@@ -8431,6 +8433,12 @@ mod tests {
         }
     }
 
+    /// One `(branch, tip)` pair in the shape `heads_still_at_tip` returns and
+    /// `update_open_pr_heads` consumes: the bare branch name, not the full ref.
+    fn head_pair(branch: &str, sha: &str) -> (String, String) {
+        (branch.to_string(), sha.to_string())
+    }
+
     async fn head_of(db: &crate::db::Db, repo_id: &str, number: i64) -> Option<String> {
         db.get_pr(repo_id, number)
             .await
@@ -8463,12 +8471,9 @@ mod tests {
         let db = pr_head_db(pool).await;
         seed_open_pr(&db, "repo-1", 1, "feature").await;
 
-        update_open_pr_heads(
-            &db,
-            "repo-1",
-            &[ref_update("refs/heads/feature", PR_SHA_OLD, PR_SHA_NEW)],
-        )
-        .await;
+        update_open_pr_heads(&db, "repo-1", &[head_pair("feature", PR_SHA_NEW)])
+            .await
+            .unwrap();
 
         assert_eq!(
             head_of(&db, "repo-1", 1).await,
@@ -8486,12 +8491,9 @@ mod tests {
             .await
             .unwrap();
 
-        update_open_pr_heads(
-            &db,
-            "repo-1",
-            &[ref_update("refs/heads/main", PR_SHA_OLD, PR_SHA_NEW)],
-        )
-        .await;
+        update_open_pr_heads(&db, "repo-1", &[head_pair("main", PR_SHA_NEW)])
+            .await
+            .unwrap();
 
         assert_eq!(
             head_of(&db, "repo-1", 1).await,
@@ -8512,12 +8514,9 @@ mod tests {
         let pr = db.get_pr("repo-1", 1).await.unwrap().unwrap();
         db.close_pr(&pr.id, None).await.unwrap();
 
-        update_open_pr_heads(
-            &db,
-            "repo-1",
-            &[ref_update("refs/heads/feature", PR_SHA_OLD, PR_SHA_NEW)],
-        )
-        .await;
+        update_open_pr_heads(&db, "repo-1", &[head_pair("feature", PR_SHA_NEW)])
+            .await
+            .unwrap();
 
         assert_eq!(
             head_of(&db, "repo-1", 1).await,
@@ -8539,12 +8538,9 @@ mod tests {
 
         // Non-fast-forward: old_sha is the discarded tip, new_sha is unrelated.
         let rewritten = "3333333333333333333333333333333333333333";
-        update_open_pr_heads(
-            &db,
-            "repo-1",
-            &[ref_update("refs/heads/feature", PR_SHA_OLD, rewritten)],
-        )
-        .await;
+        update_open_pr_heads(&db, "repo-1", &[head_pair("feature", rewritten)])
+            .await
+            .unwrap();
 
         assert_eq!(
             head_of(&db, "repo-1", 1).await,
@@ -8561,12 +8557,9 @@ mod tests {
         seed_open_pr(&db, "repo-1", 1, "feature").await;
         seed_open_pr(&db, "repo-2", 1, "feature").await;
 
-        update_open_pr_heads(
-            &db,
-            "repo-1",
-            &[ref_update("refs/heads/feature", PR_SHA_OLD, PR_SHA_NEW)],
-        )
-        .await;
+        update_open_pr_heads(&db, "repo-1", &[head_pair("feature", PR_SHA_NEW)])
+            .await
+            .unwrap();
 
         assert_eq!(
             head_of(&db, "repo-1", 1).await,
@@ -8579,104 +8572,170 @@ mod tests {
         );
     }
 
-    /// A tag push carries a ref name whose last segment can equal a branch
-    /// name. It is not a branch update and must not move a head.
-    #[sqlx::test]
-    async fn tag_push_does_not_move_a_same_named_branch_pr(pool: sqlx::PgPool) {
-        let db = pr_head_db(pool).await;
-        seed_open_pr(&db, "repo-1", 1, "feature").await;
-        db.set_open_pr_heads("repo-1", "feature", PR_SHA_OLD)
-            .await
-            .unwrap();
+    /// A bare repo at a tempdir whose named ref points at a real commit, for
+    /// `heads_still_at_tip` tests: `git update-ref` requires the target to
+    /// resolve, and a branch ref must point at a commit, so an empty tree is
+    /// committed first. Returns the directory (kept alive by the caller) and
+    /// the tip's real SHA.
+    fn bare_repo_with_ref(ref_name: &str, message: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        };
+        run(&["init", "-q", "--bare", "."]);
+        let mut child = std::process::Command::new("git")
+            .args(["mktree"])
+            .current_dir(dir.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("git mktree spawns");
+        drop(child.stdin.take());
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "git mktree failed");
+        let tree = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        let out = run(&["commit-tree", &tree, "-m", message]);
+        let sha = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        run(&["update-ref", ref_name, &sha]);
+        (dir, sha)
+    }
 
-        update_open_pr_heads(
-            &db,
-            "repo-1",
-            &[ref_update("refs/tags/feature", PR_SHA_OLD, PR_SHA_NEW)],
+    /// A landing that still sits at the branch's tip yields the head pair.
+    #[test]
+    fn heads_still_at_tip_returns_the_current_landing() {
+        let (dir, sha) = bare_repo_with_ref("refs/heads/feature", "tip object");
+        let heads = heads_still_at_tip(
+            dir.path(),
+            &[ref_update("refs/heads/feature", PR_SHA_OLD, &sha)],
         )
-        .await;
+        .unwrap();
+        assert_eq!(heads, vec![("feature".to_string(), sha)]);
+    }
 
-        assert_eq!(
-            head_of(&db, "repo-1", 1).await,
-            Some(PR_SHA_OLD.to_string()),
-            "a tag named like the source branch must not move the head"
+    /// The convergence property the tip check exists for: a push whose effect
+    /// runs after a newer landing moved the branch must not write its stale
+    /// tip, or the stored head — which is not self-healing — pins the rollup
+    /// to a commit the branch has moved past.
+    #[test]
+    fn heads_still_at_tip_skips_a_landing_the_branch_moved_past() {
+        let (dir, _sha) = bare_repo_with_ref("refs/heads/feature", "newer tip");
+        let heads = heads_still_at_tip(
+            dir.path(),
+            &[ref_update("refs/heads/feature", PR_SHA_OLD, PR_SHA_NEW)],
+        )
+        .unwrap();
+        assert!(
+            heads.is_empty(),
+            "a landing the branch has moved past yields no head write"
         );
     }
 
-    /// Deleting the source branch is a ref update whose new SHA is all zeros.
-    /// Writing that as the head would hand the rollup a target no commit
-    /// resolves to, so the last real SHA stands.
-    #[sqlx::test]
-    async fn branch_deletion_leaves_the_last_real_sha_in_place(pool: sqlx::PgPool) {
-        let db = pr_head_db(pool).await;
-        seed_open_pr(&db, "repo-1", 1, "feature").await;
-        db.set_open_pr_heads("repo-1", "feature", PR_SHA_OLD)
-            .await
-            .unwrap();
-
-        update_open_pr_heads(
-            &db,
-            "repo-1",
-            &[ref_update("refs/heads/feature", PR_SHA_OLD, ZERO_SHA)],
+    /// A tag push carries a ref name whose last segment can equal a branch
+    /// name. It is not a branch update and must not produce a head pair, even
+    /// when the tag's tip matches the pushed SHA.
+    #[test]
+    fn heads_still_at_tip_skips_a_same_named_tag() {
+        let (dir, sha) = bare_repo_with_ref("refs/tags/feature", "tag tip");
+        let heads = heads_still_at_tip(
+            dir.path(),
+            &[ref_update("refs/tags/feature", PR_SHA_OLD, &sha)],
         )
-        .await;
+        .unwrap();
+        assert!(heads.is_empty(), "a tag tip must not yield a branch head");
+    }
 
-        assert_eq!(
-            head_of(&db, "repo-1", 1).await,
-            Some(PR_SHA_OLD.to_string()),
-            "a deletion must not store an all-zero head"
+    /// Deleting the source branch is a ref update whose new SHA is all zeros,
+    /// and a push to a branch that no longer exists resolves to nothing.
+    /// Writing either as a head would hand the rollup a target no commit
+    /// resolves to.
+    #[test]
+    fn heads_still_at_tip_skips_deletions_and_absent_refs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let out = std::process::Command::new("git")
+            .args(["init", "-q", "--bare", "."])
+            .current_dir(dir.path())
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git init failed");
+
+        let heads = heads_still_at_tip(
+            dir.path(),
+            &[
+                ref_update("refs/heads/feature", PR_SHA_OLD, ZERO_SHA),
+                ref_update("refs/heads/gone", PR_SHA_OLD, PR_SHA_NEW),
+            ],
+        )
+        .unwrap();
+        assert!(
+            heads.is_empty(),
+            "a deletion and an absent ref both yield no head write"
         );
     }
 
     /// The scenario tests above drive `update_open_pr_heads` directly, because a
     /// full receive-pack POST needs a real pack. That proves the mechanism and
-    /// says nothing about the sink: delete the call from the push handler and
+    /// says nothing about the sink: delete the call from the effect bundle and
     /// every one of them still passes while no push ever moves a head again.
     /// Pin the wiring by source, the way the authz guards in `api/mod.rs` do.
-    /// The slice stops at the handler's own closing brace (the first `}` in
-    /// column 0) so a call in a later function cannot satisfy this, and
-    /// full-line comments are stripped so the doc comment on the call cannot
-    /// stand in for the call. Note the boundary is found by brace rather than by
-    /// a declaration prefix: `handler_names` in `api/mod.rs` scrapes every
-    /// source file for the public-async declaration prefix, so spelling that
-    /// prefix here as data (in a literal or even in this comment) registers an
-    /// empty handler name and panics that guard.
+    ///
+    /// The pin lands on `run_effect_bundle` in `durable_outbox.rs`, not on the
+    /// handler: the stored-head and poll-feed writes are durable accounting, so
+    /// they run inside the effect executor — gated on the publish verdict on
+    /// the live path and on reconcile's proof on the drain path — fed by the
+    /// request's ACCEPTED transition rows, never a live parse.
     #[test]
-    fn the_push_handler_actually_calls_the_head_update() {
-        let src = include_str!("repos.rs");
+    fn the_effect_bundle_actually_calls_the_head_update() {
+        let src = include_str!("../durable_outbox.rs");
         let body = crate::test_support::scrape_source_region(
             src,
-            Some("fn git_receive_pack("),
+            Some("fn run_effect_bundle("),
             Some("\n}"),
         )
-        .expect("git_receive_pack not found (renamed or removed?)");
+        .expect("run_effect_bundle not found (renamed or removed?)");
 
         assert!(
-            body.contains("update_open_pr_heads(&state.db, &record.id, &landed_refs)"),
-            "the receive-pack handler must feed the ACCEPTED ref updates to the \
-             stored-head update; without that call every head-maintenance test \
-             here passes against a helper nothing invokes, and with the DECLARED \
-             set it moves heads to refs git refused"
+            body.contains("heads_still_at_tip("),
+            "the stored-head update must go through the tip check: the effect \
+             executor runs after the repo write lock is released, so only a \
+             landing that still sits at the branch's current target may move a \
+             pull request's head — an unchecked write can pin the rollup to a \
+             commit a newer push already replaced"
         );
         assert!(
-            body.contains("record_push_events(&state.db, &record.id, &landed_refs)"),
-            "the poll surface must be fed the accepted ref updates for the same \
-             two reasons"
+            body.contains("update_open_pr_heads("),
+            "the effect bundle must feed the accepted transitions to the \
+             stored-head update; without that call every head-maintenance test \
+             here passes against a helper nothing invokes"
+        );
+        assert!(
+            body.contains("record_push_events("),
+            "the effect bundle must feed the accepted transitions to the \
+             push-event recorder, or the catch-up poll surface is fed by nothing"
         );
     }
 
-    /// Both writes that publish a branch's new tip happen while the repository
-    /// write lock is still held.
+    /// The handler must not write the status surfaces itself — the publish
+    /// verdict has not happened yet at the only place it could — and the
+    /// executor that owns those writes must run only after it.
     ///
-    /// The lock is what orders two concurrent pushes to one branch. Released
-    /// first, the pair below is an unordered race: the later push's UPDATE can
-    /// land before the earlier one's and leave the stored head — which the
-    /// rollup prefers over its fallback — pinned to a commit the branch has
-    /// moved past. There is no per-row version to make the UPDATE conditional
-    /// on, so the ordering has to come from the lock, and that is a property of
-    /// WHERE the calls sit rather than of what they do.
+    /// Pre-release rows would outlive a refused publish, claiming a landing
+    /// the node then deleted; effects that ran before the verdict would have
+    /// the same problem. The ordering pin is therefore negative on the handler
+    /// (no direct calls, ever) and positional on the executor's call site:
+    /// `apply_request_effects` sits after `outcome.into_result()?`, so a
+    /// refused publish returns before any durable accounting runs.
     #[test]
-    fn the_head_and_event_writes_happen_before_the_lock_is_released() {
+    fn the_status_surface_writes_wait_for_the_publish_verdict() {
         let src = include_str!("repos.rs");
         let body = crate::test_support::scrape_source_region(
             src,
@@ -8685,20 +8744,23 @@ mod tests {
         )
         .expect("git_receive_pack not found (renamed or removed?)");
 
-        let heads = body
-            .find("update_open_pr_heads(&state.db, &record.id, &landed_refs)")
-            .expect("the stored-head update must be called from the push handler");
-        let events = body
-            .find("record_push_events(&state.db, &record.id, &landed_refs)")
-            .expect("the push-event recorder must be called from the push handler");
-        let release = body
-            .find("reclaimed.release(disposition.release_ok)")
-            .expect("the write lock release must still be in the push handler");
-
         assert!(
-            heads < release && events < release,
-            "both writes must run before guard.release; after it, two accepted \
-             pushes for one branch are ordered by nothing at all"
+            !body.contains("update_open_pr_heads(") && !body.contains("record_push_events("),
+            "the handler must not write heads or push events directly: anything \
+             written before release outlives a refused publish and claims a \
+             landing that never happened; the writes belong to the effect \
+             executor, which the drain replays identically"
+        );
+        let release = body
+            .find("outcome.into_result()?")
+            .expect("the publish verdict must still be in the push handler");
+        let effects = body
+            .find("apply_request_effects(&state, &request_id)")
+            .expect("the effect executor must still be called from the push handler");
+        assert!(
+            effects > release,
+            "durable effects must run after the publish verdict; a refusal \
+             returns at into_result and must never reach them"
         );
     }
 
@@ -8715,12 +8777,10 @@ mod tests {
         update_open_pr_heads(
             &db,
             "repo-1",
-            &[
-                ref_update("refs/heads/feature", PR_SHA_OLD, PR_SHA_NEW),
-                ref_update("refs/heads/second", PR_SHA_OLD, other),
-            ],
+            &[head_pair("feature", PR_SHA_NEW), head_pair("second", other)],
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(
             head_of(&db, "repo-1", 1).await,
@@ -8786,12 +8846,28 @@ mod tests {
         }
     }
 
-    /// `n` distinct branch updates. The SHAs start at 1, not 0: forty hex zeroes
-    /// is the deletion sentinel, which both writers skip on purpose, and a
-    /// generator that emitted one would silently make every count here one short.
-    fn many_ref_updates(n: usize) -> Vec<RefUpdate> {
+    /// The same push as the accepted transition rows `run_effect_bundle` feeds
+    /// the event recorder: one applied child per ref, ordinal in push order.
+    fn many_pending_children(repo_id: &str, n: usize) -> Vec<crate::db::PendingRefTransition> {
         (0..n)
-            .map(|i| ref_update(&format!("refs/heads/b{i}"), PR_SHA_OLD, &sha_for(i)))
+            .map(|i| {
+                crate::test_support::pending_child(
+                    "req-fan",
+                    repo_id,
+                    &format!("refs/heads/b{i}"),
+                    PR_SHA_OLD,
+                    &sha_for(i),
+                    i as i32,
+                )
+            })
+            .collect()
+    }
+
+    /// The same push as the `(branch, tip)` pairs `update_open_pr_heads`
+    /// consumes after `heads_still_at_tip` has filtered it.
+    fn many_head_pairs(n: usize) -> Vec<(String, String)> {
+        (0..n)
+            .map(|i| head_pair(&format!("b{i}"), &sha_for(i)))
             .collect()
     }
 
@@ -8812,10 +8888,14 @@ mod tests {
         let db = pr_head_db(pool).await;
         seed_open_pr(&db, "repo-fan", 1, "b0").await;
         seed_open_pr(&db, "repo-fan", 2, "b3").await;
-        let updates = many_ref_updates(8);
+        let children = many_pending_children("repo-fan", 8);
+        let child_refs: Vec<_> = children.iter().collect();
+        let pairs = many_head_pairs(8);
 
         statements_since_last_check();
-        record_push_events(&db, "repo-fan", &updates).await;
+        record_push_events(&db, "req-fan", &child_refs)
+            .await
+            .unwrap();
         assert_eq!(
             statements_since_last_check(),
             1,
@@ -8823,7 +8903,7 @@ mod tests {
              trip per ref"
         );
 
-        update_open_pr_heads(&db, "repo-fan", &updates).await;
+        update_open_pr_heads(&db, "repo-fan", &pairs).await.unwrap();
         assert_eq!(
             statements_since_last_check(),
             1,
@@ -9103,11 +9183,17 @@ mod tests {
         let past = PUSH_WRITE_CHUNK + 3;
         seed_open_pr(&db, "repo-chunk", 1, "b0").await;
         seed_open_pr(&db, "repo-chunk", 2, &format!("b{past}")).await;
-        let updates = many_ref_updates(over);
+        let children = many_pending_children("repo-chunk", over);
+        let child_refs: Vec<_> = children.iter().collect();
+        let pairs = many_head_pairs(over);
 
         let logs = capture_logs();
-        record_push_events(&db, "repo-chunk", &updates).await;
-        update_open_pr_heads(&db, "repo-chunk", &updates).await;
+        record_push_events(&db, "req-fan", &child_refs)
+            .await
+            .unwrap();
+        update_open_pr_heads(&db, "repo-chunk", &pairs)
+            .await
+            .unwrap();
         let logged = logs.contents();
 
         let rows: i64 = sqlx::query_scalar(
@@ -9151,10 +9237,14 @@ mod tests {
         let over = PUSH_WRITE_CHUNK + 7;
         let chunks = over.div_ceil(PUSH_WRITE_CHUNK);
         assert_eq!(chunks, 2, "the fixture must actually cross the boundary");
-        let updates = many_ref_updates(over);
+        let children = many_pending_children("repo-chunk-cost", over);
+        let child_refs: Vec<_> = children.iter().collect();
+        let pairs = many_head_pairs(over);
 
         statements_since_last_check();
-        record_push_events(&db, "repo-chunk-cost", &updates).await;
+        record_push_events(&db, "req-fan", &child_refs)
+            .await
+            .unwrap();
         assert_eq!(
             statements_since_last_check(),
             chunks,
@@ -9162,7 +9252,9 @@ mod tests {
              one round trip per ref"
         );
 
-        update_open_pr_heads(&db, "repo-chunk-cost", &updates).await;
+        update_open_pr_heads(&db, "repo-chunk-cost", &pairs)
+            .await
+            .unwrap();
         assert_eq!(
             statements_since_last_check(),
             chunks,
@@ -9171,48 +9263,34 @@ mod tests {
         );
     }
 
-    /// A chunk the database refuses is retried once and then escalated, never
-    /// dropped behind a warning.
+    /// A chunk the database refuses propagates as an error: the caller is the
+    /// effect executor, which turns it into a `Retry` for the next pass, so a
+    /// failed write waits to be redone rather than being dropped behind a log
+    /// line — a hole in the catch-up surface no later poll would ever ask about.
     ///
-    /// receive-pack has already told the client it took these refs, so a write
-    /// that fails here is a permanent hole in the catch-up surface: no later
-    /// poll asks for those events again. The write now waits on a per-repo lock,
-    /// which makes a bounded failure (lock timeout, pool exhaustion under the
-    /// queue it creates) a real outcome rather than a theoretical one, so the
-    /// caller has to say what was lost loudly enough for an operator to find it.
+    /// The error carries the repo, the refs and the SHAs, because a request
+    /// parked for retry or quarantined is only repairable when the failure
+    /// names what it was trying to write.
     #[sqlx::test]
-    async fn a_chunk_that_cannot_be_written_is_retried_and_then_escalated(pool: sqlx::PgPool) {
+    async fn a_chunk_that_cannot_be_written_returns_an_error_naming_the_rows(pool: sqlx::PgPool) {
         let db = pr_head_db(pool).await;
-        // The table is gone, so every attempt fails the same way a real outage
-        // would, in both attempts rather than only the first.
+        // The table is gone, so the write fails the way a real outage would.
         sqlx::query("DROP TABLE repo_push_events")
             .execute(db.pool())
             .await
             .unwrap();
 
-        let updates = many_ref_updates(2);
-        let logs = capture_logs();
-        statements_since_last_check();
-        record_push_events(&db, "repo-lost", &updates).await;
-        let statements = statements_since_last_check();
-        let logged = logs.contents();
+        let children = many_pending_children("repo-lost", 2);
+        let child_refs: Vec<_> = children.iter().collect();
+        let err = record_push_events(&db, "req-lost", &child_refs)
+            .await
+            .expect_err("a write that cannot land must surface as an error");
 
-        assert_eq!(
-            statements, 2,
-            "a chunk that failed must be attempted a second time before it is \
-             given up on; got {statements} attempts"
-        );
+        let msg = format!("{err}");
         assert!(
-            logged.contains("ERROR"),
-            "events that are gone for good must escalate above the warning level \
-             a poller can never see; got: {logged}"
-        );
-        assert!(
-            logged.contains("repo-lost")
-                && logged.contains("refs/heads/b0")
-                && logged.contains(&sha_for(0)),
-            "the escalation must name the repo, the refs and the SHAs that were \
-             lost, or nothing can be replayed by hand; got: {logged}"
+            msg.contains("repo-lost") && msg.contains("refs/heads/b0") && msg.contains(&sha_for(0)),
+            "the error must name the repo, the refs and the SHAs that could not \
+             be written, or the parked request is not repairable by hand; got: {msg}"
         );
     }
 
@@ -9221,16 +9299,22 @@ mod tests {
     #[sqlx::test]
     async fn a_push_of_exactly_one_chunk_is_one_statement_per_writer(pool: sqlx::PgPool) {
         let db = pr_head_db(pool).await;
-        let updates = many_ref_updates(PUSH_WRITE_CHUNK);
+        let children = many_pending_children("repo-atchunk", PUSH_WRITE_CHUNK);
+        let child_refs: Vec<_> = children.iter().collect();
+        let pairs = many_head_pairs(PUSH_WRITE_CHUNK);
 
         statements_since_last_check();
-        record_push_events(&db, "repo-atchunk", &updates).await;
+        record_push_events(&db, "req-fan", &child_refs)
+            .await
+            .unwrap();
         assert_eq!(
             statements_since_last_check(),
             1,
             "a push of exactly one chunk must not issue a second statement"
         );
-        update_open_pr_heads(&db, "repo-atchunk", &updates).await;
+        update_open_pr_heads(&db, "repo-atchunk", &pairs)
+            .await
+            .unwrap();
         assert_eq!(statements_since_last_check(), 1);
 
         let rows: i64 = sqlx::query_scalar(
@@ -17132,29 +17216,52 @@ mod push_event_wiring_tests {
     /// The catch-up scenarios in `api/events.rs` drive `record_push_events`
     /// directly, because a full receive-pack POST needs a real pack. That proves
     /// the mechanism and says nothing about the sink: delete the call from the
-    /// push handler and every one of them still passes while no push is ever
+    /// effect bundle and every one of them still passes while no push is ever
     /// discoverable by polling again. Pin the wiring by source, the way the
-    /// stored-head guard above and the authz guards in `api/mod.rs` do. The slice
-    /// stops at the handler's own closing brace (the first `}` in column 0) so a
-    /// call in a later function cannot satisfy this, and full-line comments are
-    /// stripped so the doc comment on the call cannot stand in for the call.
+    /// stored-head guard above and the authz guards in `api/mod.rs` do. The
+    /// slice stops at the bundle's own closing brace (the first `}` in column 0)
+    /// so a call in a later function cannot satisfy this, and full-line comments
+    /// are stripped so the doc comment on the call cannot stand in for the call.
+    ///
+    /// The id is pinned alongside the call: `record_push_events` must derive it
+    /// from `(request_id, ordinal)`, not mint a random one, because a recovery
+    /// replay against the same accepted transition has to re-derive the same id
+    /// for the `ON CONFLICT` to collapse the replay instead of doubling the event.
     #[test]
-    fn the_push_handler_actually_records_push_events() {
+    fn the_effect_bundle_actually_records_push_events() {
+        let src = include_str!("../durable_outbox.rs");
+        let body = crate::test_support::scrape_source_region(
+            src,
+            Some("fn run_effect_bundle("),
+            Some("\n}"),
+        )
+        .expect("run_effect_bundle not found (renamed or removed?)");
+
+        assert!(
+            body.contains("record_push_events(&state.db, &req.id, accepted_children)"),
+            "the effect bundle must feed the ACCEPTED transition rows to the \
+             push-event recorder; without that call the catch-up poll surface is \
+             fed by nothing and every scenario test for it passes against a \
+             helper the push path never invokes"
+        );
+    }
+
+    /// The event id is deterministic on the request, so a recovery replay
+    /// records each landing exactly once no matter which path runs it.
+    #[test]
+    fn the_push_event_recorder_derives_deterministic_ids() {
         let src = include_str!("repos.rs");
         let body = crate::test_support::scrape_source_region(
             src,
-            Some("fn git_receive_pack("),
+            Some("async fn record_push_events("),
             Some("\n}"),
         )
-        .expect("git_receive_pack not found (renamed or removed?)");
+        .expect("record_push_events not found (renamed or removed?)");
 
         assert!(
-            body.contains("record_push_events(&state.db, &record.id, &landed_refs)"),
-            "the receive-pack handler must feed the ACCEPTED ref updates to the \
-             push-event recorder; without that call the catch-up poll surface is \
-             fed by nothing and every scenario test for it passes against a \
-             helper the push path never invokes, and with the DECLARED set it \
-             publishes SHAs git refused"
+            body.contains("repo_push_event_id_for(request_id"),
+            "a random id would double-deliver a landing on every replay; the \
+             id must derive from the request identity the drain re-reads"
         );
     }
 
