@@ -1,10 +1,10 @@
-//! `gl doctor` — check your gitlawb installation and connectivity.
+//! `gl doctor` — check your Twigpine installation and connectivity.
 //!
 //! Checks:
 //!   1. Identity        — ~/.gitlawb/identity.pem exists, DID parseable
 //!   2. Registration    — ~/.gitlawb/ucan.json exists (registered with a node)
-//!   3. GITLAWB_NODE    — env var is set to a non-localhost URL
-//!   4. Node            — GITLAWB_NODE is reachable (default: https://node.gitlawb.com)
+//!   3. GITLAWB_NODE    — env var points at a public node (unset is advisory)
+//!   4. Node            — GITLAWB_NODE is reachable (default: https://node.twigpine.com)
 //!   5. git helper      — git-remote-gitlawb is in PATH
 //!   6. git             — git is installed
 //!   7. version         — gl is up to date with latest GitHub release
@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use crate::http::NodeClient;
 
-const PUBLIC_NODE: &str = "https://node.gitlawb.com";
+const PUBLIC_NODE: &str = "https://node.twigpine.com";
 const GITHUB_API_BASE: &str = "https://api.github.com";
 
 #[derive(Args)]
@@ -24,7 +24,7 @@ pub struct DoctorArgs {
     #[arg(long, default_value = PUBLIC_NODE, env = "GITLAWB_NODE")]
     pub node: String,
 
-    /// Identity directory (default: ~/.gitlawb)
+    /// Identity directory (default: the parent of $GITLAWB_KEY, else ~/.gitlawb)
     #[arg(long)]
     pub dir: Option<PathBuf>,
 }
@@ -69,23 +69,63 @@ impl Check {
     }
 }
 
+/// Resolve the config dir and key path without aborting on a refused resolver.
+/// The whole point of doctor is to explain a broken setup, so a `GITLAWB_KEY`
+/// or `--dir` the resolvers reject becomes `Check::fail` rows for the checks
+/// that depend on them, while node/git checks still run.
+fn resolve_config_paths(
+    args_dir: Option<PathBuf>,
+) -> (Option<PathBuf>, Option<PathBuf>, Vec<Check>) {
+    let dir = crate::identity::gitlawb_dir(args_dir.clone());
+    let mut checks = Vec::new();
+    let dir = match dir {
+        Ok(d) => Some(d),
+        Err(e) => {
+            checks.push(Check::fail(
+                "identity",
+                format!("could not resolve config dir: {e}"),
+                "fix GITLAWB_KEY or --dir",
+            ));
+            checks.push(Check::fail(
+                "registration",
+                "skipped: config dir unresolved",
+                "fix GITLAWB_KEY or --dir",
+            ));
+            None
+        }
+    };
+    let pem_path = match crate::identity::key_path_for(args_dir.as_deref()) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            if dir.is_some() {
+                checks.push(Check::fail(
+                    "identity",
+                    format!("could not resolve key path: {e}"),
+                    "fix GITLAWB_KEY or --dir",
+                ));
+            }
+            None
+        }
+    };
+    (dir, pem_path, checks)
+}
+
 pub async fn run(args: DoctorArgs) -> Result<()> {
-    println!("gl doctor — checking your gitlawb setup");
+    println!("gl doctor — checking your Twigpine setup");
     println!();
 
-    let dir = args.dir.unwrap_or_else(|| {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".gitlawb")
-    });
-
-    let mut checks = Vec::new();
-    let mut all_ok = true;
+    // The same resolver every other command uses. `doctor` reporting on
+    // `~/.gitlawb` while `gl register` writes to the parent of `GITLAWB_KEY` would
+    // make the one command whose job is to explain a broken setup the one that
+    // misreports it.
+    let args_dir = args.dir.clone();
+    let (dir, pem_path, resolver_rows) = resolve_config_paths(args_dir.clone());
+    let mut checks = resolver_rows;
 
     // ── 1. Identity ───────────────────────────────────────────────────────
-    let pem_path = dir.join("identity.pem");
-    if pem_path.exists() {
-        match std::fs::read_to_string(&pem_path)
+    if pem_path.as_ref().is_some_and(|p| p.exists()) {
+        let pem_path = pem_path.as_ref().unwrap();
+        match std::fs::read_to_string(pem_path)
             .ok()
             .and_then(|pem| gitlawb_core::identity::Keypair::from_pem(&pem).ok())
         {
@@ -102,7 +142,7 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
                 ));
             }
         }
-    } else {
+    } else if let Some(pem_path) = &pem_path {
         checks.push(Check::fail(
             "identity",
             format!("not found at {}", pem_path.display()),
@@ -111,62 +151,48 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
     }
 
     // ── 2. Registration ───────────────────────────────────────────────────
-    let ucan_path = dir.join("ucan.json");
-    if ucan_path.exists() {
-        match std::fs::read_to_string(&ucan_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        {
-            Some(v) => {
-                let node = v["node"].as_str().unwrap_or("unknown");
-                checks.push(Check::pass(
-                    "registration",
-                    format!("registered with {node}"),
-                ));
+    if let Some(dir) = &dir {
+        let ucan_path = dir.join("ucan.json");
+        if ucan_path.exists() {
+            match std::fs::read_to_string(&ucan_path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            {
+                Some(v) => {
+                    let node = v["node"].as_str().unwrap_or("unknown");
+                    checks.push(Check::pass(
+                        "registration",
+                        format!("registered with {node}"),
+                    ));
+                }
+                None => {
+                    checks.push(Check::fail(
+                        "registration",
+                        "ucan.json exists but is malformed",
+                        "gl register",
+                    ));
+                }
             }
-            None => {
-                checks.push(Check::fail(
-                    "registration",
-                    "ucan.json exists but is malformed",
-                    "gl register",
-                ));
-            }
+        } else {
+            checks.push(Check::fail(
+                "registration",
+                "not registered with any node",
+                "gl register",
+            ));
         }
-    } else {
-        checks.push(Check::fail(
-            "registration",
-            "not registered with any node",
-            "gl register",
-        ));
     }
 
     // ── 3. GITLAWB_NODE env var ───────────────────────────────────────────
-    match std::env::var("GITLAWB_NODE") {
-        // A loopback host is a legitimate setup (self-hosted node, dev
-        // harness) — the connectivity check below fails loudly if it is not
-        // actually reachable, so don't red-flag the configuration itself.
-        Ok(v) if is_loopback_url(&v) => {
-            checks.push(Check::pass(
-                "GITLAWB_NODE",
-                format!(
-                    "{v} (local node — intentional for self-hosting/dev; unset to target the public network)"
-                ),
-            ));
-        }
-        Ok(v) if !v.is_empty() => {
-            checks.push(Check::pass("GITLAWB_NODE", v.to_string()));
-        }
-        _ => {
-            checks.push(Check::fail(
-                "GITLAWB_NODE",
-                "not set — git-remote-gitlawb will fall back to http://127.0.0.1:7545",
-                "export GITLAWB_NODE=https://node.gitlawb.com",
-            ));
-        }
-    }
+    checks.push(gitlawb_node_env_check(
+        std::env::var("GITLAWB_NODE").ok().as_deref(),
+    ));
 
     // ── 4. Node connectivity ──────────────────────────────────────────────
-    let client = NodeClient::new(&args.node, None);
+    // GITLAWB_NODE="" binds args.node to "" through clap, and check 3 groups
+    // empty with unset. The probe must apply the same normalization or it
+    // would dial "" and Fail while the env row only Warns.
+    let node_url = effective_node_url(&args.node);
+    let client = NodeClient::new(node_url, None);
     match client.get("/").await {
         Ok(resp) if resp.status().is_success() => {
             let info = resp.json::<serde_json::Value>().await.unwrap_or_default();
@@ -175,7 +201,7 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
             let short_did = did.chars().take(30).collect::<String>();
             checks.push(Check::pass(
                 "node",
-                format!("{} — v{version} ({short_did}…)", args.node),
+                format!("{} — v{version} ({short_did}…)", node_url),
             ));
             // Capability drift: a node newer than this CLI may require features
             // (RFC 9421 signing, iCaptcha) the CLI doesn't speak.
@@ -187,21 +213,21 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
                         "node is v{version} but gl is v{gl_ver} — your CLI may be missing \
                          features (signing / iCaptcha) this node requires"
                     ),
-                    "upgrade gl: curl -sSf https://gitlawb.com/install.sh | sh",
+                    "upgrade gl: curl -sSf https://twigpine.com/install.sh | sh",
                 ));
             }
         }
         Ok(resp) => {
             checks.push(Check::fail(
                 "node",
-                format!("{} returned HTTP {}", args.node, resp.status()),
+                format!("{} returned HTTP {}", node_url, resp.status()),
                 "check GITLAWB_NODE env var or try gl register --node <url>",
             ));
         }
         Err(e) => {
             checks.push(Check::fail(
                 "node",
-                format!("{} unreachable: {e}", args.node),
+                format!("{} unreachable: {e}", node_url),
                 "check your internet connection or set GITLAWB_NODE",
             ));
         }
@@ -241,7 +267,7 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
         checks.push(Check::fail(
             "git-remote-gitlawb",
             "not found in PATH — gitlawb:// clone/push will not work",
-            "curl -sSf https://gitlawb.com/install.sh | sh",
+            "curl -sSf https://twigpine.com/install.sh | sh",
         ));
     }
 
@@ -285,23 +311,21 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
             CheckState::Fail => "✗",
         };
         println!("  {icon}  {:<24}  {}", check.label, check.detail);
-        if matches!(check.state, CheckState::Fail) {
-            all_ok = false;
-        }
     }
 
     println!();
 
+    let has_failures_now = has_failures(&checks);
     let has_issues = checks
         .iter()
         .any(|c| matches!(c.state, CheckState::Fail | CheckState::Warn));
     if !has_issues {
         println!("Everything looks good. Run `gl quickstart` to create your first repo.");
     } else {
-        if all_ok {
-            println!("Setup looks good with some warnings:");
-        } else {
+        if has_failures_now {
             println!("Some checks failed. Suggested fixes:");
+        } else {
+            println!("Setup looks good with some warnings:");
         }
         for check in &checks {
             if matches!(check.state, CheckState::Fail | CheckState::Warn) {
@@ -311,12 +335,73 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
             }
         }
         println!();
-        if !all_ok {
+        if has_failures_now {
             println!("Run `gl quickstart` for a guided setup.");
         }
     }
 
+    // #357: a non-zero exit is the only signal scripting and CI have. Warn-only
+    // rows stay exit 0 (iCaptcha offline, version drift, shell-alias shadowing
+    // are all non-fatal); Fail-class rows (identity, registration, node
+    // reachable, git-remote-gitlawb present, git present) flip to exit 1.
+    // Direct `process::exit` rather than returning Err: the prose above is the
+    // user-facing summary, and an anyhow Error frame would just duplicate it.
+    if has_failures(&checks) {
+        std::process::exit(1);
+    }
+
     Ok(())
+}
+
+/// Classify the `GITLAWB_NODE` env var for `gl doctor`. Extracted so unit
+/// tests can pin the Warn tier directly (#357): an unset env is advisory, not
+/// a failure, because `--node` defaults to `https://node.twigpine.com` and the
+/// CLI works without it. Flipping this back to `Check::fail` must break a
+/// test, not just change prose.
+fn gitlawb_node_env_check(env_val: Option<&str>) -> Check {
+    match env_val {
+        // A loopback host is a legitimate setup (self-hosted node, dev
+        // harness) — the connectivity check below fails loudly if it is not
+        // actually reachable, so don't red-flag the configuration itself.
+        Some(v) if is_loopback_url(v) => Check::pass(
+            "GITLAWB_NODE",
+            format!(
+                "{v} (local node — intentional for self-hosting/dev; unset to target the public network)"
+            ),
+        ),
+        Some(v) if !v.is_empty() => Check::pass("GITLAWB_NODE", v.to_string()),
+        // `--node` defaults to `https://node.twigpine.com` and the CLI works
+        // fine without the variable, so an unset env is advisory, not a
+        // failure. Warn-class keeps the exit code 0 for a stock working
+        // install; this used to be Fail, which the obvious "return non-zero
+        // on any failure" change would have flipped to exit 1 on every
+        // default-config install (#357).
+        _ => Check::warn(
+            "GITLAWB_NODE",
+            "not set — git-remote-gitlawb will fall back to http://127.0.0.1:7545",
+            format!("export GITLAWB_NODE={PUBLIC_NODE}"),
+        ),
+    }
+}
+
+/// The URL the connectivity probe should dial. `GITLAWB_NODE` set but empty
+/// (or whitespace-only) binds `args.node` to `""` through clap rather than
+/// to the `default_value`, and check 3 already groups empty with unset, so
+/// the probe applies the same normalization: an empty effective URL means
+/// the public node, same as unset.
+fn effective_node_url(node: &str) -> &str {
+    if node.trim().is_empty() {
+        PUBLIC_NODE
+    } else {
+        node
+    }
+}
+
+/// True when at least one check is Fail-class. Warn-only runs (iCaptcha offline,
+/// version drift, shell-alias shadowing, GITLAWB_NODE unset) keep exit 0;
+/// this is the gating predicate for #357's exit-status fix.
+fn has_failures(checks: &[Check]) -> bool {
+    checks.iter().any(|c| matches!(c.state, CheckState::Fail))
 }
 
 /// Check if a binary name exists anywhere on PATH.
@@ -408,7 +493,7 @@ fn which_in_path(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Fetch the latest release tag from Gitlawb/node (the actual release repo — see install.sh's
+/// Fetch the latest release tag from Twigpine/node (the actual release repo — see install.sh's
 /// `GITLAWB_RELEASE_REPO` default) and compare to current version.
 async fn check_version(current: &'static str, github_api_base: &str) -> Check {
     let client = match reqwest::Client::builder()
@@ -422,7 +507,7 @@ async fn check_version(current: &'static str, github_api_base: &str) -> Check {
 
     let resp = match client
         .get(format!(
-            "{github_api_base}/repos/Gitlawb/node/releases/latest"
+            "{github_api_base}/repos/Twigpine/node/releases/latest"
         ))
         .send()
         .await
@@ -457,7 +542,7 @@ async fn check_version(current: &'static str, github_api_base: &str) -> Check {
         Check::warn(
             "version",
             format!("v{current} → v{tag} available"),
-            "curl -sSf https://gitlawb.com/install.sh | sh",
+            "curl -sSf https://twigpine.com/install.sh | sh",
         )
     } else {
         Check::pass("version", format!("v{current} (up to date)"))
@@ -550,7 +635,7 @@ mod tests {
         assert!(is_loopback_url("http://localhost:7545"));
         assert!(is_loopback_url("http://[::1]:7545"));
         assert!(!is_loopback_url("https://localhost.example"));
-        assert!(!is_loopback_url("https://node.gitlawb.com/localhost"));
+        assert!(!is_loopback_url("https://node.twigpine.com/localhost"));
         assert!(!is_loopback_url("not a url"));
     }
 
@@ -561,6 +646,24 @@ mod tests {
         let no_rc = fake_home(None, false);
         assert!(check_shell_alias_shadowing(Some(no_rc.path().to_path_buf())).is_none());
         assert!(check_shell_alias_shadowing(None).is_none());
+    }
+
+    #[test]
+    fn refused_resolver_becomes_check_rows_not_abort() {
+        // A relative GITLAWB_KEY makes both resolvers Err; doctor must turn
+        // that into fail rows for the dependent checks and keep going, not
+        // exit before the node/git checks ever run.
+        crate::identity::test_env::with_key(Some("relative/path"), || {
+            let (dir, pem_path, rows) = resolve_config_paths(None);
+            assert!(dir.is_none() && pem_path.is_none());
+            let fails: Vec<_> = rows
+                .iter()
+                .filter(|c| matches!(c.state, CheckState::Fail))
+                .map(|c| c.label)
+                .collect();
+            assert!(fails.contains(&"identity"), "rows: {fails:?}");
+            assert!(fails.contains(&"registration"), "rows: {fails:?}");
+        });
     }
 
     #[test]
@@ -603,7 +706,7 @@ mod tests {
     async fn test_check_version_queries_gitlawb_node_releases() {
         let mut server = mockito::Server::new_async().await;
         let _m = server
-            .mock("GET", "/repos/Gitlawb/node/releases/latest")
+            .mock("GET", "/repos/Twigpine/node/releases/latest")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"tag_name":"v9.9.9"}"#)
@@ -619,7 +722,7 @@ mod tests {
     async fn test_check_version_up_to_date() {
         let mut server = mockito::Server::new_async().await;
         let _m = server
-            .mock("GET", "/repos/Gitlawb/node/releases/latest")
+            .mock("GET", "/repos/Twigpine/node/releases/latest")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"tag_name":"v0.1.0"}"#)
@@ -635,7 +738,7 @@ mod tests {
     async fn test_check_version_http_error() {
         let mut server = mockito::Server::new_async().await;
         let _m = server
-            .mock("GET", "/repos/Gitlawb/node/releases/latest")
+            .mock("GET", "/repos/Twigpine/node/releases/latest")
             .with_status(403)
             .create_async()
             .await;
@@ -643,5 +746,104 @@ mod tests {
         let check = check_version("0.1.0", &server.url()).await;
         assert!(matches!(check.state, CheckState::Ok));
         assert!(check.detail.contains("GitHub API returned HTTP 403"));
+    }
+
+    /// #357: an all-Ok run does not flip the exit code to non-zero — a healthy
+    /// install must keep returning 0 so scripts like `gl doctor && gl push`
+    /// keep working.
+    #[test]
+    fn exit_predicate_is_false_for_all_ok() {
+        let checks = vec![
+            Check::pass("identity", "ok"),
+            Check::pass("registration", "ok"),
+            Check::pass("git", "ok"),
+        ];
+        assert!(!has_failures(&checks));
+    }
+
+    /// #357: Warn-class rows (iCaptcha offline, version drift, shell-alias
+    /// shadowing, GITLAWB_NODE unset on a default-config install) are NOT
+    /// exit-status failures — they are still printed to the user but the
+    /// process exits 0. This is the rule that the previous "any
+    /// Fail-or-Warn row → exit 1" change would have broken for stock
+    /// installs that simply have not set the env var.
+    #[test]
+    fn exit_predicate_is_false_for_warn_only() {
+        let checks = vec![
+            Check::pass("identity", "ok"),
+            Check::warn("GITLAWB_NODE", "unset", "export GITLAWB_NODE=..."),
+            Check::warn("iCaptcha", "offline", "check connectivity"),
+            Check::warn("version", "drift", "upgrade"),
+            Check::warn("shell alias", "omz git plugin", "unalias gl"),
+        ];
+        assert!(!has_failures(&checks));
+    }
+
+    /// #357: a single Fail-class row trips the exit code. The set of Fail
+    /// rows is whatever `run` writes through `Check::fail`: identity missing
+    /// or unparseable, registration missing/malformed, node unreachable,
+    /// git-remote-gitlawb absent, git absent.
+    #[test]
+    fn exit_predicate_is_true_when_a_fail_row_is_present() {
+        let checks = vec![
+            Check::pass("registration", "ok"),
+            Check::fail("identity", "missing", "gl identity new"),
+            Check::pass("git", "ok"),
+        ];
+        assert!(has_failures(&checks));
+
+        let mixed_warns = vec![
+            Check::pass("identity", "ok"),
+            Check::warn("GITLAWB_NODE", "unset", "export"),
+            Check::fail("node", "unreachable", "check network"),
+            Check::warn("iCaptcha", "offline", "check"),
+        ];
+        assert!(has_failures(&mixed_warns));
+    }
+
+    /// #357: `GITLAWB_NODE` unset must be Warn, not Fail. This pins the
+    /// re-tier so flipping it back to `Check::fail` breaks the suite — the
+    /// previous `has_failures`-only tests built their own `Check::warn` rows
+    /// and could not see the re-tier at all.
+    #[test]
+    fn gitlawb_node_env_unset_is_warn() {
+        let check = gitlawb_node_env_check(None);
+        assert!(matches!(check.state, CheckState::Warn));
+        assert!(check.detail.contains("not set"));
+        let empty = gitlawb_node_env_check(Some(""));
+        assert!(matches!(empty.state, CheckState::Warn));
+    }
+
+    /// `GITLAWB_NODE=""` binds `args.node` to `""` through clap, and check 3
+    /// groups empty with unset. The probe must dial the same URL unset
+    /// would — removing the normalization makes check 4 probe `""` and Fail
+    /// while the env row only Warns, so an empty env install exits 1.
+    #[test]
+    fn effective_node_url_treats_empty_and_blank_as_unset() {
+        assert_eq!(effective_node_url(""), PUBLIC_NODE);
+        assert_eq!(effective_node_url("   "), PUBLIC_NODE);
+        assert_eq!(effective_node_url("\t\n"), PUBLIC_NODE);
+        assert_eq!(
+            effective_node_url("http://127.0.0.1:7545"),
+            "http://127.0.0.1:7545"
+        );
+    }
+
+    #[test]
+    fn gitlawb_node_env_set_is_pass() {
+        let check = gitlawb_node_env_check(Some("https://node.twigpine.com"));
+        assert!(matches!(check.state, CheckState::Ok));
+        assert!(check.detail.contains("https://node.twigpine.com"));
+    }
+
+    #[test]
+    fn gitlawb_node_env_loopback_is_pass() {
+        for url in ["http://127.0.0.1:7545", "http://localhost:7545"] {
+            let check = gitlawb_node_env_check(Some(url));
+            assert!(
+                matches!(check.state, CheckState::Ok),
+                "loopback {url} must be Ok, not Warn/Fail"
+            );
+        }
     }
 }

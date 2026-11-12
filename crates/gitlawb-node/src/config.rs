@@ -1,5 +1,5 @@
 use clap::Parser;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Upper bound on `git_service_timeout_secs`, `ipfs_request_budget_secs`, and
 /// `ipfs_resolve_budget_secs`, in seconds (100 years).
@@ -29,7 +29,7 @@ use std::path::PathBuf;
 pub const GIT_SERVICE_TIMEOUT_SECS_MAX: u64 = 100 * 365 * 24 * 60 * 60;
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "gitlawb-node", about = "gitlawb node daemon", version)]
+#[command(name = "gitlawb-node", about = "Twigpine node daemon", version)]
 pub struct Config {
     /// Directory where bare git repositories are stored
     #[arg(long, env = "GITLAWB_REPOS_DIR", default_value = "./data/repos")]
@@ -55,7 +55,10 @@ pub struct Config {
     #[arg(long, env = "GITLAWB_KEY", default_value = "~/.gitlawb/identity.pem")]
     pub key_path: String,
 
-    /// Reserved for private-read mode; per-repo read enforcement is not wired in alpha
+    /// Reserved and currently inert: read access is enforced per repository
+    /// through `is_public` and path-scoped visibility rules, not this flag.
+    /// Setting it to false changes nothing; make a repo private through its
+    /// own visibility instead.
     #[arg(long, env = "GITLAWB_PUBLIC_READ", default_value_t = true)]
     pub public_read: bool,
 
@@ -63,11 +66,19 @@ pub struct Config {
     #[arg(long, env = "GITLAWB_PUBLIC_URL")]
     pub public_url: Option<String>,
 
+    /// Base URL for the web view of repos on this node (e.g. https://gitlawb.com).
+    /// When set, `GET /` advertises it as `web_url` so the CLI can print a
+    /// working `View:` link.  Omit for nodes that have no web front-end.
+    #[arg(long, env = "GITLAWB_WEB_URL")]
+    pub web_url: Option<String>,
+
     /// Comma-separated list of bootstrap peer URLs to announce to on startup
     #[arg(long, env = "GITLAWB_BOOTSTRAP_PEERS", value_delimiter = ',')]
     pub bootstrap_peers: Vec<String>,
 
-    /// Require RFC 9421 signatures on peer announce/sync write routes.
+    /// Require a peer write to prove its DID on any transport: RFC 9421
+    /// signatures on the peer announce/sync write routes, and a payload
+    /// signature on gossip ref-update events.
     /// Keep false during rolling upgrades so existing live nodes can still gossip.
     #[arg(
         long,
@@ -128,6 +139,18 @@ pub struct Config {
     #[arg(long, env = "GITLAWB_P2P_PORT", default_value_t = 7546)]
     pub p2p_port: u16,
 
+    /// Path to the persistent libp2p identity key. A value that cannot name a
+    /// securable key file (a bare filename, `..` traversal, a trailing
+    /// separator, the filesystem root, or a `~/` path that escapes home) is
+    /// refused before the node binds. A problem with the storage itself leaves
+    /// p2p off while HTTP keeps serving, logged as p2p_identity_key_load_failed.
+    /// With a relative path the node verifies the working directory (ownership
+    /// and write permissions) before using it. A 0755 key directory is tightened
+    /// on start; rotate the key only if the directory was group/world-writable
+    /// or the key was group/world-readable.
+    #[arg(long, env = "GITLAWB_P2P_KEY", default_value = "~/.gitlawb/p2p.key")]
+    pub p2p_key_path: String,
+
     /// libp2p bootstrap multiaddrs (comma-separated)
     /// Example: /ip4/1.2.3.4/udp/7546/quic-v1/p2p/12D3KooW...
     #[arg(long, env = "GITLAWB_P2P_BOOTSTRAP", value_delimiter = ',')]
@@ -136,6 +159,57 @@ pub struct Config {
     /// Automatically mirror repos from peers when ref-update events arrive via Gossipsub.
     #[arg(long, env = "GITLAWB_AUTO_SYNC", default_value_t = false)]
     pub auto_sync: bool,
+
+    /// Periodically fetch configured INBOUND repositories from their external
+    /// HTTPS upstream. Disabled by default: enabling this also requires
+    /// `GITLAWB_ENFORCE_OWNER_PUSH=true`, so an upstream-authoritative mirror
+    /// cannot accept writes from arbitrary signed identities between fetches.
+    #[arg(long, env = "GITLAWB_UPSTREAM_MIRROR_ENABLED", default_value_t = false)]
+    pub upstream_mirror_enabled: bool,
+
+    /// Pause between complete upstream-mirror scans. A scan is sequential and
+    /// paginated; the pause begins only after the prior scan has finished, so a
+    /// slow forge cannot create overlapping worker cycles.
+    #[arg(
+        long,
+        env = "GITLAWB_UPSTREAM_MIRROR_INTERVAL_SECS",
+        default_value_t = 300,
+        value_parser = clap::value_parser!(u64).range(5..=86_400)
+    )]
+    pub upstream_mirror_interval_secs: u64,
+
+    /// Maximum wall-clock time for one external `git fetch`. The child runs in
+    /// its own process group and is fully reaped on timeout. The preflight
+    /// URL-rewrite and local-config probes run on their own short bounds and
+    /// do not consume this budget.
+    #[arg(
+        long,
+        env = "GITLAWB_UPSTREAM_MIRROR_FETCH_TIMEOUT_SECS",
+        default_value_t = 600,
+        value_parser = clap::value_parser!(u64).range(1..=GIT_SERVICE_TIMEOUT_SECS_MAX)
+    )]
+    pub upstream_mirror_fetch_timeout_secs: u64,
+
+    /// Number of durable INBOUND rows read per database page. Every page is
+    /// processed before the scan sleeps; this bounds query memory without
+    /// permanently starving repositories beyond the first page.
+    #[arg(
+        long,
+        env = "GITLAWB_UPSTREAM_MIRROR_PAGE_SIZE",
+        default_value_t = 100,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_000)
+    )]
+    pub upstream_mirror_page_size: usize,
+    /// Enable the periodic reconciliation sweep that re-derives pin/seal sets
+    /// and fills durability gaps.  Defaults to true; set to false to disable
+    /// the sweep even when a pin backend (IPFS/Pinata) is configured.
+    #[arg(
+        long,
+        env = "GITLAWB_RECONCILIATION_SWEEP",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    pub reconciliation_sweep: bool,
 
     /// Irys URL for Arweave permanent anchoring.
     /// Leave empty to disable. Use https://devnet.irys.xyz for free devnet.
@@ -225,12 +299,35 @@ pub struct Config {
     #[arg(long, env = "GITLAWB_METRICS_ADDR", default_value = "")]
     pub metrics_addr: String,
 
-    /// Maximum time to wait for in-flight requests to drain on shutdown, in
-    /// seconds. After this elapses, the server returns 503 to anything still
-    /// in flight and exits. Default: 30s.
+    /// Shutdown grace setting, in seconds. Currently not enforced: the value
+    /// is logged at startup and axum drains in-flight requests on the shutdown
+    /// signal with no upper bound. Default: 30s.
     #[arg(long, env = "GITLAWB_SHUTDOWN_GRACE_SECS", default_value_t = 30)]
     pub shutdown_grace_secs: u64,
 
+    /// Maximum number of creation requests (repo create, issue create, PR
+    /// create, register, fork) allowed per DID within the rate-limit window.
+    /// 0 is rejected at parse time: it would silently disable the limiter
+    /// (RateLimiter treats max_requests == 0 as allow-all), not block every
+    /// creation request.
+    #[arg(
+        long,
+        env = "GITLAWB_RATE_LIMIT_MAX",
+        default_value_t = 10,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub rate_limit_max_requests: u32,
+
+    /// Rate-limit window size, in seconds, over which
+    /// `rate_limit_max_requests` applies. 0 is rejected at parse time: every
+    /// timestamp would prune immediately, silently disabling the limiter.
+    #[arg(
+        long,
+        env = "GITLAWB_RATE_LIMIT_WINDOW_SECS",
+        default_value_t = 3600,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub rate_limit_window_secs: u64,
     /// Maximum wall-clock time a single served git operation (upload-pack /
     /// receive-pack through `run_git_service`) may run before it is aborted and
     /// its process group torn down, in seconds. Bounds a git that neither
@@ -273,11 +370,9 @@ pub struct Config {
 
     /// Maximum connections in the PostgreSQL pool. This is a cap, not a floor
     /// (connections open lazily). Size against the database server's
-    /// max_connections, remembering admin tooling opens its own pool. Each
-    /// concurrent write pins one pooled connection for its whole duration (the
-    /// advisory lock in `repo_store::acquire_write` is connection-affine), so this
-    /// must exceed `max_concurrent_git_pushes` by `DB_POOL_APP_HEADROOM` or slow
-    /// pushes starve every other DB path — enforced by `Config::validate`.
+    /// max_connections, remembering admin tooling opens its own pool. Writes pin
+    /// the dedicated lock pool, not this one; this pool still needs enough headroom
+    /// for ordinary request handlers and metadata paths (`DB_POOL_APP_HEADROOM`).
     #[arg(
         long,
         env = "GITLAWB_DB_MAX_CONNECTIONS",
@@ -285,6 +380,46 @@ pub struct Config {
         value_parser = clap::value_parser!(u32).range(1..)
     )]
     pub db_max_connections: u32,
+
+    /// Maximum connections in the dedicated advisory-lock pool, which is separate
+    /// from the main pool above.
+    ///
+    /// Size this against the expected peak number of concurrent distinct-repo
+    /// writers, NOT small. Every in-flight repo write pins one connection here for
+    /// its whole duration (the write, its metadata tail, and the bounded archive
+    /// upload), so this value is a hard ceiling on simultaneous writes node-wide.
+    /// Keeping it separate from GITLAWB_DB_MAX_CONNECTIONS is what stops a push
+    /// burst from starving ordinary request handlers; the cost is that
+    /// (main pool + lock pool) must fit inside the database server's
+    /// max_connections, times the number of nodes, plus admin tooling.
+    #[arg(
+        long,
+        env = "GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS",
+        default_value_t = 40,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub db_lock_pool_max_connections: u32,
+
+    /// Upper bound, in seconds, on any single object-storage transfer that runs
+    /// while the per-repo advisory lock is HELD.
+    ///
+    /// Two bounded spans exist, and the bound applies per span. The acquire-side
+    /// refresh in `acquire_write` covers the existence HEAD and the download
+    /// together under ONE budget (it runs after the lock is taken and before the
+    /// guard is constructed), and the archive upload in `release` gets its own.
+    /// Worst-case slot occupancy is therefore about twice this value plus the git
+    /// work between them, not one times this value. Both used to be free, because the lock's
+    /// connection was returned to the pool immediately; now that a write guard
+    /// pins a lock-pool connection for its whole lifetime, an unbounded transfer
+    /// holds that slot, and enough stalled transfers deny every write on the node.
+    /// This is the bound that keeps a stall from becoming an outage.
+    #[arg(
+        long,
+        env = "GITLAWB_LOCK_HELD_TRANSFER_TIMEOUT_SECS",
+        default_value_t = 300,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub lock_held_transfer_timeout_secs: u64,
 
     /// Maximum time a request waits for a pool connection before failing with
     /// 503, in seconds. Bounds queueing when the database is slow or down.
@@ -380,15 +515,14 @@ pub struct Config {
     /// error rather than a boot-time panic).
     ///
     /// CONNECTION BUDGET. A push holds a Postgres connection from the node's separate
-    /// advisory-lock pool for the whole receive-pack, and that pool is sized from this
-    /// knob (this value + 8, clamped to 64 in `main.rs`). The node's total ceiling is
-    /// therefore `db_max_connections` (default 48) + the lock pool (default 40), i.e.
-    /// 88 by default, and at most `db_max_connections` + 64. Size BOTH against the
-    /// database server's `max_connections`: `db_max_connections`' own doc predates the
-    /// lock pool and no longer covers most of the node's connections. The +8 headroom
-    /// is shared with the three non-push `acquire_write` callers (`api/issues.rs` x2,
-    /// `api/pulls.rs`). Raising this knob past the clamp does NOT buy more lock-pool
-    /// connections; pushes beyond it wait briefly and then shed a 503 + Retry-After.
+    /// advisory-lock pool (`GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS`, default 40) for
+    /// the whole receive-pack. That pool must be at least this value plus
+    /// `DB_LOCK_POOL_NON_PUSH_HEADROOM` so admitted pushes and non-push mutations
+    /// can each pin a lock-pool connection for their whole duration. Size BOTH
+    /// pools against the database server's `max_connections`: the main pool
+    /// (`GITLAWB_DB_MAX_CONNECTIONS`, default 48) serves ordinary handlers, and the
+    /// lock pool serves writes. Raising this knob does not raise the lock pool;
+    /// set `GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS` explicitly.
     #[arg(
         long,
         env = "GITLAWB_MAX_CONCURRENT_GIT_PUSHES",
@@ -723,6 +857,60 @@ pub struct Config {
         value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(0..=86_400)
     )]
     pub pin_repair_sweep_delay_secs: u64,
+
+    /// #26 Split PR 1 step 4 — receive-pack queue retention window.
+    /// Terminal `complete` and `rejected_at_git` rows older than
+    /// this are eligible for the periodic purge. `quarantined`
+    /// rows are never purged on a timer. The v30 partial index
+    /// `idx_receive_pack_requests_completed_at` keeps the scan
+    /// cheap regardless of the value.
+    #[arg(
+        long,
+        env = "GITLAWB_QUEUE_RETENTION_DAYS",
+        default_value_t = 7,
+        value_parser = clap::builder::RangedU64ValueParser::<i64>::new().range(1..=365)
+    )]
+    pub queue_retention_days: i64,
+
+    /// #26 Split PR 1 step 4 — receive-pack queue purge batch size.
+    /// Each periodic purge pass deletes at most this many terminal
+    /// rows per batch. The drain and the purge share the same
+    /// `DRAIN_PER_PASS_LIMIT` budget; see the spawn function in
+    /// `main.rs` for the wiring.
+    #[arg(
+        long,
+        env = "GITLAWB_QUEUE_PURGE_BATCH",
+        default_value_t = 1000,
+        value_parser = clap::builder::RangedU64ValueParser::<i64>::new().range(1..=100_000)
+    )]
+    pub queue_purge_batch: i64,
+
+    /// #26 Split PR 1 step 5 — effects-executor retry bound. The
+    /// drain flips a request to `quarantined` after this many
+    /// `EffectsOutcome::Retry` returns, closing the
+    /// infinite-retry DoS window. Default 8 matches the spec; set
+    /// lower in tests.
+    #[arg(
+        long,
+        env = "GITLAWB_EFFECTS_MAX_ATTEMPTS",
+        default_value_t = 8,
+        value_parser = clap::builder::RangedU64ValueParser::<i32>::new().range(1..=1000)
+    )]
+    pub effects_max_attempts: i32,
+    /// Per-client-IP rate limit for the anonymous task read routes
+    /// (`GET /api/v1/tasks`, `GET /api/v1/tasks/{id}`), in requests per hour.
+    /// Both are publicly reachable (`optional_signature`). `GET /api/v1/tasks`
+    /// runs `collect_visible_tasks` and returns a visibility-filtered page;
+    /// `GET /api/v1/tasks/{id}` runs `get_visible_task` and returns an opaque 404
+    /// when the task is hidden or missing. These reads can require task,
+    /// repository, and visibility-rule queries even when no task is returned,
+    /// so the brake bounds the cost of anonymous probes. Keyed on the resolved
+    /// client IP via `GITLAWB_TRUSTED_PROXY`. `0` disables. Default: 1200 (a list page
+    /// followed by per-task reads is a normal client pattern, so this sits above
+    /// the `/ipfs` budget). GraphQL `tasks` / `task` queries, including WebSocket
+    /// operations, share this per-IP budget with REST task reads.
+    #[arg(long, env = "GITLAWB_TASK_READ_RATE_LIMIT", default_value_t = 1200)]
+    pub task_read_rate_limit: usize,
 }
 
 impl Config {
@@ -733,11 +921,27 @@ impl Config {
     /// Resolve ~ in key_path
     pub fn resolved_key_path(&self) -> PathBuf {
         if self.key_path.starts_with("~/") {
-            if let Some(home) = dirs_next::home_dir() {
-                return home.join(&self.key_path[2..]);
+            let suffix = &self.key_path[2..];
+            if !crate::p2p::tilde_suffix_escapes_home(suffix) {
+                if let Some(home) = dirs_next::home_dir() {
+                    return home.join(suffix);
+                }
             }
         }
         PathBuf::from(&self.key_path)
+    }
+
+    /// Resolve ~ in p2p_key_path
+    pub fn resolved_p2p_key_path(&self) -> PathBuf {
+        if self.p2p_key_path.starts_with("~/") {
+            let suffix = &self.p2p_key_path[2..];
+            if !crate::p2p::tilde_suffix_escapes_home(suffix) {
+                if let Some(home) = dirs_next::home_dir() {
+                    return home.join(suffix);
+                }
+            }
+        }
+        PathBuf::from(&self.p2p_key_path)
     }
 
     /// DB connections reserved for everything other than held write-locks: auth
@@ -746,34 +950,306 @@ impl Config {
     /// the pool must clear the concurrent-write cap by at least this margin.
     pub const DB_POOL_APP_HEADROOM: u32 = 8;
 
+    /// Lock-pool slots reserved for non-push `acquire_write` callers (issue create,
+    /// close, merge) so a saturated push budget cannot turn ordinary mutations into
+    /// lock-pool exhaustion on unrelated repositories.
+    pub const DB_LOCK_POOL_NON_PUSH_HEADROOM: u32 = 8;
+
     /// Cross-field boot validation. Single-field ranges are enforced by clap; this
     /// catches combinations that ship a denial-of-service under otherwise-valid
     /// values. Call once at startup and fail fast on `Err`.
-    pub fn validate(&self) -> Result<(), String> {
-        // A write pins one pooled connection for its whole duration (the
-        // connection-affine advisory lock in repo_store::acquire_write), and
-        // concurrent writes are capped at max_concurrent_git_pushes. If the pool
-        // does not exceed that cap by DB_POOL_APP_HEADROOM, a burst of slow pushes
-        // drains every connection and every other DB path 503s. (#174 F1)
-        let floor = (self.max_concurrent_git_pushes as u64) + (Self::DB_POOL_APP_HEADROOM as u64);
-        if (self.db_max_connections as u64) < floor {
+    ///
+    /// `&mut self` is required so the validator can normalize `web_url` to
+    /// its canonical form after validation: the configured value is
+    /// advertised on public `GET /`, and any consumer reading
+    /// `config.web_url` later must see the same string that was actually
+    /// validated.
+    pub fn validate(&mut self) -> Result<(), String> {
+        // Concurrent git writes pin the dedicated lock pool for their whole
+        // duration (connection-affine advisory lock in acquire_write). The main
+        // pool no longer carries that occupancy.
+        let lock_floor = self
+            .max_concurrent_git_pushes
+            .saturating_add(Self::DB_LOCK_POOL_NON_PUSH_HEADROOM as usize);
+        if (self.db_lock_pool_max_connections as usize) < lock_floor {
             return Err(format!(
-                "GITLAWB_DB_MAX_CONNECTIONS ({}) must be at least max_concurrent_git_pushes ({}) \
-                 + {} headroom = {}: each concurrent write pins one pooled connection for its whole \
-                 duration, so a smaller pool lets a burst of slow pushes starve every other DB path.",
-                self.db_max_connections,
+                "GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS ({}) must be at least \
+                 max_concurrent_git_pushes ({}) plus {} for non-push mutations \
+                 that share the lock pool",
+                self.db_lock_pool_max_connections,
                 self.max_concurrent_git_pushes,
-                Self::DB_POOL_APP_HEADROOM,
-                floor
+                Self::DB_LOCK_POOL_NON_PUSH_HEADROOM
             ));
         }
+        if self.upstream_mirror_enabled && !self.enforce_owner_push {
+            return Err(
+                "GITLAWB_UPSTREAM_MIRROR_ENABLED requires GITLAWB_ENFORCE_OWNER_PUSH=true: \
+                 an upstream-authoritative mirror must not accept writes from arbitrary signed identities"
+                    .to_string(),
+            );
+        }
+        let main_floor = Self::DB_POOL_APP_HEADROOM as u64;
+        if (self.db_max_connections as u64) < main_floor {
+            return Err(format!(
+                "GITLAWB_DB_MAX_CONNECTIONS ({}) must be at least {} for non-git \
+                 database paths",
+                self.db_max_connections, main_floor
+            ));
+        }
+
+        // Identity is always loaded, so a directory-valued or escaping spelling
+        // is boot-fatal here. Bare `identity.pem` stays legal; the p2p "must
+        // include a dedicated directory" rule is not imported.
+        if self.key_path.starts_with("~/") {
+            let suffix = &self.key_path[2..];
+            if crate::p2p::tilde_suffix_escapes_home(suffix) {
+                return Err(format!(
+                    "GITLAWB_KEY ({}) must stay inside the home directory after `~/` \
+                     expansion; rooted suffixes such as `~//etc/identity.pem`, drive-prefixed \
+                     suffixes, and `..` traversal are refused",
+                    self.key_path
+                ));
+            }
+        }
+        let identity_key_path = self.resolved_key_path();
+        if self.key_path.starts_with("~/") && identity_key_path == Path::new(&self.key_path) {
+            return Err(format!(
+                "GITLAWB_KEY ({}) starts with `~/` but no home directory could be resolved, \
+                 so it would name a literal `~` directory relative to the working directory. \
+                 Set an absolute path such as /data/keys/identity.pem.",
+                self.key_path
+            ));
+        }
+        if crate::p2p::path_denotes_a_directory(&identity_key_path, Some(&self.key_path))
+            || identity_key_path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(format!(
+                "GITLAWB_KEY ({}) must name a key file, not a directory; a trailing separator, \
+                 a final `.` or `..` component, and `..` traversal are refused so the path \
+                 cannot retarget a parent",
+                self.key_path
+            ));
+        }
+
+        // P2P is optional: an HTTP-only node with GITLAWB_P2P_PORT=0 never loads
+        // or creates this key, so refusing startup on an unused path would be a
+        // silent outage with no security benefit.
+        if self.p2p_port > 0 {
+            // A p2p key path naming no directory puts the node's private key in
+            // whatever directory the process was started from. The node cannot
+            // protect that: `ensure_key_dir` would have to chmod a directory the
+            // operator never nominated as a key directory, and a directory it
+            // cannot secure is one where any local user with write access can
+            // replace the key and choose the node's libp2p identity. Refuse it here,
+            // where the denial actually stops the process, rather than in the p2p
+            // start path, where main.rs logs the error and keeps serving with a
+            // green /health.
+            //
+            // Decided lexically on the resolved path: `canonicalize` would fail on a
+            // parent that does not exist yet (the shipped `~/.gitlawb` default, and
+            // every container's first boot), and comparing against the process
+            // working directory would reject `/data/p2p.key` under the image's
+            // WORKDIR, an absolute directory the operator did name.
+            // `resolved_p2p_key_path` expands a leading `~/` only when a home
+            // directory is resolvable, and otherwise hands back the literal string.
+            // That would leave the shipped default naming a directory called `~`
+            // relative to wherever the process started, which is a real directory
+            // the node would create and chmod, and whose location moves with the
+            // working directory. It passes the check below because `~` is an
+            // ordinary path component, so it has to be caught separately.
+            if self.p2p_key_path.starts_with("~/") {
+                let suffix = &self.p2p_key_path[2..];
+                if crate::p2p::tilde_suffix_escapes_home(suffix) {
+                    return Err(format!(
+                        "GITLAWB_P2P_KEY ({}) must stay inside the home directory after `~/` \
+                         expansion; rooted suffixes such as `~//etc/p2p.key`, drive-prefixed \
+                         suffixes, and `..` traversal are refused",
+                        self.p2p_key_path
+                    ));
+                }
+            }
+            let p2p_key_path = self.resolved_p2p_key_path();
+            if self.p2p_key_path.starts_with("~/") && p2p_key_path == Path::new(&self.p2p_key_path)
+            {
+                return Err(format!(
+                    "GITLAWB_P2P_KEY ({}) starts with `~/` but no home directory could be resolved, \
+                     so it would name a literal `~` directory relative to the working directory. \
+                     Set an absolute path such as /data/keys/p2p.key.",
+                    self.p2p_key_path
+                ));
+            }
+            // Lexical only: this runs before the listener binds and its
+            // failure stops the node, so it must not decide anything about
+            // live filesystem objects. Storage faults belong to the load path,
+            // which degrades instead of exiting.
+            let _ = crate::p2p::validate_p2p_key_config(&p2p_key_path, Some(&self.p2p_key_path))
+                .map_err(|e| e.to_string())?;
+        }
+
+        // GITLAWB_WEB_URL is advertised in GET / so the CLI can print a working
+        // View: link. Clap maps "" to Some("") which would produce a broken URL;
+        // reject early instead of serving a malformed link. Non-blank values must
+        // additionally parse as an absolute http(s) URL — the CLI appends
+        // `/{owner}/{repo}` to it, so scheme-less hosts ("gitlawb.com") and other
+        // garbage would render links no browser can follow.
+        if let Some(raw) = &self.web_url {
+            match validate_web_url(raw) {
+                Ok(()) => {}
+                Err(reason) => {
+                    return Err(format!(
+                        "GITLAWB_WEB_URL {reason} — \
+                         set it to an absolute URL like https://gitlawb.com or leave it unset."
+                    ));
+                }
+            }
+            // Normalize to one canonical form so every consumer (the regular
+            // and degraded `GET /` handlers, anyone who reads
+            // `config.web_url` directly) sees the same string that was
+            // actually validated. The CLI's own defensive trim would paper
+            // over the divergence on the `View:` line, but that hides the
+            // bug from any other consumer that parses the value verbatim.
+            let canonical = raw
+                .trim()
+                .parse::<url::Url>()
+                .map(|u| u.to_string())
+                .map_err(|_| "is not a valid absolute URL".to_string())?;
+            if canonical != *raw {
+                self.web_url = Some(canonical);
+            }
+        }
+
         Ok(())
     }
+}
+
+/// Validate a `web_url` value for use as a browser-reachable base URL.
+/// Blank values are rejected (clap maps `--web-url ""` to `Some("")`), and
+/// non-blank values must parse as absolute `http`/`https` URLs with no
+/// query, fragment, or userinfo — the CLI treats this as a string prefix
+/// to append paths to, so anything else produces links no browser can
+/// follow (`?a=1/owner/repo` puts the repo path inside the query string);
+/// and userinfo is rejected outright because the configured value is
+/// published on public `GET /` and reprinted on the CLI's `View:` line,
+/// so an accidentally configured password would land in public metadata,
+/// terminal scrollback, and CI logs.
+pub(crate) fn validate_web_url(raw: &str) -> Result<(), String> {
+    if raw.trim().is_empty() {
+        return Err("must not be empty or whitespace-only".into());
+    }
+    let parsed: url::Url = raw
+        .trim()
+        .parse()
+        .map_err(|_| "is not a valid absolute URL".to_string())?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => return Err(format!("must use http or https, got '{other}:'")),
+    }
+    // url::Url cannot represent a URL without a host for http/https schemes, so
+    // reaching here guarantees an absolute browser-usable base.
+    if parsed.query().is_some() {
+        return Err(
+            "must not contain a query string — it is used as a path prefix for View links".into(),
+        );
+    }
+    if parsed.fragment().is_some() {
+        return Err(
+            "must not contain a fragment — it is used as a path prefix for View links".into(),
+        );
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(
+            "must not contain a username or password — it is advertised publicly and printed on the View: line"
+                .into(),
+        );
+    }
+    // Bidi/control bytes can hide behind percent-encoding: a literal scan of
+    // the wire form misses `.../%E2%80%AE` even though a browser decodes it
+    // into a reordering character on the rendered View: link. Check the
+    // decoded host and path before the value is advertised on GET / (INV-6).
+    let host = parsed.host_str().unwrap_or("");
+    let decoded_path = percent_encoding::percent_decode_str(parsed.path()).decode_utf8_lossy();
+    if host
+        .chars()
+        .chain(decoded_path.chars())
+        .any(|c| c.is_control() || gitlawb_core::sanitize::is_bidi_format(c))
+    {
+        return Err(
+            "must not contain control or bidi characters, even percent-encoded — the View: line is terminal output"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_mirror_worker_is_default_off_and_bounded() {
+        let mut config = Config::parse_from(["gitlawb-node"]);
+        assert!(!config.upstream_mirror_enabled);
+        assert_eq!(config.upstream_mirror_interval_secs, 300);
+        assert_eq!(config.upstream_mirror_fetch_timeout_secs, 600);
+        assert_eq!(config.upstream_mirror_page_size, 100);
+        config.validate().unwrap();
+
+        assert!(
+            Config::try_parse_from(["gitlawb-node", "--upstream-mirror-interval-secs", "4",])
+                .is_err()
+        );
+        assert!(
+            Config::try_parse_from(["gitlawb-node", "--upstream-mirror-page-size", "0",]).is_err()
+        );
+    }
+
+    #[test]
+    fn upstream_mirror_worker_requires_owner_push_enforcement() {
+        // enforce_owner_push defaults true on main, so the only unsafe shape
+        // is the explicit opt-out: mirror enabled plus enforcement refused.
+        let mut unsafe_config = Config::parse_from([
+            "gitlawb-node",
+            "--upstream-mirror-enabled",
+            "--enforce-owner-push",
+            "false",
+        ]);
+        let error = unsafe_config.validate().unwrap_err();
+        assert!(error.contains("GITLAWB_ENFORCE_OWNER_PUSH=true"));
+
+        Config::parse_from([
+            "gitlawb-node",
+            "--upstream-mirror-enabled",
+            "--enforce-owner-push",
+            "true",
+        ])
+        .validate()
+        .unwrap();
+        // The default posture alone also validates: enforcement is on.
+        Config::parse_from(["gitlawb-node", "--upstream-mirror-enabled"])
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn lock_pool_size_defaults_to_40_and_rejects_zero() {
+        assert_eq!(
+            Config::parse_from(["gitlawb-node"]).db_lock_pool_max_connections,
+            40
+        );
+        assert_eq!(
+            Config::parse_from(["gitlawb-node", "--db-lock-pool-max-connections", "8"])
+                .db_lock_pool_max_connections,
+            8
+        );
+        // A zero-sized lock pool would deny every write, so clap must reject it
+        // rather than let a node boot into a state where no repo can be written.
+        assert!(
+            Config::try_parse_from(["gitlawb-node", "--db-lock-pool-max-connections", "0"])
+                .is_err()
+        );
+    }
 
     #[test]
     fn git_service_timeout_defaults_to_600_and_rejects_zero() {
@@ -1051,6 +1527,30 @@ mod tests {
             Config::try_parse_from(["gitlawb-node", "--pin-repair-sweep-delay-secs", "86401"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn queue_lifecycle_knobs_default_conservatively() {
+        let c = Config::parse_from(["gitlawb-node"]);
+        // 7-day retention matches the v30 partial index comment
+        // and the spec at .gravirei/plans/state-model-durable-post-receive.md.
+        assert_eq!(c.queue_retention_days, 7);
+        // 1000 rows per pass matches DRAIN_PER_PASS_LIMIT in durable_outbox.
+        assert_eq!(c.queue_purge_batch, 1000);
+
+        assert_eq!(
+            Config::parse_from(["gitlawb-node", "--queue-retention-days", "30"])
+                .queue_retention_days,
+            30
+        );
+        assert!(Config::try_parse_from(["gitlawb-node", "--queue-retention-days", "0"]).is_err());
+        assert!(Config::try_parse_from(["gitlawb-node", "--queue-retention-days", "366"]).is_err());
+
+        assert_eq!(
+            Config::parse_from(["gitlawb-node", "--queue-purge-batch", "500"]).queue_purge_batch,
+            500
+        );
+        assert!(Config::try_parse_from(["gitlawb-node", "--queue-purge-batch", "0"]).is_err());
     }
 
     #[test]
@@ -1453,42 +1953,202 @@ mod tests {
         );
     }
 
-    /// #174 F1: a connection-affine write lock pins a pooled connection per
-    /// concurrent write, so the pool must clear `max_concurrent_git_pushes` by
-    /// `DB_POOL_APP_HEADROOM` or a push burst starves every other DB path.
-    /// `validate()` must reject an under-sized pool at boot.
+    /// #174 F1: concurrent git writes pin the dedicated lock pool, not the main
+    /// pool. `validate()` must reject an under-sized lock pool at boot.
     #[test]
     fn db_pool_must_clear_the_git_push_cap() {
-        // Shipped defaults validate (48 >= 32 + 8).
+        // Shipped defaults validate (lock pool 40 >= pushes 32 + non-push headroom 8).
         Config::parse_from(["gitlawb-node"])
             .validate()
             .expect("default config must validate");
 
-        // An under-sized pool relative to the push cap is rejected (20 < 32 + 8).
-        let under = Config::parse_from([
+        // An under-sized lock pool relative to the push cap is rejected.
+        let mut under_lock = Config::parse_from([
             "gitlawb-node",
-            "--db-max-connections",
-            "20",
+            "--db-lock-pool-max-connections",
+            "16",
             "--max-concurrent-git-pushes",
             "32",
         ]);
         assert!(
-            under.validate().is_err(),
-            "db_max_connections 20 below max_concurrent_git_pushes 32 + headroom must be rejected"
+            under_lock.validate().is_err(),
+            "db_lock_pool_max_connections below max_concurrent_git_pushes + headroom must be rejected"
         );
 
-        // Exactly at the floor validates (40 == 32 + 8).
-        let at_floor = Config::parse_from([
+        // Exactly at the push cap without non-push headroom is rejected.
+        let mut push_only = Config::parse_from([
+            "gitlawb-node",
+            "--db-lock-pool-max-connections",
+            "32",
+            "--max-concurrent-git-pushes",
+            "32",
+        ]);
+        assert!(
+            push_only.validate().is_err(),
+            "db_lock_pool_max_connections equal to max_concurrent_git_pushes must be rejected"
+        );
+
+        // Main pool can be smaller than pushes + headroom when the lock pool carries writes.
+        let mut split = Config::parse_from([
             "gitlawb-node",
             "--db-max-connections",
+            "16",
+            "--db-lock-pool-max-connections",
             "40",
             "--max-concurrent-git-pushes",
             "32",
         ]);
         assert!(
-            at_floor.validate().is_ok(),
-            "db_max_connections at the floor (pushes + headroom) must validate"
+            split.validate().is_ok(),
+            "a small main pool with a large lock pool must validate"
         );
+
+        // Main pool still needs the app headroom floor.
+        let mut under_main = Config::parse_from(["gitlawb-node", "--db-max-connections", "4"]);
+        assert!(
+            under_main.validate().is_err(),
+            "db_max_connections below DB_POOL_APP_HEADROOM must be rejected"
+        );
+    }
+
+    #[test]
+    fn web_url_rejects_empty_and_whitespace() {
+        // Unset is fine.
+        Config::parse_from(["gitlawb-node"])
+            .validate()
+            .expect("no web_url must validate");
+
+        // A real URL validates.
+        let mut cfg = Config::parse_from(["gitlawb-node"]);
+        cfg.web_url = Some("https://gitlawb.com".into());
+        assert!(cfg.validate().is_ok());
+
+        // Empty string is rejected.
+        let mut cfg = Config::parse_from(["gitlawb-node"]);
+        cfg.web_url = Some("".into());
+        assert!(cfg.validate().is_err(), "empty web_url must be rejected");
+
+        // Whitespace-only is rejected.
+        let mut cfg = Config::parse_from(["gitlawb-node"]);
+        cfg.web_url = Some("   ".into());
+        assert!(
+            cfg.validate().is_err(),
+            "whitespace-only web_url must be rejected"
+        );
+    }
+
+    #[test]
+    fn web_url_rejects_non_absolute_or_non_browser_urls() {
+        // Scheme-less host: parses nowhere, renders a broken View: link.
+        for bad in [
+            "gitlawb.com",
+            "not a url",
+            "ftp://files.example.com",
+            "javascript:alert(1)",
+            "https://", // no host
+        ] {
+            let mut cfg = Config::parse_from(["gitlawb-node"]);
+            cfg.web_url = Some(bad.into());
+            assert!(cfg.validate().is_err(), "web_url {bad:?} must be rejected");
+        }
+
+        // Query strings and fragments corrupt the appended repo path, since
+        // web_url is used as a raw string prefix (`?a=1` would swallow
+        // `/{owner}/{repo}` into the query).
+        for bad in [
+            "https://gitlawb.com?a=1",
+            "https://gitlawb.com/?utm_source=docs",
+            "https://gitlawb.com#section",
+            "https://gitlawb.com/#faq",
+        ] {
+            let mut cfg = Config::parse_from(["gitlawb-node"]);
+            cfg.web_url = Some(bad.into());
+            assert!(
+                cfg.validate().is_err(),
+                "web_url {bad:?} (query or fragment) must be rejected"
+            );
+        }
+
+        // Surrounding whitespace around a valid URL is tolerated.
+        let mut cfg = Config::parse_from(["gitlawb-node"]);
+        cfg.web_url = Some("  https://gitlawb.com  ".into());
+        assert!(
+            cfg.validate().is_ok(),
+            "padded-but-valid web_url must validate"
+        );
+
+        // Percent-encoded bidi must not boot: the wire form carries no Cf
+        // code point, but a browser decodes %E2%80%AE into a reordering
+        // character on the rendered View: link (INV-6). Literal bidi and
+        // control bytes are rejected the same way.
+        for bad in [
+            "https://example.com/%E2%80%AE",
+            "https://example.com/\u{202e}spoof",
+            "https://example.com/%1b[31m",
+        ] {
+            let mut cfg = Config::parse_from(["gitlawb-node"]);
+            cfg.web_url = Some(bad.into());
+            assert!(
+                cfg.validate().is_err(),
+                "web_url {bad:?} (control or bidi, even encoded) must be rejected"
+            );
+        }
+
+        // Non-default ports and paths are fine.
+        let mut cfg = Config::parse_from(["gitlawb-node"]);
+        cfg.web_url = Some("http://localhost:8080/ui".into());
+        assert!(cfg.validate().is_ok(), "port+path web_url must validate");
+
+        // Userinfo must be rejected: `web_url` is published on public
+        // `GET /` and reprinted on the CLI's `View:` line, so an
+        // accidentally configured password would land in public metadata,
+        // terminal scrollback, and CI logs. Reject username-only and
+        // user+password forms.
+        for bad in [
+            "https://user@example.com",
+            "https://user:secret@example.com",
+            "https://:secret@example.com",
+        ] {
+            let mut cfg = Config::parse_from(["gitlawb-node"]);
+            cfg.web_url = Some(bad.into());
+            assert!(
+                cfg.validate().is_err(),
+                "web_url {bad:?} (userinfo) must be rejected"
+            );
+        }
+    }
+
+    /// `validate()` accepts whitespace-padded input but the stored value
+    /// must match the canonical form actually validated, so every consumer
+    /// (the regular and degraded `GET /` handlers, anyone who reads
+    /// `config.web_url` directly) sees the same string. Without this, an
+    /// operator that sets `GITLAWB_WEB_URL="  https://git.example  "` boots
+    /// a node that advertises `"  https://git.example  "` on public
+    /// metadata — different from what was validated, different from what
+    /// any other consumer would parse.
+    #[test]
+    fn web_url_is_normalized_to_canonical_form_after_validation() {
+        // Padded input is rewritten to the canonical form. `url::Url`'s
+        // own `to_string` is what we use for the canonicalization, and
+        // it always appends a path-separator slash to a bare-host URL,
+        // so the stored value is `https://git.example/` (which is also
+        // what every browser would normalize the operator-typed form to).
+        let mut cfg = Config::parse_from(["gitlawb-node"]);
+        cfg.web_url = Some("  https://git.example  ".into());
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.web_url.as_deref(),
+            Some("https://git.example/"),
+            "stored web_url must be the canonical form, not the operator-typed one"
+        );
+
+        // Already-canonical input is left alone after a no-op
+        // re-normalization — same form comes back out, so any consumer
+        // reading the stored value sees a stable string across calls.
+        let mut cfg = Config::parse_from(["gitlawb-node"]);
+        cfg.web_url = Some("https://git.example/".into());
+        cfg.validate().unwrap();
+        assert_eq!(cfg.web_url.as_deref(), Some("https://git.example/"));
     }
 
     /// The DECLARED default, read off the parser rather than out of a parse.
@@ -1514,6 +2174,28 @@ mod tests {
         );
     }
 
+    /// #338: GITLAWB_PUBLIC_READ is inert, so its help must not claim read
+    /// enforcement is missing; it must tell the operator the flag changes
+    /// nothing and where the real control lives.
+    #[test]
+    fn public_read_help_describes_the_flag_as_inert() {
+        use clap::CommandFactory;
+        let cmd = Config::command();
+        let arg = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "public_read")
+            .expect("the argument must exist");
+        let help = arg.get_help().map(|h| h.to_string()).unwrap_or_default();
+        assert!(
+            !help.contains("not wired"),
+            "the help still claims read enforcement is unwired: {help}"
+        );
+        assert!(
+            help.contains("inert"),
+            "the help must say the flag is inert so an operator does not rely on it: {help}"
+        );
+    }
+
     /// The flip must not strand an operator mid-upgrade.
     ///
     /// Turning the gate on is a breaking change for any deployment whose pushers are
@@ -1536,5 +2218,520 @@ mod tests {
         assert!(
             Config::parse_from(["gitlawb-node", "--enforce-owner-push", "true"]).enforce_owner_push
         );
+    }
+
+    fn config_with_p2p_key(path: &str) -> Config {
+        Config::parse_from(["gitlawb-node", "--p2p-key-path", path])
+    }
+
+    fn config_with_key(path: &str) -> Config {
+        Config::parse_from(["gitlawb-node", "--key-path", path])
+    }
+
+    fn config_with_p2p_port_and_key(port: u16, path: &str) -> Config {
+        Config::parse_from([
+            "gitlawb-node",
+            "--p2p-port",
+            &port.to_string(),
+            "--p2p-key-path",
+            path,
+        ])
+    }
+
+    /// The configuration half of the key-storage contract matrix: enabled
+    /// versus disabled p2p, crossed with the path spellings the contract
+    /// rules on. The filesystem-object half (which objects at and around the
+    /// key path boot or are refused) lives in `p2p::tests::
+    /// p2p_key_storage_contract_matrix`; nothing there runs unless this gate
+    /// lets a config through.
+    ///
+    /// Rule 1 is proven through its own rejections: every disabled row uses a
+    /// path that an enabled row shows to be invalid, so `Ok` on the disabled
+    /// row is direct evidence the validator never resolved or inspected the
+    /// unused key storage.
+    #[test]
+    fn p2p_key_storage_contract_config_matrix() {
+        enum Expect {
+            Accepted,
+            Rejected(&'static str),
+        }
+
+        struct Row {
+            port: u16,
+            path: &'static str,
+            expect: Expect,
+            /// Skip when no home directory resolves: the row's outcome is
+            /// about `~/` expansion, which then legitimately fails earlier
+            /// with the no-home error instead.
+            needs_home: bool,
+        }
+
+        let rows = [
+            // Rule 1: disabled p2p leaves its unused key storage alone.
+            Row {
+                port: 0,
+                path: "p2p.key",
+                expect: Expect::Accepted,
+                needs_home: false,
+            },
+            Row {
+                port: 0,
+                path: "~/",
+                expect: Expect::Accepted,
+                needs_home: false,
+            },
+            Row {
+                port: 0,
+                path: "~//etc/p2p.key",
+                expect: Expect::Accepted,
+                needs_home: false,
+            },
+            Row {
+                port: 0,
+                path: "~/../etc/p2p.key",
+                expect: Expect::Accepted,
+                needs_home: false,
+            },
+            Row {
+                port: 0,
+                path: "",
+                expect: Expect::Accepted,
+                needs_home: false,
+            },
+            // Enabled: ordinary absolute and home-relative paths pass, a
+            // doubled separator in an absolute path is harmless (it does not
+            // re-root anything), and the shipped default resolves beneath
+            // home (asserted separately below).
+            Row {
+                port: 7546,
+                path: "/data/keys/p2p.key",
+                expect: Expect::Accepted,
+                needs_home: false,
+            },
+            Row {
+                port: 7546,
+                path: "/data//keys/p2p.key",
+                expect: Expect::Accepted,
+                needs_home: false,
+            },
+            Row {
+                port: 7546,
+                path: "~/.gitlawb/p2p.key",
+                expect: Expect::Accepted,
+                needs_home: true,
+            },
+            // Rule 2: a `~/` suffix that would re-root or walk out of home is
+            // refused at parse time, before any join. These fire whether or
+            // not a home directory resolves, because the suffix is judged
+            // before expansion.
+            Row {
+                port: 7546,
+                path: "~//etc/p2p.key",
+                expect: Expect::Rejected("inside the home directory"),
+                needs_home: false,
+            },
+            Row {
+                port: 7546,
+                path: "~/../etc/p2p.key",
+                expect: Expect::Rejected("inside the home directory"),
+                needs_home: false,
+            },
+            // Rule 3's lexical pre-checks, still gated on the port.
+            Row {
+                port: 7546,
+                path: "p2p.key",
+                expect: Expect::Rejected("directory"),
+                needs_home: false,
+            },
+            Row {
+                port: 7546,
+                path: "~/",
+                expect: Expect::Rejected("must name a key file"),
+                needs_home: true,
+            },
+            Row {
+                port: 7546,
+                path: "/data/keys/.",
+                expect: Expect::Rejected("must name a key file"),
+                needs_home: false,
+            },
+            Row {
+                port: 7546,
+                path: "/data/keys/./.",
+                expect: Expect::Rejected("must name a key file"),
+                needs_home: false,
+            },
+            Row {
+                port: 7546,
+                path: "~/.gitlawb/.",
+                expect: Expect::Rejected("must name a key file"),
+                needs_home: true,
+            },
+        ];
+
+        let have_home = dirs_next::home_dir().is_some();
+        for row in rows {
+            if row.needs_home && !have_home {
+                continue;
+            }
+            let result = config_with_p2p_port_and_key(row.port, row.path).validate();
+            match row.expect {
+                Expect::Accepted => assert!(
+                    result.is_ok(),
+                    "[port={} path={:?}] must be accepted, got: {result:?}",
+                    row.port,
+                    row.path
+                ),
+                Expect::Rejected(needle) => {
+                    let err = result.expect_err(&format!(
+                        "[port={} path={:?}] must be rejected",
+                        row.port, row.path
+                    ));
+                    assert!(
+                        err.contains(needle),
+                        "[port={} path={:?}] rejection must mention {needle:?}, got: {err}",
+                        row.port,
+                        row.path
+                    );
+                }
+            }
+        }
+    }
+
+    /// Rule 1's absence-of-IO half against a real on-disk trap: a disabled
+    /// node pointed at a key path whose parent is a symlink — a shape the
+    /// enabled path refuses and must never chmod — validates clean and leaves
+    /// the trap directory exactly as it was.
+    #[cfg(unix)]
+    #[test]
+    fn p2p_disabled_key_storage_is_never_inspected_or_mutated() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let target = base.path().join("real");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = base.path().join("keys");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let key_path = link.join("p2p.key");
+
+        let mut config = Config::parse_from([
+            "gitlawb-node",
+            "--p2p-port",
+            "0",
+            "--p2p-key-path",
+            key_path.to_str().unwrap(),
+        ]);
+        assert!(
+            config.validate().is_ok(),
+            "a disabled node must not validate the unused key path"
+        );
+
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "the symlink target's mode must stay unchanged");
+        assert_eq!(
+            std::fs::read_dir(&target).unwrap().count(),
+            0,
+            "nothing may be created behind the symlink"
+        );
+    }
+
+    /// The other half of the scoping pair: p2p ENABLED, hostile resource on
+    /// disk, and `validate` still passes.
+    ///
+    /// This is the finding-2 boundary. A symlinked parent, a regular file
+    /// where the key directory should be, and an unreadable parent are live
+    /// storage facts, not properties of the configured value, so they belong
+    /// to the load path, which degrades. Deciding them here made the node exit
+    /// before binding for exactly the cases README and `.env.example` promise
+    /// leave HTTP up. Each row also proves validate touched nothing: an
+    /// inspection is still an observation, and the port-zero test above is the
+    /// disabled half of the same pair.
+    #[cfg(unix)]
+    #[test]
+    fn enabled_p2p_does_not_treat_live_storage_faults_as_configuration_errors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn snapshot(root: &std::path::Path) -> Vec<String> {
+            let mut out = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(root) {
+                for e in entries.flatten() {
+                    let md = std::fs::symlink_metadata(e.path()).unwrap();
+                    out.push(format!(
+                        "{} dir={} link={} mode={:04o}",
+                        e.path().display(),
+                        md.is_dir(),
+                        md.is_symlink(),
+                        md.permissions().mode() & 0o7777
+                    ));
+                }
+            }
+            out.sort();
+            out
+        }
+
+        /// Builds a trap under `base` and returns the key path inside it.
+        type BuildTrap = Box<dyn Fn(&std::path::Path) -> std::path::PathBuf>;
+
+        // (label, build the trap, the key path inside it)
+        let cases: Vec<(&str, BuildTrap)> = vec![
+            (
+                "symlinked parent",
+                Box::new(|base: &std::path::Path| {
+                    let target = base.join("real");
+                    std::fs::create_dir(&target).unwrap();
+                    let link = base.join("keys");
+                    std::os::unix::fs::symlink(&target, &link).unwrap();
+                    link.join("p2p.key")
+                }),
+            ),
+            (
+                "regular file as the key directory",
+                Box::new(|base: &std::path::Path| {
+                    let file = base.join("keys");
+                    std::fs::write(&file, b"not a directory").unwrap();
+                    file.join("p2p.key")
+                }),
+            ),
+            (
+                "unreadable parent",
+                Box::new(|base: &std::path::Path| {
+                    let locked = base.join("locked");
+                    std::fs::create_dir(&locked).unwrap();
+                    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+                        .unwrap();
+                    locked.join("keys").join("p2p.key")
+                }),
+            ),
+        ];
+
+        for (label, build) in cases {
+            let base = tempfile::tempdir().unwrap();
+            let key_path = build(base.path());
+            let before = snapshot(base.path());
+
+            let mut config = Config::parse_from([
+                "gitlawb-node",
+                "--p2p-port",
+                "7546",
+                "--p2p-key-path",
+                key_path.to_str().unwrap(),
+            ]);
+            let verdict = config.validate();
+            assert!(
+                verdict.is_ok(),
+                "{label}: a live storage fault is not a configuration error, got: {verdict:?}"
+            );
+            assert_eq!(
+                snapshot(base.path()),
+                before,
+                "{label}: validation must not mutate the key tree"
+            );
+
+            // Leave the tempdir removable.
+            let locked = base.path().join("locked");
+            if locked.exists() {
+                let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+    }
+
+    /// Rule 2's positive direction: the shipped `~/` default resolves to a
+    /// path beneath the selected home, and suffixes that would escape are
+    /// left unexpanded (and then rejected by `validate`, as the matrix above
+    /// asserts) rather than joined and repaired after.
+    #[test]
+    fn p2p_tilde_expansion_stays_beneath_home() {
+        let Some(home) = dirs_next::home_dir() else {
+            return;
+        };
+
+        let resolved = config_with_p2p_key("~/.gitlawb/p2p.key").resolved_p2p_key_path();
+        assert!(
+            resolved.starts_with(&home),
+            "the resolved default must stay beneath home"
+        );
+        assert!(
+            resolved.ends_with(".gitlawb/p2p.key"),
+            "the resolved default must keep the configured suffix"
+        );
+
+        for path in ["~//etc/p2p.key", "~/../etc/p2p.key"] {
+            assert_eq!(
+                config_with_p2p_key(path).resolved_p2p_key_path(),
+                Path::new(path),
+                "an escaping suffix must never be joined onto home"
+            );
+        }
+    }
+
+    /// A p2p key path that names no directory component would put the node's
+    /// private key in whatever directory the process happens to be started from,
+    /// which `ensure_key_dir` cannot protect without tightening a directory the
+    /// operator never nominated. Reject it at boot instead.
+    #[test]
+    fn p2p_key_path_without_a_directory_component_is_rejected() {
+        for path in [
+            // No directory component at all.
+            "p2p.key",
+            "./p2p.key",
+            "././p2p.key",
+            "p2p.key/",
+            "",
+            // Looks like it names a directory and does not: each of these
+            // resolves back to the working directory or above it, so accepting
+            // them would defeat the check and chmod an unnominated directory.
+            "a/../p2p.key",
+            "./keys/../p2p.key",
+            "../p2p.key",
+            // Absolute too: the lexical parent is what gets chmodded, so these
+            // would tighten /data and / rather than the named directory.
+            "/data/keys/../p2p.key",
+            "/data/../p2p.key",
+        ] {
+            let err = config_with_p2p_key(path)
+                .validate()
+                .expect_err(&format!("{path:?} names no directory and must be rejected"));
+            assert!(
+                err.contains("directory"),
+                "{path:?} must be rejected for naming no directory, got: {err}"
+            );
+        }
+    }
+
+    /// The mirror of the above, and the case that stops the predicate widening
+    /// into "reject every relative path". The shipped default is included on
+    /// purpose: a predicate that rejects it is a boot failure for every node.
+    #[test]
+    fn p2p_key_path_naming_a_directory_is_accepted() {
+        for path in [
+            "keys/p2p.key",
+            "./keys/p2p.key",
+            "/data/keys/p2p.key",
+            "/data/p2p.key",
+            "~/.gitlawb/p2p.key",
+        ] {
+            assert!(
+                config_with_p2p_key(path).validate().is_ok(),
+                "{path:?} names a directory and must be accepted"
+            );
+        }
+
+        Config::parse_from(["gitlawb-node"])
+            .validate()
+            .expect("the shipped default p2p key path must validate");
+    }
+
+    /// `~/` expands to the home directory itself, which is a directory rather
+    /// than a key file, so it must be rejected before its parent is chmodded.
+    #[test]
+    fn p2p_key_path_is_checked_after_tilde_expansion() {
+        if dirs_next::home_dir().is_none() {
+            panic!("this test needs a home directory to distinguish raw from resolved");
+        }
+        let err = config_with_p2p_key("~/")
+            .validate()
+            .expect_err("`~/` must name a key file, not a directory");
+        assert!(
+            err.contains("must name a key file"),
+            "`~/` must be rejected before chmodding its parent, got: {err}"
+        );
+    }
+
+    #[test]
+    fn p2p_key_path_trailing_directory_separator_is_rejected() {
+        let err = config_with_p2p_key("/data/keys/")
+            .validate()
+            .expect_err("a trailing directory separator must be rejected");
+        assert!(
+            err.contains("must name a key file"),
+            "trailing `/` must be rejected before chmod, got: {err}"
+        );
+    }
+
+    /// A terminal `.` is a directory-valued spelling. Rust's Path drops it, so
+    /// `/data/keys/.` would otherwise be stored as the file `keys` under `/data`.
+    #[test]
+    fn p2p_key_path_terminal_dot_is_rejected() {
+        for path in ["/data/keys/.", "/data/keys/./.", "/data/keys/.//."] {
+            let err = config_with_p2p_key(path)
+                .validate()
+                .expect_err("a terminal `.` must be rejected as a directory");
+            assert!(
+                err.contains("must name a key file"),
+                "{path:?} must be refused before Path can retarget it, got: {err}"
+            );
+        }
+    }
+
+    /// Identity allows a bare filename; it does not allow a directory spelling
+    /// that Path would retarget onto a parent.
+    #[test]
+    fn identity_key_path_terminal_dot_is_rejected() {
+        for path in ["/data/keys/.", "/data/keys/./.", "/data/keys/.//."] {
+            let err = config_with_key(path)
+                .validate()
+                .expect_err("a terminal `.` must be rejected as a directory");
+            assert!(
+                err.contains("GITLAWB_KEY") && err.contains("must name a key file"),
+                "{path:?} must be refused before Path can retarget it, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_key_path_trailing_directory_separator_is_rejected() {
+        let err = config_with_key("/data/keys/")
+            .validate()
+            .expect_err("a trailing directory separator must be rejected");
+        assert!(
+            err.contains("must name a key file"),
+            "trailing `/` must be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn identity_key_path_tilde_directory_is_rejected() {
+        let err = config_with_key("~/")
+            .validate()
+            .expect_err("`~/` must name a key file, not a directory");
+        assert!(
+            err.contains("must name a key file"),
+            "`~/` must be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn identity_key_path_tilde_escape_is_rejected() {
+        let err = config_with_key("~//etc/identity.pem")
+            .validate()
+            .expect_err("a `~/` spelling that escapes home must be rejected");
+        assert!(
+            err.contains("must stay inside the home directory"),
+            "tilde escape must be refused, got: {err}"
+        );
+    }
+
+    #[test]
+    fn identity_key_path_parent_dir_component_is_rejected() {
+        let err = config_with_key("/data/keys/../identity.pem")
+            .validate()
+            .expect_err("`..` in an identity path must be rejected");
+        assert!(
+            err.contains("..") || err.contains("must name a key file"),
+            "`..` must be refused so the parent cannot retarget, got: {err}"
+        );
+    }
+
+    #[test]
+    fn identity_key_path_bare_filename_is_accepted() {
+        for path in ["identity.pem", "./identity.pem", "/identity.pem"] {
+            config_with_key(path)
+                .validate()
+                .unwrap_or_else(|e| panic!("{path:?} is a legal identity path, got: {e}"));
+        }
+        Config::parse_from(["gitlawb-node"])
+            .validate()
+            .expect("the shipped default identity path must validate");
     }
 }

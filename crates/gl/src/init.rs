@@ -1,7 +1,7 @@
 //! `gl init` — zero-to-push in one command.
 //!
 //! Detects or initializes a git repo, ensures an identity exists,
-//! registers with the node, creates a remote repo, adds the gitlawb
+//! registers with the node, creates a remote repo, adds the Twigpine
 //! remote, and pushes.
 
 use anyhow::{Context, Result};
@@ -19,10 +19,14 @@ pub struct InitArgs {
     pub name: Option<String>,
 
     /// Node URL to register with
-    #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+    #[arg(
+        long,
+        default_value = "https://node.twigpine.com",
+        env = "GITLAWB_NODE"
+    )]
     pub node: String,
 
-    /// Identity directory (default: ~/.gitlawb)
+    /// Identity directory (default: the parent of $GITLAWB_KEY, else ~/.gitlawb)
     #[arg(long)]
     pub dir: Option<PathBuf>,
 
@@ -105,20 +109,17 @@ async fn run_in(cwd: &std::path::Path, args: InitArgs) -> Result<()> {
     // Save UCAN if returned
     if let Some(ucan) = payload.get("ucan").and_then(|v| v.as_str()) {
         if !ucan.is_empty() {
-            let ucan_dir = args
-                .dir
-                .clone()
-                .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".gitlawb"));
-            std::fs::create_dir_all(&ucan_dir)?;
+            let ucan_dir = crate::identity::gitlawb_dir(args.dir.clone())?;
+            crate::secret_file::create_dir(&ucan_dir)?;
             let record = json!({
                 "ucan": ucan,
                 "node": args.node,
                 "did": did.to_string(),
                 "saved_at": chrono::Utc::now().to_rfc3339(),
             });
-            std::fs::write(
-                ucan_dir.join("ucan.json"),
-                serde_json::to_string_pretty(&record)?,
+            crate::secret_file::write(
+                &ucan_dir.join("ucan.json"),
+                serde_json::to_string_pretty(&record)?.as_bytes(),
             )?;
         }
     }
@@ -162,7 +163,7 @@ async fn run_in(cwd: &std::path::Path, args: InitArgs) -> Result<()> {
         println!("  Repository created.");
     }
 
-    // 5. Add gitlawb remote
+    // 5. Add Twigpine remote
     let did_short = did.to_string();
     let did_short = did_short.split(':').next_back().unwrap_or(&did_short);
     let remote_url = format!("gitlawb://{did_short}/{repo_name}");
@@ -240,29 +241,26 @@ fn repo_already_exists(payload: &Value) -> bool {
 }
 
 fn generate_identity(dir: Option<&std::path::Path>) -> Result<gitlawb_core::identity::Keypair> {
-    let base = if let Some(d) = dir {
-        d.to_path_buf()
-    } else {
-        dirs::home_dir()
-            .context("could not determine home directory")?
-            .join(".gitlawb")
-    };
-    std::fs::create_dir_all(&base)?;
+    let path = crate::identity::key_path_for(dir)?;
+    let base = path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    crate::secret_file::create_dir(&base)?;
 
     let keypair = gitlawb_core::identity::Keypair::generate();
     let pem = keypair.to_pem()?;
-    let path = base.join("identity.pem");
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(&path, pem.as_bytes())?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&path, pem.as_bytes())?;
-    }
+    crate::secret_file::write_new(&path, pem.as_bytes()).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            anyhow::anyhow!(
+                "identity key already exists at {} — refusing to overwrite; pass --dir for a fresh location or move the key",
+                path.display()
+            )
+        } else {
+            anyhow::anyhow!(e)
+        }
+    })?;
 
     Ok(keypair)
 }

@@ -1,0 +1,3964 @@
+// Crate builds as both a library (`gitlawb_node`) and the `gitlawb-node` binary.
+// The library exposes the boot surface (build_router, AppState, Config,
+// migrations) so the out-of-crate deny-harness integration crate can spawn a
+// real node; `src/main.rs` is a thin shim over `run()`. Modules the harness
+// reaches are `pub`; the rest stay crate-private.
+mod ans104;
+pub mod api;
+mod arweave;
+mod arweave_v2;
+pub mod auth;
+mod bootstrap;
+mod cert;
+pub mod config;
+pub mod db;
+mod durable_outbox;
+mod encrypted_pin;
+pub mod error;
+pub mod git;
+mod graphql;
+mod icaptcha;
+mod ipfs_pin;
+mod metrics;
+mod operator;
+mod p2p;
+mod pinata;
+mod rate_limit;
+mod reconciliation;
+pub mod server;
+pub mod state;
+mod sync;
+#[cfg(feature = "test-harness")]
+pub mod test_harness;
+#[cfg(any(test, feature = "test-harness"))]
+pub mod test_support;
+mod upstream_mirror;
+mod visibility;
+mod webhook_secret;
+mod webhooks;
+
+use anyhow::{anyhow, Context, Result};
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::routing::get;
+use axum::{Json, Router};
+use clap::Parser;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use tokio::net::TcpListener;
+use tokio::sync::watch;
+use tracing::{error, info, warn};
+
+use gitlawb_core::http_sig::sign_request;
+use gitlawb_core::identity::Keypair;
+
+use config::Config;
+use db::Db;
+use state::AppState;
+
+#[derive(Clone)]
+struct DegradedState {
+    node_did: String,
+    db_startup: Arc<DbStartupStatus>,
+    web_url: Option<String>,
+}
+
+/// Two independent counters with no cross-field invariant — atomics, not a
+/// lock, so the retry loop and the degraded handlers never contend.
+const DB_SCHEMA_CONFLICT_CODE: &str = "db_schema_conflict";
+const DB_SCHEMA_CONFLICT_MESSAGE: &str =
+    "database schema conflicts with this build; operator action is required";
+
+#[derive(Default)]
+struct DbStartupStatus {
+    attempts: AtomicU64,
+    next_retry_secs: AtomicU64,
+    /// Set once the retry loop sees a migration version collision. Latched:
+    /// the condition is a code-level numbering bug that cannot heal between
+    /// attempts, and it changes what the readiness payload must say.
+    schema_conflict: AtomicBool,
+}
+
+impl DbStartupStatus {
+    fn mark_schema_conflict(&self) {
+        self.schema_conflict.store(true, Ordering::Relaxed);
+    }
+
+    fn schema_conflict(&self) -> bool {
+        self.schema_conflict.load(Ordering::Relaxed)
+    }
+}
+
+pub async fn run() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("gitlawb_node=debug".parse().unwrap())
+                .add_directive("tower_http=info".parse().unwrap()),
+        )
+        .init();
+
+    let mut config = Config::parse();
+
+    // Merge the embedded seed list of public network nodes into the runtime
+    // bootstrap peers. Operators can opt out via GITLAWB_BOOTSTRAP_DISABLE_SEEDS.
+    bootstrap::merge_seeds(&mut config);
+
+    // Fail fast on config combinations that are individually in-range but jointly
+    // unsafe — notably a DB pool too small for the concurrent-write cap, which
+    // would let a push burst starve every other DB path (#174 F1).
+    config
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid configuration: {e}"))?;
+
+    if !config.public_read {
+        warn!(
+            "GITLAWB_PUBLIC_READ=false has no effect; reads are gated per repository by is_public and path-scoped visibility rules, not this flag"
+        );
+    }
+
+    // Load or generate the node's identity keypair
+    let keypair = Arc::new(load_or_create_keypair(&config)?);
+    // Sealing key for the legacy-scan continuation tokens, DERIVED from the identity
+    // just loaded so it is the same key after a restart (see `derive_scan_token_key`).
+    let scan_token_key = AppState::derive_scan_token_key(&keypair);
+    let webhook_secret_key = AppState::derive_webhook_secret_key(&keypair);
+    let node_did = keypair.did();
+
+    // One-time metrics init. Must run before any handler that calls into
+    // `metrics::record_*` so the registry exists when the first event fires.
+    // Safe to call even when GITLAWB_METRICS_ADDR is unset — those helpers
+    // are simply no-ops until something reads from the registry.
+    metrics::init(env!("CARGO_PKG_VERSION"), &node_did.to_string());
+
+    info!("╔══════════════════════════════════════════╗");
+    info!(
+        "║         Twigpine node v{}            ║",
+        env!("CARGO_PKG_VERSION")
+    );
+    info!("╚══════════════════════════════════════════╝");
+    // Process-wide shutdown signal. One sender lives in AppState (cloned
+    // into every handler); main() keeps a clone and flips it on SIGINT
+    // or SIGTERM. Tasks that hold a watch::Receiver get notified at
+    // their next await point.
+    let (shutdown_tx, _shutdown_rx_for_main) = watch::channel(false);
+    spawn_shutdown_signal(shutdown_tx.clone());
+
+    info!(did = %node_did, "node identity");
+    info!(addr = %config.bind_addr(), "binding HTTP listener");
+
+    // Bind HTTP once, before dependency initialization, and keep this socket
+    // for the life of the process. The degraded server accepts on a dup of the
+    // same socket, so the degraded→full handoff never closes the port: while
+    // the full server initializes, connections queue in the shared backlog
+    // instead of being refused.
+    let listener = TcpListener::bind(config.bind_addr())
+        .await
+        .with_context(|| format!("failed to bind to {}", config.bind_addr()))?;
+    let full_std_listener = listener.into_std()?;
+    let degraded_listener = TcpListener::from_std(
+        full_std_listener
+            .try_clone()
+            .context("failed to clone HTTP listener for degraded server")?,
+    )?;
+
+    // Metrics must stay observable during a database outage — the degraded
+    // window is exactly when dashboards need data — so this listener starts
+    // before the DB connects.
+    let metrics_handle = if !config.metrics_addr.is_empty() {
+        match spawn_metrics_server(&config.metrics_addr, shutdown_tx.subscribe()).await {
+            Ok(handle) => {
+                info!(addr = %config.metrics_addr, "metrics endpoint listening");
+                Some(handle)
+            }
+            Err(e) => {
+                warn!(err = %e, addr = %config.metrics_addr, "failed to start metrics endpoint — continuing without");
+                None
+            }
+        }
+    } else {
+        info!("metrics endpoint disabled (GITLAWB_METRICS_ADDR not set)");
+        None
+    };
+
+    let db_startup = Arc::new(DbStartupStatus::default());
+    let (db_ready_tx, db_ready_rx) = watch::channel(false);
+    let mut degraded_handle = tokio::spawn(run_degraded_server(
+        degraded_listener,
+        node_did.to_string(),
+        Arc::clone(&db_startup),
+        config.web_url.clone(),
+        db_ready_rx,
+        shutdown_tx.subscribe(),
+    ));
+
+    // Resolve the p2p identity BEFORE the database connect, both arms of the
+    // port gate together.
+    //
+    // The key load is pure filesystem work with no database dependency, and
+    // its failure is deliberately non-fatal. Leaving it behind the DB connect
+    // meant the "HTTP up, p2p off" outcome and the port-zero no-IO guarantee
+    // were both unobservable whenever the database was unreachable, because
+    // `connect_db_with_retry` retries indefinitely and never falls through.
+    // Moving only the load would have left the disabled arm stranded, so the
+    // whole gate moves and just `p2p::start` stays behind the database.
+    let p2p_local_key = if config.p2p_port > 0 {
+        match p2p::load_or_create_p2p_keypair(&config.resolved_p2p_key_path()) {
+            Ok(local_key) => {
+                metrics::set_p2p_key_load_failed(false);
+                Some(local_key)
+            }
+            // Non-fatal by policy, and the cost is named rather than hidden:
+            // the node keeps serving HTTP with a green /health while it is off
+            // the p2p network entirely. Logged at error with a stable event
+            // name and mirrored into a metric, so the outage is alertable
+            // without reading startup logs by hand.
+            Err(e) => {
+                error!(
+                    err = %format!("{e:#}"),
+                    event = "p2p_identity_key_load_failed",
+                    "failed to load p2p identity key, continuing without p2p"
+                );
+                metrics::set_p2p_key_load_failed(true);
+                None
+            }
+        }
+    } else {
+        info!("p2p disabled (p2p_port = 0)");
+        metrics::set_p2p_key_load_failed(false);
+        None
+    };
+
+    // Connect to PostgreSQL database. A transient outage or bad secret should
+    // not crash-loop the process and hammer the database provider; permanent
+    // misconfiguration surfaces through error-level logs and the /ready check.
+    let db = tokio::select! {
+        db = connect_db_with_retry(&config, Arc::clone(&db_startup), shutdown_tx.subscribe()) => {
+            match db {
+                Some(db) => db,
+                None => {
+                    // Shutdown requested while waiting for the database. The
+                    // degraded server only serves one-shot 503s — abort it
+                    // rather than drain, so a slow client can't stall exit.
+                    degraded_handle.abort();
+                    return Ok(());
+                }
+            }
+        }
+        degraded = &mut degraded_handle => {
+            if *shutdown_tx.borrow() {
+                return Ok(());
+            }
+            return match degraded {
+                Ok(Ok(())) => Err(anyhow!("degraded HTTP server stopped before database became ready")),
+                Ok(Err(err)) => Err(err.context("degraded HTTP server failed")),
+                Err(err) => Err(anyhow!("degraded HTTP server task failed: {err}")),
+            };
+        }
+    };
+
+    // Flip the degraded server into graceful shutdown, but do NOT await the
+    // drain: one slow in-flight request must not delay the full server, and
+    // the shared socket means there is no port gap to cover. The drain
+    // finishes (and logs) in the background.
+    db_ready_tx.send(true).ok();
+    tokio::spawn(async move {
+        match degraded_handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => warn!(err = %err, "degraded HTTP server exited with error"),
+            Err(err) => warn!(err = %err, "degraded HTTP server task failed"),
+        }
+    });
+    info!(addr = %config.bind_addr(), "database ready; starting full HTTP server");
+
+    // Prune peer rows that point back at this node (stale self-loop entries)
+    if let Some(public_url) = config.public_url.as_deref() {
+        match db.prune_self_peers(public_url).await {
+            Ok(0) => {}
+            Ok(n) => info!(removed = n, public_url, "pruned self-loop peer rows"),
+            Err(e) => warn!(err = %e, "prune_self_peers failed (non-fatal)"),
+        }
+    }
+
+    // Prune peer rows with non-public hosts (loopback/private/internal) that
+    // were injected via the unauthenticated announce route — they poison the
+    // sync-notify fan-out (SSRF + crowding out real peers).
+    match db.prune_non_public_peers().await {
+        Ok(0) => {}
+        Ok(n) => info!(removed = n, "pruned non-public (poisoned) peer rows"),
+        Err(e) => warn!(err = %e, "prune_non_public_peers failed (non-fatal)"),
+    }
+
+    // Ensure repos directory exists
+    std::fs::create_dir_all(&config.repos_dir).context("failed to create repos directory")?;
+
+    // The identity was resolved before the database connect; this is only the
+    // swarm start, which genuinely needs the database handle.
+    let p2p_handle = match p2p_local_key {
+        Some(local_key) => {
+            let bootstrap_addrs = config
+                .p2p_bootstrap
+                .iter()
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            let shutdown_rx = shutdown_tx.subscribe();
+            match p2p::start(
+                local_key,
+                config.p2p_port,
+                bootstrap_addrs,
+                Arc::clone(&db),
+                config.auto_sync,
+                shutdown_rx,
+                Arc::clone(&keypair),
+                config.require_signed_peer_writes,
+            )
+            .await
+            {
+                Ok(handle) => {
+                    info!(port = config.p2p_port, peer_id = %handle.local_peer_id, "libp2p swarm started");
+                    Some(Arc::new(handle))
+                }
+                Err(e) => {
+                    tracing::warn!(err = %e, "failed to start libp2p swarm — continuing without p2p");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+
+    // Shared no-redirect HTTP client. See build_http_client for the SSRF rationale.
+    let http_client = Arc::new(build_http_client()?);
+
+    let (ref_update_tx, _) = tokio::sync::broadcast::channel::<state::RefUpdateBroadcast>(256);
+    let (task_event_tx, _) = tokio::sync::broadcast::channel::<state::TaskEventBroadcast>(256);
+
+    // Node-keyed, so continuation tokens this node mints are only accepted by
+    // this node and survive its restarts without any configured secret.
+    let task_cursor_key = api::task_cursor::TaskCursorKey::derive(&keypair.to_seed());
+
+    let graphql_schema = Arc::new(graphql::build_schema(
+        Arc::clone(&db),
+        ref_update_tx.clone(),
+        task_event_tx.clone(),
+        task_cursor_key.clone(),
+    ));
+
+    let machine_id = std::env::var("FLY_MACHINE_ID").ok();
+    if let Some(ref mid) = machine_id {
+        info!("  fly machine: {mid}");
+    }
+
+    // Initialize Tigris S3 client if bucket is configured
+    let tigris = if !config.tigris_bucket.is_empty() {
+        match git::tigris::TigrisClient::new(&config.tigris_bucket).await {
+            Ok(client) => {
+                info!(bucket = %config.tigris_bucket, "tigris storage enabled");
+                Some(client)
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, "failed to initialize Tigris client — using local-only storage");
+                None
+            }
+        }
+    } else {
+        info!("tigris storage disabled (no bucket configured)");
+        None
+    };
+
+    // Advisory-lock connections come from their own pool: a write guard pins one
+    // for its whole lifetime, and sharing the application pool would let a push
+    // burst starve ordinary request handlers.
+    let lock_pool = db::Db::lock_pool(
+        &config.database_url,
+        config.db_lock_pool_max_connections,
+        std::time::Duration::from_secs(config.db_acquire_timeout_secs),
+    )?;
+    let repo_store = git::repo_store::RepoStore::new(
+        config.repos_dir.clone(),
+        tigris,
+        lock_pool,
+        std::time::Duration::from_secs(config.lock_held_transfer_timeout_secs),
+    );
+
+    // Per-DID limiter for the creation endpoints. Keyed on the authenticated
+    // DID (attacker-varied), so bound its key set to cap memory. Max and window
+    // are operator-configurable via GITLAWB_RATE_LIMIT_MAX /
+    // GITLAWB_RATE_LIMIT_WINDOW_SECS; both reject 0 at parse time.
+    let rate_limiter = rate_limit::RateLimiter::new_bounded(
+        config.rate_limit_max_requests as usize,
+        std::time::Duration::from_secs(config.rate_limit_window_secs),
+        200_000,
+    );
+
+    // Per-client-IP flood brake for the creation endpoints. The per-DID limiter
+    // above is bypassed by a DID farm (one throwaway did:key per repo), which is
+    // exactly how the recurring spam-repo floods get past both it and the
+    // iCaptcha gate. Keyed on the resolved client IP so a single-source flood is
+    // capped regardless of how many identities it mints. Sized well above any
+    // legitimate per-IP creation rate; GITLAWB_CREATE_RATE_LIMIT overrides, 0
+    // disables. Bounded key set — the key is a client-influenced IP.
+    let create_limit = std::env::var("GITLAWB_CREATE_RATE_LIMIT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(120);
+    let create_ip_rate_limiter = rate_limit::RateLimiter::new_bounded(
+        create_limit,
+        std::time::Duration::from_secs(3600),
+        200_000,
+    );
+    if create_limit == 0 {
+        tracing::warn!("GITLAWB_CREATE_RATE_LIMIT=0 — per-IP creation rate limiting disabled");
+    }
+
+    // Push-path flood brake: max git-receive-pack requests per client IP per
+    // hour (counts both the info/refs advertisement and the push POST). Sized
+    // for heavy agent automation while still stopping flood traffic (the June
+    // 2026 attack pushed several times per second per IP). GITLAWB_PUSH_RATE_LIMIT
+    // overrides; 0 disables. Bounded key set — the key is a client-influenced IP.
+    let push_limit = std::env::var("GITLAWB_PUSH_RATE_LIMIT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(600);
+    let push_rate_limiter = rate_limit::RateLimiter::new_bounded(
+        push_limit,
+        std::time::Duration::from_secs(3600),
+        200_000,
+    );
+    if push_limit == 0 {
+        tracing::warn!("GITLAWB_PUSH_RATE_LIMIT=0 — per-IP push rate limiting disabled");
+    }
+
+    // close_issue drives a full archive download for non-owner author pre-checks.
+    // Keep it on its own bucket so it cannot drain the receive-pack limit.
+    let close_issue_limit = std::env::var("GITLAWB_CLOSE_ISSUE_RATE_LIMIT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(120);
+    let close_issue_rate_limiter = rate_limit::RateLimiter::new_bounded(
+        close_issue_limit,
+        std::time::Duration::from_secs(3600),
+        200_000,
+    );
+    if close_issue_limit == 0 {
+        tracing::warn!(
+            "GITLAWB_CLOSE_ISSUE_RATE_LIMIT=0 — per-IP close_issue rate limiting disabled"
+        );
+    }
+
+    // Which forwarded header the edge is trusted to set. Default None (trust
+    // nothing, key on the socket peer). Fly nodes set GITLAWB_TRUSTED_PROXY=fly;
+    // a node behind Caddy/NGINX sets it to x-forwarded-for.
+    let push_limiter_trust = rate_limit::TrustedProxy::from_env_value(
+        &std::env::var("GITLAWB_TRUSTED_PROXY").unwrap_or_default(),
+    );
+    tracing::info!(trust = ?push_limiter_trust, push_limit, "push rate limiter configured");
+
+    // Peer-sync flood brakes, keyed on the resolved client IP (per-DID is useless
+    // here — a did:key farm self-registers). Two buckets so an unsigned notify
+    // flood can't drain the signed trigger caller's quota (#82). Bounded key sets
+    // (the key is a client-influenced IP); 0 disables each.
+    let sync_trigger_rate_limiter = rate_limit::RateLimiter::new_bounded(
+        config.sync_trigger_rate_limit,
+        std::time::Duration::from_secs(3600),
+        200_000,
+    );
+    let peer_write_rate_limiter = rate_limit::RateLimiter::new_bounded(
+        config.peer_write_rate_limit,
+        std::time::Duration::from_secs(3600),
+        200_000,
+    );
+    let federated_rate_limiter =
+        rate_limit::RateLimiter::new_bounded(12, std::time::Duration::from_secs(60), 10_000);
+    // Per-client-IP brake on the signed write routes, matching its sibling
+    // buckets. Every signed attempt on those routes commits a ledger row
+    // before the handler runs, so an unkeyed flood gets its own cap rather
+    // than draining the create, push, or peer-sync quotas.
+    let signed_write_rate_limiter =
+        rate_limit::RateLimiter::new_bounded(600, std::time::Duration::from_secs(3600), 200_000);
+    if config.sync_trigger_rate_limit == 0 {
+        tracing::warn!(
+            "GITLAWB_SYNC_TRIGGER_RATE_LIMIT=0 — /sync/trigger IP rate limiting disabled"
+        );
+    }
+    if config.peer_write_rate_limit == 0 {
+        tracing::warn!("GITLAWB_PEER_WRITE_RATE_LIMIT=0 — peer-write IP rate limiting disabled");
+    }
+
+    // Initialize the iCaptcha proof gate (inert unless ICAPTCHA_MODE is set).
+    icaptcha::init().await;
+
+    let state = AppState {
+        config: Arc::new(config.clone()),
+        db,
+        node_did: node_did.clone(),
+        node_keypair: keypair,
+        task_cursor_key,
+        p2p: p2p_handle,
+        http_client,
+        ref_update_tx,
+        task_event_tx,
+        graphql_schema,
+        machine_id,
+        repo_store,
+        rate_limiter,
+        create_ip_rate_limiter,
+        push_rate_limiter,
+        close_issue_rate_limiter,
+        ipfs_max_history_walks: crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST,
+        ipfs_max_legacy_probes: AppState::ipfs_legacy_probe_budget(&config),
+        ipfs_legacy_scan_page_rows: crate::api::ipfs::LEGACY_SCAN_PAGE_ROWS,
+        ipfs_max_legacy_scan_rows: AppState::ipfs_legacy_scan_row_budget(&config),
+        ipfs_max_legacy_scan_rule_bytes: crate::api::ipfs::MAX_LEGACY_SCAN_RULE_BYTES_PER_REQUEST,
+        ipfs_scan_token_key: Arc::new(scan_token_key),
+        webhook_secret_key: Arc::new(webhook_secret_key),
+        ipfs_max_served_object_bytes: crate::api::ipfs::MAX_SERVED_OBJECT_BYTES,
+        push_limiter_trust,
+        sync_trigger_rate_limiter,
+        peer_write_rate_limiter,
+        signed_write_rate_limiter,
+        federated_rate_limiter,
+        shutdown_tx: shutdown_tx.clone(),
+        git_read_semaphore: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_git_ops)),
+        git_write_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent_git_pushes,
+        )),
+        // Anon receive-pack advertisements get their OWN pool, same size as the
+        // write pool but disjoint, so filling it (which takes many source IPs, each
+        // capped by git_push_advert_per_caller) never occupies a permit the
+        // authenticated POST needs (#174).
+        git_push_advert_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent_git_pushes,
+        )),
+        // Bounds concurrent detached post-push encryption walks, sized from the push
+        // pool (no separate knob — Q1): completed pushes cannot outnumber active
+        // encryption walks past this (#174 P1-e).
+        git_encrypt_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent_git_pushes,
+        )),
+        // Bounds how many post-push pin loops run concurrently across all repos (#174 F6),
+        // independent of the per-repo encrypt-task coalescing below. Not a bound on the
+        // MB-scale object-id lists themselves: parked tasks still hold theirs (see the
+        // field doc on AppState::pin_semaphore).
+        pin_semaphore: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_pin_tasks)),
+        // Coalesces the DETACHED post-push encryption tasks per repo so a rapid pusher
+        // cannot grow the outstanding parked-waiter set past one task per repo (#174
+        // P2-2). No knob: it is a natural cap (one entry per distinct repo), not a
+        // sized pool.
+        encrypt_inflight: crate::state::EncryptInflight::new(),
+        // Per-repo in-process write-lease serializer (#174 U2/F3): supplements the pg
+        // advisory lock so a disconnected push's still-reaping git group can't be raced
+        // by a second same-node push. The map is naturally capped (one entry per contended
+        // repo, freed when unreferenced); the sized knob is how many pushes may PARK on
+        // one repo, since each parked push holds a fully buffered pack.
+        repo_write_leases: crate::state::RepoWriteLeases::new(config.repo_lease_max_waiters),
+        git_read_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
+            config.max_concurrent_reads_per_caller,
+        ),
+        // Per-source cap on the receive-pack advertisement, sized to an eighth of the
+        // write pool (min 1): one resolved client key (rate_limit::client_key) can hold
+        // at most this many slots in the DEDICATED advert pool (git_push_advert_semaphore,
+        // disjoint from the write pool), so saturating that pool takes ~8 distinct keys
+        // (#174). That bounds an IPv4 or single-address caller; a caller controlling many
+        // addresses (an IPv6 /64 is 2^64 keys) still gets one cap per address, since
+        // client_key uses the full IP with no prefix folding. Narrowing the keying is a
+        // deferred design call, not something these caps claim to solve. Sized off the
+        // write pool only because the advert pool is created at the same size; an advert
+        // flood cannot touch a write permit.
+        git_push_advert_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
+            rate_limit::per_source_push_cap(config.max_concurrent_git_pushes),
+        ),
+        // Per-source cap on the authenticated receive-pack POST, sized like the advert
+        // cap: one resolved client key can hold at most this many write-pool slots, so
+        // monopolizing the pool takes ~8 distinct keys (#174 P1-d). Same residual as
+        // above: keys are full IPs, so a caller with many addresses has many caps.
+        git_write_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
+            rate_limit::per_source_push_cap(config.max_concurrent_git_pushes),
+        ),
+        // Bounds concurrent /ipfs visibility walks — a distinct public cost center, so
+        // its own pool + per-source sub-cap + per-IP rate limiter, never a git pool
+        // (#174 P1-3). The per-source map is bounded (reject-before-insert, INV-15).
+        git_ipfs_walk_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent_ipfs_walks,
+        )),
+        git_ipfs_walk_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
+            config.ipfs_walk_per_source,
+        ),
+        ipfs_rate_limiter: rate_limit::RateLimiter::new_bounded(
+            config.ipfs_rate_limit,
+            std::time::Duration::from_secs(3600),
+            200_000,
+        ),
+        ipfs_work_rate_limiter: rate_limit::RateLimiter::new_bounded(
+            AppState::ipfs_work_budget(&config),
+            std::time::Duration::from_secs(3600),
+            200_000,
+        ),
+        task_read_rate_limiter: rate_limit::RateLimiter::new_bounded(
+            config.task_read_rate_limit,
+            std::time::Duration::from_secs(3600),
+            200_000,
+        ),
+        git_bin: "git".to_string(),
+    };
+
+    // One-time re-encryption of any webhook HMAC secrets still resting as
+    // plaintext (written before at-rest encryption shipped). A SQL migration
+    // cannot do it — Postgres never sees the node-held key — so it runs here.
+    match state
+        .db
+        .reencrypt_legacy_webhook_secrets(state.webhook_secret_key.as_ref())
+        .await
+    {
+        Ok(0) => {}
+        Ok(n) => info!(
+            count = n,
+            "re-encrypted legacy webhook HMAC secrets at rest"
+        ),
+        Err(e) => warn!(err = %e, "failed to re-encrypt legacy webhook secrets"),
+    }
+
+    if config.ipfs_rate_limit == 0 {
+        tracing::warn!("GITLAWB_IPFS_RATE_LIMIT=0 — per-IP /ipfs rate limiting disabled");
+    }
+    if config.task_read_rate_limit == 0 {
+        tracing::warn!("GITLAWB_TASK_READ_RATE_LIMIT=0 — per-IP task read rate limiting disabled");
+    }
+
+    // Periodic peer-count poll for the metrics gauge. If p2p is disabled
+    // we still set the gauge to 0 so dashboards don't show "no data".
+    {
+        let p2p_for_metrics = state.p2p.clone();
+        let mut shutdown_rx = state.subscribe_shutdown();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let count = match &p2p_for_metrics {
+                            Some(h) => h.status().await.map(|s| s.connected_peers).unwrap_or(0),
+                            None => 0,
+                        };
+                        metrics::set_peers_connected(count as i64);
+                    }
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Periodic cleanup of expired rate limit entries + consumed-proof ledger
+    {
+        let sweep_state = state.clone();
+        let db = state.db.clone();
+        let mut shutdown_rx = state.subscribe_shutdown();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
+                        sweep_state.sweep_rate_limiters().await;
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        if let Err(e) = db.sweep_expired_proofs(now).await {
+                            tracing::warn!(err = %e, "failed to sweep expired iCaptcha proofs");
+                        }
+                    }
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    let _legacy_cid_sweep = spawn_legacy_cid_sweep(&state, &config);
+    let _queue_lifecycle_sweep = spawn_queue_lifecycle_sweep(&state, &config);
+    // NOTE: the due-request worker is spawned AFTER the one-shot startup
+    // reconcile/drain below, not here: its 5s interval would otherwise tick
+    // during operator/PoS setup and interleave with boot recovery on backlog
+    // rows (state gates prevent data loss, but the interleave costs recovery
+    // latency and widens the reconcile/drain race window).
+    let _marker_cleanup_worker = spawn_marker_cleanup_worker(&state);
+
+    let router = server::build_router(state.clone());
+    // Re-register the socket bound at startup — same fd, so there was never a
+    // moment with the port closed between the degraded and full servers.
+    let listener = TcpListener::from_std(full_std_listener)
+        .context("failed to re-register HTTP listener with the runtime")?;
+
+    info!("✓ node started — did:{}", node_did);
+    info!("  repos dir: {}", config.repos_dir.display());
+    info!(
+        "  database:  PostgreSQL ({})",
+        &config.database_url.split('@').next_back().unwrap_or("?")
+    );
+
+    // Publish our DID record to the Kademlia DHT shortly after startup
+    if let Some(p2p) = &state.p2p {
+        let did_record = p2p::DidRecord {
+            did: node_did.to_string(),
+            http_url: config.public_url.clone().unwrap_or_default(),
+            peer_id: p2p.local_peer_id.to_string(),
+            p2p_port: config.p2p_port,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+        let p2p_clone = Arc::clone(p2p);
+        let mut shutdown_rx = state.subscribe_shutdown();
+        tokio::spawn(async move {
+            // Small delay so Kademlia can find peers first
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                _ = shutdown_rx.changed() => return,
+            }
+            p2p_clone.put_did(did_record).await;
+            info!("DID record published to Kademlia DHT");
+        });
+    }
+
+    // Spawn background gossip: announce to bootstrap peers, then ping known peers periodically
+    {
+        let gossip_state = state.clone();
+        let bootstrap_peers = config.bootstrap_peers.clone();
+        let shutdown_rx = state.subscribe_shutdown();
+        tokio::spawn(async move {
+            gossip_task(gossip_state, bootstrap_peers, shutdown_rx).await;
+        });
+    }
+
+    // Start multi-node sync worker if auto_sync is enabled
+    if config.auto_sync {
+        sync::start(
+            Arc::clone(&state.db),
+            Arc::clone(&state.config),
+            Arc::clone(&state.node_keypair),
+            state.subscribe_shutdown(),
+        );
+        info!("auto-sync worker started");
+    }
+
+    // External-forge mirroring is a separate, default-off worker. Startup
+    // validation already requires owner-only pushes when it is enabled; the
+    // worker additionally verifies the Git runtime can pin DNS answers before
+    // any URL reaches `git fetch`.
+    if config.upstream_mirror_enabled {
+        upstream_mirror::start(
+            Arc::clone(&state.db),
+            Arc::clone(&state.config),
+            state.repo_store.clone(),
+            state.repo_write_leases.clone(),
+            Arc::clone(&state.git_write_semaphore),
+            state.subscribe_shutdown(),
+        )
+        .context("starting upstream mirror worker")?;
+    }
+
+    // Periodic reconciliation sweep: re-derives pin/seal sets and fills gaps
+    // so a dropped replication job never means data loss.
+    {
+        let db = state.db.clone();
+        let config = Arc::clone(&state.config);
+        let http_client = Arc::clone(&state.http_client);
+        let node_keypair = Arc::clone(&state.node_keypair);
+        let node_did = state.node_did.clone();
+        let pin_sem = Arc::clone(&state.pin_semaphore);
+        let shutdown_rx = state.subscribe_shutdown();
+        if reconciliation::spawn(
+            db,
+            config,
+            http_client,
+            node_keypair,
+            node_did,
+            pin_sem,
+            shutdown_rx,
+            Some(state.repo_store.clone()),
+        ) {
+            info!("reconciliation sweep worker started");
+        }
+    }
+
+    // On-chain operator setup: verify stake + spawn heartbeat loop
+    if !state.config.contract_node_staking.is_empty()
+        && !state.config.operator_private_key.is_empty()
+    {
+        match build_operator_client(&state.config, &state.node_did.to_string()) {
+            Ok(client) => match operator::startup_check(&client).await {
+                Ok(_) => {
+                    let arc_client = Arc::new(client);
+                    arc_client.spawn_heartbeat_loop(state.subscribe_shutdown());
+                }
+                Err(e) => {
+                    if state.config.operator_strict_mode {
+                        return Err(e.context("strict-mode operator check failed"));
+                    }
+                    tracing::warn!(err = %e, "operator startup check failed — continuing without heartbeat loop");
+                }
+            },
+            Err(e) => {
+                if state.config.operator_strict_mode {
+                    return Err(e.context("strict-mode: failed to build operator client"));
+                }
+                tracing::warn!(err = %e, "operator client could not be built — continuing without PoS");
+            }
+        }
+    } else {
+        info!("on-chain PoS disabled (GITLAWB_CONTRACT_NODE_STAKING or GITLAWB_OPERATOR_PRIVATE_KEY unset)");
+    }
+
+    // axum's `with_graceful_shutdown` waits for in-flight requests to
+    // complete (up to the configured grace) once the future resolves.
+    let shutdown_signal_for_axum = state.subscribe_shutdown();
+    let grace = std::time::Duration::from_secs(config.shutdown_grace_secs);
+    info!(grace_secs = config.shutdown_grace_secs, "axum server ready");
+
+    // #26 Split PR 1: drain any `applied` rows left by a previous
+    // process that crashed after Git applied a ref but before the
+    // bookkeeping landed. Runs once, BEFORE the server accepts new
+    // pushes, so a recovery re-derivation does not race a fresh push.
+    // Non-fatal: a transient drain failure is logged and the rows
+    // remain `applied` for the next startup to pick up.
+    //
+    // P1-A: the reconcile step runs FIRST and promotes any `prepared`
+    // or `uncertain` row whose target SHA actually landed on disk.
+    // This is the path that recovers a ref when the post-receive
+    // `mark_pending_ref_transitions_applied` call errored or was
+    // interrupted after `receive_pack` returned Ok, or when
+    // receive-pack returned Err but some refs may have landed
+    // (the `uncertain` state). Without this step, the drain (gated
+    // on `state = 'applied'`) would never see those rows.
+    //
+    // P2 (reviewer-1/2 round 3): use the multi-pass reconcile so
+    // prepared/uncertain rows beyond the first 1000-row page are
+    // processed in the same startup, rather than waiting for the
+    // next restart (where they might age out of MAX_RECONCILE_AGE).
+    match durable_outbox::reconcile_prepared_from_disk_all(
+        state.clone(),
+        durable_outbox::DRAIN_PER_PASS_LIMIT,
+        durable_outbox::DRAIN_MAX_PASSES,
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(n) => info!(
+            n,
+            "reconciled prepared/uncertain -> applied via on-disk ref match"
+        ),
+        Err(e) => warn!(
+            err = %e,
+            "pending ref transition reconcile failed at startup (non-fatal; will retry on next start)"
+        ),
+    }
+    match durable_outbox::drain_receive_pack_requests_all(
+        state.clone(),
+        durable_outbox::DRAIN_PER_PASS_LIMIT,
+        durable_outbox::DRAIN_MAX_PASSES,
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(n) => info!(n, "drained pending ref transitions from prior run"),
+        Err(e) => warn!(
+            err = %e,
+            "pending ref transition drain failed at startup (non-fatal; will retry on next start)"
+        ),
+    }
+
+    // Start the due-request worker only now that boot recovery is done (see
+    // the note at the other spawns above): its first tick must not interleave
+    // with the one-shot reconcile/drain on backlog rows.
+    let _due_request_worker = spawn_due_request_worker(&state);
+
+    // `into_make_service_with_connect_info` exposes the socket peer address as
+    // `ConnectInfo<SocketAddr>` so the push limiter can key on the real client
+    // when no trusted proxy header applies (see `rate_limit::client_key`).
+    let serve_result = axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let mut rx = shutdown_signal_for_axum;
+        // Wait until the watcher flips to true, then return so axum
+        // can begin draining.
+        while !*rx.borrow_and_update() {
+            if rx.changed().await.is_err() {
+                // Sender dropped — treat as shutdown.
+                break;
+            }
+        }
+    })
+    .await;
+
+    // Server has stopped accepting new connections and drained in-flight
+    // requests. Tear the rest of the system down.
+    info!("HTTP server stopped, beginning process shutdown");
+    if let Some(h) = metrics_handle {
+        h.abort();
+    }
+    let _ = grace; // recorded for operators in the log above; not enforced
+    serve_result?;
+    info!("clean exit");
+    Ok(())
+}
+
+/// U4 (#173): spawn the periodic legacy provider-CID repair sweep. Releases before this
+/// version stored the PROVIDER CID (Kubo dag-pb / Pinata CIDv0) in `pinned_cids.cid`,
+/// and this version's `/ipfs/{cid}` resolver withholds any row whose stored key is not
+/// the raw-content CID. The opportunistic repair on the pin path only fires when a push
+/// re-carries the object, which normal git negotiation makes it not do, so those rows
+/// need a walk. DETACHED, never on the boot path: the caller keeps serving while this
+/// runs, and the sweep's own batch bound plus inter-batch delay keep it off the DB's
+/// critical path. Its cursor is durable, so a restart mid-walk resumes instead of
+/// rewinding. It re-arms after every run, including a failed one, so it never returns
+/// and there is no awaited value to log here; the shutdown watcher below is what ends
+/// it.
+///
+/// A named function rather than an inline block in `main` so the WIRING has a seam a
+/// test can call: that the task is spawned at all, that it reads its batch and delay
+/// from the config knobs rather than some other field, that the caller is not blocked
+/// on it, and that the shutdown watcher actually ends it mid-walk. The sweep's own
+/// behavior is covered elsewhere; this is the boot-path half.
+fn spawn_legacy_cid_sweep(state: &AppState, config: &Config) -> tokio::task::JoinHandle<()> {
+    let db = state.db.clone();
+    let repos_dir = config.repos_dir.clone();
+    let git_bin = state.git_bin.clone();
+    let git_timeout = std::time::Duration::from_secs(config.git_service_timeout_secs);
+    let batch = config.pin_repair_sweep_batch;
+    let delay = std::time::Duration::from_secs(config.pin_repair_sweep_delay_secs);
+    let mut shutdown_rx = state.subscribe_shutdown();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = ipfs_pin::run_sweep_rearmed(
+                &repos_dir, &git_bin, git_timeout, batch, delay,
+                ipfs_pin::SWEEP_REARM_DELAY, &db,
+            ) => {}
+            // Shutdown mid-walk simply drops the run; the persisted cursor means the
+            // next boot picks up where this one stopped.
+            _ = shutdown_rx.changed() => {}
+        }
+    })
+}
+
+/// #26 Split PR 1 step 4 — periodic queue-lifecycle purge. Runs on
+/// the same detached task pattern as `spawn_legacy_cid_sweep`:
+/// tokio::spawn with a shutdown watcher, never on the boot path. The
+/// interval is fixed at 24 hours (the spec calls for "one per
+/// cluster per day"); the inter-batch delay is implicit in the
+/// batch size plus the wall-clock cost of each pass. The drain
+/// (`drain_receive_pack_requests_all`) and the purge
+/// (`purge_request_queue`) share the same `DRAIN_PER_PASS_LIMIT`
+/// budget so a 1000-row purge pass takes roughly the same time as
+/// a 1000-row drain pass.
+fn spawn_queue_lifecycle_sweep(state: &AppState, config: &Config) -> tokio::task::JoinHandle<()> {
+    let app_state = state.clone();
+    let retention_days = config.queue_retention_days;
+    let batch = config.queue_purge_batch;
+    let git_timeout = std::time::Duration::from_secs(config.git_service_timeout_secs.min(30));
+    let mut shutdown_rx = state.subscribe_shutdown();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Consume the immediate first tick: Tokio intervals fire
+        // immediately on creation, which would run the purge
+        // concurrently with startup reconcile/drain. The child purge
+        // is terminal-parent-gated in SQL, but delaying the first
+        // sweep a full period removes the race entirely.
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(e) = durable_outbox::purge_request_queue(
+                        &app_state.db,
+                        retention_days,
+                        batch,
+                    ).await {
+                        tracing::warn!(err = %e, "queue lifecycle purge failed; will retry on next tick");
+                    }
+                    // Drain marker tombstones with the bounded deleter;
+                    // failures retain the tombstone for the next tick.
+                    if let Err(e) = durable_outbox::drain_marker_cleanup_queue(
+                        &app_state,
+                        batch,
+                        git_timeout,
+                    ).await {
+                        tracing::warn!(err = %e, "marker cleanup drain failed");
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    break;
+                }
+            }
+        }
+    })
+}
+
+/// Shutdown-aware background due-request loop. The startup drain runs
+/// once; without this, `effects_pending` rows with a future
+/// `next_attempt_at` would wait until the next process restart.
+/// Polls the indexed due query with bounded batches and failure
+/// isolation (one request's error never aborts the batch).
+fn spawn_due_request_worker(state: &AppState) -> tokio::task::JoinHandle<()> {
+    let app_state = state.clone();
+    let mut shutdown_rx = state.subscribe_shutdown();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    match durable_outbox::drain_receive_pack_requests(
+                        app_state.clone(),
+                        durable_outbox::DRAIN_PER_PASS_LIMIT,
+                    )
+                    .await
+                    {
+                        Ok((0, _)) => {}
+                        Ok((n, _)) => tracing::info!(n, "due request worker drained"),
+                        Err(e) => tracing::warn!(err = %e, "due request worker drain failed"),
+                    }
+                }
+                _ = shutdown_rx.changed() => break,
+            }
+        }
+    })
+}
+
+/// Dedicated marker-tombstone worker at a shorter cadence than the
+/// daily purge, so external Git refs do not linger a full period
+/// after their SQL owner is gone.
+fn spawn_marker_cleanup_worker(state: &AppState) -> tokio::task::JoinHandle<()> {
+    let app_state = state.clone();
+    let git_timeout =
+        std::time::Duration::from_secs(app_state.config.git_service_timeout_secs.min(30));
+    let mut shutdown_rx = state.subscribe_shutdown();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(e) = durable_outbox::drain_marker_cleanup_queue(
+                        &app_state,
+                        durable_outbox::DRAIN_PER_PASS_LIMIT,
+                        git_timeout,
+                    )
+                    .await
+                    {
+                        tracing::warn!(err = %e, "marker cleanup worker failed");
+                    }
+                }
+                _ = shutdown_rx.changed() => break,
+            }
+        }
+    })
+}
+
+fn spawn_shutdown_signal(tx: watch::Sender<bool>) {
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal as unix_signal, SignalKind};
+            let mut sigterm =
+                unix_signal(SignalKind::terminate()).expect("install SIGTERM handler");
+            let mut sigint = unix_signal(SignalKind::interrupt()).expect("install SIGINT handler");
+            tokio::select! {
+                _ = sigterm.recv() => info!("SIGTERM received, shutting down"),
+                _ = sigint.recv()  => info!("SIGINT received, shutting down"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            use tokio::signal;
+            let _ = signal::ctrl_c().await;
+            info!("Ctrl-C received, shutting down");
+        }
+        tx.send(true).ok();
+    });
+}
+
+async fn connect_db_with_retry(
+    config: &Config,
+    db_startup: Arc<DbStartupStatus>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Option<Arc<Db>> {
+    let initial_retry_secs = config.db_retry_initial_secs;
+    let max_retry_secs = config.db_retry_max_secs.max(initial_retry_secs);
+    let acquire_timeout = std::time::Duration::from_secs(config.db_acquire_timeout_secs);
+    let attempt_timeout = std::time::Duration::from_secs(config.db_connect_timeout_secs);
+    let mut attempts = 0_u64;
+
+    loop {
+        if *shutdown_rx.borrow() {
+            return None;
+        }
+
+        attempts = attempts.saturating_add(1);
+        db_startup.attempts.store(attempts, Ordering::Relaxed);
+
+        // Bound the whole attempt, not just the pool connect: migrations
+        // block on a cross-instance advisory lock, and an unbounded wait
+        // there would wedge this loop — no retries, no logs, no recovery.
+        // Timing out and retrying is safe; migrations are idempotent.
+        let attempt = match tokio::time::timeout(
+            attempt_timeout,
+            Db::connect(
+                &config.database_url,
+                config.db_max_connections,
+                acquire_timeout,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!(
+                "connect + migrate attempt exceeded {}s (GITLAWB_DB_CONNECT_TIMEOUT_SECS); \
+                 is another instance holding the migration lock?",
+                attempt_timeout.as_secs()
+            )),
+        };
+
+        match attempt {
+            Ok(db) => {
+                info!(attempts, "database connection established");
+                return Some(Arc::new(db));
+            }
+            Err(err) => {
+                // A bad DATABASE_URL or rejected credentials won't heal on
+                // their own. Still retry (exiting would crash-loop and hammer
+                // the provider — and take liveness down with it), but log at
+                // error level and skip straight to the maximum backoff; the
+                // /ready health check is what surfaces this to deploys.
+                // One call decides the backoff, the log level and the readiness
+                // signal, and applies the latch. Everything below reads from
+                // its result, so the branch cannot drift away from the latch.
+                let fault = record_db_startup_failure(&err, &db_startup);
+                let DbStartupFault {
+                    permanent,
+                    schema_conflict,
+                } = fault;
+                let retry_secs = if permanent {
+                    max_retry_secs
+                } else {
+                    database_retry_delay_secs(initial_retry_secs, max_retry_secs, attempts)
+                };
+                db_startup
+                    .next_retry_secs
+                    .store(retry_secs, Ordering::Relaxed);
+                if schema_conflict {
+                    tracing::error!(
+                        attempts,
+                        retry_secs,
+                        err = %err,
+                        "database schema conflicts with this build's migration catalogue; this will not heal on retry; operator action is required"
+                    );
+                } else if permanent {
+                    tracing::error!(
+                        attempts,
+                        retry_secs,
+                        err = %err,
+                        "database rejected our configuration (bad DATABASE_URL or credentials?) — retrying, but operator action is likely required"
+                    );
+                } else {
+                    warn!(
+                        attempts,
+                        retry_secs,
+                        err = %err,
+                        "database unavailable during startup; retrying"
+                    );
+                }
+
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(retry_secs)) => {}
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Classified failure of one DB connection attempt, so the retry loop can
+/// distinguish a transient outage from faults that retrying cannot heal.
+struct DbStartupFault {
+    /// The error class says retry cannot fix it (bad URL, auth refusal).
+    permanent: bool,
+    /// A migration version collision, latched on DbStartupStatus so the
+    /// readiness payload reports the real reason the DB never comes up.
+    schema_conflict: bool,
+}
+
+fn record_db_startup_failure(err: &anyhow::Error, db_startup: &DbStartupStatus) -> DbStartupFault {
+    let schema_conflict = err
+        .downcast_ref::<db::MigrationVersionCollision>()
+        .is_some();
+    if schema_conflict {
+        db_startup.mark_schema_conflict();
+    }
+    DbStartupFault {
+        permanent: is_likely_permanent_db_error(err),
+        schema_conflict,
+    }
+}
+
+/// Errors that indicate misconfiguration rather than a transient outage: a
+/// malformed DATABASE_URL, or a server that answered and rejected us —
+/// Postgres error class 28xxx (invalid authorization) or 3D000 (database
+/// does not exist). Best-effort: an error that anyhow can't downcast back to
+/// sqlx just counts as transient.
+fn is_likely_permanent_db_error(err: &anyhow::Error) -> bool {
+    // A migration version collision cannot heal on its own, so the caller
+    // takes the permanent branch: max backoff, error-level log, and (through
+    // record_db_startup_failure's latch) a readiness payload that stops saying
+    // "database unavailable, retrying".
+    if err
+        .downcast_ref::<db::MigrationVersionCollision>()
+        .is_some()
+    {
+        return true;
+    }
+    match err.downcast_ref::<sqlx::Error>() {
+        Some(sqlx::Error::Configuration(_)) => true,
+        Some(sqlx::Error::Database(db)) => db
+            .code()
+            .map(|c| c.starts_with("28") || c.starts_with("3D"))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn database_retry_delay_secs(initial_secs: u64, max_secs: u64, attempts: u64) -> u64 {
+    // The exponent bound only keeps the u32 cast safe — max_secs is the real
+    // (operator-configurable) cap, and saturating math handles overflow.
+    let exponent = attempts.saturating_sub(1).min(63) as u32;
+    initial_secs
+        .saturating_mul(2_u64.saturating_pow(exponent))
+        .min(max_secs)
+}
+
+async fn run_degraded_server(
+    listener: TcpListener,
+    node_did: String,
+    db_startup: Arc<DbStartupStatus>,
+    web_url: Option<String>,
+    mut db_ready_rx: watch::Receiver<bool>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    let addr = listener.local_addr().ok();
+    let router = build_degraded_router(node_did, db_startup, web_url);
+    info!(?addr, "degraded HTTP server ready");
+
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            // wait_for resolves on predicate-true or sender-drop; either way
+            // this phase is over.
+            tokio::select! {
+                _ = db_ready_rx.wait_for(|ready| *ready) => {}
+                _ = shutdown_rx.wait_for(|stop| *stop) => {}
+            }
+        })
+        .await?;
+
+    Ok(())
+}
+
+fn build_degraded_router(
+    node_did: String,
+    db_startup: Arc<DbStartupStatus>,
+    web_url: Option<String>,
+) -> Router {
+    let state = DegradedState {
+        node_did,
+        db_startup,
+        web_url,
+    };
+    // Everything answers 503 with the same body — including /health and
+    // /ready, so peer readiness probes and uptime monitors correctly see a
+    // node that cannot serve traffic.
+    // `/` additionally carries the node identity for probing peers.
+    Router::new()
+        .route("/", get(degraded_node_info))
+        .fallback(degraded_unavailable)
+        .with_state(state)
+}
+
+/// One source of truth for the degraded 503 body, sharing the error
+/// vocabulary with error.rs so clients see the same code/message for
+/// "database unavailable" regardless of which phase produced it.
+fn degraded_body(db_startup: &DbStartupStatus) -> serde_json::Value {
+    // A schema conflict is not a database that is still coming up. Saying
+    // "initializing" for it hides a permanent, operator-actionable fault behind
+    // a status that reads as "wait longer".
+    let (state, code, message) = if db_startup.schema_conflict() {
+        (
+            "schema_conflict",
+            DB_SCHEMA_CONFLICT_CODE,
+            DB_SCHEMA_CONFLICT_MESSAGE,
+        )
+    } else {
+        (
+            "initializing",
+            error::DB_UNAVAILABLE_CODE,
+            error::DB_UNAVAILABLE_MESSAGE,
+        )
+    };
+    serde_json::json!({
+        "status": "degraded",
+        "database": state,
+        "error": code,
+        "message": message,
+        "db_attempts": db_startup.attempts.load(Ordering::Relaxed),
+        "db_next_retry_secs": db_startup.next_retry_secs.load(Ordering::Relaxed),
+    })
+}
+
+async fn degraded_node_info(State(state): State<DegradedState>) -> impl IntoResponse {
+    let mut body = degraded_body(&state.db_startup);
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("name".into(), "gitlawb-node".into());
+        obj.insert("version".into(), env!("CARGO_PKG_VERSION").into());
+        obj.insert("did".into(), state.node_did.clone().into());
+        if let Some(web_url) = &state.web_url {
+            obj.insert("web_url".into(), web_url.clone().into());
+        }
+    }
+    (StatusCode::SERVICE_UNAVAILABLE, Json(body))
+}
+
+async fn degraded_unavailable(State(state): State<DegradedState>) -> impl IntoResponse {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(degraded_body(&state.db_startup)),
+    )
+}
+
+/// Spawn a small axum router that exposes only `GET /metrics` on its own
+/// listener. Returns the JoinHandle so `main()` can abort it on shutdown.
+/// This is deliberately separate from the main router so the metrics port
+/// can be firewalled differently from the API port — bind to localhost
+/// or a private interface only.
+async fn spawn_metrics_server(
+    addr: &str,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<tokio::task::JoinHandle<()>> {
+    use axum::{response::IntoResponse, routing::get, Router};
+
+    async fn metrics_handler() -> impl IntoResponse {
+        match metrics::encode() {
+            Ok(body) => (
+                axum::http::StatusCode::OK,
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    "text/plain; version=0.0.4; charset=utf-8",
+                )],
+                body,
+            ),
+            Err(e) => (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    "text/plain; charset=utf-8",
+                )],
+                format!("metrics encode error: {e}"),
+            ),
+        }
+    }
+
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("failed to bind metrics listener to {addr}"))?;
+    let app = Router::new().route("/metrics", get(metrics_handler));
+
+    let handle = tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                while !*shutdown_rx.borrow_and_update() {
+                    if shutdown_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await
+        {
+            warn!(err = %e, "metrics server exited with error");
+        }
+    });
+    Ok(handle)
+}
+
+fn build_operator_client(
+    config: &config::Config,
+    node_did: &str,
+) -> Result<operator::OperatorClient> {
+    use alloy::primitives::Address;
+    use std::str::FromStr;
+
+    let contract_address = Address::from_str(&config.contract_node_staking)
+        .with_context(|| format!("invalid contract address: {}", config.contract_node_staking))?;
+
+    let cfg = operator::OperatorConfig {
+        rpc_url: config.chain_rpc_url.clone(),
+        private_key: config.operator_private_key.clone(),
+        contract_address,
+        node_did: node_did.to_string(),
+        heartbeat_interval: std::time::Duration::from_secs(config.heartbeat_interval_hours * 3600),
+        strict_mode: config.operator_strict_mode,
+    };
+    Ok(operator::OperatorClient::new(cfg))
+}
+
+/// Outcome of one announce POST, richer than a bool so the announce path can
+/// surface a peer's machine-readable rejection code (e.g. spent signature)
+/// instead of only logging "rejected".
+enum AnnounceOutcome {
+    Accepted,
+    Rejected {
+        status: u16,
+        error_code: Option<String>,
+    },
+}
+
+fn classify_announce_response(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> AnnounceOutcome {
+    if status.is_success() {
+        return AnnounceOutcome::Accepted;
+    }
+    AnnounceOutcome::Rejected {
+        status: status.as_u16(),
+        error_code: api::peers::peer_error_code(headers).map(str::to_string),
+    }
+}
+
+/// Announce to bootstrap peers on startup, then periodically ping all known peers.
+async fn gossip_task(
+    state: AppState,
+    bootstrap_peers: Vec<String>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    // If shutdown arrives during the initial delay, exit before announcing.
+    tokio::select! {
+        _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+        _ = shutdown_rx.changed() => {
+            if *shutdown_rx.borrow() {
+                info!("gossip: shutdown during startup delay, exiting");
+                return;
+            }
+        }
+    }
+
+    // Reuse the shared no-redirect client for every gossip outbound call (the
+    // bootstrap announce POST and the periodic peer /ready ping). Peer URLs are
+    // attacker-influenceable, so a 3xx to a private address must not be followed.
+    // Do NOT fall back to reqwest::Client::new(): its default follows redirects
+    // and would reintroduce the SSRF closed here (#93).
+    let client = state.http_client.clone();
+    let my_did = state.node_did.to_string();
+    let my_url = state.config.public_url.clone().unwrap_or_default();
+
+    // Announce ourselves to each bootstrap peer
+    for peer_url in &bootstrap_peers {
+        // Cooperative shutdown between peers — a slow peer shouldn't
+        // block the node exiting.
+        if *shutdown_rx.borrow() {
+            info!("gossip: shutdown signalled during peer announce, exiting");
+            return;
+        }
+        let path = "/api/v1/peers/announce";
+        let announce_url = format!("{}{}", peer_url.trim_end_matches('/'), path);
+        let body = serde_json::json!({
+            "did": my_did.clone(),
+            "http_url": my_url.clone(),
+        });
+        let body_bytes = match serde_json::to_vec(&body) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(err = %e, "failed to serialize peer announce body");
+                continue;
+            }
+        };
+        let signed = sign_request(state.node_keypair.as_ref(), "POST", path, &body_bytes);
+        // Per-request timeout inside the loop; do not let one hung peer
+        // block others. The request itself is a normal tokio future so
+        // it's cancel-safe on shutdown.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client
+                .post(&announce_url)
+                .header("Content-Type", "application/json")
+                .header("Content-Digest", signed.content_digest)
+                .header("Signature-Input", signed.signature_input)
+                .header("Signature", signed.signature)
+                .body(body_bytes)
+                .send(),
+        )
+        .await
+        {
+            Ok(Ok(resp)) => match classify_announce_response(resp.status(), resp.headers()) {
+                AnnounceOutcome::Accepted => {
+                    if let Ok(json) = resp.json::<serde_json::Value>().await {
+                        // Add them back to our peer list
+                        if let (Some(their_did), Some(their_url)) = (
+                            json.get("node_did").and_then(|v| v.as_str()),
+                            json.get("node_url").and_then(|v| v.as_str()),
+                        ) {
+                            if !their_url.is_empty() {
+                                // Unproven, unconditionally: their_did and
+                                // their_url come straight out of the contacted
+                                // peer's JSON response body, with no signature
+                                // and no proof the claimed DID belongs to the
+                                // peer we reached. This path therefore seeds
+                                // new peers and can never repoint an existing
+                                // row. The upsert's result is matched rather
+                                // than discarded, because "bootstrap peer
+                                // added" printed over a refused write is a
+                                // denial rendering as success. Non-fatal to the
+                                // loop either way.
+                                match state
+                                    .db
+                                    .upsert_peer(
+                                        their_did,
+                                        their_url,
+                                        db::PeerWriteAuthority::Unproven,
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        tracing::info!(did = %their_did, url = %their_url, "bootstrap peer added")
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(did = %their_did, url = %their_url, err = %e, "bootstrap peer announce-back rejected")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Without this arm a refused announce produced no log line at
+                // all, so a node whose peers reject it looked identical to one
+                // succeeding. Same shape as the two sibling signed calls
+                // (sync.rs replica registration, repos.rs peer sync notify).
+                AnnounceOutcome::Rejected { status, error_code } => {
+                    warn!(
+                        url = %announce_url,
+                        status = status,
+                        error_code = error_code.as_deref().unwrap_or("none"),
+                        "bootstrap peer announce rejected"
+                    );
+                }
+            },
+            Ok(Err(e)) => {
+                tracing::warn!(url = %announce_url, err = %e, "failed to announce to bootstrap peer")
+            }
+            Err(_) => tracing::warn!(url = %announce_url, "bootstrap peer announce timed out (5s)"),
+        }
+    }
+
+    // Periodic ping every 5 minutes — exit on shutdown.
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let peers = match state.db.list_peers().await {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                for peer in peers {
+                    let ok = ping_peer_readiness(&client, &peer.http_url).await;
+                    let _ = state.db.mark_peer_ping(&peer.did, ok).await;
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    info!("gossip task: shutdown signal received, exiting");
+                    return;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod rate_limiter_sweep_tests {
+    use crate::rate_limit::RateLimiter;
+    use std::time::Duration;
+
+    // Every per-key limiter the router mounts must be swept by the periodic
+    // task, the `/ipfs` one included: a limiter left out keeps expired keys
+    // until its map fills and the inline capacity sweep fires. Fails on the
+    // pre-fix sweeper, which skipped `ipfs_rate_limiter`.
+    #[tokio::test]
+    async fn sweep_evicts_expired_keys_from_every_limiter() {
+        let window = Duration::from_millis(30);
+        let mut state = crate::test_support::test_state_lazy();
+        state.rate_limiter = RateLimiter::new(10, window);
+        state.create_ip_rate_limiter = RateLimiter::new(10, window);
+        state.push_rate_limiter = RateLimiter::new(10, window);
+        state.close_issue_rate_limiter = RateLimiter::new(10, window);
+        state.sync_trigger_rate_limiter = RateLimiter::new(10, window);
+        state.peer_write_rate_limiter = RateLimiter::new(10, window);
+        state.federated_rate_limiter = RateLimiter::new(10, window);
+        state.ipfs_rate_limiter = RateLimiter::new(10, window);
+        state.ipfs_work_rate_limiter = RateLimiter::new(10, window);
+        state.task_read_rate_limiter = RateLimiter::new(10, window);
+
+        let limiters = |s: &crate::state::AppState| {
+            [
+                s.rate_limiter.clone(),
+                s.create_ip_rate_limiter.clone(),
+                s.push_rate_limiter.clone(),
+                s.close_issue_rate_limiter.clone(),
+                s.sync_trigger_rate_limiter.clone(),
+                s.peer_write_rate_limiter.clone(),
+                s.federated_rate_limiter.clone(),
+                s.ipfs_rate_limiter.clone(),
+                s.ipfs_work_rate_limiter.clone(),
+                s.task_read_rate_limiter.clone(),
+            ]
+        };
+        for l in limiters(&state) {
+            assert!(l.check("1.2.3.4").await);
+            assert_eq!(l.tracked_keys().await, 1);
+        }
+
+        tokio::time::sleep(window * 3).await;
+        state.sweep_rate_limiters().await;
+
+        for (i, l) in limiters(&state).into_iter().enumerate() {
+            assert_eq!(l.tracked_keys().await, 0, "limiter {i} was not swept");
+        }
+    }
+}
+
+/// Build the shared node HTTP client used for every outbound fan-out (sync
+/// trigger, profile/repo fetches, gossip announce + peer pings).
+///
+/// No redirects: peer URLs are attacker-influenceable, so a `3xx` to a private
+/// address must not be followed (SSRF guard, #78/#93). Do NOT replace with
+/// `reqwest::Client::new()` — its default follows redirects. Kept as a named
+/// builder so tests bind the redirect guarantee to the real client the node
+/// runs, not a hand-rolled equivalent.
+fn build_http_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(OUTBOUND_HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
+const OUTBOUND_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Ping a peer's DB-aware `/ready` endpoint and report whether it answered 2xx.
+///
+/// A 404 falls back to `/health` for compatibility with nodes released before
+/// `/ready` existed. Other readiness failures, including 503 during a database
+/// outage, fail closed and must not use the liveness-only endpoint. The complete
+/// `/ready`-then-`/health` probe shares one timeout budget.
+///
+/// Takes the client by reference so callers supply the shared, no-redirect
+/// `state.http_client`. Peer URLs are attacker-influenceable, so a `3xx` to a
+/// private address must not be followed. Do NOT call this with a bare
+/// `reqwest::Client::new()`: its default follows redirects and would
+/// reintroduce the SSRF this guards against (#93).
+pub(crate) async fn ping_peer_readiness(client: &reqwest::Client, http_url: &str) -> bool {
+    ping_peer_readiness_with_timeout(client, http_url, OUTBOUND_HTTP_TIMEOUT).await
+}
+
+async fn ping_peer_readiness_with_timeout(
+    client: &reqwest::Client,
+    http_url: &str,
+    timeout: std::time::Duration,
+) -> bool {
+    let base_url = http_url.trim_end_matches('/');
+    let result = tokio::time::timeout(timeout, async {
+        let readiness = client.get(format!("{base_url}/ready")).send().await;
+
+        match readiness {
+            Ok(response) if response.status().is_success() => true,
+            Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {
+                info!(
+                    peer_url = %http_url,
+                    "peer has no readiness endpoint; falling back to legacy health probe"
+                );
+                match client.get(format!("{base_url}/health")).send().await {
+                    Ok(response) if response.status().is_success() => true,
+                    Ok(response) => {
+                        warn!(
+                            peer_url = %http_url,
+                            status = %response.status(),
+                            "legacy peer health probe reported unhealthy"
+                        );
+                        false
+                    }
+                    Err(error) => {
+                        warn!(
+                            peer_url = %http_url,
+                            err = %error,
+                            "legacy peer health probe failed"
+                        );
+                        false
+                    }
+                }
+            }
+            Ok(response) => {
+                warn!(
+                    peer_url = %http_url,
+                    status = %response.status(),
+                    "peer readiness probe reported unready"
+                );
+                false
+            }
+            Err(error) => {
+                warn!(
+                    peer_url = %http_url,
+                    err = %error,
+                    "peer readiness probe failed"
+                );
+                false
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(ready) => ready,
+        Err(_) => {
+            warn!(
+                peer_url = %http_url,
+                timeout_ms = timeout.as_millis(),
+                "peer readiness probe timed out"
+            );
+            false
+        }
+    }
+}
+
+fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
+    load_or_create_keypair_at(&config.resolved_key_path())
+}
+
+fn load_or_create_keypair_at(key_path: &std::path::Path) -> Result<Keypair> {
+    if p2p::path_denotes_a_directory(key_path, None)
+        || key_path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        anyhow::bail!(
+            "GITLAWB_KEY ({}) must name a key file, not a directory; a trailing separator, \
+             a final `.` or `..` component, and `..` traversal are refused so the path \
+             cannot retarget a parent",
+            key_path.display()
+        );
+    }
+
+    #[cfg(unix)]
+    if let Some(pem) = p2p::load_identity_pem_if_present(key_path)? {
+        let kp = Keypair::from_pem(&pem).map_err(|e| anyhow::anyhow!("invalid PEM key: {e}"))?;
+        info!(path = %key_path.display(), "loaded existing identity");
+        return Ok(kp);
+    }
+
+    #[cfg(not(unix))]
+    if key_path.exists() {
+        let pem = std::fs::read_to_string(key_path)
+            .with_context(|| format!("failed to read key from {}", key_path.display()))?;
+        let kp = Keypair::from_pem(&pem).map_err(|e| anyhow::anyhow!("invalid PEM key: {e}"))?;
+        info!(path = %key_path.display(), "loaded existing identity");
+        return Ok(kp);
+    }
+
+    let kp = Keypair::generate();
+    let pem = kp
+        .to_pem()
+        .map_err(|e| anyhow::anyhow!("failed to serialize key: {e}"))?;
+
+    // The directory is created pinned to 0700 and the PEM is published
+    // through the same scratch-then-link path the p2p key uses, at a
+    // verified 0600. The previous flow (create_dir_all with no mode, then
+    // write, then set_permissions) is the sequence INV-23 prohibits: it
+    // left the directory world-writable under a permissive umask, and
+    // under a restrictive one it could not be opened at all, which failed
+    // the whole node here, before the listener binds.
+    #[cfg(unix)]
+    p2p::create_pinned_dir_and_publish(key_path, pem.as_bytes())?;
+
+    #[cfg(not(unix))]
+    {
+        if let Some(parent) = key_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(key_path, pem.as_bytes())?;
+    }
+
+    info!(path = %key_path.display(), did = %kp.did(), "generated new node identity");
+    Ok(kp)
+}
+
+#[cfg(test)]
+mod gossip_ssrf_tests {
+    use super::{ping_peer_readiness, ping_peer_readiness_with_timeout};
+    use axum::{http::StatusCode, routing::get, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    // Build the client exactly as production does (super::build_http_client) so
+    // these tests bind the redirect guarantee to the real shared client the
+    // node runs. A regression that makes build_http_client follow redirects
+    // fails ping_peer_readiness_does_not_follow_redirect.
+    fn production_http_client() -> reqwest::Client {
+        super::build_http_client().expect("failed to build production http client")
+    }
+
+    // A peer answering `/ready` with a 302 toward an internal address must not
+    // be followed: the redirect target must never be requested (#93).
+    #[tokio::test]
+    async fn ping_peer_readiness_does_not_follow_redirect() {
+        let mut server = mockito::Server::new_async().await;
+        let internal = server
+            .mock("GET", "/internal-metadata")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+        let _ready = server
+            .mock("GET", "/ready")
+            .with_status(302)
+            .with_header("location", &format!("{}/internal-metadata", server.url()))
+            .create_async()
+            .await;
+
+        let ok = ping_peer_readiness(&production_http_client(), &server.url()).await;
+
+        assert!(!ok, "a 302 must not count as a healthy peer");
+        // expect(0) is enforced only at assert time; this fails if the redirect
+        // was followed to the internal target.
+        internal.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn ping_peer_readiness_reports_success_on_200() {
+        let mut server = mockito::Server::new_async().await;
+        let _ready = server
+            .mock("GET", "/ready")
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let ok = ping_peer_readiness(&production_http_client(), &server.url()).await;
+
+        assert!(ok, "a 200 /ready must count as a ready peer");
+    }
+
+    #[tokio::test]
+    async fn ping_peer_readiness_ignores_liveness_only_health() {
+        let mut server = mockito::Server::new_async().await;
+        let health = server
+            .mock("GET", "/health")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+        let ready = server
+            .mock("GET", "/ready")
+            .with_status(503)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let ok = ping_peer_readiness(&production_http_client(), &server.url()).await;
+
+        assert!(!ok, "a peer with an unavailable database must not be ready");
+        health.assert_async().await;
+        ready.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn ping_peer_readiness_falls_back_for_legacy_peer() {
+        let mut server = mockito::Server::new_async().await;
+        let ready = server
+            .mock("GET", "/ready")
+            .with_status(404)
+            .expect(1)
+            .create_async()
+            .await;
+        let health = server
+            .mock("GET", "/health")
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let ok = ping_peer_readiness(&production_http_client(), &server.url()).await;
+
+        assert!(
+            ok,
+            "a legacy peer with a healthy /health must remain reachable"
+        );
+        ready.assert_async().await;
+        health.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn ping_peer_readiness_legacy_fallback_shares_deadline() {
+        let health_requests = Arc::new(AtomicUsize::new(0));
+        let health_requests_for_route = Arc::clone(&health_requests);
+        let app = Router::new()
+            .route(
+                "/ready",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    StatusCode::NOT_FOUND
+                }),
+            )
+            .route(
+                "/health",
+                get(move || {
+                    let health_requests = Arc::clone(&health_requests_for_route);
+                    async move {
+                        health_requests.fetch_add(1, Ordering::Relaxed);
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        StatusCode::OK
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind delayed legacy peer");
+        let peer_url = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("delayed legacy peer has no local address")
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("delayed legacy peer failed");
+        });
+
+        let ok = ping_peer_readiness_with_timeout(
+            &production_http_client(),
+            &peer_url,
+            // Each response arrives within 350 ms, but the two serial requests
+            // cannot both finish within one 350 ms probe budget.
+            Duration::from_millis(350),
+        )
+        .await;
+
+        assert!(!ok, "the fallback must not start a fresh timeout budget");
+        assert_eq!(
+            health_requests.load(Ordering::Relaxed),
+            1,
+            "the delayed 404 should reach the legacy fallback"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ping_peer_readiness_legacy_fallback_does_not_follow_redirect() {
+        let mut server = mockito::Server::new_async().await;
+        let internal = server
+            .mock("GET", "/internal-metadata")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+        let _ready = server
+            .mock("GET", "/ready")
+            .with_status(404)
+            .create_async()
+            .await;
+        let _health = server
+            .mock("GET", "/health")
+            .with_status(302)
+            .with_header("location", &format!("{}/internal-metadata", server.url()))
+            .create_async()
+            .await;
+
+        let ok = ping_peer_readiness(&production_http_client(), &server.url()).await;
+
+        assert!(!ok, "the legacy fallback must not follow redirects");
+        internal.assert_async().await;
+    }
+
+    // A transport error (nothing listening) must map to unhealthy, never a
+    // spurious healthy — the .unwrap_or(false) arm.
+    #[tokio::test]
+    async fn ping_peer_readiness_reports_unready_on_connection_error() {
+        let ok = ping_peer_readiness(&production_http_client(), "http://127.0.0.1:1").await;
+        assert!(!ok, "a connection error must count as an unready peer");
+    }
+}
+
+#[cfg(test)]
+mod identity_key_storage_tests {
+    use super::*;
+
+    /// Requested modes for the objects this invocation creates. Named once so
+    /// a failure prints achieved against requested rather than a bare boolean.
+    #[cfg(unix)]
+    const IDENTITY_WANT_DIR_MODE: u32 = 0o700;
+    #[cfg(unix)]
+    const IDENTITY_WANT_KEY_MODE: u32 = 0o600;
+    /// Mode a PRE-EXISTING ancestor is built at. Not group-writable, so the
+    /// write-authority check accepts it, and nothing this process does may
+    /// change it: only directories this invocation creates are its business.
+    #[cfg(unix)]
+    const IDENTITY_PREEXISTING_MODE: u32 = 0o755;
+    /// Mode the group-writable rows build. A parent carrying it must be
+    /// refused before anything is created inside it.
+    #[cfg(unix)]
+    const IDENTITY_LOOSE_MODE: u32 = 0o775;
+
+    #[cfg(unix)]
+    fn identity_mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(path)
+            .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()))
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    /// Every directory on the key path with its achieved mode against what the
+    /// contract requested, so a RED is attributable to the mode rather than to
+    /// "something failed".
+    #[cfg(unix)]
+    fn identity_key_tree(base: &std::path::Path, key: &std::path::Path) -> String {
+        let mut dirs = Vec::new();
+        let mut cur = key.parent();
+        while let Some(d) = cur {
+            dirs.push(d.to_path_buf());
+            if d == base {
+                break;
+            }
+            cur = d.parent();
+        }
+        dirs.reverse();
+        let mut out = String::new();
+        for d in dirs {
+            match std::fs::symlink_metadata(&d) {
+                Ok(_) => out.push_str(&format!(
+                    "  dir  {} achieved mode {:04o}, requested {:04o}\n",
+                    d.display(),
+                    identity_mode_of(&d),
+                    IDENTITY_WANT_DIR_MODE
+                )),
+                Err(e) => out.push_str(&format!("  dir  {} absent ({e})\n", d.display())),
+            }
+        }
+        match std::fs::symlink_metadata(key) {
+            Ok(_) => out.push_str(&format!(
+                "  key  {} achieved mode {:04o}, requested {:04o}\n",
+                key.display(),
+                identity_mode_of(key),
+                IDENTITY_WANT_KEY_MODE
+            )),
+            Err(e) => out.push_str(&format!("  key  {} absent ({e})\n", key.display())),
+        }
+        out
+    }
+
+    /// An object a refused boot must not have left behind. The message is the
+    /// fixture's own: the anyhow text never carries the phrase, so a `contains`
+    /// on the error would be a check that can never pass.
+    #[cfg(unix)]
+    fn assert_identity_absent(path: &std::path::Path) {
+        assert!(
+            std::fs::symlink_metadata(path).is_err(),
+            "{} left behind by a refused boot",
+            path.display()
+        );
+    }
+
+    /// A symlink refusal must name the symlink. An unrelated EACCES, ENOENT,
+    /// or write-authority failure satisfies "an error happened" while proving
+    /// nothing about whether the interior component was followed, so every
+    /// symlink row asserts the reason rather than the bare failure.
+    #[cfg(unix)]
+    fn assert_names_symlink_refusal(text: &str, what: &str) {
+        let lower = text.to_lowercase();
+        assert!(
+            lower.contains("symlink") || lower.contains("symbolic link"),
+            "{what} must be refused for the symlink on the path, and the refusal must say so, \
+             got: {text}"
+        );
+    }
+
+    /// Every regular file under `root`, following no symlink out of it. Used
+    /// to prove a refused boot published nothing where a followed interior
+    /// link would have put it, including a target outside the base.
+    #[cfg(unix)]
+    fn identity_collect_files(root: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(md) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if md.is_dir() {
+                identity_collect_files(&path, found);
+            } else if md.is_file() {
+                found.push(path);
+            }
+        }
+    }
+
+    /// No key anywhere beneath `root`. Stronger than naming one expected path,
+    /// because a followed link can land the key at a name the test did not
+    /// predict.
+    #[cfg(unix)]
+    fn assert_no_identity_key_under(root: &std::path::Path, what: &str) {
+        let mut found = Vec::new();
+        identity_collect_files(root, &mut found);
+        let keys: Vec<String> = found
+            .iter()
+            .filter(|p| p.file_name().is_some_and(|n| n == "identity.pem"))
+            .map(|p| p.display().to_string())
+            .collect();
+        assert!(
+            keys.is_empty(),
+            "{what}: a refused boot published an identity under {}: {keys:?}",
+            root.display()
+        );
+    }
+
+    /// The assertions every success row shares: exact 0700 on each directory
+    /// this invocation created, 0600 on the key, no scratch residue beside it,
+    /// and a base this process never touched.
+    #[cfg(unix)]
+    fn assert_identity_success(
+        base: &std::path::Path,
+        key: &std::path::Path,
+        created: &[std::path::PathBuf],
+    ) {
+        for d in created {
+            let mode = identity_mode_of(d);
+            assert_eq!(
+                mode,
+                IDENTITY_WANT_DIR_MODE,
+                "created directory {} achieved mode {:04o}, requested {:04o}\n{}",
+                d.display(),
+                mode,
+                IDENTITY_WANT_DIR_MODE,
+                identity_key_tree(base, key)
+            );
+        }
+        let key_mode = identity_mode_of(key);
+        assert_eq!(
+            key_mode,
+            IDENTITY_WANT_KEY_MODE,
+            "identity key achieved mode {key_mode:04o}, requested 0600\n{}",
+            identity_key_tree(base, key)
+        );
+        let leaf = key.parent().expect("the key names a parent");
+        let entries: Vec<String> = std::fs::read_dir(leaf)
+            .expect("read the key directory")
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![key.file_name().unwrap().to_string_lossy().into_owned()],
+            "the key directory must hold only the published key, no scratch residue: {entries:?}"
+        );
+        let base_mode = identity_mode_of(base);
+        assert_eq!(
+            base_mode, 0o700,
+            "the base directory must be left at 0700, achieved {base_mode:04o}"
+        );
+    }
+
+    /// Boot a success row and check its contract. `call_path` is what the code
+    /// is handed (relative for the relative row); `key` is the same key under
+    /// `base`, so the mode checks never depend on the child's cwd.
+    #[cfg(unix)]
+    fn run_identity_success_row(
+        base: &std::path::Path,
+        call_path: &std::path::Path,
+        key: &std::path::Path,
+        created: &[std::path::PathBuf],
+        phase: &str,
+    ) -> String {
+        if phase == "reload" {
+            assert!(
+                key.exists(),
+                "the reload phase requires the create phase to have published a key at {}",
+                key.display()
+            );
+        }
+        let kp = load_or_create_keypair_at(call_path).unwrap_or_else(|e| {
+            panic!(
+                "{} the node identity, got: {e:#}\nkey storage at failure:\n{}",
+                if phase == "reload" {
+                    "reload in a fresh process must load"
+                } else {
+                    "first boot must create"
+                },
+                identity_key_tree(base, key)
+            )
+        });
+        assert_identity_success(base, key, created);
+        kp.did().to_string()
+    }
+
+    /// Fixture: one (layout, umask, phase) row of the identity lifecycle
+    /// matrix.
+    ///
+    /// `~/.gitlawb` holds BOTH keys, and `load_or_create_keypair` runs before
+    /// the listener binds, so a mask that strips owner bits here takes the
+    /// whole node down before any p2p code is reached. `umask` is
+    /// process-global, so every row is a child. Double-gated like the p2p
+    /// fixtures: `#[ignore]` keeps it out of a normal run and the env check
+    /// keeps it inert under a bare `--ignored` sweep, which would otherwise set
+    /// a process-global umask inside the shared test process.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=identity-key-umask"]
+    fn fixture_identity_key_under_hostile_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref() != Some("identity-key-umask") {
+            return;
+        }
+        let base = std::path::PathBuf::from(
+            std::env::var("GITLAWB_TEST_BASE").expect("GITLAWB_TEST_BASE"),
+        );
+        let umask_val =
+            u32::from_str_radix(&std::env::var("GITLAWB_TEST_UMASK").unwrap(), 8).unwrap();
+        let layout = std::env::var("GITLAWB_TEST_LAYOUT").expect("GITLAWB_TEST_LAYOUT");
+        let phase = std::env::var("GITLAWB_TEST_PHASE").expect("GITLAWB_TEST_PHASE");
+
+        // SAFETY: `umask` only reads and replaces the process-wide value, and
+        // this process exists solely for this probe. No restore: the value dies
+        // with the child. Set FIRST, before any layout is built, so the
+        // explicit chmods below are what give a pre-existing directory its
+        // mode regardless of the mask.
+        unsafe { libc::umask(umask_val as libc::mode_t) };
+
+        match layout.as_str() {
+            "one-missing" => {
+                let dir = base.join(".gitlawb");
+                let key = dir.join("identity.pem");
+                let did = run_identity_success_row(&base, &key, &key, &[dir], &phase);
+                println!("identity-key-umask: asserted did={did}");
+            }
+            "multi-missing" => {
+                let one = base.join("one");
+                let two = one.join("two");
+                let key = two.join("identity.pem");
+                let did = run_identity_success_row(&base, &key, &key, &[one, two], &phase);
+                println!("identity-key-umask: asserted did={did}");
+            }
+            "three-missing" => {
+                let one = base.join("one");
+                let two = one.join("two");
+                let three = two.join("three");
+                let key = three.join("identity.pem");
+                let did = run_identity_success_row(&base, &key, &key, &[one, two, three], &phase);
+                println!("identity-key-umask: asserted did={did}");
+            }
+            "under-preexisting" => {
+                let pre = base.join("pre");
+                if phase == "create" {
+                    std::fs::create_dir(&pre).expect("create the pre-existing ancestor");
+                    std::fs::set_permissions(
+                        &pre,
+                        std::fs::Permissions::from_mode(IDENTITY_PREEXISTING_MODE),
+                    )
+                    .expect("chmod the pre-existing ancestor");
+                }
+                let one = pre.join("one");
+                let two = one.join("two");
+                let key = two.join("identity.pem");
+                let did = run_identity_success_row(&base, &key, &key, &[one, two], &phase);
+                let pre_mode = identity_mode_of(&pre);
+                assert_eq!(
+                    pre_mode,
+                    IDENTITY_PREEXISTING_MODE,
+                    "a pre-existing ancestor is neither chmodded nor judged: {} achieved \
+                     {pre_mode:04o}, expected {:04o}",
+                    pre.display(),
+                    IDENTITY_PREEXISTING_MODE
+                );
+                println!("identity-key-umask: asserted did={did}");
+            }
+            "relative-multi-missing" => {
+                std::env::set_current_dir(&base).expect("chdir into the row's base");
+                let one = base.join("one");
+                let two = one.join("two");
+                let key = two.join("identity.pem");
+                let call_path = std::path::PathBuf::from("one/two/identity.pem");
+                let did = run_identity_success_row(&base, &call_path, &key, &[one, two], &phase);
+                println!("identity-key-umask: asserted did={did}");
+            }
+            "loose-ancestor" => {
+                let loose = base.join("loose");
+                std::fs::create_dir(&loose).expect("create the group-writable ancestor");
+                std::fs::set_permissions(
+                    &loose,
+                    std::fs::Permissions::from_mode(IDENTITY_LOOSE_MODE),
+                )
+                .expect("chmod the group-writable ancestor");
+                let one = loose.join("one");
+                let two = one.join("two");
+                let key = two.join("identity.pem");
+                let Err(err) = load_or_create_keypair_at(&key) else {
+                    panic!(
+                        "a group-writable deepest ancestor must be refused\nkey storage:\n{}",
+                        identity_key_tree(&base, &key)
+                    )
+                };
+                let text = format!("{err:#}");
+                // The reason is checked before the leftovers so a refusal for
+                // the wrong reason is reported as that, not as a stray file.
+                assert!(
+                    text.contains("writable beyond its owner"),
+                    "a group-writable deepest ancestor must be refused for the write-authority \
+                     reason, got: {text}"
+                );
+                assert_identity_absent(&one);
+                assert_identity_absent(&two);
+                assert_identity_absent(&key);
+                let loose_mode = identity_mode_of(&loose);
+                assert_eq!(
+                    loose_mode,
+                    IDENTITY_LOOSE_MODE,
+                    "a refusal must not chmod {}: achieved {loose_mode:04o}",
+                    loose.display()
+                );
+                println!("identity-key-umask: refused");
+            }
+            "write-failure" => {
+                let one = base.join("one");
+                let two = one.join("two");
+                let three = two.join("three");
+                let key = three.join("identity.pem");
+                // Armed on this thread only, and disarmed before the
+                // assertions so a later boot in this process is unaffected.
+                p2p::FAIL_KEY_WRITE.with(|f| f.set(true));
+                let result = load_or_create_keypair_at(&key);
+                p2p::FAIL_KEY_WRITE.with(|f| f.set(false));
+                let Err(err) = result else {
+                    panic!("an injected key-write failure must not report a created identity")
+                };
+                let text = format!("{err:#}");
+                assert!(
+                    text.contains("injected key-write failure"),
+                    "the failure must name the injected key write, got: {text}"
+                );
+                assert_identity_absent(&one);
+                assert_identity_absent(&two);
+                assert_identity_absent(&three);
+                assert_identity_absent(&key);
+                let residue: Vec<String> = std::fs::read_dir(&base)
+                    .expect("read the base directory")
+                    .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect();
+                assert!(
+                    residue.is_empty(),
+                    "a failed first boot must leave nothing under the base: {residue:?}"
+                );
+                println!("identity-key-umask: refused");
+            }
+            "race-loose-intermediate" => {
+                let one = base.join("one");
+                let two = one.join("two");
+                let key = two.join("identity.pem");
+                // A concurrent process wins the mkdir with a group-writable
+                // mode. The loser adopts nothing it did not create, so its
+                // rollback must leave the winner's directory alone.
+                p2p::pin::RACE_CREATE_MODE.with(|c| c.set(Some(IDENTITY_LOOSE_MODE)));
+                let result = load_or_create_keypair_at(&key);
+                let Err(err) = result else {
+                    panic!("a race-won group-writable intermediate must be refused")
+                };
+                let text = format!("{err:#}");
+                assert!(
+                    text.contains("writable beyond its owner"),
+                    "the refusal must name the write-authority problem, got: {text}"
+                );
+                assert!(
+                    one.exists(),
+                    "a directory this invocation did not create must not be removed: {} is gone",
+                    one.display()
+                );
+                let one_mode = identity_mode_of(&one);
+                assert_eq!(
+                    one_mode,
+                    IDENTITY_LOOSE_MODE,
+                    "a directory this invocation did not create must not be removed or chmodded: \
+                     {} achieved {one_mode:04o}",
+                    one.display()
+                );
+                assert_identity_absent(&two);
+                assert_identity_absent(&key);
+                println!("identity-key-umask: refused");
+            }
+            "symlinked-deepest-ancestor" => {
+                let real = base.join("real");
+                std::fs::create_dir(&real).expect("create the real ancestor");
+                std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700))
+                    .expect("chmod the real ancestor");
+                let link = base.join("link");
+                std::os::unix::fs::symlink("real", &link).expect("plant the symlinked ancestor");
+                let key = link.join("one").join("two").join("identity.pem");
+                let Err(err) = load_or_create_keypair_at(&key) else {
+                    panic!("a symlinked deepest existing ancestor must be refused, not followed")
+                };
+                let text = format!("{err:#}");
+                assert!(
+                    text.contains("a symlink here is refused rather than followed"),
+                    "a symlinked deepest existing ancestor must be refused, not followed, and the \
+                     refusal must say so, got: {text}"
+                );
+                for p in [
+                    link.join("one"),
+                    link.join("one").join("two"),
+                    key.clone(),
+                    real.join("one"),
+                    real.join("one").join("two"),
+                    real.join("one").join("two").join("identity.pem"),
+                ] {
+                    assert_identity_absent(&p);
+                }
+                println!("identity-key-umask: refused");
+            }
+            "populated-leaf-refuses-rollback" => {
+                let one = base.join("one");
+                let two = one.join("two");
+                let key = two.join("identity.pem");
+                // The key is published and only the scratch removal fails, so
+                // the leaf this invocation created is no longer empty when the
+                // rollback reaches it. `AT_REMOVEDIR` must refuse it.
+                p2p::FAIL_SCRATCH_UNLINK.with(|f| f.set(true));
+                let result = load_or_create_keypair_at(&key);
+                p2p::FAIL_SCRATCH_UNLINK.with(|f| f.set(false));
+                let Err(err) = result else {
+                    panic!("an injected scratch-unlink failure must not report success")
+                };
+                let text = format!("{err:#}");
+                assert!(
+                    text.contains("failed to remove the scratch name"),
+                    "the failure must name the scratch it could not remove, got: {text}"
+                );
+                assert!(
+                    text.contains("also failed to remove")
+                        && text.contains("which this process created"),
+                    "the rollback must report the populated leaf it was refused, got: {text}"
+                );
+                let key_mode = identity_mode_of(&key);
+                assert_eq!(
+                    key_mode, IDENTITY_WANT_KEY_MODE,
+                    "a published key must survive its own boot's rollback: achieved \
+                     {key_mode:04o}, requested 0600"
+                );
+                for d in [&one, &two] {
+                    let mode = identity_mode_of(d);
+                    assert_eq!(
+                        mode,
+                        IDENTITY_WANT_DIR_MODE,
+                        "created directory {} achieved mode {mode:04o}, requested {:04o}",
+                        d.display(),
+                        IDENTITY_WANT_DIR_MODE
+                    );
+                }
+                let scratch: Vec<String> = std::fs::read_dir(&two)
+                    .expect("read the key directory")
+                    .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.starts_with(".p2p.key.") && n.ends_with(".tmp"))
+                    .collect();
+                assert_eq!(
+                    scratch.len(),
+                    1,
+                    "the refused unlink must leave exactly one scratch beside the key: {scratch:?}"
+                );
+                let kp = load_or_create_keypair_at(&key)
+                    .expect("a boot after the injected failure must load the published key");
+                println!("identity-key-umask: refused did={}", kp.did());
+            }
+            // One process of a real concurrent first boot. Every child of a
+            // race runs this arm; the driver owns the tree assertions, because
+            // only it knows the race has finished.
+            "concurrent-first-boot" => {
+                let barrier = std::path::PathBuf::from(
+                    std::env::var("GITLAWB_TEST_BARRIER").expect("GITLAWB_TEST_BARRIER"),
+                );
+                let id = std::env::var("GITLAWB_TEST_RACE_ID").expect("GITLAWB_TEST_RACE_ID");
+                let role = std::env::var("GITLAWB_TEST_RACE_ROLE").expect("GITLAWB_TEST_RACE_ROLE");
+                let key = base.join("one").join("two").join("identity.pem");
+
+                // Two-phase rendezvous: each child announces itself with
+                // `ready.<id>` and then spins on `go`, which the driver creates
+                // only once every ready file is present. Chosen over a shared
+                // wake-up timestamp because a deadline bounds only the skew it
+                // cannot observe: a child that is slow to exec still arrives
+                // late and the race never overlaps. Here every child is already
+                // inside the spin loop before `go` can appear, so the spread
+                // across the racing call is one loop iteration rather than the
+                // tens of milliseconds a process takes to start. The deadline
+                // exists so a child whose sibling died never hangs the suite.
+                std::fs::write(barrier.join(format!("ready.{id}")), b"")
+                    .expect("announce readiness at the starting barrier");
+                let go = barrier.join("go");
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+                while !go.exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the starting barrier never opened"
+                    );
+                    std::hint::spin_loop();
+                }
+
+                // The `fail-write` role is the only injected part of the race,
+                // and it is what puts a REAL second process into the window
+                // section 7 of the plan describes: this child creates a
+                // component, the other adopts it, this one fails before either
+                // has written, and its rollback reaches the still-empty
+                // directory the other is holding open.
+                if role == "fail-write" {
+                    p2p::FAIL_KEY_WRITE.with(|f| f.set(true));
+                }
+                let result = load_or_create_keypair_at(&key);
+                p2p::FAIL_KEY_WRITE.with(|f| f.set(false));
+
+                match result {
+                    Ok(kp) => {
+                        // A boot that reports success must have the identity it
+                        // returned on disk, at 0600, and readable as a keypair.
+                        // Checked here rather than in the driver so a success
+                        // that raced with a rollback is attributed to the
+                        // process that claimed it.
+                        let mode = identity_mode_of(&key);
+                        assert_eq!(
+                            mode,
+                            IDENTITY_WANT_KEY_MODE,
+                            "a successful concurrent boot published {} at {mode:04o}, requested \
+                             0600",
+                            key.display()
+                        );
+                        let pem = std::fs::read_to_string(&key)
+                            .unwrap_or_else(|e| panic!("read {}: {e}", key.display()));
+                        let on_disk = Keypair::from_pem(&pem)
+                            .expect("a successful concurrent boot must leave a loadable keypair");
+                        assert_eq!(
+                            on_disk.did().to_string(),
+                            kp.did().to_string(),
+                            "a successful boot must return the identity that is on disk"
+                        );
+                        println!("identity-key-race: ok did={}", kp.did());
+                    }
+                    Err(err) => {
+                        // One line so the driver can classify it; the anyhow
+                        // chain is multi-line under `{:#}` only when a context
+                        // carries a newline, but flattening is free insurance.
+                        let text = format!("{err:#}").replace('\n', " ");
+                        println!("identity-key-race: err {text}");
+                    }
+                }
+            }
+            other => panic!("unknown layout {other}"),
+        }
+    }
+
+    /// GITLAWB_KEY names a PEM file, not a dedicated key directory. An existing
+    /// 0755 parent is usable (no group/world write) and must not be chmodded.
+    #[cfg(unix)]
+    #[test]
+    fn existing_identity_parent_is_not_chmodded() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for parent_name in [".gitlawb", "shared"] {
+            let base = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let dir = base.path().join(parent_name);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let key = dir.join("identity.pem");
+            load_or_create_keypair_at(&key).expect("first boot into an existing 0755 parent");
+
+            let mode = std::fs::symlink_metadata(&dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(
+                mode, 0o755,
+                "{parent_name}: an existing 0755 identity parent must stay 0755, found {mode:04o}"
+            );
+            assert_eq!(
+                std::fs::symlink_metadata(&key)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o600,
+                "the identity key must be owner-only"
+            );
+        }
+    }
+
+    /// A parent this process creates is still pinned to 0700. That is the
+    /// missing-directory path, not an adopt of an operator-owned tree.
+    #[cfg(unix)]
+    #[test]
+    fn missing_identity_parent_is_created_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = base.path().join(".gitlawb");
+        let key = dir.join("identity.pem");
+        load_or_create_keypair_at(&key).expect("first boot creates the identity parent");
+        let mode = std::fs::symlink_metadata(&dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o700, "a parent this process created must be 0700");
+    }
+
+    /// Group/world write on the parent is replacement authority over a 0600
+    /// key. Refuse, and leave the directory untouched.
+    #[cfg(unix)]
+    #[test]
+    fn writable_identity_parent_is_refused_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = base.path().join("tmp");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let key = dir.join("identity.pem");
+        let Err(err) = load_or_create_keypair_at(&key) else {
+            panic!("a world-writable identity parent must be refused");
+        };
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("writable") || text.contains("replace"),
+            "the refusal must name the write-authority problem, got: {text}"
+        );
+        let mode = std::fs::symlink_metadata(&dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o777, "a refusal must not chmod the parent");
+        assert!(!key.exists(), "a refusal must not publish the identity key");
+    }
+
+    /// An existing key is loaded, never rewritten and never chmodded: the
+    /// creation path is the only thing this change touches.
+    #[cfg(unix)]
+    #[test]
+    fn existing_identity_key_is_loaded_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let key = base.path().join(".gitlawb").join("identity.pem");
+
+        let created = load_or_create_keypair_at(&key).expect("first boot");
+        let before = std::fs::read(&key).unwrap();
+
+        // A deliberately odd but readable mode must survive: an existing key is
+        // the operator's, and this path does not repair it.
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let reloaded = load_or_create_keypair_at(&key).expect("reload");
+
+        assert_eq!(created.did(), reloaded.did(), "the identity must be stable");
+        assert_eq!(
+            std::fs::read(&key).unwrap(),
+            before,
+            "the key must not be rewritten"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&key)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o400,
+            "an existing key's mode must not be changed"
+        );
+    }
+
+    /// Parent for the identity lifecycle matrix: drives every row as a child
+    /// process and requires create and reload to agree on the DID.
+    #[cfg(unix)]
+    #[test]
+    fn identity_key_storage_is_umask_independent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const SUCCESS_SENTINEL: &str = "identity-key-umask: asserted did=";
+        const REFUSED_SENTINEL: &str = "identity-key-umask: refused";
+        // Fixed order, and part of the contract: 0000 and 0002 are the masks
+        // that leave a group/world-writable ancestor behind, 0022 is the one
+        // that boots with the wrong mode, and 0777 strips owner bits. Rows
+        // abort at the first failing mask, so several load-bearing proofs are
+        // pinned to which mask that is.
+        const ALL_UMASKS: &[&str] = &["0000", "0002", "0022", "0777"];
+
+        // (layout, umasks, succeeds). A success row runs create then reload
+        // against one base and must return the same DID; a reject row runs
+        // create alone and must print the refusal sentinel.
+        let rows: &[(&str, &[&str], bool)] = &[
+            ("one-missing", ALL_UMASKS, true),
+            ("multi-missing", ALL_UMASKS, true),
+            ("three-missing", ALL_UMASKS, true),
+            ("under-preexisting", ALL_UMASKS, true),
+            ("relative-multi-missing", ALL_UMASKS, true),
+            ("loose-ancestor", ALL_UMASKS, false),
+            ("write-failure", ALL_UMASKS, false),
+            ("race-loose-intermediate", &["0002"], false),
+            ("symlinked-deepest-ancestor", &["0022"], false),
+            ("populated-leaf-refuses-rollback", &["0022"], false),
+        ];
+
+        // Both filters are optional and both panic on a value that names
+        // nothing: a typo that quietly ran no child would be an empty green,
+        // which is the failure this matrix exists to rule out.
+        let layout_only = std::env::var("GITLAWB_TEST_LAYOUT_ONLY").ok();
+        let umask_only = std::env::var("GITLAWB_TEST_UMASK_ONLY").ok();
+        if let Some(l) = layout_only.as_deref() {
+            assert!(
+                rows.iter().any(|r| r.0 == l),
+                "GITLAWB_TEST_LAYOUT_ONLY={l} names no row in the matrix"
+            );
+        }
+        if let Some(u) = umask_only.as_deref() {
+            assert!(
+                ALL_UMASKS.contains(&u),
+                "GITLAWB_TEST_UMASK_ONLY={u} names no umask in the matrix"
+            );
+        }
+
+        // Run one row in a child and return whatever follows its sentinel.
+        fn run_row(
+            base: &std::path::Path,
+            umask: &str,
+            layout: &str,
+            phase: &str,
+            sentinel: &str,
+        ) -> String {
+            let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+            cmd.args([
+                "identity_key_storage_tests::fixture_identity_key_under_hostile_umask",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("GITLAWB_TEST_FIXTURE", "identity-key-umask")
+            .env("GITLAWB_TEST_BASE", base)
+            .env("GITLAWB_TEST_UMASK", umask)
+            .env("GITLAWB_TEST_LAYOUT", layout)
+            .env("GITLAWB_TEST_PHASE", phase);
+            let output = cmd.output().expect("spawn the identity-key fixture");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let row = format!("layout={layout} umask={umask} phase={phase}");
+
+            assert!(
+                output.status.success(),
+                "row {row}: the identity-key fixture must pass\n\
+                 --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+            );
+            // A filter matching nothing exits 0, and the fixture's env gate
+            // returns early as a passing test, so neither alone is proof.
+            assert!(
+                stdout.contains("1 passed"),
+                "row {row}: filter must select one passing test\n{stdout}"
+            );
+            let line = stdout
+                .lines()
+                .find(|l| l.starts_with(sentinel))
+                .unwrap_or_else(|| {
+                    panic!("row {row}: fixture must print its sentinel\n--- stdout ---\n{stdout}")
+                });
+            line[sentinel.len()..].trim().to_string()
+        }
+
+        let mut ran = 0usize;
+        for (layout, umasks, succeeds) in rows {
+            if layout_only.as_deref().is_some_and(|l| l != *layout) {
+                continue;
+            }
+            for umask in *umasks {
+                if umask_only.as_deref().is_some_and(|u| u != *umask) {
+                    continue;
+                }
+                let base = tempfile::tempdir().unwrap();
+                std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                if *succeeds {
+                    let created = run_row(base.path(), umask, layout, "create", SUCCESS_SENTINEL);
+                    let reloaded = run_row(base.path(), umask, layout, "reload", SUCCESS_SENTINEL);
+                    assert_eq!(
+                        created, reloaded,
+                        "layout={layout} umask={umask}: a fresh process must reload the same DID"
+                    );
+                } else {
+                    run_row(base.path(), umask, layout, "create", REFUSED_SENTINEL);
+                }
+                ran += 1;
+            }
+        }
+        assert!(
+            ran > 0,
+            "the row and umask filters selected no child; a matrix that runs nothing is not a \
+             passing matrix"
+        );
+    }
+
+    /// Two or more real first boots racing the same multi-level missing key
+    /// path.
+    ///
+    /// The rollback added by this round can remove an intermediate a concurrent
+    /// boot has already adopted, so the plan's section 7 claims both processes
+    /// still fail closed. That claim was reasoned, not executed. This drives it
+    /// with real processes: `umask` and the injection hooks are process-global,
+    /// so threads inside one process would not be the production path.
+    ///
+    /// The race is nondeterministic and the assertions are not. Nothing here
+    /// asserts a particular interleaving; every check is a property that must
+    /// hold for all of them, so the test is deterministic in PASS/FAIL:
+    ///
+    /// * a boot that reports success has its own identity on disk at 0600 and
+    ///   parseable (asserted in the child, which is the process that claimed
+    ///   it);
+    /// * every surviving directory this run created is exactly 0700, never
+    ///   group or world writable;
+    /// * every successful boot agrees on the DID;
+    /// * if no boot succeeded, nothing partial is left (no key, no scratch) and
+    ///   a retry in this process then succeeds, which is the explicit form of
+    ///   "fail closed and recover on the next boot".
+    #[cfg(unix)]
+    #[test]
+    fn identity_concurrent_first_boots_fail_closed() {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+
+        const OK_SENTINEL: &str = "identity-key-race: ok did=";
+        const ERR_SENTINEL: &str = "identity-key-race: err ";
+        // 0002 is the mask that produced finding 1, so a directory this run
+        // creates without pinning it lands 0775 and the exact-mode assertions
+        // below catch it.
+        const RACE_UMASK: &str = "0002";
+
+        // (arm, one role per child). The pure arm is three unaided first boots.
+        // The other two add losers that fail after the walk and before any key
+        // is written, so their rollback reaches a directory a sibling may
+        // already hold open: that is the window the plan describes and the only
+        // injected part of the race. Two children hit it rarely, because the
+        // winner reaches its scratch file before a single loser reaches its
+        // rmdir; four losers against one unaided boot hit it often, so the
+        // pressure arm is what actually executes the interleaving. The
+        // assertions do not depend on which arm hits it.
+        let arms: &[(&str, &[&str])] = &[
+            ("pure", &["pure", "pure", "pure"][..]),
+            ("loser-fails", &["fail-write", "pure"][..]),
+            (
+                "rollback-pressure",
+                &[
+                    "fail-write",
+                    "fail-write",
+                    "fail-write",
+                    "fail-write",
+                    "pure",
+                ][..],
+            ),
+        ];
+
+        // A single run of a nondeterministic test proves very little, so the
+        // default loops the whole race; raise it through the env for a longer
+        // shake without editing the test.
+        let iterations: usize = std::env::var("GITLAWB_TEST_RACE_ITERATIONS")
+            .ok()
+            .map(|v| {
+                v.parse()
+                    .expect("GITLAWB_TEST_RACE_ITERATIONS must be a count")
+            })
+            .unwrap_or(50);
+        assert!(iterations > 0, "a race run zero times proves nothing");
+
+        #[derive(Default)]
+        struct Tally {
+            all_ok: usize,
+            some_ok: usize,
+            none_ok: usize,
+            /// A boot refused because the directory it was holding had been
+            /// removed under it: the interleaving section 7 describes.
+            adopted_dir_unlinked: usize,
+        }
+        let mut tallies: Vec<(&str, Tally)> = arms
+            .iter()
+            .map(|(name, _)| (*name, Tally::default()))
+            .collect();
+
+        for iteration in 0..iterations {
+            for (arm_idx, (arm, roles)) in arms.iter().enumerate() {
+                let base = tempfile::tempdir().unwrap();
+                std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                let barrier = tempfile::tempdir().unwrap();
+                let one = base.path().join("one");
+                let two = one.join("two");
+                let key = two.join("identity.pem");
+                let label = format!("arm={arm} iteration={iteration}");
+
+                let mut children = Vec::new();
+                for (id, role) in roles.iter().enumerate() {
+                    let mut cmd =
+                        std::process::Command::new(std::env::current_exe().expect("current_exe"));
+                    cmd.args([
+                        "identity_key_storage_tests::fixture_identity_key_under_hostile_umask",
+                        "--exact",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env("GITLAWB_TEST_FIXTURE", "identity-key-umask")
+                    .env("GITLAWB_TEST_BASE", base.path())
+                    .env("GITLAWB_TEST_UMASK", RACE_UMASK)
+                    .env("GITLAWB_TEST_LAYOUT", "concurrent-first-boot")
+                    .env("GITLAWB_TEST_PHASE", "create")
+                    .env("GITLAWB_TEST_BARRIER", barrier.path())
+                    .env("GITLAWB_TEST_RACE_ID", id.to_string())
+                    .env("GITLAWB_TEST_RACE_ROLE", *role)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+                    children.push(cmd.spawn().expect("spawn a racing identity boot"));
+                }
+
+                // Open the barrier only once every child has announced itself.
+                // If one died before announcing, the deadline lets the run
+                // proceed to the exit-status assertion below rather than hang.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+                loop {
+                    let ready = (0..roles.len())
+                        .filter(|id| barrier.path().join(format!("ready.{id}")).exists())
+                        .count();
+                    if ready == roles.len() || std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                std::fs::write(barrier.path().join("go"), b"").expect("open the starting barrier");
+
+                let mut oks = Vec::new();
+                let mut errs = Vec::new();
+                for (id, child) in children.into_iter().enumerate() {
+                    let output = child.wait_with_output().expect("await a racing boot");
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let who = format!("{label} child={id} role={}", roles[id]);
+                    assert!(
+                        output.status.success(),
+                        "{who}: the racing fixture must pass whichever way the race went\n\
+                         --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+                    );
+                    assert!(
+                        stdout.contains("1 passed"),
+                        "{who}: filter must select one passing test\n{stdout}"
+                    );
+                    let line = stdout
+                        .lines()
+                        .find(|l| l.starts_with("identity-key-race: "))
+                        .unwrap_or_else(|| {
+                            panic!("{who}: the child must report its outcome\n{stdout}")
+                        });
+                    if let Some(did) = line.strip_prefix(OK_SENTINEL) {
+                        oks.push(did.trim().to_string());
+                    } else if let Some(text) = line.strip_prefix(ERR_SENTINEL) {
+                        errs.push((roles[id], text.to_string()));
+                    } else {
+                        panic!("{who}: unrecognized outcome line {line:?}");
+                    }
+                }
+
+                // Invariant: every surviving directory this run created is
+                // exactly 0700. A missing one is legal (a loser rolled it
+                // back); a group or world writable one never is.
+                for d in [&one, &two] {
+                    if d.exists() {
+                        let mode = identity_mode_of(d);
+                        assert_eq!(
+                            mode,
+                            IDENTITY_WANT_DIR_MODE,
+                            "{label}: surviving directory {} achieved mode {mode:04o}, requested \
+                             {:04o}",
+                            d.display(),
+                            IDENTITY_WANT_DIR_MODE
+                        );
+                        let residue: Vec<String> = std::fs::read_dir(d)
+                            .expect("read a surviving directory")
+                            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                            .filter(|n| n.starts_with(".p2p.key.") && n.ends_with(".tmp"))
+                            .collect();
+                        assert!(
+                            residue.is_empty(),
+                            "{label}: a finished race must leave no scratch behind in {}: \
+                             {residue:?}",
+                            d.display()
+                        );
+                    }
+                }
+
+                if key.exists() {
+                    // Invariant: the published key is 0600 and loadable, and
+                    // every boot that reported success agrees on it.
+                    let mode = identity_mode_of(&key);
+                    assert_eq!(
+                        mode, IDENTITY_WANT_KEY_MODE,
+                        "{label}: the surviving key achieved mode {mode:04o}, requested 0600"
+                    );
+                    let mut pem = String::new();
+                    std::fs::File::open(&key)
+                        .expect("open the surviving key")
+                        .read_to_string(&mut pem)
+                        .expect("read the surviving key");
+                    let on_disk = Keypair::from_pem(&pem)
+                        .expect("the surviving key must parse as a keypair")
+                        .did()
+                        .to_string();
+                    for did in &oks {
+                        assert_eq!(
+                            *did, on_disk,
+                            "{label}: a successful boot reported an identity the disk does not \
+                             hold"
+                        );
+                    }
+                } else {
+                    // Invariant: no key means no boot may claim success, and
+                    // the tree must be clean enough that the next boot works.
+                    assert!(
+                        oks.is_empty(),
+                        "{label}: a boot reported success with no key on disk: {oks:?}"
+                    );
+                    let kp = load_or_create_keypair_at(&key).unwrap_or_else(|e| {
+                        panic!(
+                            "{label}: every boot failed, so a retry must succeed, got: {e:#}\n\
+                             errors: {errs:?}\nkey storage:\n{}",
+                            identity_key_tree(base.path(), &key)
+                        )
+                    });
+                    assert_identity_success(base.path(), &key, &[one.clone(), two.clone()]);
+                    assert!(
+                        !kp.did().to_string().is_empty(),
+                        "{label}: the recovering boot must produce an identity"
+                    );
+                }
+
+                let tally = &mut tallies[arm_idx].1;
+                if oks.len() == roles.len() {
+                    tally.all_ok += 1;
+                } else if oks.is_empty() {
+                    tally.none_ok += 1;
+                } else {
+                    tally.some_ok += 1;
+                }
+                // The rollback-under-an-adopted-directory window: a boot that
+                // was refused because the directory it held was unlinked.
+                if errs.iter().any(|(_, t)| {
+                    t.contains("No such file or directory") || t.contains("(os error 2)")
+                }) {
+                    tally.adopted_dir_unlinked += 1;
+                }
+            }
+        }
+
+        for (arm, tally) in &tallies {
+            println!(
+                "identity-race-summary: arm={arm} iterations={iterations} all_ok={} some_ok={} \
+                 none_ok={} adopted_dir_unlinked={}",
+                tally.all_ok, tally.some_ok, tally.none_ok, tally.adopted_dir_unlinked
+            );
+        }
+    }
+
+    /// Bare `GITLAWB_KEY=identity.pem` (and `./identity.pem`) must still create
+    /// the identity in the working directory. The p2p key refuses that form on
+    /// purpose; the node identity has always allowed it.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=identity-key-bare"]
+    fn fixture_bare_identity_key_in_cwd() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref() != Some("identity-key-bare") {
+            return;
+        }
+        let cwd = std::path::PathBuf::from(
+            std::env::var("GITLAWB_TEST_BASE").expect("GITLAWB_TEST_BASE"),
+        );
+        std::env::set_current_dir(&cwd).expect("chdir into isolated tempdir");
+        let cwd_mode_before = std::fs::symlink_metadata(".").unwrap().permissions().mode() & 0o7777;
+
+        let name = std::env::var("GITLAWB_TEST_KEY_NAME").expect("GITLAWB_TEST_KEY_NAME");
+        let kp = load_or_create_keypair_at(std::path::Path::new(&name))
+            .unwrap_or_else(|e| panic!("bare identity path {name:?} must create, got: {e:#}"));
+        assert!(
+            std::path::Path::new(&name).exists() || std::path::Path::new("identity.pem").exists(),
+            "the key must land in the working directory"
+        );
+        let key = if std::path::Path::new(&name).exists() {
+            std::path::PathBuf::from(&name)
+        } else {
+            std::path::PathBuf::from("identity.pem")
+        };
+        assert_eq!(
+            std::fs::symlink_metadata(&key)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600,
+            "the identity key must be owner-only"
+        );
+        let cwd_mode_after = std::fs::symlink_metadata(".").unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            cwd_mode_before, cwd_mode_after,
+            "creating a bare identity key must not chmod the working directory"
+        );
+        let reloaded = load_or_create_keypair_at(std::path::Path::new(&name)).expect("reload");
+        assert_eq!(kp.did(), reloaded.did(), "the identity must be stable");
+        println!("identity-key-bare: asserted did={}", kp.did());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bare_identity_key_path_creates_in_cwd_without_chmodding_cwd() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for name in ["identity.pem", "./identity.pem"] {
+            let base = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+            cmd.args([
+                "identity_key_storage_tests::fixture_bare_identity_key_in_cwd",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("GITLAWB_TEST_FIXTURE", "identity-key-bare")
+            .env("GITLAWB_TEST_BASE", base.path())
+            .env("GITLAWB_TEST_KEY_NAME", name);
+            let output = cmd.output().expect("spawn the bare-identity fixture");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "name={name}: bare identity path must create\n\
+                 --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+            );
+            assert!(
+                stdout.contains("1 passed"),
+                "name={name}: filter must select one passing test\n{stdout}"
+            );
+            assert!(
+                stdout.contains("identity-key-bare: asserted did="),
+                "name={name}: fixture must print its sentinel\n{stdout}"
+            );
+            let cwd_mode = std::fs::symlink_metadata(base.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(
+                cwd_mode, 0o755,
+                "name={name}: the parent test must also see cwd left at 0755"
+            );
+        }
+    }
+
+    /// A 0600 identity file is not protected if cwd is group/world-writable:
+    /// another local user can unlink or replace the entry. Creating into that
+    /// cwd must fail, and must not leave a key behind. Do not chmod cwd.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=identity-key-bare-writable"]
+    fn fixture_bare_identity_key_in_writable_cwd_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref()
+            != Some("identity-key-bare-writable")
+        {
+            return;
+        }
+        let cwd = std::path::PathBuf::from(
+            std::env::var("GITLAWB_TEST_BASE").expect("GITLAWB_TEST_BASE"),
+        );
+        std::env::set_current_dir(&cwd).expect("chdir into isolated tempdir");
+        std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let cwd_mode_before = std::fs::symlink_metadata(".").unwrap().permissions().mode() & 0o7777;
+
+        let Err(err) = load_or_create_keypair_at(std::path::Path::new("identity.pem")) else {
+            panic!("a bare identity path under a writable cwd must be refused");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("writable beyond its owner") || msg.contains("0777"),
+            "the refusal must name the writable-parent reason, got: {msg}"
+        );
+        assert!(
+            !std::path::Path::new("identity.pem").exists(),
+            "a refused cwd must not have identity.pem created"
+        );
+        let cwd_mode_after = std::fs::symlink_metadata(".").unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            cwd_mode_before, cwd_mode_after,
+            "refusing a writable cwd must not chmod it"
+        );
+        println!("identity-key-bare-writable: asserted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bare_identity_key_path_refuses_a_writable_cwd() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+        cmd.args([
+            "identity_key_storage_tests::fixture_bare_identity_key_in_writable_cwd_is_refused",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("GITLAWB_TEST_FIXTURE", "identity-key-bare-writable")
+        .env("GITLAWB_TEST_BASE", base.path());
+        let output = cmd
+            .output()
+            .expect("spawn the writable-cwd identity fixture");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "writable cwd must refuse the bare identity path\n\
+             --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "filter must select one passing test\n{stdout}"
+        );
+        assert!(
+            stdout.contains("identity-key-bare-writable: asserted"),
+            "fixture must print its sentinel\n{stdout}"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(base.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "parent must also see no identity.pem, found: {leftovers:?}"
+        );
+        let cwd_mode = std::fs::symlink_metadata(base.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(cwd_mode, 0o777, "cwd must stay 0777");
+    }
+
+    /// An existing key in a writable directory still loads. Create is refused
+    /// there; turning that into a boot failure on upgrade would strand nodes
+    /// that already have a key.
+    #[cfg(unix)]
+    #[test]
+    fn existing_identity_in_a_writable_dir_still_loads() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let key = base.path().join("identity.pem");
+        let created = load_or_create_keypair_at(&key).expect("create under 0755");
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let reloaded = load_or_create_keypair_at(&key)
+            .expect("an existing identity in a writable directory must still load");
+        assert_eq!(created.did(), reloaded.did());
+        assert_eq!(
+            std::fs::symlink_metadata(base.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o777,
+            "load must not chmod the writable directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_symlink_key_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let real = base.path().join("real.pem");
+        let created = load_or_create_keypair_at(&real).expect("create the symlink target");
+        std::os::unix::fs::symlink(&real, base.path().join("identity.pem")).unwrap();
+        let err = match load_or_create_keypair_at(&base.path().join("identity.pem")) {
+            Ok(kp) => panic!(
+                "a symlink at the identity path must be refused, not followed; loaded did={}",
+                kp.did()
+            ),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("symlink") || err.to_lowercase().contains("too many levels"),
+            "symlink refusal must name the link, got: {err}"
+        );
+        let reread = load_or_create_keypair_at(&real).expect("target still loads by its real path");
+        assert_eq!(
+            created.did(),
+            reread.did(),
+            "the symlink target must be unchanged"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_symlinked_grandparent_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let key = link.join("keys").join("identity.pem");
+        let err = match load_or_create_keypair_at(&key) {
+            Ok(_) => panic!("a symlinked grandparent must be refused, not followed"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("symlink")
+                || err.to_lowercase().contains("too many levels")
+                || err.contains("loop"),
+            "symlinked grandparent refusal must name the link, got: {err}"
+        );
+        assert!(
+            !real.join("keys").exists(),
+            "symlink target must be untouched"
+        );
+    }
+
+    /// Build `base/evil/one` plus `base/link -> evil`, the layout every
+    /// interior-symlink row shares. `link` is relative so the layout is
+    /// self-contained; the absolute row builds its own.
+    #[cfg(unix)]
+    fn plant_interior_symlink_layout(base: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let evil = base.join("evil");
+        std::fs::create_dir(&evil).expect("create the symlink target directory");
+        std::fs::set_permissions(&evil, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod the symlink target directory");
+        let one = evil.join("one");
+        std::fs::create_dir(&one).expect("create the already-existing next level");
+        std::fs::set_permissions(&one, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod the already-existing next level");
+        std::os::unix::fs::symlink("evil", base.join("link")).expect("plant the interior symlink");
+        evil
+    }
+
+    /// `O_NOFOLLOW` binds the FINAL component only, so an interior symlink
+    /// whose next level already exists is resolved in one open and followed.
+    /// With `link -> evil` and `evil/one` present, the walk-up opens
+    /// `link/one` by pathname, anchors on `evil/one`, and creates the node
+    /// identity inside the attacker's tree.
+    #[cfg(unix)]
+    #[test]
+    fn identity_interior_symlink_with_existing_next_level_is_refused_not_followed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let evil = plant_interior_symlink_layout(base.path());
+
+        let key = base
+            .path()
+            .join("link")
+            .join("one")
+            .join("two")
+            .join("identity.pem");
+        match load_or_create_keypair_at(&key) {
+            Ok(kp) => panic!(
+                "an interior symlink on the key path was followed, not refused: the identity \
+                 {} was created through {} into the symlink's target\nkey storage:\n{}",
+                kp.did(),
+                key.display(),
+                identity_key_tree(base.path(), &key)
+            ),
+            Err(e) => assert_names_symlink_refusal(
+                &format!("{e:#}"),
+                "an interior symlink whose next level already exists",
+            ),
+        }
+        assert_identity_absent(&evil.join("one").join("two"));
+        assert_no_identity_key_under(
+            base.path(),
+            "an interior symlink with an existing next level",
+        );
+    }
+
+    /// The same interior symlink pointed by absolute path at a directory
+    /// outside the base. Following it publishes the node's identity somewhere
+    /// the configured path does not name at all, so the assertion is that no
+    /// key appears outside the base.
+    #[cfg(unix)]
+    #[test]
+    fn identity_interior_symlink_escaping_the_base_must_not_publish_the_key_outside_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(outside.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let outside_one = outside.path().join("one");
+        std::fs::create_dir(&outside_one).expect("create the escaped next level");
+        std::fs::set_permissions(&outside_one, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(outside.path(), base.path().join("link"))
+            .expect("plant the absolute escaping symlink");
+
+        let key = base
+            .path()
+            .join("link")
+            .join("one")
+            .join("two")
+            .join("identity.pem");
+        match load_or_create_keypair_at(&key) {
+            Ok(kp) => panic!(
+                "an absolute interior symlink was followed out of the base: the identity {} \
+                 was created outside {} through {}",
+                kp.did(),
+                base.path().display(),
+                key.display()
+            ),
+            Err(e) => assert_names_symlink_refusal(
+                &format!("{e:#}"),
+                "an interior symlink whose target is outside the base",
+            ),
+        }
+        assert_no_identity_key_under(outside.path(), "an escaping interior symlink");
+        assert_identity_absent(&outside_one.join("two"));
+    }
+
+    /// A chain, because refusing one link is not the same property as
+    /// refusing the path. `l1 -> l2 -> evil`, so the resolution that must be
+    /// refused takes two hops before it reaches the existing next level.
+    #[cfg(unix)]
+    #[test]
+    fn identity_chained_interior_symlinks_are_refused_not_followed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let evil = base.path().join("evil");
+        std::fs::create_dir(&evil).unwrap();
+        std::fs::set_permissions(&evil, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let one = evil.join("one");
+        std::fs::create_dir(&one).unwrap();
+        std::fs::set_permissions(&one, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink("evil", base.path().join("l2")).expect("plant the second hop");
+        std::os::unix::fs::symlink("l2", base.path().join("l1")).expect("plant the first hop");
+
+        let key = base
+            .path()
+            .join("l1")
+            .join("one")
+            .join("two")
+            .join("identity.pem");
+        match load_or_create_keypair_at(&key) {
+            Ok(kp) => panic!(
+                "a two-link chain on the key path was followed, not refused: the identity {} \
+                 was created through {}",
+                kp.did(),
+                key.display()
+            ),
+            Err(e) => {
+                assert_names_symlink_refusal(&format!("{e:#}"), "a chain of two interior symlinks")
+            }
+        }
+        assert_identity_absent(&one.join("two"));
+        assert_no_identity_key_under(base.path(), "a chain of two interior symlinks");
+    }
+
+    /// The existing-named-parent fast path never enters the walk: it opens the
+    /// whole configured parent pathname in one call and publishes into
+    /// whatever that resolves to. `link/one` exists through the symlink, so
+    /// this row reaches the fast path and not the walk-up.
+    #[cfg(unix)]
+    #[test]
+    fn identity_existing_named_parent_reached_through_a_symlink_is_refused_not_followed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let evil = plant_interior_symlink_layout(base.path());
+
+        let key = base.path().join("link").join("one").join("identity.pem");
+        match load_or_create_keypair_at(&key) {
+            Ok(kp) => panic!(
+                "the existing-named-parent fast path followed an interior symlink: the identity \
+                 {} was published into {} through {}",
+                kp.did(),
+                evil.join("one").display(),
+                key.display()
+            ),
+            Err(e) => assert_names_symlink_refusal(
+                &format!("{e:#}"),
+                "an interior symlink on the existing-named-parent fast path",
+            ),
+        }
+        assert_identity_absent(&evil.join("one").join("identity.pem"));
+        assert_no_identity_key_under(base.path(), "the existing-named-parent fast path");
+    }
+
+    /// Fixture: the relative-path row. `cwd` is process-global, so the row
+    /// that proves a relative configured path is judged the same way runs in
+    /// its own process. Double-gated like the other fixtures here: `#[ignore]`
+    /// keeps it out of a normal run and the env check keeps it inert under a
+    /// bare `--ignored` sweep, which would otherwise chdir the shared test
+    /// process.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=identity-symlink-relative"]
+    fn fixture_identity_relative_path_with_interior_symlink() {
+        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref()
+            != Some("identity-symlink-relative")
+        {
+            return;
+        }
+        let base = std::path::PathBuf::from(
+            std::env::var("GITLAWB_TEST_BASE").expect("GITLAWB_TEST_BASE"),
+        );
+        let evil = plant_interior_symlink_layout(&base);
+        std::env::set_current_dir(&base).expect("chdir into the row's base");
+
+        let call_path = std::path::Path::new("link/one/two/identity.pem");
+        match load_or_create_keypair_at(call_path) {
+            Ok(kp) => panic!(
+                "an interior symlink on a RELATIVE key path was followed, not refused: the \
+                 identity {} was created through {}",
+                kp.did(),
+                call_path.display()
+            ),
+            Err(e) => assert_names_symlink_refusal(
+                &format!("{e:#}"),
+                "an interior symlink on a relative configured path",
+            ),
+        }
+        assert_identity_absent(&evil.join("one").join("two"));
+        assert_no_identity_key_under(&base, "a relative path with an interior symlink");
+        println!("identity-symlink-relative: refused");
+    }
+
+    /// Driver for the relative row. An absolute path is not the only shape an
+    /// operator configures, and the walk resolves a relative pathname against
+    /// the process cwd, so the same interior-symlink refusal has to hold there.
+    #[cfg(unix)]
+    #[test]
+    fn identity_relative_key_path_with_interior_symlink_is_refused_not_followed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const REFUSED_SENTINEL: &str = "identity-symlink-relative: refused";
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+        cmd.args([
+            "identity_key_storage_tests::fixture_identity_relative_path_with_interior_symlink",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("GITLAWB_TEST_FIXTURE", "identity-symlink-relative")
+        .env("GITLAWB_TEST_BASE", base.path());
+        let output = cmd
+            .output()
+            .expect("spawn the relative-path symlink fixture");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            output.status.success(),
+            "a relative key path with an interior symlink must be refused, not followed\n\
+             --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+        // A filter matching nothing exits 0, and the fixture's env gate returns
+        // early as a passing test, so neither alone is proof the row ran.
+        assert!(
+            stdout.contains("1 passed"),
+            "the filter must select one passing test\n{stdout}"
+        );
+        assert!(
+            stdout.contains(REFUSED_SENTINEL),
+            "the fixture must print its refusal sentinel\n--- stdout ---\n{stdout}"
+        );
+    }
+
+    /// THE LOAD PATH, which is the identity-substitution primitive rather than
+    /// a permissions bug. The node's real key sits at `a/keys/identity.pem`
+    /// and the configured path is `link/keys/identity.pem`. An attacker who
+    /// can only repoint `link` from `a` to `b` makes the load resolve to a PEM
+    /// they supplied, and the node boots as THEIR DID while the real key is
+    /// still on disk, untouched, with nothing logged as wrong.
+    ///
+    /// The assertion is on the DID, not on a mode or an error string: a mode
+    /// assertion cannot see a substitution, because the substituted key is
+    /// a perfectly well-formed 0600 PEM.
+    #[cfg(unix)]
+    #[test]
+    fn identity_load_through_repointed_interior_symlink_must_not_adopt_the_substituted_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let real_key = base.path().join("a").join("keys").join("identity.pem");
+        let real_did = load_or_create_keypair_at(&real_key)
+            .expect("plant the node's real identity")
+            .did()
+            .to_string();
+        let attacker_key = base.path().join("b").join("keys").join("identity.pem");
+        let attacker_did = load_or_create_keypair_at(&attacker_key)
+            .expect("plant the attacker's identity")
+            .did()
+            .to_string();
+        assert_ne!(
+            real_did, attacker_did,
+            "the row needs two distinct identities to tell substitution from a load"
+        );
+        let real_bytes = std::fs::read(&real_key).expect("read the real key");
+
+        // The configured path never changes. Only the interior component does,
+        // which is exactly the authority an attacker with write access to one
+        // directory has.
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink("a", &link).expect("point the configured path at the real key");
+        std::fs::remove_file(&link).expect("the attacker repoints the interior component");
+        std::os::unix::fs::symlink("b", &link).expect("repoint the interior component");
+
+        let configured = link.join("keys").join("identity.pem");
+        match load_or_create_keypair_at(&configured) {
+            Ok(kp) => {
+                let booted = kp.did().to_string();
+                if booted == attacker_did {
+                    panic!(
+                        "identity substitution: repointing the interior symlink {} made the node \
+                         boot as the attacker's identity {attacker_did} (planted at {}) instead \
+                         of its own {real_did} at {}",
+                        link.display(),
+                        attacker_key.display(),
+                        real_key.display()
+                    );
+                }
+                panic!(
+                    "the load followed the interior symlink at {} and returned {booted} rather \
+                     than refusing the path",
+                    link.display()
+                );
+            }
+            Err(e) => assert_names_symlink_refusal(
+                &format!("{e:#}"),
+                "a repointed interior symlink on the load path",
+            ),
+        }
+
+        assert_eq!(
+            std::fs::read(&real_key).expect("read the real key"),
+            real_bytes,
+            "the real key must be untouched by the refused boot"
+        );
+        assert_eq!(
+            load_or_create_keypair_at(&real_key)
+                .expect("the real key must still load by its real path")
+                .did()
+                .to_string(),
+            real_did,
+            "the node's own identity must be unchanged"
+        );
+    }
+
+    /// The weaker variant of the same primitive. The attacker repoints the
+    /// interior component at an EMPTY directory, the load finds no key, and
+    /// the create path mints a fresh identity and logs it as a first boot. The
+    /// node comes up with a DID nobody knows and its real key is orphaned in
+    /// place with nothing reported.
+    #[cfg(unix)]
+    #[test]
+    fn identity_load_through_symlink_to_an_empty_directory_must_not_silently_mint_a_new_identity() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let real_key = base.path().join("a").join("keys").join("identity.pem");
+        let real_did = load_or_create_keypair_at(&real_key)
+            .expect("plant the node's real identity")
+            .did()
+            .to_string();
+        let real_bytes = std::fs::read(&real_key).expect("read the real key");
+
+        let empty_keys = base.path().join("empty").join("keys");
+        std::fs::create_dir_all(&empty_keys).expect("create the empty target tree");
+        std::fs::set_permissions(&empty_keys, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            base.path().join("empty"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink("a", &link).expect("point the configured path at the real key");
+        std::fs::remove_file(&link).expect("the attacker repoints the interior component");
+        std::os::unix::fs::symlink("empty", &link).expect("repoint at an empty directory");
+
+        let configured = link.join("keys").join("identity.pem");
+        match load_or_create_keypair_at(&configured) {
+            Ok(kp) => {
+                let booted = kp.did().to_string();
+                panic!(
+                    "silent identity loss: repointing the interior symlink {} at an empty \
+                     directory made the node mint a fresh identity {booted} as if this were a \
+                     first boot, orphaning its real identity {real_did} at {}",
+                    link.display(),
+                    real_key.display()
+                );
+            }
+            Err(e) => assert_names_symlink_refusal(
+                &format!("{e:#}"),
+                "an interior symlink repointed at an empty directory",
+            ),
+        }
+
+        assert_identity_absent(&empty_keys.join("identity.pem"));
+        assert_eq!(
+            std::fs::read(&real_key).expect("read the real key"),
+            real_bytes,
+            "the real key must be untouched by the refused boot"
+        );
+        assert_eq!(
+            load_or_create_keypair_at(&real_key)
+                .expect("the real key must still load by its real path")
+                .did()
+                .to_string(),
+            real_did,
+            "the node's own identity must be unchanged"
+        );
+    }
+
+    /// Already correct, and here so it stays that way: a symlink at the key's
+    /// IMMEDIATE parent is the final component of the load's directory open,
+    /// which is the one position `O_NOFOLLOW` does bind.
+    #[cfg(unix)]
+    #[test]
+    fn identity_symlinked_immediate_parent_is_refused_at_load() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let real = base.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let planted_did = load_or_create_keypair_at(&real.join("identity.pem"))
+            .expect("plant a key behind the symlink")
+            .did()
+            .to_string();
+        std::os::unix::fs::symlink("real", base.path().join("link")).unwrap();
+
+        let configured = base.path().join("link").join("identity.pem");
+        match load_or_create_keypair_at(&configured) {
+            Ok(kp) => panic!(
+                "a symlink at the key's immediate parent was followed: loaded {} (planted \
+                 {planted_did}) through {}",
+                kp.did(),
+                configured.display()
+            ),
+            Err(e) => assert_names_symlink_refusal(
+                &format!("{e:#}"),
+                "a symlink at the key's immediate parent",
+            ),
+        }
+    }
+
+    /// Already correct, and here so it stays that way: a dangling symlink is
+    /// refused rather than replaced by a real directory of the same name,
+    /// both when it is the top component of the missing suffix and when it
+    /// sits under a real directory.
+    #[cfg(unix)]
+    #[test]
+    fn identity_dangling_symlink_on_the_key_path_is_refused_never_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for under_real_dir in [false, true] {
+            let base = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let holder = if under_real_dir {
+                let real = base.path().join("real");
+                std::fs::create_dir(&real).unwrap();
+                std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+                real
+            } else {
+                base.path().to_path_buf()
+            };
+            let link = holder.join("link");
+            std::os::unix::fs::symlink("nowhere", &link).expect("plant the dangling symlink");
+
+            let key = link.join("one").join("identity.pem");
+            let where_ = if under_real_dir {
+                "a dangling symlink under a real directory"
+            } else {
+                "a dangling symlink at the top of the path"
+            };
+            match load_or_create_keypair_at(&key) {
+                Ok(kp) => panic!(
+                    "{where_} was not refused: the identity {} was created through {}",
+                    kp.did(),
+                    key.display()
+                ),
+                Err(e) => assert_names_symlink_refusal(&format!("{e:#}"), where_),
+            }
+            assert!(
+                std::fs::symlink_metadata(&link)
+                    .expect("the dangling symlink must still be there")
+                    .file_type()
+                    .is_symlink(),
+                "{where_}: the refused boot replaced {} with something else",
+                link.display()
+            );
+            assert_no_identity_key_under(base.path(), where_);
+        }
+    }
+
+    /// 0111 grandparent cannot mkdir, so the key directory must already exist.
+    /// Opening that grandparent must not require directory-list permission.
+    #[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+    #[test]
+    fn identity_search_only_grandparent_publishes_into_existing_key_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let gp = base.path().join("searchonly");
+        let keys = gp.join("keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&gp, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let key = keys.join("identity.pem");
+        let created = match load_or_create_keypair_at(&key) {
+            Ok(kp) => kp,
+            Err(e) => {
+                let _ = std::fs::set_permissions(&gp, std::fs::Permissions::from_mode(0o700));
+                panic!("search-only grandparent must be enough to publish into an existing 0700 key dir: {e:#}");
+            }
+        };
+        let reloaded = load_or_create_keypair_at(&key);
+        std::fs::set_permissions(&gp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let reloaded = reloaded.expect("reload");
+        assert_eq!(created.did(), reloaded.did());
+    }
+
+    /// `/identity.pem` is a pathname contract, not a filesystem probe: its
+    /// parent is the root, which the operator has already nominated, so
+    /// `create_pinned_dir_and_publish` must take the already-nominated branch.
+    /// Asserted lexically because a probe against the real `/` cannot be
+    /// isolated and, run as root, leaves a real key at `/identity.pem`.
+    #[cfg(unix)]
+    #[test]
+    fn identity_root_adjacent_path_is_an_already_nominated_parent() {
+        use std::path::{Component, Path};
+
+        let root_adjacent = Path::new("/identity.pem");
+
+        assert!(
+            !p2p::path_denotes_a_directory(root_adjacent, None),
+            "the lexical gate in load_or_create_keypair_at must admit /identity.pem"
+        );
+        assert!(
+            !root_adjacent
+                .components()
+                .any(|c| c == Component::ParentDir),
+            "/identity.pem walks back out through no `..`"
+        );
+        assert_eq!(
+            p2p::key_parent(root_adjacent),
+            Path::new("/"),
+            "the lexical parent of /identity.pem is the filesystem root"
+        );
+        assert!(
+            p2p::identity_parent_is_already_nominated(root_adjacent),
+            "root-adjacent identity path must take the already-nominated branch, not the named-parent branch that fails with 'names no final directory component'"
+        );
+
+        for nominated in ["identity.pem", "./identity.pem"] {
+            assert!(
+                p2p::identity_parent_is_already_nominated(Path::new(nominated)),
+                "{nominated} publishes into the working directory, which is already nominated"
+            );
+        }
+
+        for named in [
+            "/data/identity.pem",
+            "keys/identity.pem",
+            "/identity/identity.pem",
+        ] {
+            assert!(
+                !p2p::identity_parent_is_already_nominated(Path::new(named)),
+                "{named} names a parent component this process may create"
+            );
+        }
+    }
+
+    /// A terminal `.` is a directory spelling. Path drops it, so this would
+    /// otherwise publish a 0600 file named `keys` under `data`.
+    #[cfg(unix)]
+    #[test]
+    fn identity_terminal_dot_path_is_refused_without_retargeting() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let data = base.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let spelling = format!("{}/keys/.", data.display());
+        let key = std::path::Path::new(&spelling);
+        let Err(err) = load_or_create_keypair_at(key) else {
+            panic!("a terminal `.` identity path must be refused");
+        };
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("must name a key file") || text.contains("directory"),
+            "the refusal must name the directory spelling, got: {text}"
+        );
+        let mode = std::fs::symlink_metadata(&data)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o755, "rejection must not chmod the parent");
+        assert!(
+            !data.join("keys").exists(),
+            "rejection must not create a file named keys"
+        );
+    }
+}

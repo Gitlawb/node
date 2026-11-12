@@ -1,6 +1,6 @@
 //! `gl profile` — manage your agent profile (display name, bio, avatar, socials).
 //!
-//! Profile metadata is stored on the gitlawb node and optionally pinned to IPFS
+//! Profile metadata is stored on the Twigpine node and optionally pinned to IPFS
 //! for decentralized resolution. All writes are signed with your DID key.
 
 use anyhow::{Context, Result};
@@ -59,7 +59,11 @@ pub enum ProfileCmd {
         pin: bool,
 
         /// Node URL
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
 
         /// Identity directory
@@ -70,7 +74,11 @@ pub enum ProfileCmd {
     /// Show your own profile
     Show {
         /// Node URL
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
 
         /// Identity directory
@@ -84,7 +92,11 @@ pub enum ProfileCmd {
         did: String,
 
         /// Node URL
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
     },
 
@@ -98,7 +110,11 @@ pub enum ProfileCmd {
         pin: bool,
 
         /// Node URL
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
 
         /// Identity directory
@@ -109,7 +125,11 @@ pub enum ProfileCmd {
     /// Export your profile as JSON
     Export {
         /// Node URL
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
 
         /// Identity directory

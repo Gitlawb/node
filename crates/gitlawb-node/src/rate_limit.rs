@@ -73,6 +73,14 @@ impl RateLimiter {
         self.window.min(Duration::from_secs(1))
     }
 
+    /// The configured window, exposed so a 429 can carry an honest
+    /// `retry-after`: a hardcoded value lies when the operator retunes the
+    /// window, and a client that honors the header would retry into another
+    /// 429 until the real window elapses.
+    pub fn window(&self) -> Duration {
+        self.window
+    }
+
     pub(crate) async fn check(&self, key: &str) -> bool {
         // max_requests == 0 means the limiter is disabled, not "block all".
         if self.max_requests == 0 {
@@ -144,6 +152,23 @@ impl RateLimiter {
             return window.timestamps.len() >= self.max_requests;
         }
         false
+    }
+
+    /// The configured key ceiling. Tests use it to assert that a limiter a
+    /// production factory builds is actually bounded, which flooding the real
+    /// ceiling in distinct keys would be far too slow to show.
+    #[cfg(test)]
+    pub fn max_keys(&self) -> usize {
+        self.max_keys
+    }
+
+    /// The configured per-key request cap. Tests use it to assert that a
+    /// limiter a production factory builds carries the cap it is documented
+    /// with; re-asserting the constant on its own cannot tell whether the
+    /// factory passed that constant or a different one.
+    #[cfg(test)]
+    pub fn max_requests(&self) -> usize {
+        self.max_requests
     }
 
     pub async fn cleanup(&self) {
@@ -282,7 +307,7 @@ pub async fn rate_limit_by_did(request: Request, next: Next) -> Response {
             // Same response as the per-IP brake: a client cannot act on the
             // difference between the two buckets, and both need the code that
             // tells them apart from the ledger's 429.
-            return too_many_requests();
+            return too_many_requests(limiter.window().as_secs());
         }
     }
 
@@ -397,6 +422,11 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerAddr {
     }
 }
 
+/// The message every per-IP brake answers with, shared so the GraphQL surface
+/// (which cannot return a 429 status inside a 200 GraphQL envelope) says the
+/// same thing as the REST routes.
+pub const RATE_LIMIT_MESSAGE: &str = "rate limit exceeded — try again later";
+
 /// The shared 429 response for the flood brakes. Route-agnostic: this serves
 /// the push path AND the peer-sync routes, so the message stays generic (the
 /// offending path is recorded in the warn log at the call site).
@@ -409,14 +439,66 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerAddr {
 /// headers produces. A client cannot act on a difference it cannot see: `gl`
 /// would print "invalid JSON response" for a rate limit, and a peer's sync
 /// sender would retry a brake it can never clear inside its budget.
-pub fn too_many_requests() -> Response {
+pub fn too_many_requests(retry_after_secs: u64) -> Response {
     let code = NodeDenial::RateLimited.as_str();
     (
         StatusCode::TOO_MANY_REQUESTS,
-        [("retry-after", "60"), ("X-Gitlawb-Error", code)],
-        Json(json!({ "error": code, "message": "rate limit exceeded — try again later" })),
+        [
+            ("retry-after", retry_after_secs.to_string()),
+            ("X-Gitlawb-Error", code.to_string()),
+        ],
+        Json(json!({ "error": code, "message": RATE_LIMIT_MESSAGE })),
     )
         .into_response()
+}
+
+/// The per-IP task-read brake carried as GraphQL request data: the limiter plus
+/// the client key the transport already resolved.
+///
+/// `/graphql` is a single POST endpoint, so this brake cannot sit in middleware
+/// the way `task_read_routes` mounts `rate_limit_by_ip`: that would charge every
+/// unrelated query and every mutation against the task-read bucket. The two task
+/// resolvers debit it instead, which also prices an aliased query honestly — ten
+/// aliased `tasks` fields run the visibility gate ten times and pay ten slots,
+/// where one request-scoped debit would pay one (#327 review).
+/// Default cap on the number of task read fields (across all aliases) permitted
+/// in a single GraphQL request before rejecting further field executions (#327 review).
+pub const MAX_GRAPHQL_TASK_READS_PER_REQUEST: usize = 5;
+
+#[derive(Clone)]
+pub struct TaskReadBrake {
+    pub limiter: RateLimiter,
+    /// `None` when no key could be resolved at all (no trusted header and no
+    /// `ConnectInfo`, e.g. a synthetic test request). Never braked, matching
+    /// [`rate_limit_by_ip`].
+    pub key: Option<String>,
+    pub request_count: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl TaskReadBrake {
+    /// Debit one slot for one task-read field. `true` = proceed.
+    pub async fn check(&self, field: &str) -> bool {
+        let Some(key) = self.key.as_deref() else {
+            return true;
+        };
+        let count = self
+            .request_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count >= MAX_GRAPHQL_TASK_READS_PER_REQUEST {
+            tracing::warn!(
+                key = %key,
+                field = %field,
+                count = count + 1,
+                "per-request GraphQL task field limit exceeded"
+            );
+            return false;
+        }
+        if self.limiter.check(key).await {
+            return true;
+        }
+        tracing::warn!(key = %key, field = %field, "per-IP rate limit exceeded");
+        false
+    }
 }
 
 /// Throttle the git push path by resolved client IP. The socket peer address is
@@ -438,7 +520,7 @@ pub async fn rate_limit_by_ip(request: Request, next: Next) -> Response {
             if let Some(key) = client_key(request.headers(), peer, limiter.trust) {
                 if !limiter.limiter.check(&key).await {
                     tracing::warn!(key = %key, path = %request.uri().path(), "per-IP rate limit exceeded");
-                    return too_many_requests();
+                    return too_many_requests(limiter.limiter.window().as_secs());
                 }
             }
         }
@@ -457,7 +539,7 @@ mod tests {
     /// `X-Gitlawb-Error` header and a JSON body whose `error` matches it.
     #[tokio::test]
     async fn brake_429_carries_a_machine_readable_code_and_json_body() {
-        let resp = too_many_requests();
+        let resp = too_many_requests(60);
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
             resp.headers()

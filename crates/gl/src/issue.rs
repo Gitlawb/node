@@ -32,7 +32,11 @@ pub enum IssueCmd {
         /// Issue body (optional)
         #[arg(long, short)]
         body: Option<String>,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -41,7 +45,11 @@ pub enum IssueCmd {
     List {
         /// Repository in <owner>/<repo> or <repo> format
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -52,7 +60,11 @@ pub enum IssueCmd {
         repo: String,
         /// Issue ID
         id: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -63,7 +75,11 @@ pub enum IssueCmd {
         repo: String,
         /// Issue ID
         id: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -74,7 +90,11 @@ pub enum IssueCmd {
         id: String,
         #[arg(long, short)]
         body: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -83,7 +103,11 @@ pub enum IssueCmd {
     Comments {
         repo: String,
         id: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -142,12 +166,7 @@ async fn resolve_repo(
             did.split(':').next_back().unwrap_or(&did).to_string()
         } else {
             let client = NodeClient::new(node, None);
-            let info: Value = client
-                .get("/")
-                .await?
-                .json()
-                .await
-                .context("failed to fetch node info")?;
+            let info = crate::http::read_json(client.get("/").await?, "node info").await?;
             let did = info["did"].as_str().context("node info missing 'did'")?;
             did.split(':').next_back().unwrap_or(did).to_string()
         };
@@ -215,12 +234,7 @@ async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
 
     let client = signed_client(&node, dir.as_deref());
     let path = format!("/api/v1/repos/{owner}/{name}/issues");
-    let resp: Value = client
-        .get_authed(&path)
-        .await?
-        .json()
-        .await
-        .context("failed to list issues")?;
+    let resp = crate::http::read_json(client.get_authed(&path).await?, "issues").await?;
 
     let issues = resp["issues"].as_array().cloned().unwrap_or_default();
 
@@ -237,7 +251,7 @@ async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
         let status = issue["status"].as_str().unwrap_or("?");
         let created = issue["created_at"]
             .as_str()
-            .map(|s| &s[..10])
+            .map(|s| crate::text::truncate(s, 10))
             .unwrap_or("?");
         let icon = match status {
             "open" => "○",
@@ -330,14 +344,15 @@ async fn cmd_issue_comments(
     let (owner, name) = resolve_repo(&repo, &node, dir.as_deref()).await?;
     let client = signed_client(&node, dir.as_deref());
 
-    let resp: Value = client
-        .get_authed(&format!(
-            "/api/v1/repos/{owner}/{name}/issues/{id}/comments"
-        ))
-        .await?
-        .json()
-        .await
-        .context("invalid JSON")?;
+    let resp = crate::http::read_json(
+        client
+            .get_authed(&format!(
+                "/api/v1/repos/{owner}/{name}/issues/{id}/comments"
+            ))
+            .await?,
+        "issue comments",
+    )
+    .await?;
 
     let comments = resp["comments"].as_array().cloned().unwrap_or_default();
     if comments.is_empty() {
@@ -351,10 +366,13 @@ async fn cmd_issue_comments(
         let author_short = author
             .split(':')
             .next_back()
-            .map(|s| &s[..s.len().min(8)])
+            .map(|s| crate::text::truncate(s, 8))
             .unwrap_or("?");
         let cbody = c["body"].as_str().unwrap_or("");
-        let created = c["created_at"].as_str().map(|s| &s[..10]).unwrap_or("?");
+        let created = c["created_at"]
+            .as_str()
+            .map(|s| crate::text::truncate(s, 10))
+            .unwrap_or("?");
         println!("  · {author_short} ({created})");
         println!("    {cbody}");
         println!();
@@ -426,6 +444,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cmd_list_survives_malformed_timestamps() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+
+        let mut server = mockito::Server::new_async().await;
+        // A short timestamp used to panic on `&s[..10]`; a timestamp whose
+        // byte 10 is mid-char panics even with a len() guard.
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/issues$".to_string()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"issues":[{"id":"a","title":"short ts","status":"open","created_at":"2026"},{"id":"b","title":"mb ts","status":"open","created_at":"2026-08-1é5T00:00:00Z"},{"id":"c","title":"empty ts","status":"open","created_at":""}]}"#)
+            .create_async()
+            .await;
+
+        cmd_list(
+            "myrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn test_cmd_create_success() {
         let dir = TempDir::new().unwrap();
         write_identity(&dir);
@@ -467,6 +513,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"repo not found"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -481,6 +528,8 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("repo not found"));
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -528,6 +577,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"issue not found"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -541,6 +591,8 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("show failed"), "got: {err}");
         assert!(err.to_string().contains("issue not found"), "got: {err}");
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy the error assertion vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -589,6 +641,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"issue not found"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -601,6 +654,8 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("close issue failed"), "got: {err}");
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy the error assertion vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -647,6 +702,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"issue not found"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -660,6 +716,8 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("issue not found"), "got: {err}");
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy the error assertion vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -716,5 +774,49 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cmd_list_surfaces_denial_not_empty() {
+        // A gated 404 on the issue-list read must Err, not print "No issues".
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/alice/secret/issues$".to_string()),
+            )
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = cmd_list("alice/secret".to_string(), server.url(), None).await;
+        assert!(result.is_err(), "issue list must Err on a gated 404");
+        // Prove the gated issues path was actually requested: without this, an
+        // unmatched route (mockito's 501, also non-2xx) would satisfy is_err().
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn resolve_repo_surfaces_denial() {
+        // A slash-free repo with an empty identity dir forces the GET / node-info
+        // fetch. A gated 404 there must Err (surfacing the status), proving the
+        // read_json conversion is load-bearing rather than silently ignored.
+        let mut server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap(); // empty, no identity.pem, forces the GET / branch
+        let _m = server
+            .mock("GET", "/")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"denied"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let err = resolve_repo("noslash", &server.url(), Some(dir.path()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"), "got: {err}");
+        _m.assert_async().await;
     }
 }
