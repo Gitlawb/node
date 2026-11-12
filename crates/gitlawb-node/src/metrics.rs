@@ -20,7 +20,7 @@
 //!     `gitlawb_gossip_replay_guard_saturated_total`
 //!   * how big are the packs we're sending and receiving? —
 //!     `gitlawb_pack_size_bytes`
-//!   * how long until an origin ref update is visible on this mirror? —
+//!   * how long after an origin lands a push is it visible on this mirror? —
 //!     `gitlawb_sync_lag_seconds`
 //!   * a single `gitlawb_info{version, did}` gauge = 1, for joins/dashboards
 //!   * currently-connected peer count — `gitlawb_peers_connected`
@@ -134,7 +134,7 @@ fn init_inner(version: &str, node_did: &str) {
     let push_duration = Histogram::with_opts(
         HistogramOpts::new(
             "gitlawb_push_duration_seconds",
-            "Duration of successful git push (receive-pack) handlers in seconds",
+            "Wall time of a successful git push (receive-pack) request in seconds, from handler entry to the point its effects are recorded",
         )
         .buckets(operation_duration_buckets()),
     )
@@ -164,7 +164,7 @@ fn init_inner(version: &str, node_did: &str) {
     let sync_lag = Histogram::with_opts(
         HistogramOpts::new(
             "gitlawb_sync_lag_seconds",
-            "Lag from an origin ref-update timestamp to successful local mirror visibility in seconds",
+            "Lag from the origin push-land timestamp (lag_origin) to successful local mirror visibility in seconds",
         )
         .buckets(vec![
             1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1_800.0, 3_600.0,

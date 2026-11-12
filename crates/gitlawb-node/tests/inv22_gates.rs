@@ -517,7 +517,7 @@ fn inv22_ipfs_walk_admission_reaches_every_blocking_site() {
 /// drives the actual disconnect through a parked `release`. Same instrument the F3
 /// gate above uses.
 ///
-/// MUTATION (RED): move the `tokio::spawn(post_receive_replication_tail` call below
+/// MUTATION (RED): move the `post_receive_replication_tail(` call below
 /// `guard.release(` and the ordering assertion fails; take it out of the
 /// `if disposition.spawn_tail` block and the failed-push assertion fails; gate
 /// `spawn_tail`/`release_ok` on the outcome commit and
@@ -542,17 +542,21 @@ fn inv22_replication_tail_spawns_at_the_durability_boundary() {
     // position (carve-out early, or durability-bound at release) must sit
     // inside a `disposition.spawn_tail` gate and feed `landed_refs` —
     // never the unfiltered `ref_updates`.
-    let spawn_count = production
-        .matches("tokio::spawn(post_receive_replication_tail(")
-        .count();
+    // Match the tail CALL, not the `tokio::spawn(...)` wrapper: production
+    // currently wraps it in `tokio::spawn(async move { ... })`, and keying on
+    // the wrapper's exact shape is what let this gate go blind on the refactor.
+    // The `pub(crate) async fn` definition is the only other text occurrence,
+    // filtered by the `fn ` that must precede it.
+    let spawn_positions: Vec<usize> = production
+        .match_indices("post_receive_replication_tail(")
+        .map(|(p, _)| p)
+        .filter(|&p| !production[..p].trim_end().ends_with("fn"))
+        .collect();
     assert!(
-        spawn_count >= 1,
+        !spawn_positions.is_empty(),
         "U5 gate missing: the replication tail must be spawned by git_receive_pack"
     );
-    for (i, (pos, _)) in production
-        .match_indices("tokio::spawn(post_receive_replication_tail(")
-        .enumerate()
-    {
+    for (i, pos) in spawn_positions.iter().copied().enumerate() {
         let gate = production[..pos].rfind("if disposition.spawn_tail").expect(
             "U5 gate missing: every tail spawn must be gated on `if disposition.spawn_tail`",
         );
@@ -578,13 +582,15 @@ fn inv22_replication_tail_spawns_at_the_durability_boundary() {
         );
         let call_end = production[pos..].find(");").unwrap() + pos;
         let call = &production[pos..call_end];
+        // `landed` is the in-scope alias for `landed_refs` in the carve-out
+        // spawn; either name is the proven-landed set, `ref_updates` is not.
         assert!(
-            call.contains("landed_refs"),
+            call.contains("landed"),
             "U5 gate bypassed: tail #{i} must carry the proven-landed ref set, not unfiltered ref_updates"
         );
     }
-    let spawn = production
-        .find("tokio::spawn(post_receive_replication_tail(")
+    let spawn = *spawn_positions
+        .first()
         .expect("U5 gate missing: the replication tail must be spawned by git_receive_pack");
     let release = production
         .find(".release(disposition.release_ok)")
