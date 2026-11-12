@@ -730,11 +730,11 @@ fn inv26_step3_live_and_drain_share_apply_request_effects() {
 }
 
 /// #26 Split PR 1 step 4 — the periodic queue-lifecycle purge is
-/// wired in `main.rs` and the contract is enforced by the `idx_receive_pack_requests_completed_at`
+/// wired in `lib.rs` and the contract is enforced by the `idx_receive_pack_requests_completed_at`
 /// partial index from v41.
 ///
 /// Assertions:
-/// 1. `main.rs` calls `purge_request_queue` once at boot (well, on
+/// 1. `lib.rs` calls `purge_request_queue` once at boot (well, on
 ///    the spawn-task interval) and the spawn function exists.
 /// 2. The DB helpers `purge_completed_receive_pack_requests` and
 ///    `purge_completed_pending_ref_transitions` exist in `db/mod.rs`.
@@ -744,14 +744,14 @@ fn inv26_step3_live_and_drain_share_apply_request_effects() {
 ///    introduce the state, but the invariant holds for the future).
 #[test]
 fn inv26_step4_queue_lifecycle_purge_is_wired() {
-    let main_src = src("main.rs");
+    let boot_src = src("lib.rs");
     assert!(
-        main_src.contains("spawn_queue_lifecycle_sweep"),
-        "main.rs must spawn the periodic queue-lifecycle purge"
+        boot_src.contains("spawn_queue_lifecycle_sweep"),
+        "lib.rs must spawn the periodic queue-lifecycle purge"
     );
     assert!(
-        main_src.contains("purge_request_queue"),
-        "main.rs must call purge_request_queue on the periodic sweep"
+        boot_src.contains("purge_request_queue"),
+        "lib.rs must call purge_request_queue on the periodic sweep"
     );
 
     let db_src = src("db/mod.rs");

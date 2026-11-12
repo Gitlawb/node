@@ -663,7 +663,7 @@ pub(crate) fn publish_lock(local_path: &Path) -> Arc<Mutex<()>> {
 /// Owns a snapshot temp dir from extraction through handoff to [`RepoSnapshot`].
 /// Dropped when the `spawn_blocking` join result is abandoned, so cancellation
 /// before the outer future resumes still removes the directory.
-pub(crate) struct TempSnapshotDir {
+pub struct TempSnapshotDir {
     path: PathBuf,
 }
 
