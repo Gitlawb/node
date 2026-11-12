@@ -533,7 +533,29 @@ pub async fn run_purge_spam(
                         summary.disk_failed += 1;
                     }
                     Ok(p) => {
-                        if let Err(e) = std::fs::remove_dir_all(p) {
+                        // Post-commit window: delete_repo_by_id's slug lock ends
+                        // at commit, so a concurrent mirror ingest can insert a
+                        // new row for this slug before remove_dir_all runs.
+                        // Re-check immediately before the destructive op and
+                        // abort the disk delete when a fresh row landed rather
+                        // than wipe disk under a live row. A probe error fails
+                        // closed, the same as the lock-phase checks.
+                        let row_gone = match db.get_repo_by_id(&c.id).await {
+                            Ok(None) => true,
+                            Ok(Some(_)) => {
+                                warn!(repo = %c.id,
+                                    "purge-spam: a repo row reappeared after delete — refusing to remove disk under a live row");
+                                false
+                            }
+                            Err(e) => {
+                                warn!(repo = %c.id, err = %e,
+                                    "purge-spam: could not re-check row absence — refusing to remove (fail-closed)");
+                                false
+                            }
+                        };
+                        if !row_gone {
+                            summary.disk_failed += 1;
+                        } else if let Err(e) = std::fs::remove_dir_all(p) {
                             warn!(repo = %c.id, path = %p.display(), err = %e,
                                 "purge-spam: deleted DB row but could not remove on-disk repo dir");
                             summary.disk_failed += 1;

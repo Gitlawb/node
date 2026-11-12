@@ -1595,6 +1595,7 @@ mod rate_limiter_sweep_tests {
         let mut state = crate::test_support::test_state_lazy();
         state.rate_limiter = RateLimiter::new(10, window);
         state.create_ip_rate_limiter = RateLimiter::new(10, window);
+        state.write_rate_limiter = RateLimiter::new(10, window);
         state.push_rate_limiter = RateLimiter::new(10, window);
         state.close_issue_rate_limiter = RateLimiter::new(10, window);
         state.sync_trigger_rate_limiter = RateLimiter::new(10, window);
@@ -1608,6 +1609,7 @@ mod rate_limiter_sweep_tests {
             [
                 s.rate_limiter.clone(),
                 s.create_ip_rate_limiter.clone(),
+                s.write_rate_limiter.clone(),
                 s.push_rate_limiter.clone(),
                 s.close_issue_rate_limiter.clone(),
                 s.sync_trigger_rate_limiter.clone(),

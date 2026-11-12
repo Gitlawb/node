@@ -373,15 +373,30 @@ pub async fn create_repo(
         if let Err(e) = landed {
             tracing::warn!(repo = %req.name, err = %e,
                 "create: initial archive upload failed — rolling back row and dir");
-            if let Err(dbe) = state.db.delete_repo_by_id(&record.id).await {
-                tracing::warn!(repo = %req.name, err = %dbe,
-                    "create rollback: could not delete the repo row");
-            }
-            let _ = std::fs::remove_dir_all(&disk_path);
+            let row_deleted = match state.db.delete_repo_by_id(&record.id).await {
+                Ok(_) => true,
+                Err(dbe) => {
+                    tracing::warn!(repo = %req.name, err = %dbe,
+                        "create rollback: could not delete the repo row");
+                    false
+                }
+            };
+            let dir_removed = std::fs::remove_dir_all(&disk_path).is_ok();
             repo_lock.release().await;
-            return Err(AppError::Git(format!(
-                "repo created but initial archive upload failed and was rolled back: {e}"
-            )));
+            let residual = match (row_deleted, dir_removed) {
+                (true, true) => None,
+                (false, true) => Some("the repo row remains"),
+                (true, false) => Some("the on-disk directory remains"),
+                (false, false) => Some("the repo row and on-disk directory both remain"),
+            };
+            return Err(match residual {
+                None => AppError::Git(format!(
+                    "initial archive upload failed; the repo was rolled back: {e}"
+                )),
+                Some(what) => AppError::Git(format!(
+                    "initial archive upload failed and rollback is incomplete: {what}; operator cleanup required: {e}"
+                )),
+            });
         }
     }
 
