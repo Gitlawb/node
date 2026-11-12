@@ -398,8 +398,10 @@ pub async fn run() -> Result<()> {
     let create_ip_rate_limiter = build_ip_limiter("GITLAWB_CREATE_RATE_LIMIT", 120, "creation");
 
     // Per-IP brake for the authenticated non-creation write surface (issue/PR
-    // comments, labels, stars, merges, protect, replicas, visibility, tasks,
-    // bounties, profile, GraphQL mutations). Its own bucket, separate from the
+    // comments, issue close, labels, stars, merges, protect, replicas, webhook
+    // create/delete, visibility, tasks, bounties, profile, every HTTP /graphql
+    // request). Issue comment/close debit it in the handler, after the read
+    // gate; the rest via the router-level brake. Its own bucket, separate from the
     // creation brake, so a write flood cannot drain the creation budget and vice
     // versa (same rationale as the sync_trigger / peer_write split). Sized above
     // any legitimate per-IP write rate — real agent automation makes many small

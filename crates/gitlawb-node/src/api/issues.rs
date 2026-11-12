@@ -290,7 +290,14 @@ pub async fn close_issue(
         // Both buckets debit here, after the read gate (INV-12): the shared
         // per-IP write brake — the route group deliberately carries no outer
         // brake — and this route's own close budget.
-        if !state.write_rate_limiter.check(&key).await
+        //
+        // Decide on the non-consuming probe first, so a close refused by one
+        // cap spends nothing from the other bucket. The consuming checks run
+        // only once both buckets have room; a concurrent request landing in
+        // between can still fail one of them, which is a 429 like any other.
+        if state.write_rate_limiter.is_throttled(&key).await
+            || state.close_issue_rate_limiter.is_throttled(&key).await
+            || !state.write_rate_limiter.check(&key).await
             || !state.close_issue_rate_limiter.check(&key).await
         {
             tracing::warn!(repo = %repo, key = %key, "close_issue rate limited");
@@ -1286,6 +1293,95 @@ mod lock_pool_shed_tests {
             matches!(res, Err(AppError::RepoNotFound(_))),
             "a non-reader must see 404, not 429, even when rate limited: {:?}",
             res
+        );
+    }
+
+    /// A close refused by its own cap must not spend the shared write budget:
+    /// the 429 completed no close, so stars/comments/GraphQL keep their slot.
+    #[sqlx::test]
+    async fn close_issue_refused_by_close_cap_does_not_debit_write_bucket(pool: PgPool) {
+        use std::net::SocketAddr;
+        use std::time::Duration;
+
+        let owner = "did:key:zCLOSEDUALOWNERAAAAAAAAAAAAAAAAAAAAAAA";
+        let mut state = crate::test_support::test_state(pool).await;
+        state.close_issue_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
+        state.write_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "dual-close"))
+            .await
+            .expect("seed repo");
+
+        let peer: SocketAddr = "203.0.113.77:7000".parse().unwrap();
+        let key = peer.ip().to_string();
+        assert!(
+            state.close_issue_rate_limiter.check(&key).await,
+            "exhaust only the close bucket"
+        );
+
+        let res = close_issue(
+            State(state.clone()),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((owner.to_string(), "dual-close".to_string(), "1".to_string())),
+            axum::http::HeaderMap::new(),
+            crate::rate_limit::PeerAddr(Some(peer)),
+        )
+        .await;
+        assert!(
+            matches!(res, Err(AppError::TooManyRequests(_))),
+            "close cap exhausted must 429: {:?}",
+            res
+        );
+        assert!(
+            state.write_rate_limiter.check(&key).await,
+            "a close refused by the close cap must leave the write bucket untouched"
+        );
+    }
+
+    /// A close refused by the shared write cap must not spend the close budget.
+    #[sqlx::test]
+    async fn close_issue_refused_by_write_cap_does_not_debit_close_bucket(pool: PgPool) {
+        use std::net::SocketAddr;
+        use std::time::Duration;
+
+        let owner = "did:key:zCLOSEDUALOWNERBBBBBBBBBBBBBBBBBBBBBBB";
+        let mut state = crate::test_support::test_state(pool).await;
+        state.close_issue_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
+        state.write_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "dual-write"))
+            .await
+            .expect("seed repo");
+
+        let peer: SocketAddr = "203.0.113.78:7000".parse().unwrap();
+        let key = peer.ip().to_string();
+        assert!(
+            state.write_rate_limiter.check(&key).await,
+            "exhaust only the write bucket"
+        );
+
+        let res = close_issue(
+            State(state.clone()),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((owner.to_string(), "dual-write".to_string(), "1".to_string())),
+            axum::http::HeaderMap::new(),
+            crate::rate_limit::PeerAddr(Some(peer)),
+        )
+        .await;
+        assert!(
+            matches!(res, Err(AppError::TooManyRequests(_))),
+            "write cap exhausted must 429: {:?}",
+            res
+        );
+        assert!(
+            state.close_issue_rate_limiter.check(&key).await,
+            "a close refused by the write cap must leave the close bucket untouched"
         );
     }
 

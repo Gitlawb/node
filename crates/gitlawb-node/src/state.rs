@@ -95,8 +95,13 @@ pub struct AppState {
     pub create_ip_rate_limiter: RateLimiter,
     /// Per-client-IP rate limiter for the authenticated write surface that is
     /// not repo/agent creation: issue/PR comments, labels, stars, merges,
-    /// protect/unprotect, replicas, visibility, tasks, bounties, profile, and
-    /// the GraphQL `MutationRoot`. Separate bucket from `create_ip_rate_limiter`
+    /// protect/unprotect, replicas, webhook create/delete, visibility (its GET
+    /// shares the group), tasks, bounties, profile, and every HTTP `/graphql`
+    /// request (queries and the playground GET as well as mutations; the
+    /// WebSocket route is excluded). Issue comment and issue close debit it in
+    /// the handler after the read gate, not via router middleware; close also
+    /// draws on `close_issue_rate_limiter` and spends neither bucket when
+    /// either refuses. Separate bucket from `create_ip_rate_limiter`
     /// (its own budget, per the `sync_trigger`/`peer_write` precedent) so a
     /// write flood cannot drain the creation budget and vice versa. Per-DID is
     /// deliberately NOT paired here: a DID farm never trips it, and busy
