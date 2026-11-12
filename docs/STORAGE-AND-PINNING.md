@@ -17,10 +17,15 @@ Pinning does not run on every push. The post-push tail only reaches the pin
 steps when the push passed publish-durability confirmation and the repository
 replicates at root (`announce_at_root`): private repositories and other repos
 that are not anonymously readable at the root skip both public pin paths, and
-path-scoped rules exclude withheld objects. The warm path additionally requires
-this push's own withheld walk to have succeeded. A separate best-effort path can
-pin encrypted withheld blobs to Kubo for authorized readers; it is not a
-two-tier backup and is outside this page's scope.
+path-scoped rules exclude withheld objects. The warm path additionally checks
+whether this push ran its own withheld walk: an admitted, non-coalesced push
+whose tail walk failed spawns no warm worker. A push that coalesced onto an
+in-flight encrypt/pin task has no walk of its own, so it still runs warm
+pinning; the detached worker re-derives the withheld set inside its pin permit
+(`pinata_object_list_for_refs`) and fails closed on that result instead. A
+separate best-effort path can pin encrypted withheld blobs to Kubo for
+authorized readers; it is not a two-tier backup and is outside this page's
+scope.
 
 | Tier | Sink | Module | Enabled by | Purpose |
 |------|------|--------|-----------|---------|
@@ -58,10 +63,12 @@ Pinning happens **after** a push is accepted, not on the push's critical path:
   unreachable Pinata never blocks the pusher.
 
 Both tiers share a single global **pin admission semaphore**
-(`max_concurrent_pin_tasks`). One admitted push with both backends configured
-can hold up to **two** loops on this pool at once, so the default of eight caps
-loops, not pushes: roughly four concurrent all-dual-tier pushes fit before new
-loops wait. The pool **defers rather than sheds**: when it is
+(`max_concurrent_pin_tasks`). One admitted push that starts its own hot
+encrypt/pin task with both backends configured can hold up to **two** loops on
+this pool at once, so the default of eight caps loops, not pushes: roughly four
+concurrent all-dual-tier pushes fit before new loops wait. A push that coalesced
+onto an in-flight task starts no hot task of its own, so it adds at most one new
+loop (the warm worker) to that count. The pool **defers rather than sheds**: when it is
 saturated, a pin loop waits for a slot instead of dropping the pin. Each batch is
 bounded by `PIN_BATCH_BUDGET` (120s) so the pin batch itself cannot hold a slot
 indefinitely. The Pinata tail re-derives its object list only *after* acquiring a
