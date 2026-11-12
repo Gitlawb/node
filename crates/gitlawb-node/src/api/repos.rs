@@ -3455,7 +3455,6 @@ pub async fn git_receive_pack(
     // that case via `run_effects`, so this is defensive).
     let _ = state.db.touch_repo(&record.id).await;
     crate::metrics::record_push(&record.id);
-    crate::metrics::observe_push_duration(push_started.elapsed());
     crate::metrics::observe_pack_size(body_len as f64);
 
     // Claim ownership before inline effects: a background worker may
@@ -3468,6 +3467,7 @@ pub async fn git_receive_pack(
     {
         Ok(true) => {}
         _ => {
+            crate::metrics::observe_push_duration(push_started.elapsed());
             return axum::response::Response::builder()
                 .status(axum::http::StatusCode::OK)
                 .header("Content-Type", "application/x-git-receive-pack-result")
@@ -3572,6 +3572,7 @@ pub async fn git_receive_pack(
         }
     }
 
+    crate::metrics::observe_push_duration(push_started.elapsed());
     axum::response::Response::builder()
         .status(axum::http::StatusCode::OK)
         .header("Content-Type", "application/x-git-receive-pack-result")

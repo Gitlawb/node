@@ -374,6 +374,14 @@ fn observe_duration(histogram: &OnceLock<Histogram>, duration: Duration) {
     }
 }
 
+/// Test-only: current `gitlawb_sync_lag_seconds` sample count (0 if the
+/// registry is not initialized). Lets the sync lag-gate tests assert that a
+/// skipped observation really never reached the histogram.
+#[cfg(test)]
+pub fn sync_lag_sample_count_for_test() -> u64 {
+    SYNC_LAG.get().map(|h| h.get_sample_count()).unwrap_or(0)
+}
+
 /// Test-only: current `gitlawb_fetches_total` value for `repo` (0 if the registry
 /// is not initialized). Lets api-layer tests assert the completed-fetch count with
 /// a unique label instead of scraping the encoded text.
@@ -565,7 +573,9 @@ mod tests {
             .inc();
         observe_push_duration(Duration::from_millis(42));
         observe_fetch_duration(Duration::from_millis(24));
-        observe_sync_lag(Duration::from_secs(12));
+        // `observe_sync_lag` is deliberately NOT called. The sync lag-gate
+        // test asserts a before/after delta on the process-wide histogram, so
+        // a sample from this test running concurrently would flake it.
         record_reconciliation_gaps_found(7);
         record_reconciliation_gaps_filled(3);
 
@@ -634,12 +644,13 @@ mod tests {
         // here. It is a label-less process-wide counter and the seen-set test
         // that asserts it asserts a before/after delta, so an increment from a
         // second test running concurrently in this binary would be a flake with
-        // no diagnostic value.
+        // no diagnostic value. `observe_sync_lag` is withheld for the same
+        // reason: the sync lag-gate test asserts a sample-count delta on the
+        // process-wide histogram.
         record_gossip_ingest("accepted");
         observe_pack_size(1024.0);
         observe_push_duration(Duration::from_secs(1));
         observe_fetch_duration(Duration::from_secs(1));
-        observe_sync_lag(Duration::from_secs(1));
         set_peers_connected(0);
     }
 
