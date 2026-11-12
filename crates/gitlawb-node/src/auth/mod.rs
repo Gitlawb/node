@@ -898,7 +898,10 @@ mod tests {
         // write group, where the marker sits outside `add_auth_layers`.
         let marked = Router::new()
             .route("/", axum::routing::post(report_body))
-            .layer(middleware::from_fn_with_state(crate::auth::SignatureBodyLimit(65536), require_signature))
+            .layer(middleware::from_fn_with_state(
+                crate::auth::SignatureBodyLimit(65536),
+                require_signature,
+            ))
             .layer(axum::Extension(PersistsSignedBody));
         let resp = marked.oneshot(signed_post("/", body)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -911,7 +914,10 @@ mod tests {
 
         let unmarked = Router::new()
             .route("/", axum::routing::post(report_body))
-            .layer(middleware::from_fn_with_state(crate::auth::SignatureBodyLimit(65536), require_signature));
+            .layer(middleware::from_fn_with_state(
+                crate::auth::SignatureBodyLimit(65536),
+                require_signature,
+            ));
         let resp = unmarked.oneshot(signed_post("/", body)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let seen = axum::body::to_bytes(resp.into_body(), 2048).await.unwrap();
@@ -937,7 +943,10 @@ mod tests {
 
         let app = Router::new()
             .route("/", axum::routing::post(report_marker))
-            .layer(middleware::from_fn_with_state(crate::auth::SignatureBodyLimit(65536), require_signature))
+            .layer(middleware::from_fn_with_state(
+                crate::auth::SignatureBodyLimit(65536),
+                require_signature,
+            ))
             .layer(axum::Extension(PersistsSignedBody));
         let resp = app.oneshot(signed_post("/", b"{}")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);

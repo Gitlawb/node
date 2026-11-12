@@ -2333,11 +2333,6 @@ pub async fn git_receive_pack(
         ref_count = ref_updates.len(),
         "parsed ref updates from pack"
     );
-    // Before the per-ref protection queries below, and well before the pack
-    // reaches git: everything downstream of receive-pack can only report on refs
-    // the client has already been told were taken.
-    bound_declared_refs(&ref_updates)?;
-
     // ── Owner-only push enforcement (on by default; GITLAWB_ENFORCE_OWNER_PUSH) ──
     // Runs before branch protection on purpose: when enabled, a non-owner is
     // rejected here regardless of whether the target branch is protected, so a
@@ -3303,7 +3298,7 @@ pub async fn git_receive_pack(
     // tail spawns there carrying the durability slot; otherwise it fires
     // here for the carve-out path (replication on in-memory knowledge).
     let landed_refs: Vec<RefUpdate> = if disposition.spawn_tail {
-        accepted_ref_updates(&receive_raw, &ref_updates)
+        accepted_ref_updates(&ok_set, &ref_updates)
     } else {
         Vec::new()
     };
@@ -3677,55 +3672,26 @@ async fn publish_durability_confirmed(
     }
 }
 
-/// The detached post-receive replication tail (#174 F2): everything a landed push
-/// still owes after its git response has been returned: the replication decision,
-/// the per-repo-coalesced pin/encrypt task, and this push's own Pinata + announce
-/// task. Split out of `git_receive_pack` so the ordering the coalescing gate depends
-/// on is directly testable; the handler spawns it and returns.
-/// Deferred-replication entry: the drain spawns this for aggregates that
-/// complete without ever having a live tail (capability-free pushes whose
-/// landing reconcile proved). `pub(crate)` so the drain can call it; the
-/// live handler is the other caller.
-
 /// Chunk size for the batched post-receive writers below: bounded per
 /// statement while every accepted ref still lands.
 pub(crate) const PUSH_WRITE_CHUNK: usize = 256;
 
-/// Refuse a push that declares more refs than [`MAX_REF_UPDATES`].
-///
-/// A 400, not a 429: the request itself is the problem and waiting will not
-/// make it acceptable. The count is a floor, not the true one: the parse
-/// stops one past the cap, so the message says "more than" rather than
-/// reporting a number that would be a lie.
-fn bound_declared_refs(ref_updates: &[RefUpdate]) -> Result<()> {
-    if ref_updates.len() > MAX_REF_UPDATES {
-        return Err(AppError::BadRequest(format!(
-            "push declares more ref updates than the {MAX_REF_UPDATES} this node accepts in              one request; push fewer refs at a time"
-        )));
-    }
-    Ok(())
-}
-
-
-/// The refs receive-pack reported as accepted, intersected with the declared
-/// set — never the declared set alone, and never declared refs on a parse
-/// failure (inconclusive is treated as unproven here; the caller decides what
-/// "unproven" means for its own effect).
-fn accepted_ref_updates(report: &[u8], declared: &[RefUpdate]) -> Vec<RefUpdate> {
-    let Some((unpack_ok, results)) = smart_http::parse_report_status(report) else {
-        return declared.to_vec();
-    };
-    if !unpack_ok {
-        return Vec::new();
-    }
-    let landed: std::collections::HashSet<&str> = results
-        .iter()
-        .filter(|(_, ok)| *ok)
-        .map(|(ref_name, _)| ref_name.as_str())
-        .collect();
+/// The declared refs the report's ok set proves landed — never the declared
+/// set alone, and never a ref the report did not accept. The caller passes the
+/// `ok_set` already derived for the outcome commit, so the set that feeds the
+/// head update and the push-event write is exactly the set that marked each
+/// ref `applied`; a report that cannot be parsed yields an empty set upstream
+/// and nothing here invents landing for it.
+fn accepted_ref_updates<S>(
+    ok_refs: &std::collections::HashSet<S>,
+    declared: &[RefUpdate],
+) -> Vec<RefUpdate>
+where
+    S: std::borrow::Borrow<str> + Eq + std::hash::Hash,
+{
     declared
         .iter()
-        .filter(|u| landed.contains(u.ref_name.as_str()))
+        .filter(|u| ok_refs.contains(u.ref_name.as_str()))
         .cloned()
         .collect()
 }
@@ -3746,7 +3712,6 @@ fn branch_from_ref(ref_name: &str) -> Option<&str> {
 /// of refs pushed. A failure is logged and skipped: the push itself already
 /// succeeded and the objects are on disk, so refusing the response over a stale
 /// rollup target would be the worse trade.
-
 async fn update_open_pr_heads(db: &crate::db::Db, repo_id: &str, ref_updates: &[RefUpdate]) {
     let mut heads: Vec<(String, String)> = Vec::new();
     // Position of each branch already in `heads`, so the dedupe below is a
@@ -3863,6 +3828,15 @@ pub(crate) async fn record_push_events(
     }
 }
 
+/// The detached post-receive replication tail (#174 F2): everything a landed push
+/// still owes after its git response has been returned: the replication decision,
+/// the per-repo-coalesced pin/encrypt task, and this push's own Pinata + announce
+/// task. Split out of `git_receive_pack` so the ordering the coalescing gate depends
+/// on is directly testable; the handler spawns it and returns.
+/// Deferred-replication entry: the drain spawns this for aggregates that
+/// complete without ever having a live tail (capability-free pushes whose
+/// landing reconcile proved). `pub(crate)` so the drain can call it; the
+/// live handler is the other caller.
 pub(crate) async fn post_receive_replication_tail(
     state: AppState,
     record: RepoRecord,
@@ -5549,7 +5523,7 @@ pub struct RefUpdate {
 
 /// A git object id is 40 hex chars; length alone is not enough, since a peer
 /// can send 40 arbitrary bytes (#398).
-fn is_hex_sha(s: &str) -> bool {
+pub(crate) fn is_hex_sha(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
@@ -8654,14 +8628,14 @@ mod tests {
         .expect("git_receive_pack not found (renamed or removed?)");
 
         assert!(
-            body.contains("update_open_pr_heads(&state.db, &record.id, &accepted)"),
+            body.contains("update_open_pr_heads(&state.db, &record.id, &landed_refs)"),
             "the receive-pack handler must feed the ACCEPTED ref updates to the \
              stored-head update; without that call every head-maintenance test \
              here passes against a helper nothing invokes, and with the DECLARED \
              set it moves heads to refs git refused"
         );
         assert!(
-            body.contains("record_push_events(&state.db, &record.id, &accepted)"),
+            body.contains("record_push_events(&state.db, &record.id, &landed_refs)"),
             "the poll surface must be fed the accepted ref updates for the same \
              two reasons"
         );
@@ -8688,13 +8662,13 @@ mod tests {
         .expect("git_receive_pack not found (renamed or removed?)");
 
         let heads = body
-            .find("update_open_pr_heads(&state.db, &record.id, &accepted)")
+            .find("update_open_pr_heads(&state.db, &record.id, &landed_refs)")
             .expect("the stored-head update must be called from the push handler");
         let events = body
-            .find("record_push_events(&state.db, &record.id, &accepted)")
+            .find("record_push_events(&state.db, &record.id, &landed_refs)")
             .expect("the push-event recorder must be called from the push handler");
         let release = body
-            .find("guard.release(")
+            .find("reclaimed.release(disposition.release_ok)")
             .expect("the write lock release must still be in the push handler");
 
         assert!(
@@ -8896,6 +8870,22 @@ mod tests {
         updates.iter().map(|u| u.ref_name.as_str()).collect()
     }
 
+    /// The ok-name set the handler derives from a parsed report — what `ok_set`
+    /// holds at the production call site of `accepted_ref_updates`. An
+    /// unparseable report yields an empty set, exactly as the handler's match
+    /// arm produces, and a report whose refs were all refused has no ok names
+    /// in it.
+    fn ok_set_of(report: &[u8]) -> std::collections::HashSet<String> {
+        match smart_http::parse_report_status(report) {
+            Some((_, results)) => results
+                .iter()
+                .filter(|(_, ok)| *ok)
+                .map(|(name, _)| name.clone())
+                .collect(),
+            None => std::collections::HashSet::new(),
+        }
+    }
+
     fn two_ref_push() -> Vec<RefUpdate> {
         vec![
             ref_update("refs/heads/main", PR_SHA_OLD, PR_SHA_NEW),
@@ -8926,7 +8916,7 @@ mod tests {
         );
 
         assert_eq!(
-            names(&accepted_ref_updates(&report, &declared)),
+            names(&accepted_ref_updates(&ok_set_of(&report), &declared)),
             vec!["refs/heads/third"],
             "a refused ref must not reach the writes that publish a branch tip"
         );
@@ -8938,7 +8928,7 @@ mod tests {
             &["unpack ok", "ok refs/heads/main", "ok refs/heads/third"],
         );
         assert_eq!(
-            names(&accepted_ref_updates(&all_ok, &declared)),
+            names(&accepted_ref_updates(&ok_set_of(&all_ok), &declared)),
             vec!["refs/heads/main", "refs/heads/third"],
             "an accepted push must keep every ref it declared"
         );
@@ -8951,7 +8941,7 @@ mod tests {
         let declared = two_ref_push();
         let report = plain_report(&["unpack fail", "ng refs/heads/main unpacker error"]);
         assert!(
-            accepted_ref_updates(&report, &declared).is_empty(),
+            accepted_ref_updates(&ok_set_of(&report), &declared).is_empty(),
             "nothing lands when the pack itself did not unpack"
         );
     }
@@ -8967,22 +8957,22 @@ mod tests {
             "ok refs/heads/third",
         ]);
         assert_eq!(
-            names(&accepted_ref_updates(&report, &declared)),
+            names(&accepted_ref_updates(&ok_set_of(&report), &declared)),
             vec!["refs/heads/third"]
         );
     }
 
-    /// No report at all is INCONCLUSIVE, and inconclusive keeps every ref.
+    /// No report at all is INCONCLUSIVE, and inconclusive proves no ref.
     ///
     /// A client that never requested `report-status` is told nothing about
-    /// individual refs, and neither is a reader of a truncated response. Reading
-    /// that silence as rejection would drop the poll events and the head update
-    /// for a push git really did accept — permanently, since nothing re-derives
-    /// them — which is the failure the catch-up surface exists to prevent. This
-    /// is the one place the trade runs toward keeping rather than dropping, and
-    /// it is also what makes the change a no-op for clients that say nothing.
+    /// individual refs, and neither is a reader of a truncated response. Nothing
+    /// can distinguish "landed but unreported" from "refused", so the ok set is
+    /// empty and these writes record nothing: recording the declared set would
+    /// publish SHAs git may have refused. The unproven refs are not lost — the
+    /// outcome rows stay `uncertain` and startup reconcile owns proving what
+    /// actually landed from the on-disk reflog.
     #[test]
-    fn an_unreadable_report_leaves_every_declared_ref_in_place() {
+    fn an_unreadable_report_proves_no_ref_landed() {
         let declared = two_ref_push();
         for (label, report) in [
             ("empty", Vec::new()),
@@ -8993,35 +8983,11 @@ mod tests {
             ),
             ("truncated", b"0057\x01000eunpack o".to_vec()),
         ] {
-            assert_eq!(
-                names(&accepted_ref_updates(&report, &declared)).len(),
-                2,
-                "a {label} report says nothing either way and must not drop refs"
+            assert!(
+                accepted_ref_updates(&ok_set_of(&report), &declared).is_empty(),
+                "a {label} report proves nothing, and unproven must not be                  recorded as landed"
             );
         }
-    }
-
-    /// The total-ref bound refuses, and it refuses BEFORE git is handed the
-    /// pack: at the bound the push is admitted, one over it is a 400 naming the
-    /// limit.
-    #[test]
-    fn a_push_declaring_more_refs_than_the_bound_is_refused() {
-        let at = many_ref_updates(MAX_REF_UPDATES);
-        assert!(
-            bound_declared_refs(&at).is_ok(),
-            "a push exactly at the bound must still be admitted"
-        );
-
-        let over = many_ref_updates(MAX_REF_UPDATES + 1);
-        let err = bound_declared_refs(&over).expect_err("one ref past the bound must be refused");
-        assert!(
-            matches!(err, AppError::BadRequest(_)),
-            "an oversized push is the client's request to fix, got: {err}"
-        );
-        assert!(
-            err.to_string().contains(&MAX_REF_UPDATES.to_string()),
-            "the refusal must name the limit the client has to get under, got: {err}"
-        );
     }
 
     /// A receive-pack request body carrying `n` well-formed ref-update lines.
@@ -9037,32 +9003,19 @@ mod tests {
         out.into_bytes()
     }
 
-    /// The parser STOPS at the cap instead of scanning and allocating the whole
-    /// request and being refused afterwards.
-    ///
-    /// The bound was worth nothing where it stood. Git routes raise the body
-    /// limit to GITLAWB_MAX_PACK_BYTES — 2 GB by default — and `parse_ref_updates`
-    /// ran over the entire body first, keeping three heap-allocated strings for
-    /// every valid pkt-line in it; `bound_declared_refs` then reported a 400
-    /// against a vector that had already cost exactly the work the cap exists to
-    /// refuse, and concurrent requests multiplied it.
-    ///
-    /// The two arms are the whole property: one past the cap is retained, so the
-    /// refusal still fires, and nothing beyond that is. The control at the cap
-    /// shows the early stop did not start truncating ordinary pushes.
+    /// The parser REFUSES at the cap instead of scanning and allocating the whole
+    /// request and being refused afterwards. Git routes raise the body
+    /// limit to GITLAWB_MAX_PACK_BYTES — 2 GB by default — so the count check
+    /// lives inside `parse_ref_updates`'s command loop, which returns the 400
+    /// the first command past the cap rather than at the end of whatever the
+    /// client sent.
     #[test]
-    fn the_ref_parser_stops_one_past_the_bound_instead_of_scanning_the_whole_body() {
-        let far_over = parse_ref_updates(&ref_update_request(MAX_REF_UPDATES * 3))
-            .expect("the parse keeps one past the cap, it does not fail");
-        assert_eq!(
-            far_over.len(),
-            MAX_REF_UPDATES + 1,
-            "the parser must stop as soon as the cap is exceeded, not at the end \
-             of whatever the client sent"
-        );
+    fn the_ref_parser_refuses_past_the_bound_instead_of_scanning_the_whole_body() {
+        let err = parse_ref_updates(&ref_update_request(MAX_REF_UPDATES * 3))
+            .expect_err("a body over the cap must be refused");
         assert!(
-            bound_declared_refs(&far_over).is_err(),
-            "what the parser kept must still be enough to refuse on"
+            err.to_string().contains(&MAX_REF_UPDATES.to_string()),
+            "the refusal must name the limit the client has to get under, got: {err}"
         );
 
         let at = parse_ref_updates(&ref_update_request(MAX_REF_UPDATES))
@@ -9072,7 +9025,6 @@ mod tests {
             MAX_REF_UPDATES,
             "a push exactly at the cap must be parsed in full"
         );
-        assert!(bound_declared_refs(&at).is_ok());
     }
 
     /// The bound is only worth anything ahead of the accept. It runs before the
@@ -9090,13 +9042,13 @@ mod tests {
         .expect("git_receive_pack not found (renamed or removed?)");
 
         let bound = body
-            .find("bound_declared_refs(&ref_updates)?")
-            .expect("the receive-pack handler must bound the declared ref count");
+            .find("parse_ref_updates(&body)")
+            .expect("the receive-pack handler must parse (and cap) the declared refs");
         let protection = body
             .find("is_branch_protected(")
             .expect("branch protection loop not found (renamed or removed?)");
         let accept = body
-            .find("smart_http::receive_pack(")
+            .find("smart_http::receive_pack_raw_with_reflog(")
             .expect("receive_pack call not found (renamed or removed?)");
 
         assert!(
@@ -17173,7 +17125,7 @@ mod push_event_wiring_tests {
         .expect("git_receive_pack not found (renamed or removed?)");
 
         assert!(
-            body.contains("record_push_events(&state.db, &record.id, &accepted)"),
+            body.contains("record_push_events(&state.db, &record.id, &landed_refs)"),
             "the receive-pack handler must feed the ACCEPTED ref updates to the \
              push-event recorder; without that call the catch-up poll surface is \
              fed by nothing and every scenario test for it passes against a \

@@ -683,12 +683,14 @@ pub fn list_refs(repo_path: &Path) -> Result<Vec<(String, String)>> {
 /// a 40-char SHA-1 hex string. The reconcile compares two hex
 /// strings.
 ///
-/// Production callers use [`read_ref_bounded`]; this unbounded form is kept
-/// for test harnesses that stage markers without a timeout budget.
-#[allow(dead_code)]
+/// `show-ref --verify` matches the exact ref name — unlike `rev-parse`,
+/// which peels expressions, so it is the right primitive when the name is
+/// caller-adjacent. Most production callers use [`read_ref_bounded`]; this
+/// unbounded form also serves test harnesses that stage markers without a
+/// timeout budget.
 pub fn read_ref(repo_path: &Path, ref_name: &str) -> Result<Option<String>> {
-    // allow-unbounded-git: #[allow(dead_code)] harness form; production
-    // callers use read_ref_bounded.
+    // allow-unbounded-git: exact-name resolution; callers that need a timeout
+    // budget use read_ref_bounded.
     let output = Command::new("git")
         .args(["show-ref", "--verify", "--hash", ref_name])
         .current_dir(repo_path)
@@ -1577,7 +1579,7 @@ fn guard_refs(target_branch: &str, source_branch: &str) -> Result<()> {
 
 /// Stored short branch names are passed to git as explicit local-branch refs so a
 /// syntax-valid name cannot be reinterpreted as a revision shorthand at the sink.
-fn local_branch_ref(short_name: &str) -> String {
+pub(crate) fn local_branch_ref(short_name: &str) -> String {
     format!("refs/heads/{short_name}")
 }
 

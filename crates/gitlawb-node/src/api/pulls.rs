@@ -232,12 +232,10 @@ pub async fn merge_pr(
     // already moved the branch and the row's own `head_commit` is stale; the
     // value frozen on the merged PR has to be what was merged. `None` when the
     // ref cannot be resolved, which leaves whatever the push path last stored.
-    let merged_source_head = store::list_refs(&disk_path).ok().and_then(|refs| {
-        let want = format!("refs/heads/{}", pr.source_branch);
-        refs.into_iter()
-            .find(|(name, _)| *name == want)
-            .map(|(_, sha)| sha)
-    });
+    let merged_source_head =
+        store::read_ref(&disk_path, &store::local_branch_ref(&pr.source_branch))
+            .ok()
+            .flatten();
 
     let merge_result = store::merge_branch(
         &disk_path,

@@ -282,10 +282,8 @@ pub struct StatusClaim {
     /// Database-assigned ordering key. Ignored on insert (see
     /// [`Db::insert_status_claim`]); nothing the producer supplies orders the
     /// projection.
-    // Read back by the row mapper and asserted in tests, but no production
-    // reader takes it off the record: the projection orders on `seq` inside SQL,
-    // and the write response reports the value the insert returned directly.
-    #[allow(dead_code)]
+    // The projection orders on `seq` inside SQL, and the replay path reads it
+    // back to answer a duplicate write with the original claim's sequence.
     pub seq: i64,
     pub repo_id: String,
     /// Lowercase 40-character hex commit SHA. Never existence-checked.
@@ -4287,6 +4285,7 @@ impl Db {
 
 // ── Status Claims ─────────────────────────────────────────────────────────────
 
+#[cfg(test)]
 const INSERT_STATUS_CLAIM_SQL: &str = "INSERT INTO status_claims
      (id, repo_id, commit_sha, state, context, target_url, description,
       producer_did, authorizing_did, signature, signature_input,
@@ -4420,8 +4419,9 @@ impl Db {
     /// the database assigns the value, which is returned here so a caller can
     /// report the row it just wrote without a second read.
     // The write handler uses the capped form below; this stays the uncapped
-    // primitive the db tests drive directly.
-    #[allow(dead_code)]
+    // primitive the db tests drive directly, and compiling it only under
+    // cfg(test) keeps that fact from decaying into an unused production API.
+    #[cfg(test)]
     pub async fn insert_status_claim(&self, claim: &StatusClaim) -> Result<i64> {
         let row = status_claim_insert(INSERT_STATUS_CLAIM_SQL, claim)
             .fetch_one(&self.pool)
@@ -4542,7 +4542,7 @@ impl Db {
 
     /// Every claim recorded for one commit, oldest first. Ordering is on `seq`,
     /// never on the timestamp, which is display data and can collide.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub async fn list_status_claims(
         &self,
         repo_id: &str,
@@ -11571,12 +11571,12 @@ mod migration_tests {
         db.migrate().await.unwrap();
     }
 
-    // ── Status claims, stored PR head, push events (v24) ─────────────────────
+    // ── Status claims, stored PR head, push events (v47) ─────────────────────
 
     /// The version this branch's migration claims. Kept as a named constant so
     /// the upgrade test's rollback target is derived from `MIGRATIONS` rather
     /// than hard-coded twice.
-    const V24: i64 = 24;
+    const V47: i64 = 47;
 
     const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -11675,10 +11675,10 @@ mod migration_tests {
     }
 
     /// Fresh-database path: the whole chain on an empty database creates all
-    /// three v24 objects, and a claim round-trips field for field, including
+    /// three v47 objects, and a claim round-trips field for field, including
     /// the nullable columns in both directions.
     #[sqlx::test]
-    async fn migration_v24_fresh_chain_round_trips_a_claim(pool: sqlx::PgPool) {
+    async fn migration_v47_fresh_chain_round_trips_a_claim(pool: sqlx::PgPool) {
         let db = super::Db::for_testing(pool);
         db.migrate().await.unwrap();
 
@@ -12090,17 +12090,17 @@ mod migration_tests {
 
     /// Upgrade path, the load-bearing one: `#[sqlx::test]` hands out a fresh
     /// database that runs the entire chain, so the fresh-chain test above stays
-    /// green even if the v24 statements were appended to an already-applied
+    /// green even if the v47 statements were appended to an already-applied
     /// entry. Only a simulated existing node catches that.
     #[sqlx::test]
-    async fn migration_v24_upgrade_path_adds_claims_head_commit_and_push_events(
+    async fn migration_v47_upgrade_path_adds_claims_head_commit_and_push_events(
         pool: sqlx::PgPool,
     ) {
         let db = super::Db::for_testing(pool);
         db.migrate().await.unwrap();
 
         // Roll the database back to the state of a node at the highest version
-        // below 24 that this build declares.
+        // below 47 that this build declares.
         sqlx::query("DROP TABLE IF EXISTS status_claims")
             .execute(&db.pool)
             .await
@@ -12114,7 +12114,7 @@ mod migration_tests {
             .await
             .unwrap();
         sqlx::query("DELETE FROM schema_migrations WHERE version >= $1")
-            .bind(V24)
+            .bind(V47)
             .execute(&db.pool)
             .await
             .unwrap();
@@ -12122,16 +12122,16 @@ mod migration_tests {
         let prior = MIGRATIONS
             .iter()
             .map(|m| m.version)
-            .filter(|v| *v < V24)
+            .filter(|v| *v < V47)
             .max()
-            .expect("MIGRATIONS must declare a version below 24");
+            .expect("MIGRATIONS must declare a version below 47");
         let recorded_max: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
             .fetch_one(&db.pool)
             .await
             .unwrap();
         assert_eq!(
             recorded_max, prior,
-            "the simulated node must sit at the highest version below {V24}"
+            "the simulated node must sit at the highest version below {V47}"
         );
 
         // A pull request written by the old node, before the column existed.
@@ -12187,11 +12187,11 @@ mod migration_tests {
         .await;
 
         let recorded: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM schema_migrations WHERE version = 24")
+            sqlx::query_as("SELECT COUNT(*) FROM schema_migrations WHERE version = 47")
                 .fetch_one(&db.pool)
                 .await
                 .unwrap();
-        assert_eq!(recorded.0, 1, "v24 must be recorded as applied");
+        assert_eq!(recorded.0, 1, "v47 must be recorded as applied");
 
         // Idempotent re-run.
         db.migrate().await.unwrap();

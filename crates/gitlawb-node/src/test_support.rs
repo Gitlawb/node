@@ -322,6 +322,13 @@ mod scrape_source_region_tests {
     }
 }
 
+/// A local endpoint whose TCP accept succeeds instantly but that never writes an
+/// HTTP response, so any request against it stalls deterministically until the
+/// caller's own timeout. (A non-routable address hangs only if the network
+/// blackholes the SYN — a fast RST would end the stall early and make a timeout
+/// test pass for the wrong reason.) The accepted sockets are parked in the
+/// spawned task, which dies with the test's runtime, so the peer never sees a
+/// close mid-test.
 pub(crate) async fn silent_http_endpoint() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -332,6 +339,28 @@ pub(crate) async fn silent_http_endpoint() -> String {
         }
     });
     endpoint
+}
+
+/// The response body decoded as JSON.
+#[allow(dead_code)] // shared response helper for api test mods
+pub(crate) async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("body bytes");
+    serde_json::from_slice(&bytes).expect("json body")
+}
+
+/// Status plus the full response body, for the byte-identical deny comparison.
+#[allow(dead_code)] // shared response helper for api test mods
+pub(crate) async fn status_and_bytes(
+    resp: axum::response::Response,
+) -> (axum::http::StatusCode, Vec<u8>) {
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    (status, bytes)
 }
 
 /// Body of the `for-each-ref` arm of a fake-git fixture in the
@@ -481,7 +510,6 @@ mod helper_tests {
     }
 }
 
-#[cfg(test)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2413,7 +2441,7 @@ mod tests {
 
         // Insert the poisoned row DIRECTLY, as a pre-fix row or an ungated writer would.
         let pr = crate::db::PullRequest {
-                head_commit: None,
+            head_commit: None,
             id: uuid::Uuid::new_v4().to_string(),
             repo_id: repo.id.clone(),
             number: 1,
@@ -2772,7 +2800,7 @@ mod tests {
         state.db.create_repo(&repo).await.expect("seed repo");
 
         let pr = crate::db::PullRequest {
-                head_commit: None,
+            head_commit: None,
             id: uuid::Uuid::new_v4().to_string(),
             repo_id: repo.id.clone(),
             number: 1,
@@ -2891,7 +2919,7 @@ mod tests {
         state.db.create_repo(&repo).await.expect("seed repo");
 
         let pr = crate::db::PullRequest {
-                head_commit: None,
+            head_commit: None,
             id: uuid::Uuid::new_v4().to_string(),
             repo_id: repo.id.clone(),
             number: 1,
@@ -3318,7 +3346,7 @@ mod tests {
         state.db.create_repo(&repo).await.expect("seed repo");
 
         let pr = crate::db::PullRequest {
-                head_commit: None,
+            head_commit: None,
             id: uuid::Uuid::new_v4().to_string(),
             repo_id: repo.id.clone(),
             number: 1,
@@ -3445,7 +3473,7 @@ mod tests {
         state.db.create_repo(&repo).await.expect("seed repo");
 
         let pr = crate::db::PullRequest {
-                head_commit: None,
+            head_commit: None,
             id: uuid::Uuid::new_v4().to_string(),
             repo_id: repo.id.clone(),
             number: 1,
@@ -3614,7 +3642,7 @@ mod tests {
         state.db.create_repo(&repo).await.expect("seed repo");
 
         let pr = crate::db::PullRequest {
-                head_commit: None,
+            head_commit: None,
             id: uuid::Uuid::new_v4().to_string(),
             repo_id: repo.id.clone(),
             number: 1,
@@ -3779,7 +3807,7 @@ mod tests {
         state.db.create_repo(&repo).await.expect("seed repo");
 
         let pr = crate::db::PullRequest {
-                head_commit: None,
+            head_commit: None,
             id: uuid::Uuid::new_v4().to_string(),
             repo_id: repo.id.clone(),
             number: 1,
@@ -3970,7 +3998,7 @@ mod tests {
         state.db.create_repo(&repo).await.expect("seed repo");
 
         let pr = crate::db::PullRequest {
-                head_commit: None,
+            head_commit: None,
             id: uuid::Uuid::new_v4().to_string(),
             repo_id: repo.id.clone(),
             number: 1,
@@ -4123,7 +4151,7 @@ mod tests {
         let _ = std::fs::remove_file(&pwn);
 
         let pr = crate::db::PullRequest {
-                head_commit: None,
+            head_commit: None,
             id: uuid::Uuid::new_v4().to_string(),
             repo_id: repo.id.clone(),
             number: 1,

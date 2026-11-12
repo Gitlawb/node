@@ -558,7 +558,7 @@ pub async fn list_repo_push_events(
 #[cfg(test)]
 mod ref_updates_feed_tests {
     use crate::db::{ReceivedRefUpdate, RefCertificate, RepoRecord};
-    use crate::test_support::{signed_request_as, test_state};
+    use crate::test_support::{body_json, signed_request_as, test_state};
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
     use axum::Router;
@@ -617,13 +617,6 @@ mod ref_updates_feed_tests {
             .uri("/api/v1/events/ref-updates")
             .body(Body::empty())
             .expect("request builder")
-    }
-
-    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("body bytes");
-        serde_json::from_slice(&bytes).expect("json body")
     }
 
     /// Repo slugs present in the `events` array of the feed response.
@@ -1739,7 +1732,7 @@ mod ref_updates_feed_tests {
 #[cfg(test)]
 mod push_events_tests {
     use crate::db::{RepoPushEvent, RepoRecord};
-    use crate::test_support::{signed_request_as, test_state};
+    use crate::test_support::{body_json, signed_request_as, status_and_bytes, test_state};
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
     use axum::Router;
@@ -1811,23 +1804,6 @@ mod push_events_tests {
                 .expect("request builder"),
         };
         poll_router(state.clone()).oneshot(req).await.unwrap()
-    }
-
-    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("body bytes");
-        serde_json::from_slice(&bytes).expect("json body")
-    }
-
-    /// Status plus the full response body, for the byte-identical deny comparison.
-    async fn status_and_bytes(resp: axum::response::Response) -> (StatusCode, Vec<u8>) {
-        let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap()
-            .to_vec();
-        (status, bytes)
     }
 
     fn event_rows(v: &serde_json::Value) -> Vec<(String, String, String)> {

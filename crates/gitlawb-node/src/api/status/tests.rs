@@ -6,7 +6,7 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 
 use crate::db::RepoRecord;
-use crate::test_support::{signed_request_as, test_state};
+use crate::test_support::{body_json, signed_request_as, status_and_bytes, test_state};
 
 const OWNER: &str = "did:key:zSTATUSOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const STRANGER: &str = "did:key:zSTATUSSTRANGERBBBBBBBBBBBBBBBBBBBBBBBBB";
@@ -110,16 +110,6 @@ async fn post_as(
         .oneshot(signed_with_material(did, uri, body).await)
         .await
         .unwrap()
-}
-
-/// Status plus the full response body, for the byte-identical deny comparison.
-async fn status_and_bytes(resp: axum::response::Response) -> (StatusCode, Vec<u8>) {
-    let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap()
-        .to_vec();
-    (status, bytes)
 }
 
 /// The owner's claim is recorded with both DIDs and a server timestamp. The
@@ -1386,13 +1376,6 @@ async fn get_status(
             .unwrap(),
     };
     read_router(state.clone()).oneshot(req).await.unwrap()
-}
-
-async fn body_json(resp: axum::response::Response) -> serde_json::Value {
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    serde_json::from_slice(&bytes).expect("response body must be json")
 }
 
 /// One claim row with every field chosen by the caller, including the

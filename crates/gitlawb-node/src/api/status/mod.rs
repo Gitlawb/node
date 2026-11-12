@@ -529,7 +529,7 @@ async fn rollup_head(
     if pr.source_branch.is_empty() {
         return Ok(None);
     }
-    let ref_name = format!("refs/heads/{}", pr.source_branch);
+    let ref_name = crate::git::store::local_branch_ref(&pr.source_branch);
     #[cfg(test)]
     BRANCH_RESOLVES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let resolved = state
@@ -580,7 +580,7 @@ fn combined_state(statuses: &[StatusEntry]) -> &'static str {
 /// 40 hex characters, lowercased. The SHA is never existence-checked (KTD-7):
 /// a claim describes a commit object, and the object may not have arrived yet.
 fn normalize_sha(sha: &str) -> Result<String> {
-    if sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if crate::api::repos::is_hex_sha(sha) {
         Ok(sha.to_ascii_lowercase())
     } else {
         Err(AppError::BadRequest(
