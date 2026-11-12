@@ -11,7 +11,8 @@ use crate::state::AppState;
 
 /// Hard ceiling on rows any ref-update feed returns in one request. Shared by the
 /// shared collector's clamp and the per-handler request caps so they can't drift.
-const MAX_VISIBLE_REF_UPDATES: i64 = 200;
+/// `pub(crate)` so the GraphQL complexity meter can price against the same bound.
+pub(crate) const MAX_VISIBLE_REF_UPDATES: i64 = 200;
 
 /// Documented maximum page size of the repo-scoped push-event poll surface, and
 /// the value an over-large `limit` is clamped to. Named separately from the
@@ -664,6 +665,7 @@ mod ref_updates_feed_tests {
             node_did: "did:key:z6MkNode".into(),
             signature: "sig".into(),
             issued_at: Utc::now().to_rfc3339(),
+            version: 1,
         }
     }
 
@@ -1667,7 +1669,8 @@ mod ref_updates_feed_tests {
 
     // A DB error in the gate fails closed as 500, not swallowed into an empty 200 (the
     // regression the old get_repo().ok().flatten() allowed). Inject by dropping a
-    // column get_repo selects so its query errors.
+    // column get_repo selects so its query errors. Also pin the anonymous body to
+    // the exact opaque object (#226).
     #[sqlx::test]
     async fn repo_events_db_error_fails_closed_500(pool: PgPool) {
         let state = test_state(pool.clone()).await;
@@ -1689,6 +1692,18 @@ mod ref_updates_feed_tests {
             resp.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
             "a DB error must fail closed (500), never serve an empty 200"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body = String::from_utf8_lossy(&body);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json body");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "error": "db_error",
+                "message": crate::error::DB_ERROR_MESSAGE,
+            })
         );
     }
 
@@ -1946,6 +1961,7 @@ mod push_events_tests {
         crate::webhooks::fire_event(
             state.db.clone(),
             state.http_client.clone(),
+            state.webhook_secret_key.clone(),
             "r-ae6",
             "push",
             serde_json::json!({ "ref": "refs/heads/main", "after": SHA_A }),
