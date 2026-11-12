@@ -55,6 +55,12 @@ pub struct PurgeSummary {
     /// fail-closed like skipped_store_error, but bucketed separately so an
     /// operator can tell "work in flight" apart from "could not even check".
     pub skipped_unsettled_probe: usize,
+    /// Rows deleted whose destructive follow-through was refused because the
+    /// slug read as live afterwards — a fresh canonical or mirror row landed
+    /// in the post-commit window — or because the liveness probe itself
+    /// failed closed. Both disk and archive are left in place for these, so
+    /// the bucket never hides destruction skipped under a surviving row.
+    pub skipped_slug_live: usize,
     /// Rows deleted whose on-disk dir removal FAILED (or was refused by the
     /// containment guard) — DB/disk drift the operator must reconcile.
     pub disk_failed: usize,
@@ -508,97 +514,17 @@ pub async fn run_purge_spam(
             }
             Ok(n) => {
                 summary.deleted += n;
-                // Remove the now-orphaned on-disk bare repo (empty, so cheap) so
-                // the DB row and disk stay consistent. Belt-and-suspenders: assert
-                // the resolved path is canonically INSIDE repos_dir before any
-                // remove_dir_all, so a symlinked slug dir or any residual traversal
-                // can never delete outside the repo root (the name is already
-                // validated at selection; this guards the destructive op itself).
-                // A disk-removal failure is counted separately, NOT folded into the
-                // deleted total, so the summary never reports a clean success while
-                // an on-disk dir survives (DB/disk drift the operator must fix).
-                // Disk removal is best-effort and NEVER gates the archive
-                // delete below: a failed or refused local removal must not
-                // strand the object-store copy of a row we just deleted.
-                let path = crate::git::repo_store::validated_repo_disk_path(
+                purge_deleted_repo_storage(
+                    db,
+                    repo_store,
                     &repos_dir,
-                    &c.owner_did,
-                    &c.name,
-                )
-                .map(|p| p.into_path_buf());
-                match &path {
-                    Ok(p) if !path_within(p, &repos_dir) => {
-                        warn!(repo = %c.id, path = %p.display(),
-                            "purge-spam: on-disk path escapes repos_dir — refusing to remove");
-                        summary.disk_failed += 1;
-                    }
-                    Ok(p) => {
-                        // Post-commit window: delete_repo_by_id's slug lock ends
-                        // at commit, so a concurrent mirror ingest can insert a
-                        // new row for this slug before remove_dir_all runs.
-                        // Re-check immediately before the destructive op and
-                        // abort the disk delete when a fresh row landed rather
-                        // than wipe disk under a live row. A probe error fails
-                        // closed, the same as the lock-phase checks.
-                        let row_gone = match db.get_repo_by_id(&c.id).await {
-                            Ok(None) => true,
-                            Ok(Some(_)) => {
-                                warn!(repo = %c.id,
-                                    "purge-spam: a repo row reappeared after delete — refusing to remove disk under a live row");
-                                false
-                            }
-                            Err(e) => {
-                                warn!(repo = %c.id, err = %e,
-                                    "purge-spam: could not re-check row absence — refusing to remove (fail-closed)");
-                                false
-                            }
-                        };
-                        if !row_gone {
-                            summary.disk_failed += 1;
-                        } else if let Err(e) = std::fs::remove_dir_all(p) {
-                            warn!(repo = %c.id, path = %p.display(), err = %e,
-                                "purge-spam: deleted DB row but could not remove on-disk repo dir");
-                            summary.disk_failed += 1;
-                        } else {
-                            info!(repo = %c.id, rows = n, "purge-spam: deleted repo row + on-disk dir");
-                        }
-                    }
-                    Err(e) => {
-                        warn!(repo = %c.id, err = %e,
-                            "purge-spam: could not validate repo path — refusing to remove");
-                        summary.disk_failed += 1;
-                    }
-                }
-                // Delete the object-store archive too (a no-op when no store is
-                // configured), else it survives and can be downloaded into a
-                // later repo created with the same owner/name. Counted separately
-                // so a surviving archive never reads as a clean success.
-                // Fence on the generation refreshed above: a PUT landing after
-                // the emptiness check moves the archive generation, and a moved
-                // generation must read as skip, not delete-then-report.
-                match tokio::time::timeout(
+                    c,
                     bound,
-                    repo_store.delete_archive(&c.owner_did, &c.name, refreshed.as_deref()),
+                    refreshed.as_deref(),
+                    n,
+                    &mut summary,
                 )
-                .await
-                {
-                    Ok(Ok(true)) => {}
-                    Ok(Ok(false)) => {
-                        warn!(repo = %c.id,
-                            "purge-spam: archive generation moved after the emptiness check — kept");
-                        summary.archive_failed += 1;
-                    }
-                    Ok(Err(e)) => {
-                        warn!(repo = %c.id, err = %e,
-                            "purge-spam: deleted row + dir but could not delete the object-store archive");
-                        summary.archive_failed += 1;
-                    }
-                    Err(_) => {
-                        warn!(repo = %c.id,
-                            "purge-spam: archive delete exceeded the transfer bound — counted as failed");
-                        summary.archive_failed += 1;
-                    }
-                }
+                .await;
             }
             Err(e) => {
                 warn!(repo = %c.id, err = %e, "purge-spam: failed to delete repo row — continuing");
@@ -607,23 +533,207 @@ pub async fn run_purge_spam(
         guard.release().await;
     }
     println!(
-        "purge-spam: deleted {} repo row(s); skipped {} (no longer empty), {} (locked by a live writer), {} (object store unreachable), {} (unsettled work in flight), {} (unsettled probe failed); {} on-disk removal(s) failed, {} archive removal(s) failed.",
+        "purge-spam: deleted {} repo row(s); skipped {} (no longer empty), {} (locked by a live writer), {} (object store unreachable), {} (unsettled work in flight), {} (unsettled probe failed), {} (slug still live after delete); {} on-disk removal(s) failed, {} archive removal(s) failed.",
         summary.deleted,
         summary.skipped_not_empty,
         summary.skipped_locked,
         summary.skipped_store_error,
         summary.skipped_unsettled,
         summary.skipped_unsettled_probe,
+        summary.skipped_slug_live,
         summary.disk_failed,
         summary.archive_failed
     );
     Ok(summary)
 }
 
+/// The destructive follow-through for one repo row `delete_repo_by_id` just
+/// committed: the slug-liveness probe, the on-disk removal, and the
+/// object-store archive delete. Factored out so the post-commit window — a
+/// new row for the same slug landing between the delete commit and the
+/// destructive ops — is drivable directly in tests.
+#[allow(clippy::too_many_arguments)]
+async fn purge_deleted_repo_storage(
+    db: &Db,
+    repo_store: &crate::git::repo_store::RepoStore,
+    repos_dir: &std::path::Path,
+    c: &Candidate,
+    bound: std::time::Duration,
+    refreshed: Option<&str>,
+    rows_deleted: u64,
+    summary: &mut PurgeSummary,
+) {
+    // Post-commit window: delete_repo_by_id's slug lock ends at commit, so a
+    // concurrent mirror ingest (which takes only the transaction-scoped slug
+    // lock, not the session lock) can insert a NEW row for this owner/name
+    // with a mirror id before the destructive ops run. Probe the SLUG, not
+    // the deleted primary key: a live slug must refuse BOTH the disk delete
+    // and the archive delete — gating only the disk step would still strand
+    // the object-store bytes a live row needs. A probe error fails closed,
+    // the same as the lock-phase checks.
+    let slug_live = match db.get_repo(&c.owner_did, &c.name).await {
+        Ok(Some(_)) => {
+            warn!(repo = %c.id,
+                "purge-spam: a repo row for this slug reappeared after delete — refusing disk and archive removal under a live row");
+            true
+        }
+        Ok(None) => false,
+        Err(e) => {
+            warn!(repo = %c.id, err = %e,
+                "purge-spam: could not re-check slug liveness — refusing disk and archive removal (fail-closed)");
+            true
+        }
+    };
+    if slug_live {
+        summary.skipped_slug_live += 1;
+        return;
+    }
+
+    // Remove the now-orphaned on-disk bare repo (empty, so cheap) so
+    // the DB row and disk stay consistent. Belt-and-suspenders: assert
+    // the resolved path is canonically INSIDE repos_dir before any
+    // remove_dir_all, so a symlinked slug dir or any residual traversal
+    // can never delete outside the repo root (the name is already
+    // validated at selection; this guards the destructive op itself).
+    // A disk-removal failure is counted separately, NOT folded into the
+    // deleted total, so the summary never reports a clean success while
+    // an on-disk dir survives (DB/disk drift the operator must fix).
+    // Disk removal is best-effort and NEVER gates the archive
+    // delete below: a failed or refused local removal must not
+    // strand the object-store copy of a row we just deleted.
+    let path = crate::git::repo_store::validated_repo_disk_path(repos_dir, &c.owner_did, &c.name)
+        .map(|p| p.into_path_buf());
+    match &path {
+        Ok(p) if !path_within(p, repos_dir) => {
+            warn!(repo = %c.id, path = %p.display(),
+                "purge-spam: on-disk path escapes repos_dir — refusing to remove");
+            summary.disk_failed += 1;
+        }
+        Ok(p) => {
+            if let Err(e) = std::fs::remove_dir_all(p) {
+                warn!(repo = %c.id, path = %p.display(), err = %e,
+                    "purge-spam: deleted DB row but could not remove on-disk repo dir");
+                summary.disk_failed += 1;
+            } else {
+                info!(repo = %c.id, rows = rows_deleted, "purge-spam: deleted repo row + on-disk dir");
+            }
+        }
+        Err(e) => {
+            warn!(repo = %c.id, err = %e,
+                "purge-spam: could not validate repo path — refusing to remove");
+            summary.disk_failed += 1;
+        }
+    }
+
+    // Delete the object-store archive too (a no-op when no store is
+    // configured), else it survives and can be downloaded into a
+    // later repo created with the same owner/name. Counted separately
+    // so a surviving archive never reads as a clean success.
+    // Fence on the generation refreshed above: a PUT landing after
+    // the emptiness check moves the archive generation, and a moved
+    // generation must read as skip, not delete-then-report.
+    match tokio::time::timeout(
+        bound,
+        repo_store.delete_archive(&c.owner_did, &c.name, refreshed),
+    )
+    .await
+    {
+        Ok(Ok(true)) => {}
+        Ok(Ok(false)) => {
+            warn!(repo = %c.id,
+                "purge-spam: archive generation moved after the emptiness check — kept");
+            summary.archive_failed += 1;
+        }
+        Ok(Err(e)) => {
+            warn!(repo = %c.id, err = %e,
+                "purge-spam: deleted row + dir but could not delete the object-store archive");
+            summary.archive_failed += 1;
+        }
+        Err(_) => {
+            warn!(repo = %c.id,
+                "purge-spam: archive delete exceeded the transfer bound — counted as failed");
+            summary.archive_failed += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    /// Post-commit window (P1): `delete_repo_by_id`'s slug lock ends at commit,
+    /// so a mirror ingest can land a NEW row for the same owner/name before the
+    /// destructive ops. The probe must read the slug, not the deleted primary
+    /// key — a mirror id (`owner/name`) is a different row id entirely — and a
+    /// live slug must refuse BOTH the disk delete and the archive delete.
+    #[sqlx::test]
+    async fn purge_post_delete_slug_liveness_refuses_disk_and_archive(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool.clone());
+        db.run_migrations().await.expect("migrations");
+        let dir = tempfile::tempdir().unwrap();
+        let repo_store =
+            crate::git::repo_store::RepoStore::for_testing(dir.path().to_path_buf(), pool.clone());
+
+        let owner = "did:key:z6MkPurgeSlugLiveOwner";
+        let name = "victim";
+        let mut rec = repo("rid-slug-live", owner, name);
+        rec.disk_path = dir
+            .path()
+            .join("z6MkPurgeSlugLiveOwner")
+            .join("victim.git")
+            .to_string_lossy()
+            .to_string();
+        db.create_repo(&rec).await.unwrap();
+        // The on-disk bare dir the purge would otherwise remove.
+        std::fs::create_dir_all(&rec.disk_path).unwrap();
+        assert!(std::path::Path::new(&rec.disk_path).exists());
+
+        // The delete commits; the xact slug lock dies with it.
+        db.delete_repo_by_id(&rec.id).await.unwrap();
+        // A concurrent ingest lands a fresh row for the SAME slug with a
+        // mirror id — `get_repo_by_id(&rec.id)` would read this window as
+        // empty, which is exactly the hole the probe closes.
+        let owner_short = crate::db::normalize_owner_key(owner);
+        db.upsert_mirror_repo(owner_short, name, &rec.disk_path, None, false)
+            .await
+            .unwrap();
+        assert!(
+            db.get_repo(owner, name).await.unwrap().is_some(),
+            "the slug reads live through the normalized lookup"
+        );
+
+        let c = Candidate {
+            id: rec.id.clone(),
+            owner_did: owner.to_string(),
+            name: name.to_string(),
+            ref_count: 0,
+            remote_unverified: false,
+        };
+        let mut summary = PurgeSummary::default();
+        purge_deleted_repo_storage(
+            &db,
+            &repo_store,
+            dir.path(),
+            &c,
+            std::time::Duration::from_secs(30),
+            None,
+            1,
+            &mut summary,
+        )
+        .await;
+
+        assert_eq!(
+            summary.skipped_slug_live, 1,
+            "a surviving slug row must refuse every destructive step"
+        );
+        assert!(
+            std::path::Path::new(&rec.disk_path).exists(),
+            "the on-disk dir must survive under a live slug row"
+        );
+        assert_eq!(summary.disk_failed, 0);
+        assert_eq!(summary.archive_failed, 0);
+    }
 
     const TARGET: &str = SPAM_BURST_TARGET_DID;
     const EXCLUDED_CONTENT: &str = EXCLUDED_DIDS[0]; // z6Mkk4L… content-bearing live user

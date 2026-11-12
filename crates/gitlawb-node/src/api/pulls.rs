@@ -479,6 +479,12 @@ mod merge_rollback_tests {
     fn git(dir: &std::path::Path, args: &[&str]) -> String {
         let out = std::process::Command::new("git")
             .args(["-C", &*dir.to_string_lossy()])
+            .args([
+                "-c",
+                "user.name=merge-rollback-test",
+                "-c",
+                "user.email=merge-rollback-test@example.com",
+            ])
             .args(args)
             .output()
             .unwrap();

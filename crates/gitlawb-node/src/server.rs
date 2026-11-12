@@ -457,7 +457,12 @@ pub fn build_router(state: AppState) -> Router {
     )
     .write_braked(&write_ip_limiter);
 
-    // ── Issue routes (write — require HTTP Signature + per-IP write brake) ─
+    // ── Issue routes (write — require HTTP Signature; NO outer write brake) ──
+    // Both handlers are read-gated before they mutate, so an outer per-IP
+    // brake would answer 429 before authorize_repo_read could return the
+    // opaque 404 a hidden repo owes the caller — the brake's status would
+    // distinguish a real repo from a missing one (INV-12). The write bucket
+    // is debited inside each handler, right after the read gate.
     let issue_write_routes = add_auth_layers(
         Router::new()
             .route(
@@ -470,8 +475,7 @@ pub fn build_router(state: AppState) -> Router {
             ),
         state.clone(),
         SIGNED_BODY_LIMIT,
-    )
-    .write_braked(&write_ip_limiter);
+    );
 
     // ── Peer discovery routes ─────────────────────────────────────────────
     // Peer writes accept signatures when present and can require them after a

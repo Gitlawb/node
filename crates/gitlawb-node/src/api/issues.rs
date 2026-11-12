@@ -164,6 +164,8 @@ pub async fn create_issue_comment(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, repo, issue_id)): Path<(String, String, String)>,
+    headers: axum::http::HeaderMap,
+    crate::rate_limit::PeerAddr(peer): crate::rate_limit::PeerAddr,
     Json(req): Json<CreateIssueCommentRequest>,
 ) -> Result<(StatusCode, Json<IssueComment>)> {
     if req.body.trim().is_empty() {
@@ -175,6 +177,19 @@ pub async fn create_issue_comment(
     // Read-gate: a commenter must be able to read the repo, but need not own it.
     let (record, _rules) =
         crate::api::authorize_repo_read(&state, &owner, &repo, Some(auth.0.as_str()), "/").await?;
+
+    // Shared per-IP write brake, debited AFTER the read gate so a 429 cannot
+    // distinguish a hidden repo from a missing one (INV-12 — the same
+    // placement close_issue uses for its brake). The route group carries no
+    // outer brake for exactly this reason.
+    if let Some(key) = crate::rate_limit::client_key(&headers, peer, state.push_limiter_trust) {
+        if !state.write_rate_limiter.check(&key).await {
+            tracing::warn!(repo = %repo, key = %key, "create_issue_comment rate limited");
+            return Err(AppError::TooManyRequests(
+                "rate limit exceeded — try again later".into(),
+            ));
+        }
+    }
 
     let disk_path = state
         .repo_store
@@ -272,7 +287,12 @@ pub async fn close_issue(
     // close requests for arbitrary issue ids. Applied after the read gate so a
     // denied reader still sees 404, not 429.
     if let Some(key) = crate::rate_limit::client_key(&headers, peer, state.push_limiter_trust) {
-        if !state.close_issue_rate_limiter.check(&key).await {
+        // Both buckets debit here, after the read gate (INV-12): the shared
+        // per-IP write brake — the route group deliberately carries no outer
+        // brake — and this route's own close budget.
+        if !state.write_rate_limiter.check(&key).await
+            || !state.close_issue_rate_limiter.check(&key).await
+        {
             tracing::warn!(repo = %repo, key = %key, "close_issue rate limited");
             return Err(AppError::TooManyRequests(
                 "rate limit exceeded — try again later".into(),
@@ -1352,5 +1372,80 @@ mod lock_pool_shed_tests {
         );
 
         server.abort();
+    }
+    /// INV-12 ordering: both issue write routes debit the shared write bucket
+    /// AFTER authorize_repo_read, so an exhausted bucket cannot answer 429 to a
+    /// caller the gate must 404 — that status difference would leak the repo's
+    /// existence. The route group carries no outer brake for this reason.
+    #[sqlx::test]
+    async fn an_exhausted_write_bucket_cannot_preempt_the_read_gate(pool: PgPool) {
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.write_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1, std::time::Duration::from_secs(3600));
+        state
+            .db
+            .create_repo(&crate::db::RepoRecord {
+                id: "rid-write-brake-order".to_string(),
+                name: "priv".to_string(),
+                owner_did: "did:key:z6MkWriteBrakeOwner".to_string(),
+                description: None,
+                is_public: false,
+                default_branch: "main".to_string(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                disk_path: "/tmp/write-brake-order".to_string(),
+                forked_from: None,
+                machine_id: None,
+            })
+            .await
+            .unwrap();
+
+        let headers = axum::http::HeaderMap::new();
+        let peer = || crate::rate_limit::PeerAddr(Some("203.0.113.77:5000".parse().unwrap()));
+        let key = crate::rate_limit::client_key(&headers, peer().0, state.push_limiter_trust)
+            .expect("a peer addr yields a brake key");
+        assert!(state.write_rate_limiter.check(&key).await);
+        assert!(
+            !state.write_rate_limiter.check(&key).await,
+            "the shared write bucket is empty for this caller"
+        );
+
+        let stranger = || crate::auth::AuthenticatedDid("did:key:z6MkStranger".to_string());
+        let path = || {
+            (
+                "did:key:z6MkWriteBrakeOwner".to_string(),
+                "priv".to_string(),
+                "1".to_string(),
+            )
+        };
+
+        let res = close_issue(
+            axum::extract::State(state.clone()),
+            axum::Extension(stranger()),
+            axum::extract::Path(path()),
+            headers.clone(),
+            peer(),
+        )
+        .await;
+        assert!(
+            matches!(res, Err(AppError::RepoNotFound(_))),
+            "close on an unreadable repo must reach the read gate, not the empty write bucket: {res:?}"
+        );
+
+        let res = create_issue_comment(
+            axum::extract::State(state),
+            axum::Extension(stranger()),
+            axum::extract::Path(path()),
+            headers,
+            peer(),
+            axum::Json(CreateIssueCommentRequest {
+                body: "x".to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(res, Err(AppError::RepoNotFound(_))),
+            "comment on an unreadable repo must reach the read gate, not the empty write bucket: {res:?}"
+        );
     }
 }
