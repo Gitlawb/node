@@ -390,6 +390,7 @@ impl TestNode {
             status: "open".to_string(),
             merged_by_did: None,
             merged_at: None,
+            head_commit: None,
             created_at: now.clone(),
             updated_at: now,
         };
