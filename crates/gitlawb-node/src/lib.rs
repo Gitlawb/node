@@ -44,6 +44,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use clap::Parser;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -652,7 +653,8 @@ pub async fn run() -> Result<()> {
         });
     }
 
-    // Periodic cleanup of expired rate limit entries + consumed-proof ledger
+    // Periodic cleanup of expired rate limit entries + consumed-proof and
+    // spent-signature ledgers
     {
         let sweep_state = state.clone();
         let db = state.db.clone();
@@ -666,9 +668,7 @@ pub async fn run() -> Result<()> {
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs() as i64)
                             .unwrap_or(0);
-                        if let Err(e) = db.sweep_expired_proofs(now).await {
-                            tracing::warn!(err = %e, "failed to sweep expired iCaptcha proofs");
-                        }
+                        sweep_expired_ledgers(&db, now).await;
                     }
                     _ = shutdown_rx.changed() => {
                         if *shutdown_rx.borrow() {
@@ -1440,6 +1440,16 @@ fn classify_announce_response(
     }
 }
 
+/// One pass of the periodic expiry sweep over the durable replay ledgers.
+async fn sweep_expired_ledgers(db: &Db, now: i64) {
+    if let Err(e) = db.sweep_expired_proofs(now).await {
+        tracing::warn!(err = %e, "failed to sweep expired iCaptcha proofs");
+    }
+    if let Err(e) = db.sweep_expired_signatures(now).await {
+        tracing::warn!(err = %e, "failed to sweep expired spent signatures");
+    }
+}
+
 /// Announce to bootstrap peers on startup, then periodically ping all known peers.
 async fn gossip_task(
     state: AppState,
@@ -1567,6 +1577,7 @@ async fn gossip_task(
     // Periodic ping every 5 minutes — exit on shutdown.
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut failed_once: HashSet<String> = HashSet::new();
     loop {
         tokio::select! {
             _ = interval.tick() => {
@@ -1574,10 +1585,13 @@ async fn gossip_task(
                     Ok(p) => p,
                     Err(_) => continue,
                 };
-                for peer in peers {
-                    let ok = ping_peer_readiness(&client, &peer.http_url).await;
-                    let _ = state.db.mark_peer_ping(&peer.did, ok).await;
-                }
+                gossip_ping_round(
+                    state.db.as_ref(),
+                    client.as_ref(),
+                    &mut failed_once,
+                    peers,
+                )
+                .await;
             }
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
@@ -1638,6 +1652,18 @@ mod rate_limiter_sweep_tests {
         for (i, l) in limiters(&state).into_iter().enumerate() {
             assert_eq!(l.tracked_keys().await, 0, "limiter {i} was not swept");
         }
+    }
+}
+
+/// it.
+fn peer_ping_db_update(failed_once: &mut HashSet<String>, did: &str, ready: bool) -> Option<bool> {
+    if ready {
+        failed_once.remove(did);
+        Some(true)
+    } else if failed_once.insert(did.to_owned()) {
+        None
+    } else {
+        Some(false)
     }
 }
 
@@ -1747,6 +1773,8 @@ fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
     load_or_create_keypair_at(&config.resolved_key_path())
 }
 
+/// The node identity key's load-or-create, taken by path so the storage
+/// contract can be tested without building a whole `Config`.
 fn load_or_create_keypair_at(key_path: &std::path::Path) -> Result<Keypair> {
     if p2p::path_denotes_a_directory(key_path, None)
         || key_path
@@ -1804,10 +1832,98 @@ fn load_or_create_keypair_at(key_path: &std::path::Path) -> Result<Keypair> {
     Ok(kp)
 }
 
+async fn gossip_ping_round(
+    db: &Db,
+    client: &reqwest::Client,
+    failed_once: &mut HashSet<String>,
+    peers: Vec<db::PeerRecord>,
+) {
+    {
+        let current_dids: HashSet<&str> = peers.iter().map(|peer| peer.did.as_str()).collect();
+        failed_once.retain(|did| current_dids.contains(did.as_str()));
+    }
+    for peer in peers {
+        let ok = ping_peer_readiness(client, &peer.http_url).await;
+        match peer_ping_db_update(failed_once, &peer.did, ok) {
+            Some(reachable) => {
+                if let Err(error) = db.mark_peer_ping(&peer.did, reachable).await {
+                    warn!(did = %peer.did, err = %error, "failed to persist peer readiness");
+                }
+            }
+            None => warn!(
+                did = %peer.did,
+                "peer readiness probe failed once; preserving previous federation status"
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod ledger_sweep_tests {
+    use super::sweep_expired_ledgers;
+    use crate::db::{ConsumeSignature, Db};
+    use sqlx::PgPool;
+    use std::sync::LazyLock;
+
+    // The ledger's CHECK requires a 64-char sig_hash.
+    static OLD_SIG: LazyLock<String> = LazyLock::new(|| "a".repeat(64));
+    static FRESH_SIG: LazyLock<String> = LazyLock::new(|| "b".repeat(64));
+
+    // The periodic task must age out BOTH replay ledgers. The spent-signature
+    // ledger shipped with a sweep function nothing in production called, so its
+    // table grew with every signed write and never shrank.
+    #[sqlx::test]
+    async fn periodic_sweep_ages_out_both_replay_ledgers(pool: PgPool) {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        db.consume_proof_jti("old-proof", 100).await.unwrap();
+        db.consume_proof_jti("fresh-proof", 500).await.unwrap();
+        for (hash, exp) in [(OLD_SIG.as_str(), 100i64), (FRESH_SIG.as_str(), 500)] {
+            assert_eq!(
+                db.consume_signature(hash, "did:key:zAlice", 0, exp)
+                    .await
+                    .unwrap(),
+                ConsumeSignature::Inserted
+            );
+        }
+
+        sweep_expired_ledgers(&db, 200).await;
+
+        assert!(
+            db.consume_proof_jti("old-proof", 600).await.unwrap(),
+            "an expired proof row must have been swept (free to insert again)"
+        );
+        assert!(
+            !db.consume_proof_jti("fresh-proof", 600).await.unwrap(),
+            "an unexpired proof row must survive the sweep"
+        );
+        assert_eq!(
+            db.consume_signature(&OLD_SIG, "did:key:zAlice", 200, 530)
+                .await
+                .unwrap(),
+            ConsumeSignature::Inserted,
+            "an expired signature row must have been swept"
+        );
+        assert_eq!(
+            db.consume_signature(&FRESH_SIG, "did:key:zAlice", 200, 530)
+                .await
+                .unwrap(),
+            ConsumeSignature::Replayed,
+            "an unexpired signature row must survive the sweep"
+        );
+    }
+}
+
 #[cfg(test)]
 mod gossip_ssrf_tests {
-    use super::{ping_peer_readiness, ping_peer_readiness_with_timeout};
+    use super::{
+        gossip_ping_round, peer_ping_db_update, ping_peer_readiness,
+        ping_peer_readiness_with_timeout,
+    };
     use axum::{http::StatusCode, routing::get, Router};
+    use sqlx::PgPool;
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -1818,6 +1934,107 @@ mod gossip_ssrf_tests {
     // fails ping_peer_readiness_does_not_follow_redirect.
     fn production_http_client() -> reqwest::Client {
         super::build_http_client().expect("failed to build production http client")
+    }
+
+    #[test]
+    fn peer_ping_requires_two_failures_before_marking_unreachable() {
+        let mut failed_once = HashSet::new();
+        let did = "did:key:z6MkPeer";
+
+        assert_eq!(
+            peer_ping_db_update(&mut failed_once, did, false),
+            None,
+            "one transient failure must preserve the persisted federation gate"
+        );
+        assert_eq!(
+            peer_ping_db_update(&mut failed_once, did, false),
+            Some(false),
+            "a sustained failure must mark the peer unreachable"
+        );
+        assert_eq!(
+            peer_ping_db_update(&mut failed_once, did, true),
+            Some(true),
+            "a success must restore reachability immediately"
+        );
+        assert_eq!(
+            peer_ping_db_update(&mut failed_once, did, false),
+            None,
+            "a success must reset the consecutive-failure state"
+        );
+    }
+
+    #[sqlx::test]
+    async fn gossip_ping_round_requires_two_failures_before_persisting_unreachable(pool: PgPool) {
+        let mut server = mockito::Server::new_async().await;
+        let ready = server
+            .mock("GET", "/ready")
+            .with_status(503)
+            .expect(2)
+            .create_async()
+            .await;
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let did = "did:key:z6MkGossipHysteresis";
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO peers (did, http_url, last_seen, last_ping_ok, announced_at)
+             VALUES ($1, $2, $3, TRUE, $3)",
+        )
+        .bind(did)
+        .bind(server.url())
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut failed_once = HashSet::from(["did:key:z6MkRemovedPeer".to_owned()]);
+        gossip_ping_round(
+            state.db.as_ref(),
+            &production_http_client(),
+            &mut failed_once,
+            state.db.list_peers().await.unwrap(),
+        )
+        .await;
+        assert!(
+            !failed_once.contains("did:key:z6MkRemovedPeer"),
+            "failure tracking must prune peers outside the current snapshot"
+        );
+        assert!(
+            failed_once.contains(did),
+            "the first failed sample must be retained for the next round"
+        );
+        assert!(
+            state
+                .db
+                .list_peers()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|peer| peer.did == did)
+                .unwrap()
+                .last_ping_ok,
+            "one transient failure must preserve the persisted federation gate"
+        );
+
+        gossip_ping_round(
+            state.db.as_ref(),
+            &production_http_client(),
+            &mut failed_once,
+            state.db.list_peers().await.unwrap(),
+        )
+        .await;
+        assert!(
+            !state
+                .db
+                .list_peers()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|peer| peer.did == did)
+                .unwrap()
+                .last_ping_ok,
+            "two consecutive failed rounds must persist the peer as unreachable"
+        );
+        ready.assert_async().await;
     }
 
     // A peer answering `/ready` with a 302 toward an internal address must not

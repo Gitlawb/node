@@ -168,11 +168,12 @@ impl HttpSignature {
     /// `created = T + 300`, it stayed acceptable until roughly T + 600, so the
     /// effective window was double the one this function advertises. The
     /// forward tolerance exists only to absorb honest drift between two hosts,
-    /// which is what 60 seconds buys; it is the same allowance the gossip
-    /// path's freshness check uses for the same reason.
+    /// and is [`MAX_FUTURE_SKEW_SECS`], the one constant the ledger's retention
+    /// window is derived from, so what the verifier accepts and what the
+    /// ledger remembers cannot disagree.
     pub fn check_created(&self) -> Result<()> {
-        const MAX_AGE_SECS: i64 = 300;
-        const MAX_FUTURE_SECS: i64 = 60;
+        const MAX_AGE_SECS: i64 = MAX_SIGNATURE_AGE_SECS;
+        const MAX_FUTURE_SECS: i64 = MAX_FUTURE_SKEW_SECS;
 
         let now = Utc::now().timestamp();
 
@@ -954,14 +955,13 @@ mod tests {
             );
         }
 
-        // An unbalanced quote inside an otherwise well-formed header is
-        // tolerated: `trim_matches('"')` strips whatever quotes are there.
-        // The invariant that matters is that it returns rather than panics, so
-        // assert it parses and leaves the quote-stripped component behind.
+        // An unbalanced quote inside an otherwise well-formed header is still
+        // malformed: the component parser refuses an unterminated string.
         let unbalanced = format!(r#"sig1=("@method);keyid="{did}";alg="ed25519";created=1000"#);
-        let parsed = HttpSignature::parse(&unbalanced, "sig1=:AAAA:")
-            .expect("an unbalanced quote is tolerated, not a parse failure");
-        assert_eq!(parsed.components, vec!["@method".to_string()]);
+        assert!(
+            HttpSignature::parse(&unbalanced, "sig1=:AAAA:").is_err(),
+            "an unterminated component string must be a parse error"
+        );
     }
 
     #[test]
