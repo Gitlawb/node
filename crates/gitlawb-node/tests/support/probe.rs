@@ -915,6 +915,7 @@ fn fill(path: &str, fixture: &Fixture, repo: &str, id_source: IdSource) -> Strin
     };
     path.replace("{owner}", &fixture.owner_did)
         .replace("{repo}", repo)
+        .replace("{sha}", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         .replace("{number}", "1")
         .replace("{id}", id)
         .replace("{label}", "bug")
