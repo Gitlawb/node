@@ -82,18 +82,9 @@ pub struct RepoStore {
 }
 
 impl RepoStore {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-harness"))]
     pub fn for_testing(repos_dir: PathBuf, lock_pool: PgPool) -> Self {
-        Self {
-            repos_dir,
-            tigris: None,
-            lock_pool,
-            lock_held_transfer_timeout: Duration::from_secs(300),
-            lock_acquire_deadline: LOCK_ACQUIRE_DEADLINE,
-            migrated: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
-            pre_unlock_gate: None,
-            upload_site_reached: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        }
+        Self::new(repos_dir, None, lock_pool, Duration::from_secs(300))
     }
 
     /// Same as [`RepoStore::for_testing`] but with Tigris enabled, so the paths
@@ -1237,7 +1228,7 @@ async fn retry_fork_archive_delete(
 /// `remove_dir_all` / `rename` can take it and static analysers can treat it as
 /// sanitised input (CodeQL `rust/path-injection`).
 #[derive(Debug, Clone)]
-pub(crate) struct ValidatedRepoDiskPath(PathBuf);
+pub struct ValidatedRepoDiskPath(PathBuf);
 
 impl ValidatedRepoDiskPath {
     pub(crate) fn as_path(&self) -> &Path {
@@ -2408,7 +2399,7 @@ impl RepoWriteGuard {
 /// Only the UNLOCK has to wait for the reaper. This token carries everything
 /// the settlement itself needs, so the request future can hold it and settle
 /// the tree at the disconnect instant while the reaper still holds the lock.
-pub(crate) struct TreeSettlement {
+pub struct TreeSettlement {
     local_path: ValidatedRepoDiskPath,
     repo_name: String,
     /// Shared with the guard, so the stage read here is the stage the publish
