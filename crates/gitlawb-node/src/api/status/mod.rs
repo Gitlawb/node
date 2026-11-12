@@ -572,8 +572,12 @@ fn combined_state(statuses: &[StatusEntry]) -> &'static str {
         "failure"
     } else if statuses.iter().any(|s| s.state == "pending") {
         "pending"
-    } else {
+    } else if statuses.iter().all(|s| s.state == "success") {
         "success"
+    } else {
+        // A stored state outside the vocabulary is not a pass: an
+        // unrecognized verdict folds toward failure, never silently to success.
+        "failure"
     }
 }
 

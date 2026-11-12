@@ -3745,12 +3745,34 @@ async fn update_open_pr_heads(db: &crate::db::Db, repo_id: &str, ref_updates: &[
     // Chunked for the same reason the push events are: bounded per statement,
     // and every branch git accepted still gets its head moved.
     for chunk in heads.chunks(PUSH_WRITE_CHUNK) {
-        if let Err(e) = db.set_open_pr_heads_batch(repo_id, chunk).await {
-            tracing::warn!(
+        let mut outcome = db.set_open_pr_heads_batch(repo_id, chunk).await;
+        if let Err(first) = &outcome {
+            if crate::db::is_transient_db_write(first) {
+                tracing::warn!(
+                    err = %first,
+                    repo_id = %repo_id,
+                    branches = chunk.len(),
+                    "stored-head update hit a transient failure; retrying once"
+                );
+                outcome = db.set_open_pr_heads_batch(repo_id, chunk).await;
+            }
+        }
+        if let Err(e) = outcome {
+            // Error, not a warning, and it names the rows: a stale head is not
+            // self-healing — `set_pr_head_if_absent` only fills NULL heads — so
+            // the missed update is permanent until the next push to that
+            // branch, and the SHAs are what make it repairable by hand.
+            let lost = chunk
+                .iter()
+                .map(|(branch, sha)| format!("{branch}@{sha}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            tracing::error!(
                 err = %e,
                 repo_id = %repo_id,
                 branches = chunk.len(),
-                "failed to update stored pull request heads for a pushed branch"
+                lost = %lost,
+                "stored pull request heads lost; rollups will serve a stale tip"
             );
         }
     }
@@ -3794,17 +3816,19 @@ pub(crate) async fn record_push_events(
     for chunk in events.chunks(PUSH_WRITE_CHUNK) {
         let mut outcome = db.insert_repo_push_events(chunk).await;
         if let Err(first) = &outcome {
-            // One retry, because the write now waits on a per-repo lock and the
-            // failures that wait produces are transient by construction: a lock
-            // wait that expired, or a pool acquire that timed out behind the
-            // queue. The retry is bounded because this runs inline on the push.
-            tracing::warn!(
-                err = %first,
-                repo_id = %repo_id,
-                refs = chunk.len(),
-                "recording push events failed; retrying once"
-            );
-            outcome = db.insert_repo_push_events(chunk).await;
+            // One retry, only for the transient classes the write itself can
+            // outlive: a lock wait that expired, or a pool acquire that timed
+            // out behind the queue. A permanent error's second run is a
+            // guaranteed re-failure that only adds latency to the push.
+            if crate::db::is_transient_db_write(first) {
+                tracing::warn!(
+                    err = %first,
+                    repo_id = %repo_id,
+                    refs = chunk.len(),
+                    "recording push events hit a transient failure; retrying once"
+                );
+                outcome = db.insert_repo_push_events(chunk).await;
+            }
         }
         if let Err(e) = outcome {
             // Error, not a warning, and it names the rows. receive-pack has
@@ -5609,8 +5633,8 @@ fn parse_ref_updates(body: &[u8]) -> Result<Vec<RefUpdate>> {
                 )));
             }
             let candidate = RefUpdate {
-                old_sha: parts[0].to_string(),
-                new_sha: parts[1].to_string(),
+                old_sha: parts[0].to_ascii_lowercase(),
+                new_sha: parts[1].to_ascii_lowercase(),
                 ref_name: parts[2].to_string(),
             };
             if seen.insert((
@@ -8486,7 +8510,7 @@ mod tests {
             .await
             .unwrap();
         let pr = db.get_pr("repo-1", 1).await.unwrap().unwrap();
-        db.close_pr(&pr.id).await.unwrap();
+        db.close_pr(&pr.id, None).await.unwrap();
 
         update_open_pr_heads(
             &db,

@@ -306,7 +306,30 @@ pub async fn close_pr(
         ));
     }
 
-    state.db.close_pr(&pr.id).await?;
+    // Freeze the head this close decided against, the same snapshot merge_pr
+    // takes on its path: a closed pull request's rollup serves only the stored
+    // head, so a PR closed before its first status read would report
+    // head_resolved=false forever. The recorded push for the branch is the
+    // canonical answer; the disk read covers a push whose event write failed.
+    // An unresolvable head keeps whatever the push path last stored.
+    let branch_ref = store::local_branch_ref(&pr.source_branch);
+    let closed_head = if pr.head_commit.is_some() {
+        None
+    } else {
+        state
+            .db
+            .latest_push_sha_for_ref(&record.id, &branch_ref)
+            .await
+            .ok()
+            .flatten()
+            .or_else(|| {
+                store::read_ref(std::path::Path::new(&record.disk_path), &branch_ref)
+                    .ok()
+                    .flatten()
+            })
+            .map(|sha| sha.to_ascii_lowercase())
+    };
+    state.db.close_pr(&pr.id, closed_head.as_deref()).await?;
 
     webhooks::fire_event(
         std::sync::Arc::clone(&state.db),

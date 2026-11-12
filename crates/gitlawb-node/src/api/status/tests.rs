@@ -2368,7 +2368,7 @@ async fn closed_pr_with_no_stored_head_does_not_resolve_the_branch(pool: PgPool)
     state.db.create_repo(&repo).await.unwrap();
     let pr = seed_pr(&repo.id, 1, "feature");
     state.db.create_pr(&pr).await.unwrap();
-    state.db.close_pr(&pr.id).await.unwrap();
+    state.db.close_pr(&pr.id, None).await.unwrap();
     // The branch is alive and would resolve if the fallback ran.
     seed_branch_head(&state, &repo, "feature", SHA_B).await;
 

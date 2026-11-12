@@ -391,7 +391,8 @@ pub struct Webhook {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoPushEvent {
     pub id: String,
-    /// Database-assigned ordering key, and the poll cursor itself. Ignored on
+    /// Database-assigned ordering key the poll cursor's row id resolves to.
+    /// Ignored on
     /// insert (see [`Db::insert_repo_push_events`]): nothing the writer supplies
     /// can order these rows, because `created_at` is stamped before the insert
     /// and a row stamped later can commit earlier.
@@ -4125,13 +4126,22 @@ impl Db {
         Ok(())
     }
 
-    pub async fn close_pr(&self, pr_id: &str) -> Result<()> {
+    /// `head_sha` freezes the source head the close decided against: a closed
+    /// pull request's rollup serves only the stored head, so nothing resolved
+    /// later can stand in for it. A `None` keeps whatever the push path last
+    /// recorded — the same fall-back-to-stored trade `merge_pr` makes when the
+    /// ref cannot be resolved.
+    pub async fn close_pr(&self, pr_id: &str, head_sha: Option<&str>) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        sqlx::query("UPDATE pull_requests SET status='closed', updated_at=$1 WHERE id=$2")
-            .bind(&now)
-            .bind(pr_id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE pull_requests SET status='closed', updated_at=$1, \
+             head_commit=COALESCE($3, head_commit) WHERE id=$2",
+        )
+        .bind(&now)
+        .bind(pr_id)
+        .bind(head_sha)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -4453,7 +4463,39 @@ impl Db {
         claim: &StatusClaim,
         caps: &ClaimCaps,
     ) -> Result<ClaimInsert> {
+        let mut attempt = 1;
+        loop {
+            match self.insert_status_claim_capped_attempt(claim, caps).await {
+                Ok(outcome) => return Ok(outcome),
+                Err(e) if attempt < PUSH_LOCK_ATTEMPTS && is_transient_db_write(&e) => {
+                    tracing::debug!(
+                        attempt,
+                        repo = %claim.repo_id,
+                        "status-claim write timed out waiting for the repo lock; retrying"
+                    );
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// One attempt at the capped insert: bound every lock wait in the
+    /// transaction, take the repo advisory lock, then run the cap checks and
+    /// the insert. `SET LOCAL lock_timeout` is what turns a wedged lock holder
+    /// from an unbounded wait into a retryable error.
+    async fn insert_status_claim_capped_attempt(
+        &self,
+        claim: &StatusClaim,
+        caps: &ClaimCaps,
+    ) -> Result<ClaimInsert> {
         let mut tx = self.pool.begin().await?;
+
+        sqlx::query(&format!(
+            "SET LOCAL lock_timeout = '{PUSH_LOCK_TIMEOUT_MS}ms'"
+        ))
+        .execute(&mut *tx)
+        .await?;
 
         sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
             .bind(&claim.repo_id)
@@ -8756,6 +8798,16 @@ fn is_lock_timeout(err: &sqlx::Error) -> bool {
         .is_some_and(|code| code == LOCK_NOT_AVAILABLE)
 }
 
+/// The two transient classes a bounded inline write may retry: a lock wait the
+/// timeout cancelled (`lock_not_available`), and a pool acquire that timed out
+/// behind the queue. Every other error is permanent for this attempt.
+pub(crate) fn is_transient_db_write(err: &anyhow::Error) -> bool {
+    match err.downcast_ref::<sqlx::Error>() {
+        Some(e) => is_lock_timeout(e) || matches!(e, sqlx::Error::PoolTimedOut),
+        None => false,
+    }
+}
+
 impl Db {
     /// Record one local push event. Idempotent on the row id.
     ///
@@ -12243,7 +12295,7 @@ mod migration_tests {
         let closed = sample_pr("repo-1", 3);
         db.create_pr(&closed).await.unwrap();
         set_head_directly(&db, &closed.id, SHA_A).await;
-        db.close_pr(&closed.id).await.unwrap();
+        db.close_pr(&closed.id, None).await.unwrap();
         // #4 merged on `feature`, frozen at SHA_A.
         let merged = sample_pr("repo-1", 4);
         db.create_pr(&merged).await.unwrap();
@@ -12377,7 +12429,7 @@ mod migration_tests {
         // Absent head but closed: refused.
         let closed = sample_pr("repo-1", 2);
         db.create_pr(&closed).await.unwrap();
-        db.close_pr(&closed.id).await.unwrap();
+        db.close_pr(&closed.id, None).await.unwrap();
         assert_eq!(
             db.set_pr_head_if_absent(&closed.id, SHA_A).await.unwrap(),
             0
