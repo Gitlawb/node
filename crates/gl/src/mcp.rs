@@ -716,9 +716,11 @@ async fn call_tool(
 
         "repo_get" => {
             let name = args["name"].as_str().context("missing 'name'")?;
-            let owner = resolve_owner(&args, &client).await?;
+            let owner = resolve_signed_read_owner(&args, &keypair, &client).await?;
             let repo = crate::http::read_json(
-                client.get(&format!("/api/v1/repos/{owner}/{name}")).await?,
+                client
+                    .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}"))
+                    .await?,
                 "repo",
             )
             .await?;
@@ -727,10 +729,10 @@ async fn call_tool(
 
         "repo_commits" => {
             let name = args["name"].as_str().context("missing 'name'")?;
-            let owner = resolve_owner(&args, &client).await?;
+            let owner = resolve_signed_read_owner(&args, &keypair, &client).await?;
             let commits = crate::http::read_json(
                 client
-                    .get(&format!("/api/v1/repos/{owner}/{name}/commits"))
+                    .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}/commits"))
                     .await?,
                 "commits",
             )
@@ -900,10 +902,10 @@ async fn call_tool(
 
         "pr_list" => {
             let repo = args["repo"].as_str().context("missing 'repo'")?;
-            let owner = resolve_owner(&args, &client).await?;
+            let owner = resolve_signed_read_owner(&args, &keypair, &client).await?;
             let resp = crate::http::read_json(
                 client
-                    .get(&format!("/api/v1/repos/{owner}/{repo}/pulls"))
+                    .get_maybe_signed(&format!("/api/v1/repos/{owner}/{repo}/pulls"))
                     .await?,
                 "pull requests",
             )
@@ -914,17 +916,17 @@ async fn call_tool(
         "pr_view" => {
             let repo = args["repo"].as_str().context("missing 'repo'")?;
             let number = args["number"].as_i64().context("missing 'number'")?;
-            let owner = resolve_owner(&args, &client).await?;
+            let owner = resolve_signed_read_owner(&args, &keypair, &client).await?;
             let pr = crate::http::read_json(
                 client
-                    .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}"))
+                    .get_maybe_signed(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}"))
                     .await?,
                 "pull request",
             )
             .await?;
             let reviews = crate::http::read_json(
                 client
-                    .get(&format!(
+                    .get_maybe_signed(&format!(
                         "/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews"
                     ))
                     .await?,
@@ -939,10 +941,10 @@ async fn call_tool(
         "pr_diff" => {
             let repo = args["repo"].as_str().context("missing 'repo'")?;
             let number = args["number"].as_i64().context("missing 'number'")?;
-            let owner = resolve_owner(&args, &client).await?;
+            let owner = resolve_signed_read_owner(&args, &keypair, &client).await?;
             let resp = crate::http::read_json(
                 client
-                    .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/diff"))
+                    .get_maybe_signed(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/diff"))
                     .await?,
                 "diff",
             )
@@ -1413,6 +1415,27 @@ async fn resolve_owner(args: &Value, client: &NodeClient) -> Result<String> {
     let info = crate::http::read_json(client.get("/").await?, "node info").await?;
     let did = info["did"].as_str().context("node info missing DID")?;
     Ok(did.split(':').next_back().unwrap_or(did).to_string())
+}
+
+/// Owner for the owner-gated signed reads (`repo_get`, `repo_commits`,
+/// `pr_list`, `pr_view`, `pr_diff`): an explicit `owner` arg wins, then the
+/// signing keypair's short DID, and only a caller with no identity falls back to
+/// the node root DID. The request is signed by the keypair, so a path owner that
+/// names the node instead would be aimed at a namespace the signer does not own
+/// and the node would deny it.
+async fn resolve_signed_read_owner(
+    args: &Value,
+    keypair: &Option<gitlawb_core::identity::Keypair>,
+    client: &NodeClient,
+) -> Result<String> {
+    if let Some(o) = args.get("owner").and_then(|v| v.as_str()) {
+        return Ok(o.to_string());
+    }
+    if let Some(kp) = keypair {
+        let did = kp.did().to_string();
+        return Ok(did.split(':').next_back().unwrap_or(&did).to_string());
+    }
+    resolve_owner(args, client).await
 }
 
 /// Resolve (owner, repo) for the webhook tools, matching the CLI's
@@ -2647,6 +2670,209 @@ mod tests {
         .await
         .unwrap();
         assert!(result.contains("webhooks"), "got: {result}");
+    }
+
+    /// Drive one owner-gated MCP read with an identity and a mock that requires
+    /// the signature headers (#115). `path` is the exact request path; a
+    /// regression of that arm to an unsigned `get` leaves the mock unmatched, so
+    /// the call errors on mockito's 501.
+    async fn assert_mcp_read_is_signed(tool: &str, args: Value, path: &str, body: &str) -> String {
+        let mut server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+        let m = server
+            .mock("GET", path)
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .expect(1)
+            .create_async()
+            .await;
+        let out = call_tool(tool, args, &server.url(), Some(dir.path()))
+            .await
+            .unwrap_or_else(|e| panic!("{tool} must send a signed request: {e:#}"));
+        m.assert_async().await;
+        out
+    }
+
+    #[tokio::test]
+    async fn test_repo_get_via_mcp_signs_the_request() {
+        let out = assert_mcp_read_is_signed(
+            "repo_get",
+            json!({"name": "myrepo", "owner": "alice"}),
+            "/api/v1/repos/alice/myrepo",
+            r#"{"name":"myrepo"}"#,
+        )
+        .await;
+        assert!(out.contains("myrepo"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn test_repo_commits_via_mcp_signs_the_request() {
+        assert_mcp_read_is_signed(
+            "repo_commits",
+            json!({"name": "myrepo", "owner": "alice"}),
+            "/api/v1/repos/alice/myrepo/commits",
+            r#"{"commits":[]}"#,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_pr_list_via_mcp_signs_the_request() {
+        assert_mcp_read_is_signed(
+            "pr_list",
+            json!({"repo": "myrepo", "owner": "alice"}),
+            "/api/v1/repos/alice/myrepo/pulls",
+            r#"{"pulls":[]}"#,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_pr_diff_via_mcp_signs_the_request() {
+        let out = assert_mcp_read_is_signed(
+            "pr_diff",
+            json!({"repo": "myrepo", "owner": "alice", "number": 1}),
+            "/api/v1/repos/alice/myrepo/pulls/1/diff",
+            r#"{"diff":"diff --git a/x b/x"}"#,
+        )
+        .await;
+        assert!(out.contains("diff --git"), "got: {out}");
+    }
+
+    /// pr_view issues two gated GETs; each must be signed on its own.
+    #[tokio::test]
+    async fn test_pr_view_via_mcp_signs_both_requests() {
+        let mut server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+        let pr = server
+            .mock("GET", "/api/v1/repos/alice/myrepo/pulls/1")
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"number":1}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let reviews = server
+            .mock("GET", "/api/v1/repos/alice/myrepo/pulls/1/reviews")
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"reviews":[]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        call_tool(
+            "pr_view",
+            json!({"repo": "myrepo", "owner": "alice", "number": 1}),
+            &server.url(),
+            Some(dir.path()),
+        )
+        .await
+        .expect("pr_view must send signed requests");
+        pr.assert_async().await;
+        reviews.assert_async().await;
+    }
+
+    /// With `owner` omitted and an identity present, the path owner must be the
+    /// signing keypair's short DID, not the node root DID: a signed request whose
+    /// keyid differs from the path owner is denied on a private repo. Every
+    /// changed read tool is driven; the node-root mock returns a different DID,
+    /// so a fallback to it leaves the keypair-owner mock unmatched.
+    #[tokio::test]
+    async fn test_gated_mcp_reads_default_owner_is_keypair_not_node_did() {
+        let cases: [(&str, Value, &str); 5] = [
+            ("repo_get", json!({"name": "myrepo"}), ""),
+            ("repo_commits", json!({"name": "myrepo"}), "/commits"),
+            ("pr_list", json!({"repo": "myrepo"}), "/pulls"),
+            (
+                "pr_view",
+                json!({"repo": "myrepo", "number": 1}),
+                "/pulls/1",
+            ),
+            (
+                "pr_diff",
+                json!({"repo": "myrepo", "number": 1}),
+                "/pulls/1/diff",
+            ),
+        ];
+        for (tool, args, suffix) in cases {
+            let mut server = mockito::Server::new_async().await;
+            let dir = tempfile::TempDir::new().unwrap();
+            let kp = gitlawb_core::identity::Keypair::generate();
+            std::fs::write(
+                dir.path().join("identity.pem"),
+                kp.to_pem().unwrap().as_bytes(),
+            )
+            .unwrap();
+            let did = kp.did().to_string();
+            let short = did.split(':').next_back().unwrap_or(&did).to_string();
+
+            let _root = server
+                .mock("GET", "/")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(r#"{"did":"did:key:z6MkNodeRootDid"}"#)
+                .create_async()
+                .await;
+            let m = server
+                .mock(
+                    "GET",
+                    format!("/api/v1/repos/{short}/myrepo{suffix}").as_str(),
+                )
+                .match_header("signature", mockito::Matcher::Any)
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(r#"{"diff":"d","reviews":[]}"#)
+                .expect(1)
+                .create_async()
+                .await;
+            // pr_view's second GET (reviews) lives under the same owner.
+            let _reviews = server
+                .mock(
+                    "GET",
+                    format!("/api/v1/repos/{short}/myrepo/pulls/1/reviews").as_str(),
+                )
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(r#"{"reviews":[]}"#)
+                .create_async()
+                .await;
+
+            call_tool(tool, args, &server.url(), Some(dir.path()))
+                .await
+                .unwrap_or_else(|e| panic!("{tool} must default owner to the keypair: {e:#}"));
+            m.assert_async().await;
+        }
+    }
+
+    /// An explicit `owner` still wins over the keypair default.
+    #[tokio::test]
+    async fn test_gated_mcp_read_explicit_owner_beats_keypair() {
+        assert_mcp_read_is_signed(
+            "pr_list",
+            json!({"repo": "myrepo", "owner": "bob"}),
+            "/api/v1/repos/bob/myrepo/pulls",
+            r#"{"pulls":[]}"#,
+        )
+        .await;
     }
 
     /// The MCP tool deliberately diverges from the CLI here: `gl webhook list`
