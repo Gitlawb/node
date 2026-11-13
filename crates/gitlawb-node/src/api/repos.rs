@@ -1777,6 +1777,7 @@ pub async fn git_upload_pack(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
+    let fetch_started = std::time::Instant::now();
     // #62 cheap load shed. Permit-less snapshot, not admission; see git_info_refs for
     // what it does and does not bound. The authoritative hold is `git_permit` below,
     // after the per-source cap.
@@ -1979,6 +1980,7 @@ pub async fn git_upload_pack(
     // that mislabel predates this change and is tracked as a follow-up.
     if should_count_fetch(finalizes_fetch, served_filtered_pack, served_pack) {
         crate::metrics::record_fetch(&format!("{owner}/{name}"));
+        crate::metrics::observe_fetch_duration(fetch_started.elapsed());
         crate::metrics::observe_pack_size(body_len as f64);
     }
     Ok(resp)
@@ -2190,6 +2192,7 @@ async fn notify_peer_of_ref(
     node_did: &str,
     pusher_did: &str,
     owner_did: &str,
+    origin_timestamp: &str,
 ) {
     let body = serde_json::json!({
         "repo": repo_slug,
@@ -2198,7 +2201,13 @@ async fn notify_peer_of_ref(
         "node_did": node_did,
         "pusher_did": pusher_did,
         "old_sha": old_sha,
-        "timestamp": chrono::Utc::now().to_rfc3339(),
+        // Publish semantics, matching what gossip ingest stores on the feed
+        // row: the send instant, freshness-window meaningful. Land time travels
+        // separately in lag_origin (also an Option<String> on the receiver);
+        // stamping land here would put a different clock on HTTP rows than on
+        // gossip rows for the same logical update.
+        "timestamp": Utc::now().to_rfc3339(),
+        "lag_origin": origin_timestamp,
         "owner_did": owner_did,
     });
     let body_bytes = match serde_json::to_vec(&body) {
@@ -2248,6 +2257,7 @@ async fn notify_peer_of_refs(
     node_did: &str,
     pusher_did: &str,
     owner_did: &str,
+    origin_timestamp: &str,
 ) {
     for (ref_name, old_sha, new_sha) in ref_updates {
         notify_peer_of_ref(
@@ -2262,6 +2272,7 @@ async fn notify_peer_of_refs(
             node_did,
             pusher_did,
             owner_did,
+            origin_timestamp,
         )
         .await;
     }
@@ -2280,6 +2291,7 @@ pub async fn git_receive_pack(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
+    let push_started = std::time::Instant::now();
     let name = smart_http_repo_name(&repo)?;
     // Fast-path shed before the DB lookup when the write pool is ALREADY saturated, so a
     // push flood against a full pool does not hit Postgres per request. Best-effort
@@ -3310,14 +3322,37 @@ pub async fn git_receive_pack(
     // then deleted, and a landing reconcile proves only later would emit
     // nothing at all.
     if disposition.spawn_tail && !push_succeeded && !landed_refs.is_empty() {
-        tokio::spawn(post_receive_replication_tail(
-            state.clone(),
-            record.clone(),
-            landed_refs.clone(),
-            disk_path.clone(),
-            auth.0.to_string(),
-            None,
-        ));
+        let state = state.clone();
+        let record = record.clone();
+        let landed = landed_refs.clone();
+        let disk_path = disk_path.clone();
+        let did = auth.0.to_string();
+        let db = state.db.clone();
+        let request_id = request_id.clone();
+        let fallback = now.clone();
+        tokio::spawn(async move {
+            // Resolve inside the owned task: awaiting the lookup in the handler
+            // would hold the reclaimed write lease during a DB wait and leave
+            // the tail un-owned on a disconnect. Same land rule as the deferred
+            // drain — max applied_at across this request's landed transitions,
+            // else the request row's created_at.
+            let push_landed_at = db
+                .request_push_landed_at(&request_id)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(fallback);
+            post_receive_replication_tail(
+                state,
+                record,
+                landed,
+                disk_path,
+                did,
+                Some(push_landed_at),
+                None,
+            )
+            .await;
+        });
     }
 
     // Always release the advisory lock — even on error — to prevent stale locks
@@ -3338,14 +3373,35 @@ pub async fn git_receive_pack(
         // than by the mere fact that release was entered.
         publish_durability.arm_for_release(reclaimed.publish_stage());
         if disposition.spawn_tail && !landed_refs.is_empty() {
-            tokio::spawn(post_receive_replication_tail(
-                state.clone(),
-                record.clone(),
-                landed_refs,
-                disk_path.clone(),
-                auth.0.to_string(),
-                Some(publish_durability.arc()),
-            ));
+            let state = state.clone();
+            let record = record.clone();
+            let disk_path = disk_path.clone();
+            let did = auth.0.to_string();
+            let db = state.db.clone();
+            let request_id = request_id.clone();
+            let fallback = now.clone();
+            let durability_slot = publish_durability.arc();
+            tokio::spawn(async move {
+                // Same in-task resolution and land rule as the carve-out spawn
+                // above — the handler must not await the lookup while it still
+                // holds the reclaimed write lease.
+                let push_landed_at = db
+                    .request_push_landed_at(&request_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(fallback);
+                post_receive_replication_tail(
+                    state,
+                    record,
+                    landed_refs,
+                    disk_path,
+                    did,
+                    Some(push_landed_at),
+                    Some(durability_slot),
+                )
+                .await;
+            });
         }
     }
     // Short-circuit on a refused publish BEFORE anything downstream observes
@@ -3412,6 +3468,7 @@ pub async fn git_receive_pack(
     {
         Ok(true) => {}
         _ => {
+            crate::metrics::observe_push_duration(push_started.elapsed());
             return axum::response::Response::builder()
                 .status(axum::http::StatusCode::OK)
                 .header("Content-Type", "application/x-git-receive-pack-result")
@@ -3516,6 +3573,7 @@ pub async fn git_receive_pack(
         }
     }
 
+    crate::metrics::observe_push_duration(push_started.elapsed());
     axum::response::Response::builder()
         .status(axum::http::StatusCode::OK)
         .header("Content-Type", "application/x-git-receive-pack-result")
@@ -3863,12 +3921,24 @@ pub(crate) async fn record_push_events(
 /// complete without ever having a live tail (capability-free pushes whose
 /// landing reconcile proved). `pub(crate)` so the drain can call it; the
 /// live handler is the other caller.
+/// The lag origin the tail reports: the caller-supplied push-land instant when
+/// one exists (a deferred drain passes the request row's created_at), else the
+/// tail's own entry time for callers that never knew the landing instant.
+fn lag_origin_timestamp(push_landed_at: Option<String>) -> String {
+    push_landed_at.unwrap_or_else(|| Utc::now().to_rfc3339())
+}
+
 pub(crate) async fn post_receive_replication_tail(
     state: AppState,
     record: RepoRecord,
     ref_updates: Vec<RefUpdate>,
     disk_path: std::path::PathBuf,
     did: String,
+    // The instant the push landed, captured by the caller at acceptance so a
+    // deferred tail reports push-land lag rather than drain-time lag. Callers
+    // that cannot recover the landing instant pass None and the tail falls
+    // back to its own entry time, the pre-param behavior.
+    push_landed_at: Option<String>,
     publish_durability: Option<
         Arc<std::sync::Mutex<Option<crate::git::repo_store::ReleaseOutcome>>>,
     >,
@@ -3879,6 +3949,14 @@ pub(crate) async fn post_receive_replication_tail(
             .lock_held_transfer_timeout_secs
             .saturating_add(5),
     );
+    // The sync-lag origin: the instant this push landed, captured BEFORE the
+    // durability wait so a slow publish does not shrink the lag a mirror
+    // measures. Travels to receiving peers as RefUpdateEvent::lag_origin
+    // (gossip) and the notify lag_origin field (HTTP) — never as the signed
+    // event's own `timestamp` or the notify `timestamp`, which both stay at
+    // publish time for check_freshness and feed-row parity.
+    let origin_timestamp = lag_origin_timestamp(push_landed_at);
+
     if !publish_durability_confirmed(&publish_durability, durability_wait).await {
         tracing::warn!(
             repo = %record.id,
@@ -4101,6 +4179,7 @@ pub(crate) async fn post_receive_replication_tail(
         let owner_did_for_arweave = record.owner_did.clone();
         let self_public_url = state.config.public_url.clone();
         let node_keypair = Arc::clone(&state.node_keypair);
+        let origin_timestamp_for_announce = origin_timestamp.clone();
         // #174 F2a: gated on the cheap announce predicate, not on `withheld`.
         // `withheld` is None for a push that coalesced (it never walked), and
         // this task's work is per-push and non-idempotent, so keying it on the
@@ -4226,6 +4305,7 @@ pub(crate) async fn post_receive_replication_tail(
                             old_sha: old_sha.clone(),
                             new_sha: new_sha.clone(),
                             timestamp: chrono::Utc::now().to_rfc3339(),
+                            lag_origin: Some(origin_timestamp_for_announce.clone()),
                             cert_id: None,
                             cid: cid.map(|s| s.to_string()),
                             sig: None,
@@ -4328,6 +4408,7 @@ pub(crate) async fn post_receive_replication_tail(
                             &node_did_str,
                             &pusher_did_clone,
                             &record.owner_did,
+                            &origin_timestamp_for_announce,
                         )
                         .await;
                     }
@@ -8251,6 +8332,11 @@ mod tests {
                 mockito::Matcher::PartialJsonString(
                     r#"{"owner_did":"did:key:zOwner"}"#.to_string(),
                 ),
+                // Land time rides lag_origin after the publish/land split;
+                // timestamp is a live send instant and cannot be pinned.
+                mockito::Matcher::PartialJsonString(
+                    r#"{"lag_origin":"2026-08-16T00:00:00Z"}"#.to_string(),
+                ),
             ]))
             .with_status(200)
             .expect(1)
@@ -8287,6 +8373,7 @@ mod tests {
             "did:key:zNode",
             "did:key:zPusher",
             "did:key:zOwner",
+            "2026-08-16T00:00:00Z",
         )
         .await;
 
@@ -8335,6 +8422,7 @@ mod tests {
             "did:key:zNode",
             "did:key:zPusher",
             "did:key:zOwner",
+            "2026-08-16T00:00:00Z",
         )
         .await;
 
@@ -15093,6 +15181,24 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn lag_origin_timestamp_prefers_the_caller_supplied_push_land() {
+        let landed = "2019-01-01T00:00:00Z".to_string();
+        assert_eq!(
+            lag_origin_timestamp(Some(landed.clone())),
+            landed,
+            "a deferred tail must report the request row's landing instant, not drain time"
+        );
+        let fallback = lag_origin_timestamp(None);
+        let parsed = chrono::DateTime::parse_from_rfc3339(&fallback)
+            .expect("the fallback must still be a valid RFC-3339 instant");
+        let skew = (chrono::Utc::now() - parsed.with_timezone(&chrono::Utc)).num_seconds();
+        assert!(
+            skew.abs() < 60,
+            "a caller that never knew the landing instant falls back to tail entry time"
+        );
+    }
+
     fn f2a_update(ref_name: &str, new_sha: &str) -> Vec<RefUpdate> {
         vec![RefUpdate {
             old_sha: ZERO_SHA.to_string(),
@@ -15125,6 +15231,7 @@ mod tests {
             f2a_update("refs/heads/main", &c1),
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
             Some(slot),
         )
         .await;
@@ -15171,6 +15278,7 @@ mod tests {
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
             None,
+            None,
         )
         .await;
         let after_first = f2a_walks(&log);
@@ -15191,6 +15299,7 @@ mod tests {
             f2a_update("refs/heads/second", &c1),
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
             None,
         )
         .await;
@@ -15267,6 +15376,7 @@ mod tests {
             f2a_update("refs/heads/main", &c2),
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
             None,
         )
         .await;
@@ -15349,6 +15459,7 @@ mod tests {
             f2a_update("refs/heads/main", &c2),
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
             None,
         ));
         f2a_wait_for(|| started.exists(), "the admitted push's walk to start").await;
@@ -15466,6 +15577,7 @@ mod tests {
             }],
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
             None,
         )
         .await;
@@ -16618,6 +16730,7 @@ exit 0
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
             None,
+            None,
         )
         .await;
 
@@ -16674,6 +16787,7 @@ exit 0
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
             None,
+            None,
         )
         .await;
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -16715,6 +16829,7 @@ exit 0
             }],
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
             None,
         )
         .await;
@@ -16814,6 +16929,7 @@ exit 0
             }],
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
             None,
         )
         .await;

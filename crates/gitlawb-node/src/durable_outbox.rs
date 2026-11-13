@@ -1743,6 +1743,15 @@ fn spawn_deferred_tail_after_proof(
     }
     let repo_id = req.repo_id.clone();
     let pusher_did = req.pusher_did.clone();
+    // The truest landing instant available: the applied_at stamp on the
+    // accepted transitions (written when the refs actually moved), with the
+    // request row's created_at (push acceptance) as the fallback. Either is
+    // truer than this deferred drain's Utc::now().
+    let push_landed_at = accepted
+        .iter()
+        .filter_map(|t| t.applied_at.clone())
+        .max()
+        .unwrap_or_else(|| req.created_at.clone());
     let landed: Vec<(String, String, String)> = accepted
         .iter()
         .map(|c| (c.ref_name.clone(), c.old_sha.clone(), c.new_sha.clone()))
@@ -1783,6 +1792,7 @@ fn spawn_deferred_tail_after_proof(
             ref_updates,
             std::path::PathBuf::from(repo.disk_path.clone()),
             pusher_did,
+            Some(push_landed_at),
             None,
         )
         .await;

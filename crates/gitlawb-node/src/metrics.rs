@@ -5,6 +5,8 @@
 //!
 //!   * is push traffic flowing? — `gitlawb_pushes_total`
 //!   * is fetch traffic flowing? — `gitlawb_fetches_total`
+//!   * how long do successful push and fetch operations take? —
+//!     `gitlawb_push_duration_seconds` / `gitlawb_fetch_duration_seconds`
 //!   * are signature checks passing or failing? —
 //!     `gitlawb_auth_successes_total` / `gitlawb_auth_failures_total`
 //!   * is the sync worker making progress? —
@@ -18,6 +20,8 @@
 //!     `gitlawb_gossip_replay_guard_saturated_total`
 //!   * how big are the packs we're sending and receiving? —
 //!     `gitlawb_pack_size_bytes`
+//!   * how long after an origin lands a push is it visible on this mirror? —
+//!     `gitlawb_sync_lag_seconds`
 //!   * a single `gitlawb_info{version, did}` gauge = 1, for joins/dashboards
 //!   * currently-connected peer count — `gitlawb_peers_connected`
 //!   * reconciliation sweep gaps found and filled —
@@ -34,11 +38,10 @@
 //! free.
 //!
 //! Follow-ups (not in this module):
-//!   * per-route latency histograms (TraceLayer already gives us spans)
 //!   * per-peer p2p counters
 //!   * ipfs / pinata counters
 
-use std::sync::OnceLock;
+use std::{sync::OnceLock, time::Duration};
 
 use prometheus::{
     Encoder, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
@@ -60,6 +63,9 @@ static WEBHOOK_DELIVERIES: OnceLock<IntCounterVec> = OnceLock::new();
 static GOSSIP_INGEST: OnceLock<IntCounterVec> = OnceLock::new();
 static GOSSIP_REPLAY_GUARD_SATURATED: OnceLock<IntCounter> = OnceLock::new();
 static PACK_SIZE: OnceLock<Histogram> = OnceLock::new();
+static PUSH_DURATION: OnceLock<Histogram> = OnceLock::new();
+static FETCH_DURATION: OnceLock<Histogram> = OnceLock::new();
+static SYNC_LAG: OnceLock<Histogram> = OnceLock::new();
 static PEERS_CONNECTED: OnceLock<IntGauge> = OnceLock::new();
 static RECONCILIATION_GAPS_FOUND: OnceLock<IntCounter> = OnceLock::new();
 static RECONCILIATION_GAPS_FILLED: OnceLock<IntCounter> = OnceLock::new();
@@ -124,6 +130,51 @@ fn init_inner(version: &str, node_did: &str) {
         .register(Box::new(fetches.clone()))
         .expect("register gitlawb_fetches_total");
     FETCHES.set(fetches).expect("set FETCHES once");
+
+    let push_duration = Histogram::with_opts(
+        HistogramOpts::new(
+            "gitlawb_push_duration_seconds",
+            "Wall time of a successful git push (receive-pack) request in seconds, from handler entry to its response, including claim-loser returns where another worker owns the effects",
+        )
+        .buckets(operation_duration_buckets()),
+    )
+    .expect("gitlawb_push_duration_seconds definition");
+    registry
+        .register(Box::new(push_duration.clone()))
+        .expect("register gitlawb_push_duration_seconds");
+    PUSH_DURATION
+        .set(push_duration)
+        .expect("set PUSH_DURATION once");
+
+    let fetch_duration = Histogram::with_opts(
+        HistogramOpts::new(
+            "gitlawb_fetch_duration_seconds",
+            "Duration of successful git fetch (upload-pack) completion requests in seconds",
+        )
+        .buckets(operation_duration_buckets()),
+    )
+    .expect("gitlawb_fetch_duration_seconds definition");
+    registry
+        .register(Box::new(fetch_duration.clone()))
+        .expect("register gitlawb_fetch_duration_seconds");
+    FETCH_DURATION
+        .set(fetch_duration)
+        .expect("set FETCH_DURATION once");
+
+    let sync_lag = Histogram::with_opts(
+        HistogramOpts::new(
+            "gitlawb_sync_lag_seconds",
+            "Lag from the origin push-land timestamp (lag_origin) to successful local mirror visibility in seconds",
+        )
+        .buckets(vec![
+            1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1_800.0, 3_600.0,
+        ]),
+    )
+    .expect("gitlawb_sync_lag_seconds definition");
+    registry
+        .register(Box::new(sync_lag.clone()))
+        .expect("register gitlawb_sync_lag_seconds");
+    SYNC_LAG.set(sync_lag).expect("set SYNC_LAG once");
 
     let auth_successes = IntCounterVec::new(
         Opts::new(
@@ -302,6 +353,35 @@ pub fn record_fetch(repo: &str) {
     }
 }
 
+/// Observe the elapsed time of a successful git push handler.
+pub fn observe_push_duration(duration: Duration) {
+    observe_duration(&PUSH_DURATION, duration);
+}
+
+/// Observe the elapsed time of a successful git fetch completion request.
+pub fn observe_fetch_duration(duration: Duration) {
+    observe_duration(&FETCH_DURATION, duration);
+}
+
+/// Observe end-to-end lag until an origin ref update is visible on this mirror.
+pub fn observe_sync_lag(duration: Duration) {
+    observe_duration(&SYNC_LAG, duration);
+}
+
+fn observe_duration(histogram: &OnceLock<Histogram>, duration: Duration) {
+    if let Some(h) = histogram.get() {
+        h.observe(duration.as_secs_f64());
+    }
+}
+
+/// Test-only: current `gitlawb_sync_lag_seconds` sample count (0 if the
+/// registry is not initialized). Lets the sync lag-gate tests assert that a
+/// skipped observation really never reached the histogram.
+#[cfg(test)]
+pub fn sync_lag_sample_count_for_test() -> u64 {
+    SYNC_LAG.get().map(|h| h.get_sample_count()).unwrap_or(0)
+}
+
 /// Test-only: current `gitlawb_fetches_total` value for `repo` (0 if the registry
 /// is not initialized). Lets api-layer tests assert the completed-fetch count with
 /// a unique label instead of scraping the encoded text.
@@ -420,6 +500,12 @@ pub fn observe_pack_size(bytes: f64) {
     }
 }
 
+fn operation_duration_buckets() -> Vec<f64> {
+    vec![
+        0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
+    ]
+}
+
 /// Update the currently-connected peer count gauge.
 pub fn set_peers_connected(count: i64) {
     if let Some(g) = PEERS_CONNECTED.get() {
@@ -485,6 +571,11 @@ mod tests {
             .expect("PUSHES set after init")
             .with_label_values(&["alice/repo"])
             .inc();
+        observe_push_duration(Duration::from_millis(42));
+        observe_fetch_duration(Duration::from_millis(24));
+        // `observe_sync_lag` is deliberately NOT called. The sync lag-gate
+        // test asserts a before/after delta on the process-wide histogram, so
+        // a sample from this test running concurrently would flake it.
         record_reconciliation_gaps_found(7);
         record_reconciliation_gaps_filled(3);
 
@@ -501,6 +592,16 @@ mod tests {
             body.contains("gitlawb_pushes_total{repo=\"alice/repo\"} 1"),
             "expected the incremented counter to be visible in: {body}"
         );
+        for metric in [
+            "gitlawb_push_duration_seconds",
+            "gitlawb_fetch_duration_seconds",
+            "gitlawb_sync_lag_seconds",
+        ] {
+            assert!(
+                body.contains(&format!("# TYPE {metric} histogram")),
+                "expected {metric} histogram in: {body}"
+            );
+        }
         assert!(
             body.contains("gitlawb_reconciliation_gaps_found_total 7"),
             "expected the reconciliation gaps-found counter to be visible in: {body}"
@@ -543,9 +644,13 @@ mod tests {
         // here. It is a label-less process-wide counter and the seen-set test
         // that asserts it asserts a before/after delta, so an increment from a
         // second test running concurrently in this binary would be a flake with
-        // no diagnostic value.
+        // no diagnostic value. `observe_sync_lag` is withheld for the same
+        // reason: the sync lag-gate test asserts a sample-count delta on the
+        // process-wide histogram.
         record_gossip_ingest("accepted");
         observe_pack_size(1024.0);
+        observe_push_duration(Duration::from_secs(1));
+        observe_fetch_duration(Duration::from_secs(1));
         set_peers_connected(0);
     }
 

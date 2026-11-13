@@ -2478,7 +2478,17 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_pending ON webhook_deliveries (sent_at, created_at)",
         ],
     },
-    // Reservation: v47, not 24 as this branch originally claimed — main's tail
+    Migration {
+        version: 47,
+        name: "sync_queue_origin_timestamp",
+        stmts: &[
+            // The source timestamp accompanies a ref update across either
+            // transport. It remains nullable for rows from older peers and
+            // manually-triggered syncs, which must not report a fabricated lag.
+            "ALTER TABLE sync_queue ADD COLUMN IF NOT EXISTS origin_timestamp TEXT",
+        ],
+    },
+    // Reservation: v48, not 24 as this branch originally claimed — main's tail
     // has since reached 46, and a claimed version that another entry already
     // holds is a startup schema-conflict (the typed MigrationVersionCollision),
     // not the silent skip the original reservation feared. Same rule as before:
@@ -2490,7 +2500,7 @@ const MIGRATIONS: &[Migration] = &[
     // because a merged entry is never edited and a second version would collide
     // with the same branches this one already had to clear.
     Migration {
-        version: 47,
+        version: 48,
         name: "status_claims_pr_head_and_push_events",
         stmts: &[
             // Append-only claim history. `seq` is a bigserial because the
@@ -3837,6 +3847,7 @@ pub struct SyncQueueItem {
     pub ref_name: String,
     pub new_sha: String,
     pub cid: Option<String>,
+    pub origin_timestamp: Option<String>,
     pub status: String,
     pub enqueued_at: String,
 }
@@ -3849,10 +3860,11 @@ impl Db {
         ref_name: &str,
         new_sha: &str,
         cid: Option<&str>,
+        origin_timestamp: Option<&str>,
     ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO sync_queue (id, repo, node_did, ref_name, new_sha, cid, status, enqueued_at)
-             VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)
+            "INSERT INTO sync_queue (id, repo, node_did, ref_name, new_sha, cid, origin_timestamp, status, enqueued_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)
              ON CONFLICT DO NOTHING",
         )
         .bind(Uuid::new_v4().to_string())
@@ -3861,6 +3873,7 @@ impl Db {
         .bind(ref_name)
         .bind(new_sha)
         .bind(cid)
+        .bind(origin_timestamp)
         .bind(Utc::now().to_rfc3339())
         .execute(&self.pool)
         .await?;
@@ -3903,7 +3916,7 @@ impl Db {
                  SELECT id FROM sync_queue WHERE status = 'pending'
                  ORDER BY COALESCE(attempted_at, enqueued_at) ASC LIMIT $1
              )
-             RETURNING id, repo, node_did, ref_name, new_sha, cid, status, enqueued_at",
+             RETURNING id, repo, node_did, ref_name, new_sha, cid, origin_timestamp, status, enqueued_at",
         )
         .bind(limit)
         .bind(Utc::now().to_rfc3339())
@@ -3918,6 +3931,7 @@ impl Db {
                 ref_name: r.get("ref_name"),
                 new_sha: r.get("new_sha"),
                 cid: r.get("cid"),
+                origin_timestamp: r.get("origin_timestamp"),
                 status: r.get("status"),
                 enqueued_at: r.get("enqueued_at"),
             })
@@ -6167,6 +6181,25 @@ impl Db {
     /// this once and processes each row by re-deriving the push event,
     /// the per-ref cert, and the anchor handoff.
     #[allow(dead_code)] // wired by the handler refactor in the next slice
+    /// The instant this request's refs actually moved: the latest `applied_at`
+    /// stamp across its applied transitions, or `None` when none are applied
+    /// yet. Shared definition of "push landed" for the live replication tail,
+    /// which must match the deferred drain's `max(applied_at) ?? created_at`
+    /// rule so live and deferred pushes report one lag origin.
+    pub async fn request_push_landed_at(&self, request_id: &str) -> Result<Option<String>> {
+        let row = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT MAX(applied_at) FROM pending_ref_transitions              WHERE request_id = $1 AND state = 'applied'",
+        )
+        .bind(request_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Test-only: the drain callers that used this moved to the request-scoped
+    /// `request_push_landed_at` and count helpers; kept for the transition-state
+    /// tests below.
+    #[cfg(test)]
     pub async fn list_pending_ref_transitions_applied(
         &self,
         limit: i64,
@@ -11554,7 +11587,7 @@ mod migration_tests {
         db.migrate().await.unwrap();
     }
 
-    // ── sync_queue scheduling (attempted_at, v17) ────────────────────────────
+    // ── sync_queue scheduling and origin timestamps (v17/v18) ───────────────
 
     async fn enqueue_one(db: &super::Db, repo: &str) {
         db.enqueue_sync(
@@ -11562,6 +11595,7 @@ mod migration_tests {
             "did:key:zPEER",
             "refs/heads/main",
             &"0".repeat(40),
+            None,
             None,
         )
         .await
@@ -11632,12 +11666,78 @@ mod migration_tests {
         db.migrate().await.unwrap();
     }
 
-    // ── Status claims, stored PR head, push events (v47) ─────────────────────
+    /// Upgrade-path test for the nullable source timestamp. The worker must
+    /// preserve it when it exists, while rows written before v18 remain valid.
+    #[sqlx::test]
+    async fn migration_v47_adds_sync_queue_origin_timestamp(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        sqlx::query("ALTER TABLE sync_queue DROP COLUMN origin_timestamp")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 47")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "INSERT INTO sync_queue (id, repo, node_did, ref_name, new_sha, status, enqueued_at)
+             VALUES ('legacy-sync', 'z6Mkfoo/legacy', 'did:key:zPEER', 'refs/heads/main', $1, 'pending', $2)",
+        )
+        .bind("0".repeat(40))
+        .bind("2026-08-16T00:00:00Z")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        db.migrate().await.unwrap();
+
+        let col: (String, String) = sqlx::query_as(
+            "SELECT data_type, is_nullable
+             FROM information_schema.columns
+             WHERE table_name = 'sync_queue' AND column_name = 'origin_timestamp'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(col.0, "text");
+        assert_eq!(col.1, "YES", "origin_timestamp must be nullable");
+
+        let items = db.dequeue_pending_syncs(10).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].origin_timestamp, None);
+        db.migrate().await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn dequeue_preserves_sync_origin_timestamp(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        let timestamp = "2026-08-16T00:00:00Z";
+        db.enqueue_sync(
+            "z6Mkfoo/timestamped",
+            "did:key:zPEER",
+            "refs/heads/main",
+            &"0".repeat(40),
+            None,
+            Some(timestamp),
+        )
+        .await
+        .unwrap();
+
+        let items = db.dequeue_pending_syncs(10).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].origin_timestamp.as_deref(), Some(timestamp));
+    }
+
+    // ── Status claims, stored PR head, push events (v48) ─────────────────────
 
     /// The version this branch's migration claims. Kept as a named constant so
     /// the upgrade test's rollback target is derived from `MIGRATIONS` rather
     /// than hard-coded twice.
-    const V47: i64 = 47;
+    const V48: i64 = 48;
 
     const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -11736,7 +11836,7 @@ mod migration_tests {
     }
 
     /// Fresh-database path: the whole chain on an empty database creates all
-    /// three v47 objects, and a claim round-trips field for field, including
+    /// three v48 objects, and a claim round-trips field for field, including
     /// the nullable columns in both directions.
     #[sqlx::test]
     async fn migration_v47_fresh_chain_round_trips_a_claim(pool: sqlx::PgPool) {
@@ -12151,7 +12251,7 @@ mod migration_tests {
 
     /// Upgrade path, the load-bearing one: `#[sqlx::test]` hands out a fresh
     /// database that runs the entire chain, so the fresh-chain test above stays
-    /// green even if the v47 statements were appended to an already-applied
+    /// green even if the v48 statements were appended to an already-applied
     /// entry. Only a simulated existing node catches that.
     #[sqlx::test]
     async fn migration_v47_upgrade_path_adds_claims_head_commit_and_push_events(
@@ -12161,7 +12261,7 @@ mod migration_tests {
         db.migrate().await.unwrap();
 
         // Roll the database back to the state of a node at the highest version
-        // below 47 that this build declares.
+        // below 48 that this build declares.
         sqlx::query("DROP TABLE IF EXISTS status_claims")
             .execute(&db.pool)
             .await
@@ -12175,7 +12275,7 @@ mod migration_tests {
             .await
             .unwrap();
         sqlx::query("DELETE FROM schema_migrations WHERE version >= $1")
-            .bind(V47)
+            .bind(V48)
             .execute(&db.pool)
             .await
             .unwrap();
@@ -12183,16 +12283,16 @@ mod migration_tests {
         let prior = MIGRATIONS
             .iter()
             .map(|m| m.version)
-            .filter(|v| *v < V47)
+            .filter(|v| *v < V48)
             .max()
-            .expect("MIGRATIONS must declare a version below 47");
+            .expect("MIGRATIONS must declare a version below 48");
         let recorded_max: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
             .fetch_one(&db.pool)
             .await
             .unwrap();
         assert_eq!(
             recorded_max, prior,
-            "the simulated node must sit at the highest version below {V47}"
+            "the simulated node must sit at the highest version below {V48}"
         );
 
         // A pull request written by the old node, before the column existed.
@@ -12248,11 +12348,11 @@ mod migration_tests {
         .await;
 
         let recorded: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM schema_migrations WHERE version = 47")
+            sqlx::query_as("SELECT COUNT(*) FROM schema_migrations WHERE version = 48")
                 .fetch_one(&db.pool)
                 .await
                 .unwrap();
-        assert_eq!(recorded.0, 1, "v47 must be recorded as applied");
+        assert_eq!(recorded.0, 1, "v48 must be recorded as applied");
 
         // Idempotent re-run.
         db.migrate().await.unwrap();
@@ -15307,6 +15407,24 @@ mod icaptcha_quarantine_tests {
         assert!(
             db.is_repo_quarantined("z6owner/garbage").await.unwrap(),
             "re-sync must preserve the prior quarantine decision"
+        );
+    }
+
+    /// The sync-lag gate in `sync.rs` reads this flag rather than the
+    /// attempt-local one, so the preserved flag is the exact contract the
+    /// gate's "withheld mirrors never sample" rule depends on.
+    #[sqlx::test]
+    async fn resync_preserved_quarantine_is_visible_to_the_lag_gate(pool: PgPool) {
+        let db = db(pool).await;
+        db.upsert_mirror_repo("z6owner", "garbage", "/srv/g", None, true)
+            .await
+            .unwrap();
+        db.upsert_mirror_repo("z6owner", "garbage", "/srv/g", None, false)
+            .await
+            .unwrap();
+        assert!(
+            db.is_repo_quarantined("z6owner/garbage").await.unwrap(),
+            "the lag gate reads is_repo_quarantined: a re-sync that passes              quarantined=false must still read withheld here"
         );
     }
 
@@ -18790,5 +18908,49 @@ mod policy_fence_tests {
                 .unwrap(),
             "the unfenced sentinel skips the epoch comparison"
         );
+    }
+    /// The live replication tail reads its land instant through the same rule
+    /// the deferred drain uses: max applied_at across the request's applied
+    /// transitions, or None so the caller falls back to created_at.
+    #[sqlx::test]
+    async fn request_push_landed_at_returns_max_applied_or_none(pool: PgPool) {
+        let db = db(pool).await;
+        let repo_id = seed_repo(&db).await;
+        db.insert_pending_ref_transitions(
+            "req-live",
+            &repo_id,
+            "did:key:zNode",
+            "did:key:zPusher",
+            &[
+                crate::api::repos::RefUpdate {
+                    ref_name: "refs/heads/main".into(),
+                    old_sha: "0".repeat(40),
+                    new_sha: "a".repeat(40),
+                },
+                crate::api::repos::RefUpdate {
+                    ref_name: "refs/heads/dev".into(),
+                    old_sha: "0".repeat(40),
+                    new_sha: "b".repeat(40),
+                },
+            ],
+            "sig",
+            "sigin",
+            "digest",
+        )
+        .await
+        .unwrap();
+        // Nothing applied yet: the caller must fall back to created_at.
+        assert_eq!(db.request_push_landed_at("req-live").await.unwrap(), None);
+
+        db.mark_pending_ref_transitions_applied("req-live")
+            .await
+            .unwrap();
+        let landed = db.request_push_landed_at("req-live").await.unwrap();
+        assert!(
+            landed.is_some(),
+            "an applied request must report a land instant"
+        );
+        // A different request's rows never leak into this request's instant.
+        assert_eq!(db.request_push_landed_at("req-other").await.unwrap(), None);
     }
 }
