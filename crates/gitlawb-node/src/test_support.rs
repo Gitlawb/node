@@ -95,6 +95,13 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         task_tx.clone(),
         task_cursor_key.clone(),
     ));
+
+    let ws_schema = Arc::new(graphql::build_ws_schema(
+        db.clone(),
+        ref_tx.clone(),
+        task_tx.clone(),
+        task_cursor_key.clone(),
+    ));
     AppState {
         config: Arc::new(Config::parse_from(["gitlawb-node"])),
         db,
@@ -105,11 +112,13 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         ref_update_tx: ref_tx,
         task_event_tx: task_tx,
         graphql_schema: schema,
+        graphql_ws_schema: ws_schema,
         task_cursor_key,
         machine_id: None,
         repo_store: crate::git::repo_store::RepoStore::for_testing(PathBuf::from("/tmp"), pool),
         rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
         create_ip_rate_limiter: RateLimiter::new(1000, Duration::from_secs(3600)),
+        write_rate_limiter: RateLimiter::new(1000, Duration::from_secs(3600)),
         push_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
         close_issue_rate_limiter: RateLimiter::new(120, Duration::from_secs(3600)),
         ipfs_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
@@ -125,7 +134,6 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         push_limiter_trust: crate::rate_limit::TrustedProxy::None,
         sync_trigger_rate_limiter: RateLimiter::new(60, Duration::from_secs(3600)),
         peer_write_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
-        signed_write_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
         federated_rate_limiter: RateLimiter::new_bounded(12, Duration::from_secs(60), 10_000),
         shutdown_tx: tokio::sync::watch::channel(false).0,
         // Generous — no test drives the handler-level shed (git_permit is unit-tested).
@@ -3429,7 +3437,7 @@ mod tests {
         run(&["commit", "-q", "-m", "seed"], &src);
         // The tag that shadows the missing target branch: "release" resolves via
         // DWIM but refs/heads/release never exists.
-        run(&["tag", "release"], &src);
+        run(&["tag", "-m", "release", "release"], &src);
         run(&["checkout", "-q", "-b", "feature"], &src);
         std::fs::write(src.join("feature.txt"), b"feature-only").unwrap();
         run(&["add", "feature.txt"], &src);
@@ -3589,7 +3597,7 @@ mod tests {
         // moves past it. Revision DWIM prefers refs/tags/ over refs/heads/ for
         // an ambiguous short name, so this fixture is the strongest shadowing
         // shape: a naive resolution would merge onto the stale tag commit.
-        run(&["tag", "release"], &src);
+        run(&["tag", "-m", "release", "release"], &src);
         run(&["checkout", "-q", "-b", "release"], &src);
         std::fs::write(src.join("release.txt"), b"release-only").unwrap();
         run(&["add", "release.txt"], &src);
@@ -5561,111 +5569,6 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&bytes).contains(url),
             "the verified owner sees the webhook list"
-        );
-    }
-
-    /// The signed-write IP brake is write-only. `write_routes` chains
-    /// PUT/DELETE/GET on the visibility path, and `gl visibility list` signs
-    /// that owner-only GET, so a brake that counted methods it does not exist
-    /// for would let ordinary reads spend the write quota — behind one NAT
-    /// egress, a few writes would start 429ing every listing. Through the
-    /// PRODUCTION router with a single-slot bucket: the first write spends the
-    /// quota, a second write (and a DELETE) is 429, and the authenticated
-    /// visibility GET from the SAME exhausted IP is still served. MUTATION
-    /// (RED): set `skip_reads: false` on `signed_write_ip_limiter` in
-    /// `server.rs` (or drop the method check in `rate_limit_by_ip`) and the
-    /// final GET comes back 429.
-    #[sqlx::test]
-    async fn signed_write_brake_rejects_writes_but_serves_visibility_get(pool: PgPool) {
-        use gitlawb_core::http_sig::sign_request;
-
-        let kp = Keypair::generate();
-        let owner_did = kp.did().to_string();
-        // Short owner form in the URL path, as in the real-signature test above:
-        // no colons, so the signed @path matches path_and_query() byte-for-byte.
-        let short = owner_did.split(':').next_back().unwrap().to_string();
-
-        let mut state = test_state(pool).await;
-        // Single-slot bucket: the FIRST successful write exhausts it.
-        state.signed_write_rate_limiter =
-            crate::rate_limit::RateLimiter::new(1, Duration::from_secs(3600));
-        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
-        let repo = seed_repo(&owner_did, "brake-repo");
-        state.db.create_repo(&repo).await.expect("seed repo");
-        let router = crate::server::build_router(state);
-
-        let peer: std::net::SocketAddr = "203.0.113.61:5000".parse().unwrap();
-        let path = format!("/api/v1/repos/{short}/brake-repo/visibility");
-        let put_body: &[u8] = br#"{"path_glob":"/","reader_dids":[]}"#;
-        // Each request is freshly signed — the brake is outermost, but a reused
-        // signature would trip the replay ledger and muddy which gate answered.
-        let signed_req = |method: &str, body: &'static [u8]| {
-            let signed = sign_request(&kp, method, &path, body);
-            let mut req = Request::builder()
-                .method(method)
-                .uri(&path)
-                .header(axum::http::header::CONTENT_TYPE, "application/json")
-                .header("content-digest", signed.content_digest)
-                .header("signature-input", signed.signature_input)
-                .header("signature", signed.signature)
-                .body(Body::from(body))
-                .unwrap();
-            req.extensions_mut()
-                .insert(axum::extract::ConnectInfo(peer));
-            req
-        };
-
-        // First write passes the brake, reaches the handler, and succeeds —
-        // debiting the single-slot bucket.
-        let resp = router
-            .clone()
-            .oneshot(signed_req("PUT", put_body))
-            .await
-            .unwrap();
-        assert!(
-            resp.status().is_success(),
-            "the first signed write from an IP must pass the brake, got {}",
-            resp.status()
-        );
-
-        // Second write from the same IP: braked with 429 before auth runs.
-        let resp = router
-            .clone()
-            .oneshot(signed_req("PUT", put_body))
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::TOO_MANY_REQUESTS,
-            "an exhausted signed-write bucket must reject a PUT"
-        );
-        // A DELETE is a mutation too and shares the exhausted bucket.
-        let resp = router
-            .clone()
-            .oneshot(signed_req("DELETE", put_body))
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::TOO_MANY_REQUESTS,
-            "an exhausted signed-write bucket must reject a DELETE"
-        );
-
-        // The signed visibility GET from the SAME IP bypasses the write brake
-        // and is fully served: 200 with the rule the first PUT created — the
-        // read did not merely dodge a 429, it reached the handler as the owner.
-        let resp = router.oneshot(signed_req("GET", b"")).await.unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::OK,
-            "the authenticated visibility GET must be served despite the exhausted write bucket"
-        );
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert!(
-            String::from_utf8_lossy(&bytes).contains("path_glob"),
-            "the owner sees the visibility rules through the exhausted-bucket IP"
         );
     }
 
@@ -18060,12 +17963,12 @@ mod tests {
     }
 
     /// The periodic cleanup task must sweep the ipfs walk limiter, not only its
-    /// five siblings. Drives `AppState::sweep_rate_limiters` — the exact method the
+    /// five siblings. Drives `AppState::cleanup_rate_limiters` — the exact method the
     /// 300s loop calls — and asserts the ipfs limiter's expired entry is evicted.
     /// Dropping `ipfs_rate_limiter.cleanup()` from that method leaves the entry in
     /// place (`tracked_keys` stays 1): the RED proof that the sweep covers it.
     #[sqlx::test]
-    async fn sweep_rate_limiters_includes_ipfs_limiter(pool: PgPool) {
+    async fn cleanup_rate_limiters_includes_ipfs_limiter(pool: PgPool) {
         let mut state = test_state(pool).await;
         // Short window so a single recorded hit is already expired at sweep time.
         state.ipfs_rate_limiter = crate::rate_limit::RateLimiter::new(5, Duration::from_millis(50));
@@ -18082,7 +17985,7 @@ mod tests {
 
         // Expire the entry (still mapped — cleanup hasn't run), then sweep.
         tokio::time::sleep(Duration::from_millis(60)).await;
-        state.sweep_rate_limiters().await;
+        state.cleanup_rate_limiters().await;
 
         assert_eq!(
             state.ipfs_rate_limiter.tracked_keys().await,
@@ -18385,12 +18288,12 @@ mod tests {
 
     /// U5 (R6): the periodic cleanup task sweeps the NEW work-budget limiter too, not
     /// only the route limiter and its siblings. Mirrors
-    /// `sweep_rate_limiters_includes_ipfs_limiter`: drive `sweep_rate_limiters` and
+    /// `cleanup_rate_limiters_includes_ipfs_limiter`: drive `cleanup_rate_limiters` and
     /// assert the work limiter's expired entry is evicted. Dropping the
     /// `ipfs_work_rate_limiter.cleanup()` call from that method leaves the entry in place
     /// (`tracked_keys` stays 1): the RED proof the sweep covers it.
     #[sqlx::test]
-    async fn sweep_rate_limiters_includes_ipfs_work_limiter(pool: PgPool) {
+    async fn cleanup_rate_limiters_includes_ipfs_work_limiter(pool: PgPool) {
         let mut state = test_state(pool).await;
         state.ipfs_work_rate_limiter =
             crate::rate_limit::RateLimiter::new(5, Duration::from_millis(50));
@@ -18406,43 +18309,12 @@ mod tests {
         );
 
         tokio::time::sleep(Duration::from_millis(60)).await;
-        state.sweep_rate_limiters().await;
+        state.cleanup_rate_limiters().await;
 
         assert_eq!(
             state.ipfs_work_rate_limiter.tracked_keys().await,
             0,
             "the periodic sweep must evict the work limiter's expired entries"
-        );
-    }
-
-    /// The periodic cleanup task must sweep the signed-write limiter too.
-    /// Mirrors `sweep_rate_limiters_includes_ipfs_limiter`: drive
-    /// `sweep_rate_limiters` and assert the expired entry is evicted. Dropping
-    /// the `signed_write_rate_limiter.cleanup()` call leaves it in place
-    /// (`tracked_keys` stays 1): the RED proof the sweep covers it.
-    #[sqlx::test]
-    async fn sweep_rate_limiters_includes_signed_write_limiter(pool: PgPool) {
-        let mut state = test_state(pool).await;
-        state.signed_write_rate_limiter =
-            crate::rate_limit::RateLimiter::new(5, Duration::from_millis(50));
-
-        assert!(
-            state.signed_write_rate_limiter.check("1.2.3.4").await,
-            "record a hit on the signed-write limiter"
-        );
-        assert_eq!(
-            state.signed_write_rate_limiter.tracked_keys().await,
-            1,
-            "the source-IP key is tracked before the sweep"
-        );
-
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        state.sweep_rate_limiters().await;
-
-        assert_eq!(
-            state.signed_write_rate_limiter.tracked_keys().await,
-            0,
-            "the periodic sweep must evict the signed-write limiter's expired entries"
         );
     }
 
@@ -22889,13 +22761,13 @@ mod tests {
         // property under test is that an over-limit request costs no ledger row,
         // not merely that it is refused.
 
-        /// A copy of `state` whose signed-write brake carries an explicit limit,
+        /// A copy of `state` whose shared write brake carries an explicit limit,
         /// built the same way otherwise so a test compares the limit and nothing
         /// else. `build_router` hands this limiter to the five signed-write
         /// groups, matching how the peer-sync brake tests set theirs.
-        fn with_signed_write_limit(state: &AppState, limit: usize) -> AppState {
+        fn with_write_limit(state: &AppState, limit: usize) -> AppState {
             AppState {
-                signed_write_rate_limiter: crate::rate_limit::RateLimiter::new(
+                write_rate_limiter: crate::rate_limit::RateLimiter::new(
                     limit,
                     Duration::from_secs(3600),
                 ),
@@ -22927,7 +22799,7 @@ mod tests {
         async fn signed_write_flood_is_braked_before_the_ledger(pool: PgPool) {
             let kp = Keypair::generate();
             let did = kp.did().to_string();
-            let state = with_signed_write_limit(&test_state(pool.clone()).await, 2);
+            let state = with_write_limit(&test_state(pool.clone()).await, 2);
             let body = task_body(&did);
             let router = crate::server::build_router(state.clone());
             let ip = "203.0.113.40:5000";
@@ -22985,7 +22857,7 @@ mod tests {
             // the flood test above.
             let kp = Keypair::generate();
             let did = kp.did().to_string();
-            let state = with_signed_write_limit(&test_state(pool.clone()).await, 1);
+            let state = with_write_limit(&test_state(pool.clone()).await, 1);
             let body = task_body(&did);
             let router = crate::server::build_router(state);
 

@@ -61,6 +61,37 @@ pub fn create_issue(repo_path: &Path, issue_id: &str, json: &str) -> Result<()> 
     Ok(())
 }
 
+/// Deadline-bounded variant of [`create_issue`] for compensation paths: the
+/// same hash-object + update-ref write, but every git child runs through the
+/// shared bounded runner so a hung git cannot stall the write guard past
+/// `git_service_timeout`.
+pub fn create_issue_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    issue_id: &str,
+    json: &str,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    let out = crate::git::visibility_pack::run_bounded_git(
+        git_bin,
+        &["hash-object", "--stdin", "-w"],
+        repo_path,
+        json.as_bytes(),
+        deadline,
+    )?;
+    let hash = String::from_utf8(out).context("git hash-object output is not valid UTF-8")?;
+    let hash = hash.trim();
+    let ref_name = format!("refs/gitlawb/issues/{issue_id}");
+    crate::git::visibility_pack::run_bounded_git(
+        git_bin,
+        &["update-ref", &ref_name, hash],
+        repo_path,
+        b"",
+        deadline,
+    )?;
+    Ok(())
+}
+
 /// Remove a single issue ref while the write guard still holds the advisory lock,
 /// after a definite publish refusal. Best-effort: a failed delete leaves a
 /// local-only orphan, which is still better than telling the client to retry into a

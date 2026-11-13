@@ -72,6 +72,7 @@ pub struct AppState {
     pub task_event_tx: tokio::sync::broadcast::Sender<TaskEventBroadcast>,
     /// GraphQL schema (queries + mutations + subscriptions)
     pub graphql_schema: Arc<crate::graphql::GitlawbSchema>,
+    pub graphql_ws_schema: Arc<crate::graphql::GitlawbWsSchema>,
     /// MAC key for task-list continuation tokens, derived from the node
     /// keypair seed. Held here (and handed to the GraphQL schema) so REST and
     /// GraphQL mint and accept the same tokens.
@@ -92,6 +93,21 @@ pub struct AppState {
     /// resolved client IP is what actually stops a single-source flood (same
     /// rationale as `push_rate_limiter`). Keyed by `push_limiter_trust`.
     pub create_ip_rate_limiter: RateLimiter,
+    /// Per-client-IP rate limiter for the authenticated write surface that is
+    /// not repo/agent creation: issue/PR comments, labels, stars, merges,
+    /// protect/unprotect, replicas, webhook create/delete, visibility (its GET
+    /// shares the group), tasks, bounties, profile, and every HTTP `/graphql`
+    /// request (queries and the playground GET as well as mutations; the
+    /// WebSocket route is excluded). Issue comment and issue close debit it in
+    /// the handler after the read gate, not via router middleware; close also
+    /// draws on `close_issue_rate_limiter` and spends neither bucket when
+    /// either refuses. Separate bucket from `create_ip_rate_limiter`
+    /// (its own budget, per the `sync_trigger`/`peer_write` precedent) so a
+    /// write flood cannot drain the creation budget and vice versa. Per-DID is
+    /// deliberately NOT paired here: a DID farm never trips it, and busy
+    /// legitimate agents would false-positive. `GITLAWB_WRITE_RATE_LIMIT`
+    /// overrides the default, 0 disables. Keyed by `push_limiter_trust`.
+    pub write_rate_limiter: RateLimiter,
     /// Per-client-IP rate limiter for git-receive-pack. Per-DID limits cannot
     /// brake a push flood from a DID farm (one throwaway DID per repo), so the
     /// push path throttles on the resolved client IP instead.
@@ -212,16 +228,6 @@ pub struct AppState {
     /// sink as trigger and accepts unsigned requests from known peers, so it is
     /// braked too; each peer's distinct IP gets its own bucket.
     pub peer_write_rate_limiter: RateLimiter,
-    /// Per-client-IP limiter for the signed write routes (tasks, pull-request
-    /// merge/close/review/comment, webhooks, branch protection, stars, replicas,
-    /// labels, visibility, agent deregistration, bounties, profile, issue
-    /// close/comment). Every signed attempt on those routes commits a
-    /// `consumed_signatures` row before the handler checks ownership or
-    /// existence, and `require_signature` resolves the key from the did:key
-    /// itself, so any freshly minted keypair can force that durable write. Its
-    /// own bucket so a flood here cannot drain the creation, push, or peer-sync
-    /// quotas. Keyed by `push_limiter_trust`.
-    pub signed_write_rate_limiter: RateLimiter,
     /// Per-client-IP federation budget: 12 requests per minute, with at most
     /// 10,000 tracked source keys. Shared by router instances and swept below.
     pub federated_rate_limiter: RateLimiter,
@@ -382,25 +388,6 @@ impl AppState {
         self.shutdown_tx.subscribe()
     }
 
-    /// Sweep expired entries from every per-IP/DID rate limiter. Driven by the
-    /// periodic cleanup task so a bounded limiter's key map sheds stale entries
-    /// instead of sitting near its cap until an inline capacity sweep reclaims
-    /// them. Every limiter on the state is swept here; adding a new limiter means
-    /// adding it to this list.
-    pub(crate) async fn sweep_rate_limiters(&self) {
-        self.rate_limiter.cleanup().await;
-        self.create_ip_rate_limiter.cleanup().await;
-        self.push_rate_limiter.cleanup().await;
-        self.close_issue_rate_limiter.cleanup().await;
-        self.ipfs_rate_limiter.cleanup().await;
-        self.ipfs_work_rate_limiter.cleanup().await;
-        self.sync_trigger_rate_limiter.cleanup().await;
-        self.peer_write_rate_limiter.cleanup().await;
-        self.task_read_rate_limiter.cleanup().await;
-        self.federated_rate_limiter.cleanup().await;
-        self.signed_write_rate_limiter.cleanup().await;
-    }
-
     /// Trigger graceful shutdown. Idempotent — calling more than once
     /// has no effect. Returns `true` if this call was the one that
     /// flipped the signal.
@@ -420,6 +407,26 @@ impl AppState {
     #[allow(dead_code)] // used by tests and any future handler that wants to short-circuit
     pub fn is_shutting_down(&self) -> bool {
         *self.shutdown_tx.borrow()
+    }
+
+    /// Reclaim expired entries from EVERY rate limiter. Single source of truth for
+    /// the periodic cleanup loop (main.rs), co-located with the limiter fields so a
+    /// newly-added limiter is cleaned here rather than silently omitted from a
+    /// hand-maintained list in main() (H2: `write_rate_limiter` was the omitted
+    /// one). Every limiter field above MUST be swept here; the guard test
+    /// `cleanup_rate_limiters_reaps_the_write_limiter` fails if it is not.
+    pub(crate) async fn cleanup_rate_limiters(&self) {
+        self.rate_limiter.cleanup().await;
+        self.create_ip_rate_limiter.cleanup().await;
+        self.write_rate_limiter.cleanup().await;
+        self.push_rate_limiter.cleanup().await;
+        self.close_issue_rate_limiter.cleanup().await;
+        self.ipfs_rate_limiter.cleanup().await;
+        self.ipfs_work_rate_limiter.cleanup().await;
+        self.sync_trigger_rate_limiter.cleanup().await;
+        self.peer_write_rate_limiter.cleanup().await;
+        self.task_read_rate_limiter.cleanup().await;
+        self.federated_rate_limiter.cleanup().await;
     }
 
     /// Legacy-probe budget wired from the `GITLAWB_IPFS_MAX_LEGACY_PROBES` operator
@@ -1280,6 +1287,35 @@ mod repo_identity_key_tests {
         assert_eq!(
             repo_identity_key("did:web:example.com:alice", "r"),
             repo_identity_key("did:web:example.com/alice", "r"),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// H2 guard: the write-surface limiter must be reaped by the shared cleanup
+    /// routine. Seeds a reclaimable entry into `write_rate_limiter` and asserts
+    /// `cleanup_rate_limiters` removes it. Goes RED if `write_rate_limiter` is
+    /// dropped from `cleanup_rate_limiters` — the exact H2 omission, now guarded.
+    #[tokio::test]
+    async fn cleanup_rate_limiters_reaps_the_write_limiter() {
+        let state = crate::test_support::test_state_lazy();
+        state
+            .write_rate_limiter
+            .insert_reclaimable_for_test("some-ip")
+            .await;
+        assert_eq!(
+            state.write_rate_limiter.tracked_keys().await,
+            1,
+            "precondition: the reclaimable entry is tracked"
+        );
+
+        state.cleanup_rate_limiters().await;
+
+        assert_eq!(
+            state.write_rate_limiter.tracked_keys().await,
+            0,
+            "write_rate_limiter must be reaped by cleanup_rate_limiters (H2)"
         );
     }
 }

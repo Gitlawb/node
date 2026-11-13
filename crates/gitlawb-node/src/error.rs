@@ -50,6 +50,13 @@ pub enum AppError {
     #[error("too many requests: {0}")]
     TooManyRequests(String),
 
+    /// A 429 from a per-IP limiter that knows when its window frees a slot, so
+    /// the response advertises that delay as `Retry-After` the way the router
+    /// middleware's 429s do. `TooManyRequests` stays for limiters that have no
+    /// such delay to give.
+    #[error("too many requests: retry in {}s", .0.as_secs())]
+    RateLimited(std::time::Duration),
+
     #[error("incomplete: {0}")]
     Incomplete(String),
 
@@ -209,6 +216,11 @@ impl IntoResponse for AppError {
                 gitlawb_core::node_denial::NodeDenial::RateLimited.as_str(),
                 msg.clone(),
             ),
+            AppError::RateLimited(_) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                gitlawb_core::node_denial::NodeDenial::RateLimited.as_str(),
+                crate::rate_limit::RATE_LIMIT_MESSAGE.to_string(),
+            ),
             AppError::Incomplete(msg) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "incomplete", msg.clone())
             }
@@ -225,6 +237,9 @@ impl IntoResponse for AppError {
             // 504, distinct from the 500 git_error and from the read-gate's 404 /
             // the auth 401, so the client can tell a deadline from a failure.
             AppError::Timeout(msg) => (StatusCode::GATEWAY_TIMEOUT, "git_timeout", msg.clone()),
+            // 503, retryable: a transient resource contention (e.g. the repo lock
+            // pool is pinned by a write burst or a purge holds the key), distinct
+            // from the 500 git_error so the client knows to back off and retry.
             // 503 with a FIXED body: the caller should retry, and must not be told
             // which repo is contended or for how long.
             AppError::RepoBusy => (
@@ -324,6 +339,12 @@ impl IntoResponse for AppError {
             resp.headers_mut().insert(
                 axum::http::header::RETRY_AFTER,
                 axum::http::HeaderValue::from_static("1"),
+            );
+        }
+        if let AppError::RateLimited(retry_after) = &self {
+            resp.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from(retry_after.as_secs().max(1)),
             );
         }
         resp

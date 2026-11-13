@@ -1061,6 +1061,12 @@ mod tests {
             task_tx.clone(),
             task_cursor_key.clone(),
         ));
+        let ws_schema = Arc::new(graphql::build_ws_schema(
+            db.clone(),
+            ref_tx.clone(),
+            task_tx.clone(),
+            task_cursor_key.clone(),
+        ));
         crate::state::AppState {
             config: Arc::new(Config::parse_from(["gitlawb-node"])),
             db,
@@ -1071,11 +1077,13 @@ mod tests {
             ref_update_tx: ref_tx,
             task_event_tx: task_tx,
             graphql_schema: schema,
+            graphql_ws_schema: ws_schema,
             task_cursor_key,
             machine_id: None,
             repo_store: crate::git::repo_store::RepoStore::for_testing(PathBuf::from("/tmp"), pool),
             rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
             create_ip_rate_limiter: RateLimiter::new(1000, Duration::from_secs(3600)),
+            write_rate_limiter: RateLimiter::new(1000, Duration::from_secs(3600)),
             push_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
             close_issue_rate_limiter: RateLimiter::new(120, Duration::from_secs(3600)),
             ipfs_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
@@ -1092,7 +1100,6 @@ mod tests {
             push_limiter_trust: crate::rate_limit::TrustedProxy::None,
             sync_trigger_rate_limiter: RateLimiter::new(60, Duration::from_secs(3600)),
             peer_write_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
-            signed_write_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
             federated_rate_limiter: RateLimiter::new_bounded(12, Duration::from_secs(60), 10_000),
             shutdown_tx: tokio::sync::watch::channel(false).0,
             git_read_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),

@@ -170,6 +170,12 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool, repos_dir: PathBuf) -> AppS
         task_tx.clone(),
         task_cursor_key.clone(),
     ));
+    let ws_schema = Arc::new(crate::graphql::build_ws_schema(
+        db.clone(),
+        ref_tx.clone(),
+        task_tx.clone(),
+        task_cursor_key.clone(),
+    ));
     AppState {
         config: Arc::new(Config::parse_from(["gitlawb-node"])),
         db,
@@ -180,11 +186,13 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool, repos_dir: PathBuf) -> AppS
         ref_update_tx: ref_tx,
         task_event_tx: task_tx,
         graphql_schema: schema,
+        graphql_ws_schema: ws_schema,
         task_cursor_key,
         machine_id: None,
         repo_store: crate::git::repo_store::RepoStore::for_testing(repos_dir, pool),
         rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
         create_ip_rate_limiter: RateLimiter::new(1000, Duration::from_secs(3600)),
+        write_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
         push_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
         close_issue_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
         federated_rate_limiter: RateLimiter::new(12, Duration::from_secs(60)),
@@ -202,7 +210,6 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool, repos_dir: PathBuf) -> AppS
         push_limiter_trust: TrustedProxy::None,
         sync_trigger_rate_limiter: RateLimiter::new(60, Duration::from_secs(3600)),
         peer_write_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
-        signed_write_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
         shutdown_tx: watch::channel(false).0,
         git_read_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
         git_write_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),

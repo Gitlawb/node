@@ -522,6 +522,49 @@ impl TigrisClient {
         }
     }
 
+    /// Delete whatever archive currently exists, fenced on the generation read
+    /// at call time: a concurrent publish between the HEAD and the DELETE makes
+    /// the store refuse rather than erasing the successor's object. Used by
+    /// purge-spam, which deletes a repo it did not publish (so
+    /// [`delete_if_attempt_matches`](Self::delete_if_attempt_matches) cannot
+    /// apply) while still needing the same moved-generation protection.
+    /// Returns `true` when an archive was deleted.
+    /// Delete only if the object's generation still matches `expected` — the
+    /// generation the caller checked for emptiness. A PUT landing between that
+    /// check and this delete makes the generation move; deleting the newer
+    /// (possibly non-empty) archive is exactly the outcome the fence exists to
+    /// prevent, so a moved generation refuses rather than deletes.
+    pub async fn delete_current(
+        &self,
+        owner_slug: &str,
+        repo_name: &str,
+        expected: Option<&str>,
+    ) -> Result<bool> {
+        let Some(generation) = self.head_generation(owner_slug, repo_name).await? else {
+            return Ok(false);
+        };
+        if generation.etag.as_deref() != expected {
+            return Ok(false);
+        }
+        let key = Self::repo_key(owner_slug, repo_name);
+        let mut req = self.s3.delete_object().bucket(&self.bucket).key(&key);
+        if let Some(etag) = generation.etag.as_deref() {
+            req = req.if_match(etag);
+        }
+        match req.send().await {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                if e.raw_response()
+                    .map(|raw| raw.status().as_u16())
+                    .is_some_and(|s| s == 412 || s == 409)
+                {
+                    anyhow::bail!("archive generation moved between head and delete; refusing");
+                }
+                Err(anyhow::anyhow!("tigris DELETE {key}: {e}"))
+            }
+        }
+    }
+
     /// Download a repo archive from Tigris and extract to local disk.
     pub async fn download(
         &self,

@@ -225,6 +225,19 @@ pub async fn merge_pr(
         .map_err(|e| crate::api::repos::acquire_write_app_error(&e, &name))?;
     let disk_path = guard.path().to_path_buf();
     let merger_did = auth.0;
+
+    // Snapshot the target ref's pre-merge OID so a refused durable upload can
+    // rewind the local merge, mirroring the close_issue / create_issue
+    // compensating pattern. A read failure or an absent ref (a first-commit
+    // merge onto an unborn branch) yields no rollback closure: the merge still
+    // applies and a refused publish still surfaces as 5xx.
+    let target_ref = format!("refs/heads/{}", pr.target_branch);
+    let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+    let prior_tip = store::read_ref_bounded(&state.git_bin, &disk_path, &target_ref, git_timeout)
+        .await
+        .ok()
+        .flatten();
+
     let merge_result = store::merge_branch(
         &disk_path,
         &pr.target_branch,
@@ -237,7 +250,27 @@ pub async fn merge_pr(
     // Short-circuit on a refused publish before the PR is marked merged and
     // before the webhook fires. Both are irreversible announcements of a merge
     // commit that only exists on this node's disk.
-    guard.release(merge_result.is_ok()).await.into_result()?;
+    let release_result = match (merge_result.is_ok(), prior_tip) {
+        (true, Some(tip)) => {
+            let git_bin = state.git_bin.clone();
+            let deadline = std::time::Instant::now() + git_timeout;
+            guard
+                .release_compensating(true, move |path| {
+                    crate::git::visibility_pack::run_bounded_git(
+                        &git_bin,
+                        &["update-ref", &target_ref, &tip],
+                        path,
+                        b"",
+                        deadline,
+                    )
+                    .map(|_| ())
+                })
+                .await
+                .into_result()
+        }
+        _ => guard.release(merge_result.is_ok()).await.into_result(),
+    };
+    release_result?;
 
     let merge_sha = merge_result.map_err(|e| AppError::Git(e.to_string()))?;
 
@@ -435,6 +468,136 @@ pub async fn list_comments(
 
     let comments = state.db.list_pr_comments(&pr.id).await?;
     Ok(Json(serde_json::json!({ "comments": comments })))
+}
+
+#[cfg(test)]
+mod merge_rollback_tests {
+    use super::*;
+    use axum::response::IntoResponse;
+    use sqlx::PgPool;
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(["-C", &*dir.to_string_lossy()])
+            .args([
+                "-c",
+                "user.name=merge-rollback-test",
+                "-c",
+                "user.email=merge-rollback-test@example.com",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Build a bare repo whose `main` and `feature` refs diverge: one root
+    /// commit on main, one commit on feature, so merge_branch creates a real
+    /// merge commit that a refused publish must rewind.
+    fn seeded_merge_repo(dir: &std::path::Path) -> (String, String) {
+        crate::git::store::init_bare(dir).expect("bare repo");
+        let empty_tree = git(dir, &["mktree"]);
+        let root = git(dir, &["commit-tree", &empty_tree, "-m", "root"]);
+        git(dir, &["update-ref", "refs/heads/main", &root]);
+        let tip2 = git(
+            dir,
+            &["commit-tree", &empty_tree, "-m", "feature", "-p", &root],
+        );
+        git(dir, &["update-ref", "refs/heads/feature", &tip2]);
+        (root, tip2)
+    }
+
+    /// On a definite publish refusal, the local merge commit must be rewound:
+    /// the client got a 5xx, so the repo cannot show a merge the mirror never
+    /// learned about (same contract create_issue's rollback enforces).
+    #[sqlx::test]
+    async fn merge_pr_rewinds_local_merge_when_publish_refuses(pool: PgPool) {
+        // Endpoint that answers HEAD with an etag but refuses every write.
+        let app = axum::Router::new().route(
+            "/{*key}",
+            axum::routing::any(|method: axum::http::Method| async move {
+                if method == axum::http::Method::HEAD {
+                    let mut resp = axum::http::StatusCode::OK.into_response();
+                    resp.headers_mut()
+                        .insert("etag", axum::http::HeaderValue::from_static("\"gen-1\""));
+                    resp
+                } else {
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let owner = "did:key:zMERGEROLLBACKAAAAAAAAAAAAAAAAAAAAAAAA";
+        let repo_name = "rollback-merge";
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let disk = tempfile::TempDir::new().unwrap();
+        let repo_path = disk.path().join("repo.git");
+        let (main_tip, _feature_tip) = seeded_merge_repo(&repo_path);
+
+        let mut seeded = crate::db::RepoRecord {
+            id: Uuid::new_v4().to_string(),
+            name: repo_name.to_string(),
+            owner_did: owner.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            disk_path: String::new(),
+            forked_from: None,
+            machine_id: None,
+        };
+        seeded.disk_path = repo_path.to_string_lossy().to_string();
+        let repo_id = seeded.id.clone();
+        state.db.create_repo(&seeded).await.expect("seed repo");
+        let now = Utc::now().to_rfc3339();
+        state
+            .db
+            .create_pr(&PullRequest {
+                id: Uuid::new_v4().to_string(),
+                repo_id,
+                number: 1,
+                title: "rb".to_string(),
+                body: None,
+                author_did: owner.to_string(),
+                source_branch: "feature".to_string(),
+                target_branch: "main".to_string(),
+                status: "open".to_string(),
+                merged_by_did: None,
+                merged_at: None,
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .await
+            .expect("seed PR");
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing_with_tigris(
+            disk.path().to_path_buf(),
+            crate::git::repo_store::build_lock_pool(&pool, 2, std::time::Duration::from_secs(1)),
+            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint),
+        );
+
+        let res = merge_pr(
+            State(state),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((owner.to_string(), repo_name.to_string(), 1)),
+        )
+        .await;
+        assert!(res.is_err(), "a refused publish must surface an error");
+
+        let tip_after = git(&repo_path, &["rev-parse", "refs/heads/main"]);
+        assert_eq!(
+            tip_after, main_tip,
+            "a refused publish must rewind the local merge to the pre-merge tip"
+        );
+    }
 }
 
 /// #173 F1 follow-up: merge holds no admission permit, so an exhausted write-lock
