@@ -17,11 +17,8 @@ pub async fn protect_branch(
     Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, repo, branch)): Path<(String, String, String)>,
 ) -> Result<(StatusCode, Json<serde_json::Value>)> {
-    let record = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, Some(auth.0.as_str()), "/").await?;
 
     // Only the repo owner can protect branches (DID-safe match, shared idiom).
     let caller = &auth.0;
@@ -51,11 +48,8 @@ pub async fn unprotect_branch(
     Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, repo, branch)): Path<(String, String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, Some(auth.0.as_str()), "/").await?;
 
     let caller = &auth.0;
     if !crate::api::did_matches(caller, &record.owner_did) {

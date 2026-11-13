@@ -14,7 +14,11 @@ pub struct ChangelogArgs {
     /// Maximum number of events to show
     #[arg(long, default_value = "20")]
     pub limit: usize,
-    #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+    #[arg(
+        long,
+        default_value = "https://node.twigpine.com",
+        env = "GITLAWB_NODE"
+    )]
     pub node: String,
     #[arg(long)]
     pub dir: Option<PathBuf>,
@@ -30,7 +34,7 @@ pub async fn run(args: ChangelogArgs) -> Result<()> {
     };
 
     if repo.is_empty() {
-        anyhow::bail!("no repo specified — pass <repo> or run from inside a gitlawb repo");
+        anyhow::bail!("no repo specified — pass <repo> or run from inside a Twigpine repo");
     }
 
     let (owner, name) = if let Some((o, n)) = repo.split_once('/') {
@@ -71,14 +75,14 @@ pub async fn run(args: ChangelogArgs) -> Result<()> {
 
     for event in &events {
         let ts = event["timestamp"].as_str().unwrap_or("?");
-        let date = &ts[..ts.len().min(10)];
+        let date = crate::text::truncate(ts, 10);
 
         match event["type"].as_str().unwrap_or("") {
             "commit" => {
                 let sha = event["sha"].as_str().unwrap_or("?");
                 let msg = event["message"].as_str().unwrap_or("?");
                 let first_line = msg.lines().next().unwrap_or(msg);
-                let short_sha = &sha[..sha.len().min(8)];
+                let short_sha = crate::text::truncate(sha, 8);
                 println!("  {date}  commit      {short_sha}  {first_line}");
             }
             "pr_merged" => {

@@ -19,7 +19,11 @@ pub enum StarCmd {
     Add {
         /// Repository name (owner/repo or just name — owner derived from identity)
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -28,7 +32,11 @@ pub enum StarCmd {
     Remove {
         /// Repository name (owner/repo or just name — owner derived from identity)
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -37,7 +45,11 @@ pub enum StarCmd {
     Count {
         /// Repository in owner/repo format
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,

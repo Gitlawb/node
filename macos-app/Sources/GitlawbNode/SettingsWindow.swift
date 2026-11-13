@@ -6,7 +6,7 @@ class SettingsWindowController: NSWindowController {
     convenience init() {
         let hostingController = NSHostingController(rootView: SettingsView())
         let window = NSWindow(contentViewController: hostingController)
-        window.title = "Gitlawb Node Settings"
+        window.title = "Twigpine Node Settings"
         window.setContentSize(NSSize(width: 480, height: 280))
         window.styleMask = [.titled, .closable, .miniaturizable]
         window.center()

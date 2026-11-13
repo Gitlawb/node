@@ -22,7 +22,11 @@ pub enum ProtectCmd {
         /// Repository name or owner/repo
         #[arg(long)]
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -33,7 +37,11 @@ pub enum ProtectCmd {
         branch: String,
         #[arg(long)]
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -42,7 +50,11 @@ pub enum ProtectCmd {
     List {
         #[arg(long)]
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,

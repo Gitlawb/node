@@ -11,7 +11,11 @@ pub struct SyncArgs {
     pub cmd: SyncCmd,
 
     /// Node URL
-    #[arg(long, env = "GITLAWB_NODE", default_value = "https://node.gitlawb.com")]
+    #[arg(
+        long,
+        env = "GITLAWB_NODE",
+        default_value = "https://node.twigpine.com"
+    )]
     pub node: String,
 
     /// Identity directory for signed sync trigger requests

@@ -10,7 +10,11 @@ use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
 pub struct StatusArgs {
-    #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+    #[arg(
+        long,
+        default_value = "https://node.twigpine.com",
+        env = "GITLAWB_NODE"
+    )]
     pub node: String,
     #[arg(long)]
     pub dir: Option<PathBuf>,
@@ -43,7 +47,7 @@ pub async fn run(args: StatusArgs) -> Result<()> {
         }
     }
 
-    // ── Current git repo + gitlawb remote ─────────────────────────────────
+    // ── Current git repo + Twigpine remote ─────────────────────────────────
     let remote = detect_gitlawb_remote();
     match &remote {
         Some((did, repo)) => {
@@ -51,7 +55,7 @@ pub async fn run(args: StatusArgs) -> Result<()> {
             println!("  repo      {short_did}/{repo}");
         }
         None => {
-            println!("  repo      (not in a gitlawb repo — no gitlawb:// remote)");
+            println!("  repo      (not in a Twigpine repo — no gitlawb:// remote)");
         }
     }
 
@@ -76,7 +80,7 @@ pub async fn run(args: StatusArgs) -> Result<()> {
         if let Some(line) = section_unavailable_line("PRs", &pr_resp) {
             println!("{line}");
         } else if let Ok(r) = pr_resp {
-            if let Ok(body) = r.json::<Value>().await {
+            if let Ok(body) = crate::http::read_json(r, "pull requests").await {
                 let prs = body["pulls"].as_array().cloned().unwrap_or_default();
                 let open: Vec<_> = prs
                     .iter()
@@ -105,7 +109,7 @@ pub async fn run(args: StatusArgs) -> Result<()> {
         if let Some(line) = section_unavailable_line("issues", &issue_resp) {
             println!("{line}");
         } else if let Ok(r) = issue_resp {
-            if let Ok(body) = r.json::<Value>().await {
+            if let Ok(body) = crate::http::read_json(r, "issues").await {
                 let issues = body["issues"].as_array().cloned().unwrap_or_default();
                 let open: Vec<_> = issues
                     .iter()

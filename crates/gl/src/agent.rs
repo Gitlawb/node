@@ -16,7 +16,11 @@ pub struct AgentArgs {
 pub enum AgentCmd {
     /// List agents registered on a node
     List {
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         /// Filter by capability (e.g. git:push)
         #[arg(long)]
@@ -28,7 +32,11 @@ pub enum AgentCmd {
     Show {
         /// Agent DID or short key segment
         did: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
     },
 }
@@ -80,7 +88,7 @@ async fn cmd_list(node: String, capability: Option<String>) -> Result<()> {
         let short = did
             .split(':')
             .next_back()
-            .map(|s| &s[..s.len().min(16)])
+            .map(|s| crate::text::truncate(s, 16))
             .unwrap_or("?");
         let trust = agent["trust_score"].as_f64().unwrap_or(0.0);
         let caps = agent["capabilities"]

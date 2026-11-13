@@ -30,34 +30,200 @@ fn sign_payload(secret: &str, payload: &[u8]) -> String {
     format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
 }
 
+/// What the signing step decided for one hook. Keeping this a decision (not a
+/// bare `Option`) lets the delivery path tell "hook has no secret" (send
+/// unsigned) apart from "hook has a secret that could not be opened" (withhold:
+/// an unsigned POST would present a broken hook as working while the ledger
+/// marks the event delivered).
+enum SigningOutcome {
+    NoSecret,
+    Signed(String),
+    Withhold,
+}
+
+fn signing_decision(
+    secret_key: &[u8; 32],
+    secret: Option<&crate::webhook_secret::WebhookSecret>,
+    bytes: &[u8],
+) -> SigningOutcome {
+    match secret {
+        None => SigningOutcome::NoSecret,
+        Some(s) => match crate::webhook_secret::reveal(secret_key, s) {
+            Some(plain) => SigningOutcome::Signed(sign_payload(&plain, bytes)),
+            None => SigningOutcome::Withhold,
+        },
+    }
+}
+
 /// Fire webhooks for `event` on `repo_id`. Spawns background tasks — never blocks.
 pub fn fire_event(
     db: Arc<Db>,
     http_client: Arc<reqwest::Client>,
+    secret_key: Arc<[u8; 32]>,
     repo_id: &str,
     event: &str,
     payload: serde_json::Value,
+) {
+    fire_event_occurrence(
+        db,
+        http_client,
+        secret_key,
+        repo_id,
+        event,
+        payload,
+        None,
+        None,
+    );
+}
+
+/// Occurrence-keyed variant: at most one delivery per
+/// `(request_id, ref_name, hook)` is spawned; concurrent executors
+/// collapse via the `webhook_deliveries` ledger. Best-effort on crash
+/// (ledger is claimed before spawn), which the PR scope allows.
+///
+/// For durable outbox usage, call `claim_webhook_delivery_before_spawn` first
+/// to claim deliveries synchronously, then call
+/// `fire_event_occurrence_with_claimed_hooks` with the claimed hook IDs to
+/// spawn HTTP POST only for claimed hooks.
+#[allow(clippy::too_many_arguments)]
+pub fn fire_event_occurrence(
+    db: Arc<Db>,
+    http_client: Arc<reqwest::Client>,
+    secret_key: Arc<[u8; 32]>,
+    repo_id: &str,
+    event: &str,
+    payload: serde_json::Value,
+    request_id: Option<&str>,
+    ref_name: Option<&str>,
 ) {
     let repo_id = repo_id.to_string();
     let event = event.to_string();
+    let request_id = request_id.map(|s| s.to_string());
+    let ref_name = ref_name.map(|s| s.to_string());
     tokio::spawn(async move {
-        fire_event_async(db, http_client, &repo_id, &event, payload).await;
+        fire_event_async_occurrence(
+            db,
+            http_client,
+            secret_key,
+            &repo_id,
+            &event,
+            payload,
+            request_id.as_deref(),
+            ref_name.as_deref(),
+            None,
+        )
+        .await;
     });
 }
 
-async fn fire_event_async(
+/// Variant for durable outbox: only spawn HTTP POST for previously claimed hooks.
+#[allow(clippy::too_many_arguments)]
+pub fn fire_event_occurrence_with_claimed_hooks(
     db: Arc<Db>,
     http_client: Arc<reqwest::Client>,
+    secret_key: Arc<[u8; 32]>,
     repo_id: &str,
     event: &str,
     payload: serde_json::Value,
+    request_id: Option<&str>,
+    ref_name: Option<&str>,
+    claimed_hooks: Vec<crate::db::Webhook>,
 ) {
-    let hooks = match db.list_webhooks_for_event(repo_id, event).await {
-        Ok(h) => h,
-        Err(e) => {
-            tracing::warn!(err = %e, "failed to list webhooks for event {event}");
-            return;
+    let repo_id = repo_id.to_string();
+    let event = event.to_string();
+    let request_id = request_id.map(|s| s.to_string());
+    let ref_name = ref_name.map(|s| s.to_string());
+    tokio::spawn(async move {
+        fire_event_async_occurrence(
+            db,
+            http_client,
+            secret_key,
+            &repo_id,
+            &event,
+            payload,
+            request_id.as_deref(),
+            ref_name.as_deref(),
+            Some(claimed_hooks),
+        )
+        .await;
+    });
+}
+
+/// Claim webhook delivery before spawning HTTP POST.
+/// Returns `Some(hook ids)` successfully claimed, or `None` when the hook
+/// list itself could not be read (transient DB error, unknown membership).
+/// A `None` caller must fall back to best-effort send rather than dropping
+/// the delivery: children are still deleted downstream, so an empty claim
+/// set on DB error would lose the webhook permanently.
+/// This synchronous claim phase must be awaited before child deletion to prevent
+/// permanent webhook loss on crash between deletion and claim.
+pub async fn claim_webhook_delivery_before_spawn(
+    db: Arc<Db>,
+    repo_id: &str,
+    event: &str,
+    request_id: Option<&str>,
+    ref_name: Option<&str>,
+) -> Option<Vec<crate::db::Webhook>> {
+    let mut claimed_hooks = Vec::new();
+
+    // Only claim when we have occurrence context (request_id + ref_name)
+    if let (Some(req), Some(r)) = (request_id, ref_name) {
+        let hooks = match db.list_webhooks_for_event(repo_id, event).await {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(err = %e, "failed to list webhooks for event {event}");
+                return None;
+            }
+        };
+
+        for hook in hooks {
+            let delivery_id = crate::db::deterministic_id(&["webhook", req, r, &hook.id]);
+            match db
+                .claim_webhook_delivery(&delivery_id, req, repo_id, event)
+                .await
+            {
+                Ok(true) => claimed_hooks.push(hook),
+                Ok(false) => continue, // Already claimed
+                // Send fallback (legacy best-effort): a transient claim
+                // error must not drop the delivery while children are
+                // still deleted. The in-task claimer this replaced sent
+                // anyway on claim error; keep that here.
+                Err(e) => {
+                    tracing::warn!(err = %e, hook_id = %hook.id, "webhook claim failed; sending anyway");
+                    claimed_hooks.push(hook);
+                }
+            }
         }
+    }
+
+    Some(claimed_hooks)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fire_event_async_occurrence(
+    db: Arc<Db>,
+    http_client: Arc<reqwest::Client>,
+    secret_key: Arc<[u8; 32]>,
+    repo_id: &str,
+    event: &str,
+    payload: serde_json::Value,
+    request_id: Option<&str>,
+    ref_name: Option<&str>,
+    claimed_hooks: Option<Vec<crate::db::Webhook>>,
+) {
+    // A caller that already claimed deliveries hands the claimed hook rows
+    // through; the send path must not re-list, because a list failure here
+    // would silently drop deliveries already claimed in the ledger.
+    let already_claimed = claimed_hooks.is_some();
+    let hooks = match claimed_hooks {
+        Some(h) => h,
+        None => match db.list_webhooks_for_event(repo_id, event).await {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(err = %e, "failed to list webhooks for event {event}");
+                return;
+            }
+        },
     };
 
     if hooks.is_empty() {
@@ -76,10 +242,67 @@ async fn fire_event_async(
         let client = Arc::clone(&http_client);
         let event_name = event.to_string();
         let bytes = payload_bytes.clone();
-        let delivery_id = uuid::Uuid::new_v4().to_string();
+        // Stable occurrence delivery key when request context exists;
+        // random UUID otherwise (legacy callers without occurrence).
+        let delivery_id = match (request_id, ref_name) {
+            (Some(req), Some(r)) => crate::db::deterministic_id(&["webhook", req, r, &hook.id]),
+            _ => uuid::Uuid::new_v4().to_string(),
+        };
+        // Claim before spawn so concurrent executors collapse to one
+        // delivery per occurrence. Failures to record fall back to
+        // sending (legacy best-effort) rather than dropping.
+        // Skip claim if already done by caller (durable_outbox path).
+        if !already_claimed && request_id.is_some() {
+            match db
+                .clone()
+                .claim_webhook_delivery(&delivery_id, request_id.unwrap_or(""), repo_id, event)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_) => {}
+            }
+        }
 
+        let db_for_mark = db.clone();
+        let secret_key = Arc::clone(&secret_key);
         tokio::spawn(async move {
-            let signature = hook.secret.as_deref().map(|s| sign_payload(s, &bytes));
+            // Policy skip, not a delivery failure: the stored URL predates the
+            // create-time gate. The "invalid_url" label is documented on
+            // record_webhook_delivery in metrics.rs.
+            if !crate::api::peers::is_public_http_url(&hook.url) {
+                crate::metrics::record_webhook_delivery("invalid_url");
+                tracing::warn!(
+                    url = %hook.url,
+                    event = %event_name,
+                    "webhook delivery skipped: stored URL is not a public http(s) target"
+                );
+                return;
+            }
+
+            let delivery_for_mark = delivery_id.clone();
+            // Open the secret only at signing time; at rest it stays sealed.
+            let signature =
+                match signing_decision(secret_key.as_ref(), hook.secret.as_ref(), &bytes) {
+                    SigningOutcome::NoSecret => None,
+                    SigningOutcome::Signed(sig) => Some(sig),
+                    // A hook that HAS a secret must sign with it or not deliver at
+                    // all: `reveal` returning None means the stored value could
+                    // not be opened (a foreign or rotated key, a truncated
+                    // ciphertext), and sending unsigned would present a broken
+                    // hook as a working one while the ledger marks the event
+                    // delivered. The row stays pending, like a network error, so
+                    // a fixed key can still land it.
+                    SigningOutcome::Withhold => {
+                        crate::metrics::record_webhook_delivery("secret_unopenable");
+                        tracing::warn!(
+                            hook_id = %hook.id,
+                            delivery_id = %delivery_for_mark,
+                            "webhook secret could not be opened; delivery withheld"
+                        );
+                        return;
+                    }
+                };
 
             let mut req = client
                 .post(&hook.url)
@@ -100,6 +323,10 @@ async fn fire_event_async(
                         "http_error"
                     };
                     crate::metrics::record_webhook_delivery(result_label);
+                    // Any HTTP response proves the delivery fired; mark
+                    // sent so the ledger never claims an unsent delivery.
+                    // Network errors stay pending for stale-reclaim.
+                    let _ = db_for_mark.mark_webhook_sent(&delivery_for_mark).await;
                     tracing::info!(
                         url = %hook.url,
                         event = %event_name,
@@ -118,5 +345,62 @@ async fn fire_event_async(
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::Rng;
+
+    fn key() -> [u8; 32] {
+        chacha20poly1305::aead::OsRng.gen()
+    }
+
+    /// A hook with no secret delivers unsigned, as before.
+    #[test]
+    fn signing_decision_no_secret_is_unsigned() {
+        assert!(matches!(
+            signing_decision(&key(), None, b"{}"),
+            SigningOutcome::NoSecret
+        ));
+    }
+
+    /// A sealed secret that opens signs with the revealed plaintext.
+    #[test]
+    fn signing_decision_sealed_secret_signs() {
+        let k = key();
+        let sealed =
+            crate::webhook_secret::WebhookSecret::new(crate::webhook_secret::seal(&k, "topsecret"));
+        match signing_decision(&k, Some(&sealed), b"{}") {
+            SigningOutcome::Signed(sig) => {
+                assert_eq!(sig, sign_payload("topsecret", b"{}"))
+            }
+            _ => panic!("an openable sealed secret must produce a signature"),
+        }
+    }
+
+    /// A stored value that carries the sealed prefix but cannot be opened
+    /// (foreign key, truncated ciphertext) must withhold, never send unsigned.
+    #[test]
+    fn signing_decision_unopenable_secret_withholds() {
+        let garbage =
+            crate::webhook_secret::WebhookSecret::new("enc:v1:bm90LWNoaXBoZXJ0ZXh0".to_string());
+        assert!(matches!(
+            signing_decision(&key(), Some(&garbage), b"{}"),
+            SigningOutcome::Withhold
+        ));
+    }
+
+    /// A legacy plaintext value signs with itself unchanged.
+    #[test]
+    fn signing_decision_legacy_plaintext_signs() {
+        let legacy = crate::webhook_secret::WebhookSecret::new("plainsecret".to_string());
+        match signing_decision(&key(), Some(&legacy), b"{}") {
+            SigningOutcome::Signed(sig) => {
+                assert_eq!(sig, sign_payload("plainsecret", b"{}"))
+            }
+            _ => panic!("legacy plaintext must keep signing"),
+        }
     }
 }
