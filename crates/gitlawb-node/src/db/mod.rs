@@ -3630,6 +3630,8 @@ impl Db {
             "visibility_rules",
             "encrypted_blobs",
             "repo_icaptcha_proofs",
+            "status_claims",
+            "repo_push_events",
         ] {
             sqlx::query(&format!("DELETE FROM {table} WHERE repo_id = $1"))
                 .bind(id)
@@ -14224,6 +14226,24 @@ mod dedup_db_tests {
         .await
         .unwrap();
 
+        sqlx::query(
+            "INSERT INTO status_claims (id, repo_id, commit_sha, state, context, producer_did,
+                 authorizing_did, signature, signature_input, signing_string, request_body,
+                 request_digest, created_at)
+             VALUES ('sc1', 'rid-cascade', 'abc', 'success', 'ci', 'p', 'a', 'sig', 'sigin',
+                 'ss', decode('00', 'hex'), 'digest-cascade', '2026-01-01T00:00:00Z')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO repo_push_events (id, repo_id, ref_name, after_sha, created_at)
+             VALUES ('pe1', 'rid-cascade', 'refs/heads/main', 'abc', '2026-01-01T00:00:00Z')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
         let removed = db.delete_repo_by_id("rid-cascade").await.unwrap();
         assert_eq!(removed, 1, "parent repo row deleted");
 
@@ -14264,6 +14284,18 @@ mod dedup_db_tests {
             0,
             "PR grandchild (pr_reviews) must be deleted with its parent PR"
         );
+        for table in ["status_claims", "repo_push_events"] {
+            assert_eq!(
+                count(
+                    &db,
+                    &format!("SELECT COUNT(*) FROM {table} WHERE repo_id=$1"),
+                    "rid-cascade"
+                )
+                .await,
+                0,
+                "repo_id-keyed child ({table}) must be deleted"
+            );
+        }
     }
 
     /// U4 gate-raise (INV-9 same-method slug collision): a canonical `did:key:zX`
