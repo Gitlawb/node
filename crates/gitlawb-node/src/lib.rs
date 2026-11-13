@@ -46,7 +46,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use clap::Parser;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -68,10 +68,28 @@ struct DegradedState {
 
 /// Two independent counters with no cross-field invariant — atomics, not a
 /// lock, so the retry loop and the degraded handlers never contend.
+const DB_SCHEMA_CONFLICT_CODE: &str = "db_schema_conflict";
+const DB_SCHEMA_CONFLICT_MESSAGE: &str =
+    "database schema conflicts with this build; operator action is required";
+
 #[derive(Default)]
 struct DbStartupStatus {
     attempts: AtomicU64,
     next_retry_secs: AtomicU64,
+    /// Set once the retry loop sees a migration version collision. Latched:
+    /// the condition is a code-level numbering bug that cannot heal between
+    /// attempts, and it changes what the readiness payload must say.
+    schema_conflict: AtomicBool,
+}
+
+impl DbStartupStatus {
+    fn mark_schema_conflict(&self) {
+        self.schema_conflict.store(true, Ordering::Relaxed);
+    }
+
+    fn schema_conflict(&self) -> bool {
+        self.schema_conflict.load(Ordering::Relaxed)
+    }
 }
 
 pub async fn run() -> Result<()> {
@@ -633,7 +651,8 @@ pub async fn run() -> Result<()> {
         });
     }
 
-    // Periodic cleanup of expired rate limit entries + consumed-proof ledger
+    // Periodic cleanup of expired rate limit entries + consumed-proof and
+    // spent-signature ledgers
     {
         // Clone the whole state so the sweep uses AppState::cleanup_rate_limiters
         // (the single source of truth that reaps EVERY limiter, including
@@ -650,9 +669,7 @@ pub async fn run() -> Result<()> {
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs() as i64)
                             .unwrap_or(0);
-                        if let Err(e) = db.sweep_expired_proofs(now).await {
-                            tracing::warn!(err = %e, "failed to sweep expired iCaptcha proofs");
-                        }
+                        sweep_expired_ledgers(&db, now).await;
                     }
                     _ = shutdown_rx.changed() => {
                         if *shutdown_rx.borrow() {
@@ -1223,7 +1240,14 @@ async fn connect_db_with_retry(
                 // the provider — and take liveness down with it), but log at
                 // error level and skip straight to the maximum backoff; the
                 // /ready health check is what surfaces this to deploys.
-                let permanent = is_likely_permanent_db_error(&err);
+                // One call decides the backoff, the log level and the readiness
+                // signal, and applies the latch. Everything below reads from
+                // its result, so the branch cannot drift away from the latch.
+                let fault = record_db_startup_failure(&err, &db_startup);
+                let DbStartupFault {
+                    permanent,
+                    schema_conflict,
+                } = fault;
                 let retry_secs = if permanent {
                     max_retry_secs
                 } else {
@@ -1232,7 +1256,14 @@ async fn connect_db_with_retry(
                 db_startup
                     .next_retry_secs
                     .store(retry_secs, Ordering::Relaxed);
-                if permanent {
+                if schema_conflict {
+                    tracing::error!(
+                        attempts,
+                        retry_secs,
+                        err = %err,
+                        "database schema conflicts with this build's migration catalogue; this will not heal on retry; operator action is required"
+                    );
+                } else if permanent {
                     tracing::error!(
                         attempts,
                         retry_secs,
@@ -1261,12 +1292,45 @@ async fn connect_db_with_retry(
     }
 }
 
+/// Classified failure of one DB connection attempt, so the retry loop can
+/// distinguish a transient outage from faults that retrying cannot heal.
+struct DbStartupFault {
+    /// The error class says retry cannot fix it (bad URL, auth refusal).
+    permanent: bool,
+    /// A migration version collision, latched on DbStartupStatus so the
+    /// readiness payload reports the real reason the DB never comes up.
+    schema_conflict: bool,
+}
+
+fn record_db_startup_failure(err: &anyhow::Error, db_startup: &DbStartupStatus) -> DbStartupFault {
+    let schema_conflict = err
+        .downcast_ref::<db::MigrationVersionCollision>()
+        .is_some();
+    if schema_conflict {
+        db_startup.mark_schema_conflict();
+    }
+    DbStartupFault {
+        permanent: is_likely_permanent_db_error(err),
+        schema_conflict,
+    }
+}
+
 /// Errors that indicate misconfiguration rather than a transient outage: a
 /// malformed DATABASE_URL, or a server that answered and rejected us —
 /// Postgres error class 28xxx (invalid authorization) or 3D000 (database
 /// does not exist). Best-effort: an error that anyhow can't downcast back to
 /// sqlx just counts as transient.
 fn is_likely_permanent_db_error(err: &anyhow::Error) -> bool {
+    // A migration version collision cannot heal on its own, so the caller
+    // takes the permanent branch: max backoff, error-level log, and (through
+    // record_db_startup_failure's latch) a readiness payload that stops saying
+    // "database unavailable, retrying".
+    if err
+        .downcast_ref::<db::MigrationVersionCollision>()
+        .is_some()
+    {
+        return true;
+    }
     match err.downcast_ref::<sqlx::Error>() {
         Some(sqlx::Error::Configuration(_)) => true,
         Some(sqlx::Error::Database(db)) => db
@@ -1336,11 +1400,27 @@ fn build_degraded_router(
 /// vocabulary with error.rs so clients see the same code/message for
 /// "database unavailable" regardless of which phase produced it.
 fn degraded_body(db_startup: &DbStartupStatus) -> serde_json::Value {
+    // A schema conflict is not a database that is still coming up. Saying
+    // "initializing" for it hides a permanent, operator-actionable fault behind
+    // a status that reads as "wait longer".
+    let (state, code, message) = if db_startup.schema_conflict() {
+        (
+            "schema_conflict",
+            DB_SCHEMA_CONFLICT_CODE,
+            DB_SCHEMA_CONFLICT_MESSAGE,
+        )
+    } else {
+        (
+            "initializing",
+            error::DB_UNAVAILABLE_CODE,
+            error::DB_UNAVAILABLE_MESSAGE,
+        )
+    };
     serde_json::json!({
         "status": "degraded",
-        "database": "initializing",
-        "error": error::DB_UNAVAILABLE_CODE,
-        "message": error::DB_UNAVAILABLE_MESSAGE,
+        "database": state,
+        "error": code,
+        "message": message,
         "db_attempts": db_startup.attempts.load(Ordering::Relaxed),
         "db_next_retry_secs": db_startup.next_retry_secs.load(Ordering::Relaxed),
     })
@@ -1441,6 +1521,40 @@ fn build_operator_client(
     Ok(operator::OperatorClient::new(cfg))
 }
 
+/// Outcome of one announce POST, richer than a bool so the announce path can
+/// surface a peer's machine-readable rejection code (e.g. spent signature)
+/// instead of only logging "rejected".
+enum AnnounceOutcome {
+    Accepted,
+    Rejected {
+        status: u16,
+        error_code: Option<String>,
+    },
+}
+
+fn classify_announce_response(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> AnnounceOutcome {
+    if status.is_success() {
+        return AnnounceOutcome::Accepted;
+    }
+    AnnounceOutcome::Rejected {
+        status: status.as_u16(),
+        error_code: api::peers::peer_error_code(headers).map(str::to_string),
+    }
+}
+
+/// One pass of the periodic expiry sweep over the durable replay ledgers.
+async fn sweep_expired_ledgers(db: &Db, now: i64) {
+    if let Err(e) = db.sweep_expired_proofs(now).await {
+        tracing::warn!(err = %e, "failed to sweep expired iCaptcha proofs");
+    }
+    if let Err(e) = db.sweep_expired_signatures(now).await {
+        tracing::warn!(err = %e, "failed to sweep expired spent signatures");
+    }
+}
+
 /// Announce to bootstrap peers on startup, then periodically ping all known peers.
 async fn gossip_task(
     state: AppState,
@@ -1505,8 +1619,8 @@ async fn gossip_task(
         )
         .await
         {
-            Ok(Ok(resp)) => {
-                if resp.status().is_success() {
+            Ok(Ok(resp)) => match classify_announce_response(resp.status(), resp.headers()) {
+                AnnounceOutcome::Accepted => {
                     if let Ok(json) = resp.json::<serde_json::Value>().await {
                         // Add them back to our peer list
                         if let (Some(their_did), Some(their_url)) = (
@@ -1545,7 +1659,19 @@ async fn gossip_task(
                         }
                     }
                 }
-            }
+                // Without this arm a refused announce produced no log line at
+                // all, so a node whose peers reject it looked identical to one
+                // succeeding. Same shape as the two sibling signed calls
+                // (sync.rs replica registration, repos.rs peer sync notify).
+                AnnounceOutcome::Rejected { status, error_code } => {
+                    warn!(
+                        url = %announce_url,
+                        status = status,
+                        error_code = error_code.as_deref().unwrap_or("none"),
+                        "bootstrap peer announce rejected"
+                    );
+                }
+            },
             Ok(Err(e)) => {
                 tracing::warn!(url = %announce_url, err = %e, "failed to announce to bootstrap peer")
             }
@@ -1836,6 +1962,63 @@ async fn gossip_ping_round(
                 "peer readiness probe failed once; preserving previous federation status"
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod ledger_sweep_tests {
+    use super::sweep_expired_ledgers;
+    use crate::db::{ConsumeSignature, Db};
+    use sqlx::PgPool;
+    use std::sync::LazyLock;
+
+    // The ledger's CHECK requires a 64-char sig_hash.
+    static OLD_SIG: LazyLock<String> = LazyLock::new(|| "a".repeat(64));
+    static FRESH_SIG: LazyLock<String> = LazyLock::new(|| "b".repeat(64));
+
+    // The periodic task must age out BOTH replay ledgers. The spent-signature
+    // ledger shipped with a sweep function nothing in production called, so its
+    // table grew with every signed write and never shrank.
+    #[sqlx::test]
+    async fn periodic_sweep_ages_out_both_replay_ledgers(pool: PgPool) {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        db.consume_proof_jti("old-proof", 100).await.unwrap();
+        db.consume_proof_jti("fresh-proof", 500).await.unwrap();
+        for (hash, exp) in [(OLD_SIG.as_str(), 100i64), (FRESH_SIG.as_str(), 500)] {
+            assert_eq!(
+                db.consume_signature(hash, "did:key:zAlice", 0, exp)
+                    .await
+                    .unwrap(),
+                ConsumeSignature::Inserted
+            );
+        }
+
+        sweep_expired_ledgers(&db, 200).await;
+
+        assert!(
+            db.consume_proof_jti("old-proof", 600).await.unwrap(),
+            "an expired proof row must have been swept (free to insert again)"
+        );
+        assert!(
+            !db.consume_proof_jti("fresh-proof", 600).await.unwrap(),
+            "an unexpired proof row must survive the sweep"
+        );
+        assert_eq!(
+            db.consume_signature(&OLD_SIG, "did:key:zAlice", 200, 530)
+                .await
+                .unwrap(),
+            ConsumeSignature::Inserted,
+            "an expired signature row must have been swept"
+        );
+        assert_eq!(
+            db.consume_signature(&FRESH_SIG, "did:key:zAlice", 200, 530)
+                .await
+                .unwrap(),
+            ConsumeSignature::Replayed,
+            "an unexpired signature row must survive the sweep"
+        );
     }
 }
 

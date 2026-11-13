@@ -6,6 +6,7 @@ pub mod error;
 pub mod http_sig;
 pub mod identity;
 pub mod identity_path;
+pub mod node_denial;
 // `url` is the one dependency here that drags a tail (idna, then the icu
 // crates), and gitlawb-core is allowlisted to stay embeddable. Every client that
 // needs this predicate already parses URLs, so they opt in and nothing else

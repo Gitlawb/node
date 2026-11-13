@@ -6,10 +6,10 @@
 
 use anyhow::{Context, Result};
 use clap::Args;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::path::PathBuf;
 
-use crate::http::{sanitize_node_msg, NodeClient};
+use crate::http::{json_or_denial, sanitize_node_msg, NodeClient};
 use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
@@ -65,7 +65,7 @@ pub async fn run(args: RegisterArgs) -> Result<()> {
         .await
         .context("failed to connect to node")?;
 
-    let payload = crate::http::read_json(resp, "registration").await?;
+    let payload: Value = json_or_denial("registration", resp).await?;
 
     // Save bootstrap UCAN
     let ucan = payload.get("ucan").and_then(|v| v.as_str()).unwrap_or("");

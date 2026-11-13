@@ -2,9 +2,10 @@
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
+use serde_json::Value;
 use std::path::PathBuf;
 
-use crate::http::NodeClient;
+use crate::http::{json_or_denial, NodeClient};
 use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
@@ -264,7 +265,7 @@ async fn cmd_create(
         .post(&format!("/api/v1/repos/{owner}/{repo}/pulls"), &payload)
         .await
         .context("failed to connect to node")?;
-    let pr = crate::http::read_json(resp, "create PR").await?;
+    let pr: Value = json_or_denial("create PR", resp).await?;
 
     let number = pr["number"].as_i64().unwrap_or(0);
     println!("✓ Opened PR #{number}: {title}");
@@ -463,7 +464,7 @@ async fn cmd_merge(repo: String, number: u64, node: String, dir: Option<PathBuf>
         )
         .await
         .context("failed to connect to node")?;
-    let result = crate::http::read_json(resp, "merge").await?;
+    let result: Value = json_or_denial("merge", resp).await?;
 
     let sha = result["merge_sha"].as_str().unwrap_or("?");
     println!("✓ Merged PR #{number}");
@@ -495,7 +496,7 @@ async fn cmd_review(
         )
         .await
         .context("failed to connect to node")?;
-    let _ = crate::http::read_json(resp, "review").await?;
+    json_or_denial::<Value>("review", resp).await?;
 
     let icon = match status.as_str() {
         "approved" => "✓",
@@ -525,7 +526,7 @@ async fn cmd_comment(
         )
         .await
         .context("failed to connect to node")?;
-    let _ = crate::http::read_json(resp, "comment").await?;
+    json_or_denial::<Value>("comment", resp).await?;
 
     println!("· Comment posted on PR #{number}");
     Ok(())

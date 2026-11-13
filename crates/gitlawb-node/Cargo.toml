@@ -102,6 +102,7 @@ libp2p-dns = { version = "0.45.0", features = ["tokio"] }
 tempfile = { version = "3", optional = true }
 
 [dev-dependencies]
+multibase = { workspace = true }
 mockito = "1"
 tempfile = "3"
 # test-util enables tokio::test(start_paused): the delayed claim re-sweep
