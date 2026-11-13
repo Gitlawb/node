@@ -476,8 +476,7 @@ pub async fn run() -> Result<()> {
     // buckets. Every signed attempt on those routes commits a ledger row
     // before the handler runs, so an unkeyed flood gets its own cap rather
     // than draining the create, push, or peer-sync quotas.
-    let signed_write_rate_limiter =
-        rate_limit::RateLimiter::new_bounded(600, std::time::Duration::from_secs(3600), 200_000);
+    let signed_write_rate_limiter = signed_write_limiter(&config);
     if config.sync_trigger_rate_limit == 0 {
         tracing::warn!(
             "GITLAWB_SYNC_TRIGGER_RATE_LIMIT=0 — /sync/trigger IP rate limiting disabled"
@@ -925,6 +924,22 @@ pub async fn run() -> Result<()> {
 /// from the config knobs rather than some other field, that the caller is not blocked
 /// on it, and that the shutdown watcher actually ends it mid-walk. The sweep's own
 /// behavior is covered elsewhere; this is the boot-path half.
+/// Builds the per-IP brake for the signed write routes from the operator's
+/// setting. Its own function so a test can prove startup reads the config
+/// rather than a literal.
+fn signed_write_limiter(config: &Config) -> rate_limit::RateLimiter {
+    if config.signed_write_rate_limit == 0 {
+        tracing::warn!(
+            "GITLAWB_SIGNED_WRITE_RATE_LIMIT=0 — signed-write IP rate limiting disabled"
+        );
+    }
+    rate_limit::RateLimiter::new_bounded(
+        config.signed_write_rate_limit,
+        std::time::Duration::from_secs(3600),
+        200_000,
+    )
+}
+
 fn spawn_legacy_cid_sweep(state: &AppState, config: &Config) -> tokio::task::JoinHandle<()> {
     let db = state.db.clone();
     let repos_dir = config.repos_dir.clone();
@@ -4177,5 +4192,43 @@ mod identity_key_storage_tests {
             !data.join("keys").exists(),
             "rejection must not create a file named keys"
         );
+    }
+}
+
+#[cfg(test)]
+mod signed_write_limiter_tests {
+    use super::signed_write_limiter;
+    use crate::config::Config;
+    use clap::Parser;
+
+    #[tokio::test]
+    async fn startup_honors_a_non_default_signed_write_limit() {
+        let config = Config::parse_from(["gitlawb-node", "--signed-write-rate-limit", "2"]);
+        let limiter = signed_write_limiter(&config);
+        assert!(limiter.check("1.2.3.4").await);
+        assert!(limiter.check("1.2.3.4").await);
+        assert!(
+            !limiter.check("1.2.3.4").await,
+            "a limit of 2 must refuse the third request"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_disables_the_signed_write_limit() {
+        let config = Config::parse_from(["gitlawb-node", "--signed-write-rate-limit", "0"]);
+        let limiter = signed_write_limiter(&config);
+        for _ in 0..1000 {
+            assert!(limiter.check("1.2.3.4").await);
+        }
+    }
+
+    #[tokio::test]
+    async fn default_stays_600() {
+        let config = Config::parse_from(["gitlawb-node"]);
+        let limiter = signed_write_limiter(&config);
+        for _ in 0..600 {
+            assert!(limiter.check("1.2.3.4").await);
+        }
+        assert!(!limiter.check("1.2.3.4").await);
     }
 }

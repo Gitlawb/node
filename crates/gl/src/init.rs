@@ -147,7 +147,7 @@ async fn run_in(cwd: &std::path::Path, args: InitArgs) -> Result<()> {
     if !repo_status.is_success() {
         let capped = crate::http::read_body_capped(resp, crate::http::DENIAL_BODY_CAP).await;
         let repo_result: Value = serde_json::from_str(&capped.text).unwrap_or(Value::Null);
-        if !repo_already_exists(&repo_result) {
+        if !repo_already_exists(repo_status, &repo_result) {
             let msg = repo_result["message"]
                 .as_str()
                 .or_else(|| repo_result["error"].as_str())
@@ -236,8 +236,8 @@ async fn run_in(cwd: &std::path::Path, args: InitArgs) -> Result<()> {
 /// `AppError::RepoExists` is the only thing the node renders as `repo_exists`
 /// (node `error.rs`), and it is the only non-success reply `gl init` may treat
 /// as "keep going".
-fn repo_already_exists(payload: &Value) -> bool {
-    payload["error"].as_str() == Some("repo_exists")
+fn repo_already_exists(status: reqwest::StatusCode, payload: &Value) -> bool {
+    status == reqwest::StatusCode::CONFLICT && payload["error"].as_str() == Some("repo_exists")
 }
 
 fn generate_identity(dir: Option<&std::path::Path>) -> Result<gitlawb_core::identity::Keypair> {
@@ -486,18 +486,42 @@ mod tests {
 
     #[test]
     fn repo_already_exists_matches_the_code_not_the_prose() {
+        use reqwest::StatusCode;
         assert!(repo_already_exists(
+            StatusCode::CONFLICT,
             &json!({"error":"repo_exists","message":"repository 'x' already exists"})
         ));
         // The replay denial's message contains "already" and "exists" is one
         // word away; only the code separates them.
-        assert!(!repo_already_exists(&json!({
-            "error": "signature_replayed",
-            "message": "this signature has already been used - sign a fresh request"
-        })));
         assert!(!repo_already_exists(
+            StatusCode::CONFLICT,
+            &json!({
+                "error": "signature_replayed",
+                "message": "this signature has already been used - sign a fresh request"
+            })
+        ));
+        assert!(!repo_already_exists(
+            StatusCode::CONFLICT,
             &json!({"message":"repository already exists"})
         ));
-        assert!(!repo_already_exists(&json!({})));
+        assert!(!repo_already_exists(StatusCode::CONFLICT, &json!({})));
+    }
+
+    #[test]
+    fn repo_already_exists_requires_the_conflict_status() {
+        use reqwest::StatusCode;
+        let body = json!({"error":"repo_exists"});
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+        ] {
+            assert!(
+                !repo_already_exists(status, &body),
+                "{status} with a repo_exists body must not read as already-exists"
+            );
+        }
     }
 }
