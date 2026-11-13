@@ -1819,6 +1819,10 @@ pub fn repo_disk_path(repos_dir: &Path, owner_did: &str, repo_name: &str) -> std
 
 #[cfg(test)]
 mod tests {
+    use super::{branch_diff_names, merge_branch};
+    use std::path::Path;
+    use std::process::Command;
+
     use super::{validate_git_ref, validate_git_ref_with_git, GitRefValidationError};
 
     #[test]
@@ -1884,10 +1888,6 @@ mod tests {
             "spawn failure must not be classified as invalid input, got {err:?}"
         );
     }
-
-    use super::{branch_diff_names, merge_branch};
-    use std::path::Path;
-    use std::process::Command;
 
     /// #26 split 1/4: a bare repo this node creates must KEEP REFLOGS, because
     /// the durable-outbox reconcile has no other way to prove that a stranded

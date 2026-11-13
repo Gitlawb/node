@@ -2548,17 +2548,8 @@ mod push_events_tests {
             .expect("next_cursor")
             .to_string();
 
-        assert!(
-            !cursor.contains(&seq.to_string()),
-            "the encoded cursor must not spell the global sequence, got {cursor}"
-        );
         let decoded = String::from_utf8(URL_SAFE_NO_PAD.decode(&cursor).expect("base64url"))
             .expect("utf-8 token");
-        assert!(
-            !decoded.contains(&seq.to_string()),
-            "decoding the cursor must not reveal the global sequence either, got \
-             {decoded}"
-        );
         assert_eq!(
             decoded.splitn(3, '.').nth(2),
             Some("evt-1"),

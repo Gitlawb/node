@@ -3,7 +3,8 @@
 //! Every handler that needs access to a git repo on disk goes through `RepoStore`:
 //!
 //! - `acquire()` — ensures the repo is on local disk (downloads from Tigris on cache miss).
-//! - `release_after_write()` — uploads the updated repo to Tigris after a write operation.
+//! - `upload_under_guard()`: uploads the updated repo to Tigris after a write, under a
+//!   per-repo advisory lock the caller already holds (the fork tail's durability step).
 //! - `init()` — creates a new bare repo locally and uploads to Tigris.
 //!
 //! When Tigris is disabled (bucket empty), this is a simple passthrough to local disk.
@@ -50,7 +51,7 @@ impl ConfirmedLiveTree {
     }
 }
 
-/// Centralized repo storage: local disk cache + optional Tigris backend.
+/// Centralized repo storage: local disk cache + optional object-store backend.
 #[derive(Clone)]
 pub struct RepoStore {
     repos_dir: PathBuf,
@@ -801,7 +802,22 @@ impl RepoStore {
     }
 
     /// Initialize a new bare repo on local disk and upload to Tigris.
+    /// Test-only convenience over `init_handle`; every
+    /// production caller keeps the upload inside its lock.
+    #[cfg(test)]
     pub async fn init(&self, owner_did: &str, repo_name: &str) -> Result<PathBuf> {
+        let (path, upload) = self.init_handle(owner_did, repo_name).await?;
+        drop(upload);
+        Ok(path)
+    }
+
+    /// [`init`](Self::init) plus the background archive upload's JoinHandle, so
+    /// callers holding a lock can keep the upload inside the lock's lifetime.
+    pub async fn init_handle(
+        &self,
+        owner_did: &str,
+        repo_name: &str,
+    ) -> Result<(PathBuf, Option<tokio::task::JoinHandle<Result<()>>>)> {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
 
         store::init_bare(&local_path).context("initializing bare repo")?;
@@ -812,12 +828,13 @@ impl RepoStore {
         clear_quarantine(&local_path, repo_name);
 
         // Upload to Tigris in background
+        let mut upload_handle = None;
         if let Some(ref tigris) = self.tigris {
             let tigris = tigris.clone();
             let owner_slug = owner_slug.clone();
             let repo_name = repo_name.to_string();
             let path = local_path.clone();
-            tokio::spawn(async move {
+            upload_handle = Some(tokio::spawn(async move {
                 // Create-only, and load-bearing: this uploads a freshly
                 // initialized EMPTY repo, so a user who pushes immediately
                 // after creating one would have their archive replaced by this
@@ -828,20 +845,26 @@ impl RepoStore {
                     .upload(&owner_slug, &repo_name, &path, UploadPrecondition::IfAbsent)
                     .await
                 {
-                    Ok(_) => {}
-                    // Distinct from the warn arm: the fence refusing is the
-                    // design working, not a storage failure.
+                    Ok(_) => Ok(()),
+                    // Distinct from the error arm: the fence refusing means
+                    // someone else already published this key, so the empty
+                    // bytes dropped — but for a create caller the archive then
+                    // belongs to another writer, which IS a creation failure.
                     Err(UploadError::PreconditionLost { status }) => {
                         info!(repo = %repo_name, status, "dropped the empty-repo upload: another writer already published this repo");
+                        Err(anyhow::anyhow!(
+                            "empty-repo upload fenced: key already published (status {status})"
+                        ))
                     }
                     Err(e) => {
                         warn!(repo = %repo_name, err = %e, "failed to upload new repo to tigris");
+                        Err(anyhow::anyhow!("empty-repo upload failed: {e}"))
                     }
                 }
-            });
+            }));
         }
 
-        Ok(local_path.into_path_buf())
+        Ok((local_path.into_path_buf(), upload_handle))
     }
 
     /// Upload a repo to Tigris after a write operation (push, merge, fork, etc.).
@@ -891,6 +914,102 @@ impl RepoStore {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Whether an object store is configured. Used by purge-spam to decide
+    /// whether a repo with no local copy can be a remote-unverified candidate
+    /// (its emptiness verified under the lock after a refresh) versus fail-closed.
+    pub fn has_object_store(&self) -> bool {
+        self.tigris.is_some()
+    }
+
+    /// Try to take the per-repo advisory lock WITHOUT the write guard's
+    /// download/upload pipeline: a bare lock for callers (purge-spam, the
+    /// create/fork namespace serialization) that must serialize against the
+    /// write path on the same key but are not themselves publishing a tree.
+    ///
+    /// Returns `Some(guard)` if the lock was free, `None` if another writer holds
+    /// it (so the caller can skip rather than block). The guard holds a dedicated
+    /// pooled connection for its whole lifetime, so the lock lives on that one
+    /// connection and `release()` unlocks it on the SAME connection — a plain
+    /// pool query could unlock on a different connection and silently fail.
+    pub async fn try_lock_repo(
+        &self,
+        owner_did: &str,
+        repo_name: &str,
+    ) -> Result<Option<RepoLockGuard>> {
+        self.try_lock_repo_on(&self.lock_pool, owner_did, repo_name)
+            .await
+    }
+
+    /// [`try_lock_repo`](Self::try_lock_repo) against a caller-chosen pool. The
+    /// Postgres advisory lock is DATABASE-global, so the lock still mutually
+    /// excludes holders of the same key from any other pool — only the connection
+    /// the guard pins comes from `pool`. Backs the `lock_pool`-based delegators.
+    async fn try_lock_repo_on(
+        &self,
+        pool: &PgPool,
+        owner_did: &str,
+        repo_name: &str,
+    ) -> Result<Option<RepoLockGuard>> {
+        let (owner_slug, _local) = self.local_path(owner_did, repo_name)?;
+        let lock_key = advisory_lock_key(&owner_slug, repo_name);
+        let conn = pool.acquire().await.context("acquiring lock connection")?;
+        // Route through LockProbe so a cancellation racing the query cannot
+        // return a connection holding an acquired session lock to the pool:
+        // the probe's Drop closes the session unless take_conn hands it out.
+        let mut probe = LockProbe::new(conn);
+        if !probe
+            .try_lock(lock_key)
+            .await
+            .context("try advisory lock")?
+        {
+            return Ok(None);
+        }
+        let conn = probe
+            .take_conn()
+            .context("lock probe lost its connection after a confirmed acquire")?;
+        Ok(Some(RepoLockGuard {
+            conn: Some(conn),
+            lock_key,
+            repo_name: repo_name.to_string(),
+        }))
+    }
+
+    /// Bounded-wait lock-only acquire, without any object-store I/O. Retries
+    /// `try_lock_repo` with short backoff. Used by `create_repo` and `fork_repo`
+    /// to serialize their existence-check -> write -> row-insert spans against a
+    /// concurrent same-key purge (which holds this same lock across delete-row +
+    /// remove-dir). A key held past the bounded wait surfaces as `Ok(None)`,
+    /// which the create/fork handlers map to a retryable 503.
+    pub async fn lock_repo_blocking(
+        &self,
+        owner_did: &str,
+        repo_name: &str,
+    ) -> Result<Option<RepoLockGuard>> {
+        self.lock_repo_blocking_on(&self.lock_pool, owner_did, repo_name)
+            .await
+    }
+
+    /// [`lock_repo_blocking`](Self::lock_repo_blocking) against a caller-chosen
+    /// pool. The advisory lock is DB-global, so the guard mutually excludes the same
+    /// key across pools; only the pinned connection comes from `pool`. Backs the
+    /// `lock_pool`-based [`lock_repo_blocking`](Self::lock_repo_blocking) delegator.
+    pub async fn lock_repo_blocking_on(
+        &self,
+        pool: &PgPool,
+        owner_did: &str,
+        repo_name: &str,
+    ) -> Result<Option<RepoLockGuard>> {
+        for attempt in 0..30 {
+            if let Some(g) = self.try_lock_repo_on(pool, owner_did, repo_name).await? {
+                return Ok(Some(g));
+            }
+            if attempt < 29 {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+        Ok(None)
     }
 
     /// Compute the local disk path and owner slug for a repo.
@@ -1003,6 +1122,12 @@ pub(crate) fn claim_fork_disk_path(disk_path: &Path, attempt: &PublishAttemptId)
     let Some(path) = fork_attempt_path(disk_path) else {
         return;
     };
+    // The stamp may be claimed BEFORE the mirror clone starts, when the owner
+    // directory does not exist yet; create it so the claim is not silently lost
+    // (a missing stamp makes every later ownership check refuse to clean).
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     if let Err(e) = std::fs::write(&path, attempt.as_str()) {
         warn!(
             path = %disk_path.display(),
@@ -1548,6 +1673,61 @@ fn invalidate_local_write_cache(local_path: &Path, repo_name: &str, reason: &str
     }
 }
 
+impl RepoStore {
+    /// Refresh the local copy from the authoritative object-store archive so an
+    /// emptiness recheck reflects remote state (used by purge-spam on a Tigris
+    /// deployment, where the admin node's local disk can be stale). Downloads
+    /// the archive over the local path when it exists; a no-op when no object
+    /// store is configured (single-machine). Errors propagate so the caller can
+    /// fail closed rather than delete on a stale-local view.
+    /// Returns the archive generation the refresh verified (its ETag), so the
+    /// caller can fence a later delete on exactly the view it checked.
+    pub async fn refresh_from_archive(
+        &self,
+        owner_did: &str,
+        repo_name: &str,
+    ) -> Result<Option<String>> {
+        let Some(ref store) = self.tigris else {
+            return Ok(None);
+        };
+        let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
+        let Some(generation) = store.head_generation(&owner_slug, repo_name).await? else {
+            return Ok(None);
+        };
+        store
+            .download(&owner_slug, repo_name, &local_path, None)
+            .await?;
+        Ok(generation.etag)
+    }
+
+    /// Delete the object-store archive for a repo. A no-op when no object store
+    /// is configured. Used by purge-spam so a deleted repo's archive cannot be
+    /// downloaded into a later repo created with the same owner/name. The
+    /// delete is fenced on the generation the store sees, so a cross-node
+    /// publish racing the purge makes it fail rather than erasing the
+    /// successor's archive.
+    /// `expected` is the generation the caller verified empty (an ETag from
+    /// [`refresh_from_archive`]); a moved generation means a PUT landed after
+    /// the check and the archive must be kept, so `Ok(false)` is a skip.
+    pub async fn delete_archive(
+        &self,
+        owner_did: &str,
+        repo_name: &str,
+        expected: Option<&str>,
+    ) -> Result<bool> {
+        let Some(ref store) = self.tigris else {
+            return Ok(true);
+        };
+        let (owner_slug, _local_path) = self.local_path(owner_did, repo_name)?;
+        store.delete_current(&owner_slug, repo_name, expected).await
+    }
+
+    /// The bound applied to transfers that run while a repo lock is held.
+    pub(crate) fn transfer_bound(&self) -> std::time::Duration {
+        self.lock_held_transfer_timeout
+    }
+}
+
 /// Strict allowlist validator for `owner_did` and `repo_name`.
 ///
 /// Rejects any character that isn't explicitly safe, plus length and
@@ -1704,7 +1884,7 @@ fn validate_owner_did(owner_did: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_repo_name(repo_name: &str) -> Result<()> {
+pub(crate) fn validate_repo_name(repo_name: &str) -> Result<()> {
     if repo_name.is_empty() {
         anyhow::bail!("repo_name is empty");
     }
@@ -2755,6 +2935,41 @@ pub fn build_lock_pool(source: &PgPool, max_connections: u32, acquire_timeout: D
         .connect_lazy_with((*source.connect_options()).clone())
 }
 
+/// Lock-only guard from [`RepoStore::try_lock_repo`]. Holds the Postgres advisory
+/// lock (and the dedicated connection it lives on) until `release()`. No Tigris
+/// I/O — unlike [`RepoWriteGuard`], releasing does NOT upload anything.
+pub struct RepoLockGuard {
+    conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
+    lock_key: i64,
+    repo_name: String,
+}
+
+impl RepoLockGuard {
+    /// Release the advisory lock on the same connection that took it, then return
+    /// the connection to the pool.
+    pub async fn release(mut self) {
+        if let Some(mut conn) = self.conn.take() {
+            let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+                .bind(self.lock_key)
+                .execute(&mut *conn)
+                .await;
+        }
+    }
+}
+
+impl Drop for RepoLockGuard {
+    fn drop(&mut self) {
+        // Same guarantee as RepoWriteGuard: a lock guard dropped without
+        // release() closes its connection so Postgres frees the advisory lock,
+        // rather than returning a lock-holding connection to the pool.
+        if let Some(mut conn) = self.conn.take() {
+            warn!(repo = %self.repo_name,
+                "RepoLockGuard dropped without release() — closing its connection to free the advisory lock");
+            conn.close_on_drop();
+        }
+    }
+}
+
 /// Compute a stable i64 hash for a Postgres advisory lock key.
 ///
 /// Uses SHA-256 (not `DefaultHasher`) so the same `(owner_slug, repo_name)`
@@ -2780,7 +2995,7 @@ pub(crate) fn advisory_lock_key(owner_slug: &str, repo_name: &str) -> i64 {
     i64::from_le_bytes(digest[..8].try_into().expect("sha256 output is >= 8 bytes"))
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::git::tigris::ATTEMPT_METADATA_KEY;
     use std::collections::HashMap;
@@ -4917,7 +5132,7 @@ mod tests {
     }
 
     /// Seed the minimum bare-repo shape so the upload has something to archive.
-    fn seed_bare_repo(path: &Path) {
+    pub(crate) fn seed_bare_repo(path: &Path) {
         std::fs::create_dir_all(path.join("objects/info")).unwrap();
         std::fs::create_dir_all(path.join("refs/heads")).unwrap();
         std::fs::write(path.join("HEAD"), "ref: refs/heads/main\n").unwrap();
@@ -5080,7 +5295,7 @@ mod tests {
     /// models the real S3 arm we care about (body fully transmitted, commit
     /// decided later) with no timing in it.
     #[derive(Clone, Debug)]
-    struct CapturedPut {
+    pub(crate) struct CapturedPut {
         key: String,
         body: Vec<u8>,
         if_match: Option<String>,
@@ -5090,7 +5305,7 @@ mod tests {
 
     /// One stored object.
     #[derive(Clone, Debug)]
-    struct MockObject {
+    pub(crate) struct MockObject {
         body: Vec<u8>,
         etag: String,
         /// The `x-amz-meta-gitlawb-attempt` it was written with. This is what
@@ -5103,14 +5318,14 @@ mod tests {
     /// `status` is `None` while a PUT is parked: it arrived and was logged, but
     /// no precondition has been evaluated for it yet.
     #[derive(Clone, Debug, PartialEq)]
-    struct PutAttempt {
+    pub(crate) struct PutAttempt {
         if_match: Option<String>,
         if_none_match: Option<String>,
         status: Option<u16>,
     }
 
     #[derive(Default)]
-    struct MockState {
+    pub(crate) struct MockState {
         /// Keyed by request path. A single-slot store was enough while every test
         /// drove one repo; fork creation touches the SOURCE key and the FORK key
         /// in one request, and collapsing them would make an assertion about one
@@ -5145,7 +5360,7 @@ mod tests {
     ///
     /// The fence tests downstream are only worth anything if a precondition can
     /// actually fail here, so this helper carries its own semantics tests below.
-    struct S3Mock {
+    pub(crate) struct S3Mock {
         endpoint: String,
         state: Arc<std::sync::Mutex<MockState>>,
         gate: Arc<tokio::sync::Notify>,
@@ -5215,7 +5430,7 @@ mod tests {
     }
 
     impl S3Mock {
-        async fn start() -> Self {
+        pub(crate) async fn start() -> Self {
             use axum::response::IntoResponse;
 
             let state = Arc::new(std::sync::Mutex::new(MockState::default()));
@@ -5424,7 +5639,7 @@ mod tests {
             }
         }
 
-        fn endpoint(&self) -> &str {
+        pub(crate) fn endpoint(&self) -> &str {
             &self.endpoint
         }
 
@@ -5445,7 +5660,7 @@ mod tests {
         }
 
         /// The stored object under a specific repo key.
-        fn object_for(&self, owner_slug: &str, repo_name: &str) -> Option<MockObject> {
+        pub(crate) fn object_for(&self, owner_slug: &str, repo_name: &str) -> Option<MockObject> {
             let key = format!("test-bucket/repos/v1/{owner_slug}/{repo_name}.tar.zst");
             self.state.lock().unwrap().objects.get(&key).cloned()
         }
@@ -5459,7 +5674,7 @@ mod tests {
         /// to pick up a precondition and then PUTs on it is therefore fencing
         /// on a generation that is already gone, which is the only way to drive
         /// two consecutive lost preconditions deterministically.
-        fn roll_generation_after_next_heads(&self, n: u32) {
+        pub(crate) fn roll_generation_after_next_heads(&self, n: u32) {
             self.state.lock().unwrap().roll_after_heads = n;
         }
 
@@ -5478,7 +5693,7 @@ mod tests {
         /// Deliver the next PUT in full and then fail it WITHOUT committing. The
         /// client's knowledge is identical to the arm above — that is the whole
         /// point — so only asking the store can tell the two apart.
-        fn fail_next_put_after_delivery(&self) {
+        pub(crate) fn fail_next_put_after_delivery(&self) {
             self.state.lock().unwrap().lose_next_response = Some(false);
         }
 
@@ -5489,7 +5704,7 @@ mod tests {
 
         /// Fail the next HEAD for ONE repo key with a 500, so a caller's
         /// reconciliation cannot be answered either way.
-        fn fail_next_head_for(&self, owner_slug: &str, repo_name: &str) {
+        pub(crate) fn fail_next_head_for(&self, owner_slug: &str, repo_name: &str) {
             let key = format!("test-bucket/repos/v1/{owner_slug}/{repo_name}.tar.zst");
             *self
                 .state
@@ -5501,7 +5716,7 @@ mod tests {
         }
 
         /// How many DELETEs the mock actually carried out.
-        fn deletes(&self) -> u32 {
+        pub(crate) fn deletes(&self) -> u32 {
             self.state.lock().unwrap().deletes
         }
 
@@ -5531,7 +5746,7 @@ mod tests {
             .0
         }
 
-        fn shutdown(&self) {
+        pub(crate) fn shutdown(&self) {
             self.server.abort();
         }
     }
@@ -6262,25 +6477,25 @@ mod tests {
 
     /// A client aimed at the same key the store under test publishes to, so a
     /// test can seed the archive or land an interfering publish of its own.
-    fn mock_tigris(mock: &S3Mock) -> TigrisClient {
+    pub(crate) fn mock_tigris(mock: &S3Mock) -> TigrisClient {
         TigrisClient::for_testing_with_endpoint("test-bucket", mock.endpoint())
     }
 
     /// The slug `local_path` derives from a DID, needed because a test seeds
     /// and reads the archive key directly.
-    fn owner_slug_of(owner_did: &str) -> String {
+    pub(crate) fn owner_slug_of(owner_did: &str) -> String {
         owner_did.replace([':', '/'], "_")
     }
 
     /// A bare-repo-shaped directory carrying `marker`, so a test can tell whose
     /// tree is stored without comparing compressed bytes.
-    fn marked_repo(path: &Path, marker: &str) {
+    pub(crate) fn marked_repo(path: &Path, marker: &str) {
         seed_bare_repo(path);
         std::fs::write(path.join("MARKER"), marker).unwrap();
     }
 
     /// The marker inside whatever archive is currently stored under the key.
-    async fn stored_marker(mock: &S3Mock, owner_slug: &str, repo_name: &str) -> String {
+    pub(crate) async fn stored_marker(mock: &S3Mock, owner_slug: &str, repo_name: &str) -> String {
         let out = TempDir::new().unwrap();
         let validated = super::validated_repo_disk_path(out.path(), "did:key:stored", "stored")
             .expect("test repo path must validate");

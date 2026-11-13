@@ -187,6 +187,11 @@ where
     F: std::future::Future<Output = Result<T>>,
 {
     let left = deadline.saturating_duration_since(Instant::now());
+    // `timeout` polls the future before it checks the timer, so a zero budget
+    // would still start the work. A spent deadline must not.
+    if left.is_zero() {
+        return Err(BoundedDbError::Elapsed);
+    }
     match tokio::time::timeout(left, fut).await {
         Ok(Ok(v)) => Ok(v),
         Ok(Err(e)) => Err(BoundedDbError::Db(e)),
@@ -3430,6 +3435,30 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "a spent deadline must error at once, not after a fresh full budget; got {:?}",
             started.elapsed()
+        );
+    }
+
+    /// A spent deadline must not start the work at all. `tokio::time::timeout`
+    /// polls the inner future before it checks the timer, so a future that is
+    /// ready on its first poll would otherwise slip through a zero budget and
+    /// return a value. Deterministic: the future has no await point.
+    #[tokio::test]
+    async fn db_bounded_spent_deadline_does_not_poll_a_ready_future() {
+        let spent = Instant::now() - Duration::from_secs(5);
+        let polled = std::sync::atomic::AtomicBool::new(false);
+        let out: Result<u8, BoundedDbError> = db_bounded(spent, async {
+            polled.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(7u8)
+        })
+        .await;
+
+        assert!(
+            matches!(out, Err(BoundedDbError::Elapsed)),
+            "a spent deadline must yield the timeout arm even for a ready future: {out:?}"
+        );
+        assert!(
+            !polled.load(std::sync::atomic::Ordering::SeqCst),
+            "a spent deadline must not start the work"
         );
     }
 

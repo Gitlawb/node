@@ -236,6 +236,17 @@ pub async fn merge_pr(
         store::read_ref(&disk_path, &store::local_branch_ref(&pr.source_branch))
             .ok()
             .flatten();
+    // Snapshot the target ref's pre-merge OID so a refused durable upload can
+    // rewind the local merge, mirroring the close_issue / create_issue
+    // compensating pattern. A read failure or an absent ref (a first-commit
+    // merge onto an unborn branch) yields no rollback closure: the merge still
+    // applies and a refused publish still surfaces as 5xx.
+    let target_ref = format!("refs/heads/{}", pr.target_branch);
+    let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+    let prior_tip = store::read_ref_bounded(&state.git_bin, &disk_path, &target_ref, git_timeout)
+        .await
+        .ok()
+        .flatten();
 
     let merge_result = store::merge_branch(
         &disk_path,
@@ -249,7 +260,27 @@ pub async fn merge_pr(
     // Short-circuit on a refused publish before the PR is marked merged and
     // before the webhook fires. Both are irreversible announcements of a merge
     // commit that only exists on this node's disk.
-    guard.release(merge_result.is_ok()).await.into_result()?;
+    let release_result = match (merge_result.is_ok(), prior_tip) {
+        (true, Some(tip)) => {
+            let git_bin = state.git_bin.clone();
+            let deadline = std::time::Instant::now() + git_timeout;
+            guard
+                .release_compensating(true, move |path| {
+                    crate::git::visibility_pack::run_bounded_git(
+                        &git_bin,
+                        &["update-ref", &target_ref, &tip],
+                        path,
+                        b"",
+                        deadline,
+                    )
+                    .map(|_| ())
+                })
+                .await
+                .into_result()
+        }
+        _ => guard.release(merge_result.is_ok()).await.into_result(),
+    };
+    release_result?;
 
     let merge_sha = merge_result.map_err(|e| AppError::Git(e.to_string()))?;
 
@@ -317,7 +348,9 @@ pub async fn close_pr(
     // head, so a PR closed before its first status read would report
     // head_resolved=false forever. The recorded push for the branch is the
     // canonical answer; the disk read covers a push whose event write failed.
-    // An unresolvable head keeps whatever the push path last stored.
+    // A failed lookup fails the close, leaving the pull request open to retry:
+    // it must not read as an absent head. An unresolvable head keeps whatever
+    // the push path last stored.
     let branch_ref = store::local_branch_ref(&pr.source_branch);
     let closed_head = if pr.head_commit.is_some() {
         None
@@ -325,9 +358,7 @@ pub async fn close_pr(
         state
             .db
             .latest_push_sha_for_ref(&record.id, &branch_ref)
-            .await
-            .ok()
-            .flatten()
+            .await?
             .or_else(|| {
                 store::read_ref(std::path::Path::new(&record.disk_path), &branch_ref)
                     .ok()
@@ -633,6 +664,218 @@ mod tests {
             merged.head_commit,
             Some(feature_tip),
             "the merge must stamp the source head it consumed, not the racing value"
+        );
+    }
+
+    /// A failed head lookup is not an absent head. With the push-event table
+    /// unreadable, the close must fail while the pull request is still open, so
+    /// the caller can retry. Closing with a NULL head would leave the rollup
+    /// unresolved for good, since a closed pull request serves only the stored
+    /// head. The branch exists on disk, so a swallowed error would also close
+    /// successfully through the disk fallback: that is the case this pins.
+    #[sqlx::test]
+    async fn close_fails_open_when_the_head_lookup_errors(pool: sqlx::PgPool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let owner_slug = OWNER_DID.replace([':', '/'], "_");
+        let (bare, _tip) = bare_repo_with_feature(tmp.path(), &owner_slug);
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.repo_store =
+            crate::git::repo_store::RepoStore::for_testing(tmp.path().to_path_buf(), pool.clone());
+
+        let now = Utc::now();
+        let repo = crate::db::RepoRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "demo".into(),
+            owner_did: OWNER_DID.into(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: now,
+            updated_at: now,
+            disk_path: bare.to_string_lossy().into_owned(),
+            forked_from: None,
+            machine_id: None,
+        };
+        state.db.create_repo(&repo).await.unwrap();
+        let pr = PullRequest {
+            id: Uuid::new_v4().to_string(),
+            repo_id: repo.id.clone(),
+            number: 1,
+            title: "add b".into(),
+            body: None,
+            author_did: OWNER_DID.into(),
+            source_branch: "feature".into(),
+            target_branch: "main".into(),
+            status: "open".into(),
+            merged_by_did: None,
+            merged_at: None,
+            head_commit: None,
+            created_at: now.to_rfc3339(),
+            updated_at: now.to_rfc3339(),
+        };
+        state.db.create_pr(&pr).await.unwrap();
+
+        sqlx::query("ALTER TABLE repo_push_events RENAME TO repo_push_events_gone")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let db = state.db.clone();
+        let app = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/close",
+                post(close_pr),
+            )
+            .with_state(state);
+        let response = app
+            .oneshot(crate::test_support::signed_request_as(
+                OWNER_DID,
+                Method::POST,
+                "/api/v1/repos/z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH/demo/pulls/1/close",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+
+        assert!(
+            response.status().is_server_error(),
+            "a failed head lookup must fail the close, got {}",
+            response.status()
+        );
+        let after = db.get_pr(&repo.id, 1).await.unwrap().unwrap();
+        assert_eq!(after.status, "open", "the pull request must stay open");
+        assert_eq!(after.head_commit, None);
+    }
+}
+
+#[cfg(test)]
+mod merge_rollback_tests {
+    use super::*;
+    use axum::response::IntoResponse;
+    use sqlx::PgPool;
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(["-C", &*dir.to_string_lossy()])
+            .args([
+                "-c",
+                "user.name=merge-rollback-test",
+                "-c",
+                "user.email=merge-rollback-test@example.com",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Build a bare repo whose `main` and `feature` refs diverge: one root
+    /// commit on main, one commit on feature, so merge_branch creates a real
+    /// merge commit that a refused publish must rewind.
+    fn seeded_merge_repo(dir: &std::path::Path) -> (String, String) {
+        crate::git::store::init_bare(dir).expect("bare repo");
+        let empty_tree = git(dir, &["mktree"]);
+        let root = git(dir, &["commit-tree", &empty_tree, "-m", "root"]);
+        git(dir, &["update-ref", "refs/heads/main", &root]);
+        let tip2 = git(
+            dir,
+            &["commit-tree", &empty_tree, "-m", "feature", "-p", &root],
+        );
+        git(dir, &["update-ref", "refs/heads/feature", &tip2]);
+        (root, tip2)
+    }
+
+    /// On a definite publish refusal, the local merge commit must be rewound:
+    /// the client got a 5xx, so the repo cannot show a merge the mirror never
+    /// learned about (same contract create_issue's rollback enforces).
+    #[sqlx::test]
+    async fn merge_pr_rewinds_local_merge_when_publish_refuses(pool: PgPool) {
+        // Endpoint that answers HEAD with an etag but refuses every write.
+        let app = axum::Router::new().route(
+            "/{*key}",
+            axum::routing::any(|method: axum::http::Method| async move {
+                if method == axum::http::Method::HEAD {
+                    let mut resp = axum::http::StatusCode::OK.into_response();
+                    resp.headers_mut()
+                        .insert("etag", axum::http::HeaderValue::from_static("\"gen-1\""));
+                    resp
+                } else {
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let owner = "did:key:zMERGEROLLBACKAAAAAAAAAAAAAAAAAAAAAAAA";
+        let repo_name = "rollback-merge";
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let disk = tempfile::TempDir::new().unwrap();
+        let repo_path = disk.path().join("repo.git");
+        let (main_tip, _feature_tip) = seeded_merge_repo(&repo_path);
+
+        let mut seeded = crate::db::RepoRecord {
+            id: Uuid::new_v4().to_string(),
+            name: repo_name.to_string(),
+            owner_did: owner.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            disk_path: String::new(),
+            forked_from: None,
+            machine_id: None,
+        };
+        seeded.disk_path = repo_path.to_string_lossy().to_string();
+        let repo_id = seeded.id.clone();
+        state.db.create_repo(&seeded).await.expect("seed repo");
+        let now = Utc::now().to_rfc3339();
+        state
+            .db
+            .create_pr(&PullRequest {
+                id: Uuid::new_v4().to_string(),
+                repo_id,
+                number: 1,
+                title: "rb".to_string(),
+                body: None,
+                author_did: owner.to_string(),
+                source_branch: "feature".to_string(),
+                target_branch: "main".to_string(),
+                status: "open".to_string(),
+                merged_by_did: None,
+                merged_at: None,
+                head_commit: None,
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .await
+            .expect("seed PR");
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing_with_tigris(
+            disk.path().to_path_buf(),
+            crate::git::repo_store::build_lock_pool(&pool, 2, std::time::Duration::from_secs(1)),
+            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint),
+        );
+
+        let res = merge_pr(
+            State(state),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((owner.to_string(), repo_name.to_string(), 1)),
+        )
+        .await;
+        assert!(res.is_err(), "a refused publish must surface an error");
+
+        let tip_after = git(&repo_path, &["rev-parse", "refs/heads/main"]);
+        assert_eq!(
+            tip_after, main_tip,
+            "a refused publish must rewind the local merge to the pre-merge tip"
         );
     }
 }
