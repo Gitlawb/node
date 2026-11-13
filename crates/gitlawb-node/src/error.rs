@@ -317,7 +317,10 @@ impl IntoResponse for AppError {
         }
 
         let mut resp = (status, Json(body)).into_response();
-        if matches!(self, AppError::TooManyRequests(_)) {
+        if matches!(
+            self,
+            AppError::TooManyRequests(_) | AppError::RateLimited(_)
+        ) {
             use axum::http::HeaderValue;
             let code = gitlawb_core::node_denial::NodeDenial::RateLimited.as_str();
             if let Ok(v) = HeaderValue::from_str(code) {
@@ -388,6 +391,21 @@ mod tests {
         assert_eq!(
             resp.headers().get("X-Gitlawb-Error"),
             Some(&HeaderValue::from_static("rate_limited"))
+        );
+    }
+
+    #[test]
+    fn rate_limited_carries_header_and_retry_after() {
+        use axum::http::HeaderValue;
+        let resp = AppError::RateLimited(std::time::Duration::from_secs(7)).into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers().get("X-Gitlawb-Error"),
+            Some(&HeaderValue::from_static("rate_limited"))
+        );
+        assert_eq!(
+            resp.headers().get("retry-after"),
+            Some(&HeaderValue::from_static("7"))
         );
     }
 
