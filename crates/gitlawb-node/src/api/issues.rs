@@ -164,6 +164,8 @@ pub async fn create_issue_comment(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, repo, issue_id)): Path<(String, String, String)>,
+    headers: axum::http::HeaderMap,
+    crate::rate_limit::PeerAddr(peer): crate::rate_limit::PeerAddr,
     Json(req): Json<CreateIssueCommentRequest>,
 ) -> Result<(StatusCode, Json<IssueComment>)> {
     if req.body.trim().is_empty() {
@@ -175,6 +177,17 @@ pub async fn create_issue_comment(
     // Read-gate: a commenter must be able to read the repo, but need not own it.
     let (record, _rules) =
         crate::api::authorize_repo_read(&state, &owner, &repo, Some(auth.0.as_str()), "/").await?;
+
+    // Shared per-IP write brake, debited AFTER the read gate so a 429 cannot
+    // distinguish a hidden repo from a missing one (INV-12 — the same
+    // placement close_issue uses for its brake). The route group carries no
+    // outer brake for exactly this reason.
+    if let Some(key) = crate::rate_limit::client_key(&headers, peer, state.push_limiter_trust) {
+        if let Some(retry_after) = state.write_rate_limiter.check_retry(&key).await {
+            tracing::warn!(repo = %repo, key = %key, "create_issue_comment rate limited");
+            return Err(AppError::RateLimited(retry_after));
+        }
+    }
 
     let disk_path = state
         .repo_store
@@ -272,7 +285,22 @@ pub async fn close_issue(
     // close requests for arbitrary issue ids. Applied after the read gate so a
     // denied reader still sees 404, not 429.
     if let Some(key) = crate::rate_limit::client_key(&headers, peer, state.push_limiter_trust) {
+        // Both buckets debit here, after the read gate (INV-12): the shared
+        // per-IP write brake — the route group deliberately carries no outer
+        // brake — and this route's own close budget.
+        //
+        // A close refused by either cap spends nothing from the other bucket.
+        // The write bucket is debited first, and refunded when the close cap
+        // then refuses, so the guarantee holds even when a concurrent close
+        // takes the last close slot between the two checks. A write-bucket
+        // refusal advertises its window's Retry-After; the close-cap refusal
+        // keeps the plain 429 it has always returned.
+        if let Some(retry_after) = state.write_rate_limiter.check_retry(&key).await {
+            tracing::warn!(repo = %repo, key = %key, "close_issue rate limited");
+            return Err(AppError::RateLimited(retry_after));
+        }
         if !state.close_issue_rate_limiter.check(&key).await {
+            state.write_rate_limiter.refund(&key).await;
             tracing::warn!(repo = %repo, key = %key, "close_issue rate limited");
             return Err(AppError::TooManyRequests(
                 "rate limit exceeded — try again later".into(),
@@ -434,11 +462,47 @@ pub async fn close_issue(
         }
     }
 
+    // Snapshot the issue's pre-close JSON so a failed durable upload can roll
+    // the close back on local disk, mirroring create_issue. Best-effort: if the
+    // snapshot read fails we proceed without a rollback closure (the close still
+    // applies and a failed upload still surfaces as a 5xx below).
+    //
+    // Resolve first so the compensating rewrite below lands on the SAME ref the
+    // close mutates. The path id may be an 8-char prefix, and rewriting
+    // refs/gitlawb/issues/{prefix} with the pre-close content would leave the
+    // canonical {full_id} ref closed while the client saw a 5xx.
+    let full_issue_id = git_issues::resolve_issue_id(&disk_path, &issue_id)
+        .ok()
+        .flatten();
+    let prior_json = full_issue_id
+        .as_deref()
+        .and_then(|id| git_issues::get_issue(&disk_path, id).ok().flatten());
+
     let close_result = git_issues::close_issue(&disk_path, &issue_id);
 
     // Always release the advisory lock — even on error; upload to Tigris only on success.
-    // Same short-circuit as create_issue, and before the 200 body below.
-    guard.release(close_result.is_ok()).await.into_result()?;
+    // Same short-circuit as create_issue, and before the 200 body below. With a
+    // snapshot in hand, a failed upload rewrites the ref back to the pre-close
+    // content instead of leaving the local repo closed while the client saw 5xx.
+    let release_result = match (close_result.is_ok(), prior_json, full_issue_id) {
+        (true, Some(json), Some(resolved_id)) => {
+            let git_bin = state.git_bin.clone();
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+            guard
+                .release_compensating(true, move |path| {
+                    // Same bounded-write strategy create_issue's compensator
+                    // uses: the rollback rewrites the ref with the pre-close
+                    // content through the deadline-aware runner, so a hung git
+                    // cannot stall the guard past git_service_timeout.
+                    git_issues::create_issue_bounded(&git_bin, path, &resolved_id, &json, deadline)
+                })
+                .await
+                .into_result()
+        }
+        _ => guard.release(close_result.is_ok()).await.into_result(),
+    };
+    release_result?;
 
     let updated = close_result
         .map_err(|e| AppError::Git(e.to_string()))?
@@ -1233,6 +1297,198 @@ mod lock_pool_shed_tests {
         );
     }
 
+    /// A close refused by its own cap must not spend the shared write budget:
+    /// the 429 completed no close, so stars/comments/GraphQL keep their slot.
+    #[sqlx::test]
+    async fn close_issue_refused_by_close_cap_does_not_debit_write_bucket(pool: PgPool) {
+        use std::net::SocketAddr;
+        use std::time::Duration;
+
+        let owner = "did:key:zCLOSEDUALOWNERAAAAAAAAAAAAAAAAAAAAAAA";
+        let mut state = crate::test_support::test_state(pool).await;
+        state.close_issue_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
+        state.write_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "dual-close"))
+            .await
+            .expect("seed repo");
+
+        let peer: SocketAddr = "203.0.113.77:7000".parse().unwrap();
+        let key = peer.ip().to_string();
+        assert!(
+            state.close_issue_rate_limiter.check(&key).await,
+            "exhaust only the close bucket"
+        );
+
+        let res = close_issue(
+            State(state.clone()),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((owner.to_string(), "dual-close".to_string(), "1".to_string())),
+            axum::http::HeaderMap::new(),
+            crate::rate_limit::PeerAddr(Some(peer)),
+        )
+        .await;
+        assert!(
+            matches!(res, Err(AppError::TooManyRequests(_))),
+            "close cap exhausted must 429: {:?}",
+            res
+        );
+        assert!(
+            state.write_rate_limiter.check(&key).await,
+            "a close refused by the close cap must leave the write bucket untouched"
+        );
+    }
+
+    /// A close refused by the shared write cap must not spend the close budget.
+    #[sqlx::test]
+    async fn close_issue_refused_by_write_cap_does_not_debit_close_bucket(pool: PgPool) {
+        use std::net::SocketAddr;
+        use std::time::Duration;
+
+        let owner = "did:key:zCLOSEDUALOWNERBBBBBBBBBBBBBBBBBBBBBBB";
+        let mut state = crate::test_support::test_state(pool).await;
+        state.close_issue_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
+        state.write_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "dual-write"))
+            .await
+            .expect("seed repo");
+
+        let peer: SocketAddr = "203.0.113.78:7000".parse().unwrap();
+        let key = peer.ip().to_string();
+        assert!(
+            state.write_rate_limiter.check(&key).await,
+            "exhaust only the write bucket"
+        );
+
+        let res = close_issue(
+            State(state.clone()),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((owner.to_string(), "dual-write".to_string(), "1".to_string())),
+            axum::http::HeaderMap::new(),
+            crate::rate_limit::PeerAddr(Some(peer)),
+        )
+        .await;
+        let resp = res
+            .expect_err("write cap exhausted must refuse")
+            .into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "write cap exhausted must 429"
+        );
+        assert!(
+            state.close_issue_rate_limiter.check(&key).await,
+            "a close refused by the write cap must leave the close bucket untouched"
+        );
+    }
+
+    /// 429 from the shared write bucket must advertise a window-derived
+    /// Retry-After, as the outer-middleware 429s on the other write routes do.
+    fn assert_429_with_window_retry_after(err: AppError, what: &str) {
+        let resp = err.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "{what}: an exhausted write bucket must 429"
+        );
+        let secs: u64 = resp
+            .headers()
+            .get("retry-after")
+            .unwrap_or_else(|| panic!("{what}: the write-bucket 429 must carry retry-after"))
+            .to_str()
+            .unwrap()
+            .parse()
+            .expect("retry-after must be integer seconds");
+        assert!(
+            (1..=3600).contains(&secs),
+            "{what}: retry-after {secs}s must fall inside the 3600s window, not a constant"
+        );
+    }
+
+    #[sqlx::test]
+    async fn close_issue_write_cap_429_carries_retry_after(pool: PgPool) {
+        use std::net::SocketAddr;
+        use std::time::Duration;
+
+        let owner = "did:key:zCLOSERETRYOWNERAAAAAAAAAAAAAAAAAAAAAA";
+        let mut state = crate::test_support::test_state(pool).await;
+        state.write_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1, Duration::from_secs(3600));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "retry-close"))
+            .await
+            .expect("seed repo");
+
+        let peer: SocketAddr = "203.0.113.61:7000".parse().unwrap();
+        assert!(state.write_rate_limiter.check(&peer.ip().to_string()).await);
+
+        let res = close_issue(
+            State(state),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((
+                owner.to_string(),
+                "retry-close".to_string(),
+                "1".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            crate::rate_limit::PeerAddr(Some(peer)),
+        )
+        .await;
+        assert_429_with_window_retry_after(
+            res.expect_err("write cap exhausted must refuse"),
+            "close_issue",
+        );
+    }
+
+    #[sqlx::test]
+    async fn create_issue_comment_write_cap_429_carries_retry_after(pool: PgPool) {
+        use std::net::SocketAddr;
+        use std::time::Duration;
+
+        let owner = "did:key:zCOMMENTRETRYOWNERAAAAAAAAAAAAAAAAAAAA";
+        let mut state = crate::test_support::test_state(pool).await;
+        state.write_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1, Duration::from_secs(3600));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "retry-comment"))
+            .await
+            .expect("seed repo");
+
+        let peer: SocketAddr = "203.0.113.62:7000".parse().unwrap();
+        assert!(state.write_rate_limiter.check(&peer.ip().to_string()).await);
+
+        let res = create_issue_comment(
+            State(state),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((
+                owner.to_string(),
+                "retry-comment".to_string(),
+                "1".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            crate::rate_limit::PeerAddr(Some(peer)),
+            Json(CreateIssueCommentRequest {
+                body: "x".to_string(),
+            }),
+        )
+        .await;
+        assert_429_with_window_retry_after(
+            res.expect_err("write cap exhausted must refuse"),
+            "create_issue_comment",
+        );
+    }
+
     /// close_issue and receive-pack must not share one per-IP bucket.
     #[sqlx::test]
     async fn close_issue_rate_limit_does_not_drain_push_bucket(pool: PgPool) {
@@ -1319,5 +1575,252 @@ mod lock_pool_shed_tests {
         );
 
         server.abort();
+    }
+
+    /// The compensating rewrite after a refused publish must land on the ref the
+    /// close actually mutated. A close addressed by an 8-char prefix resolves to
+    /// the full id and closes `refs/gitlawb/issues/{full_id}`; a compensator
+    /// that rewrites the path id verbatim mints `refs/gitlawb/issues/{prefix}`
+    /// with the pre-close content and leaves the canonical ref closed while the
+    /// client saw a 5xx.
+    ///
+    /// Reaching the compensator observably takes one contrivance: a definite
+    /// refusal invalidates (deletes) the live tree BEFORE the closure runs, so
+    /// the ref it writes exists only when that deletion cannot complete. The
+    /// fixture makes the tree read-only except the two directories the close
+    /// and its rollback write (`refs/gitlawb/issues/` and its reflog), and
+    /// pre-stores the closed blob so the mutation's `hash-object -w` needs no
+    /// write either. Without the contrivance the compensator runs against a
+    /// path that is already gone and there is nothing to assert on.
+    #[sqlx::test]
+    #[cfg(unix)]
+    async fn close_via_prefix_restores_the_full_ref_when_publish_refuses(pool: PgPool) {
+        use axum::response::IntoResponse;
+        use std::os::unix::fs::PermissionsExt;
+
+        // Nothing is stored under the key (404 on HEAD: no under-lock download,
+        // a create-only publish fence) and the PUT is refused outright (a 4xx
+        // classifies as provably never dispatched), so release reaches the
+        // definite-refusal arm that invalidates the tree and runs the
+        // compensator.
+        let app = axum::Router::new().route(
+            "/{*key}",
+            axum::routing::any(|method: axum::http::Method| async move {
+                if method == axum::http::Method::HEAD {
+                    axum::http::StatusCode::NOT_FOUND.into_response()
+                } else {
+                    axum::http::StatusCode::FORBIDDEN.into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let owner = "did:key:zISSUECLOSEROLLBACKBBBBBBBBBBBBBBB";
+        let repo_name = "rollback-close-prefix";
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let disk = tempfile::TempDir::new().unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing_with_tigris(
+            disk.path().to_path_buf(),
+            crate::git::repo_store::build_lock_pool(&pool, 2, std::time::Duration::from_secs(1)),
+            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint),
+        );
+        state
+            .db
+            .create_repo(&seed_repo(owner, repo_name))
+            .await
+            .expect("seed repo");
+
+        // Seed the live tree at the path the store resolves, with the issue
+        // under its full id so the route can be addressed by the 8-char prefix.
+        let live = state
+            .repo_store
+            .acquire(owner, repo_name)
+            .await
+            .expect("resolve live path");
+        crate::git::store::init_bare(&live).expect("init bare repo");
+        let full_id = "abc12345-0000-0000-0000-000000000000";
+        let prefix = "abc12345";
+        let open_json = serde_json::to_string(&IssueRecord {
+            id: full_id.to_string(),
+            title: "seeded".to_string(),
+            body: Some(String::new()),
+            author: Some(owner.to_string()),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            status: "open".to_string(),
+            signed_payload: None,
+        })
+        .expect("serialize seeded issue");
+        git_issues::create_issue(&live, full_id, &open_json).expect("seed issue blob");
+
+        // Pre-store the blob `git_issues::close_issue` will write: the same
+        // parse/set-status/serialize sequence, so the bytes are identical and
+        // the mutation's `hash-object -w` is a no-op against read-only objects/.
+        let mut closed_value: serde_json::Value =
+            serde_json::from_str(&open_json).expect("parse seeded issue");
+        closed_value["status"] = serde_json::Value::String("closed".into());
+        let closed_json = serde_json::to_string(&closed_value).expect("closed issue json");
+        {
+            use std::io::Write;
+            let mut child = std::process::Command::new("git")
+                .args(["hash-object", "--stdin", "-w"])
+                .current_dir(&live)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn hash-object");
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(closed_json.as_bytes())
+                .expect("write blob");
+            assert!(
+                child.wait().expect("hash-object").success(),
+                "pre-storing the closed blob must succeed"
+            );
+        }
+
+        // Stand the tree through the refusal's remove_dir_all: read-only
+        // everywhere, then write restored only where the close mutation and its
+        // rollback actually land (the ref and its reflog).
+        fn make_readonly(path: &std::path::Path) -> std::io::Result<()> {
+            let mut p = path.metadata()?.permissions();
+            p.set_readonly(true);
+            std::fs::set_permissions(path, p)?;
+            if path.is_dir() {
+                for entry in std::fs::read_dir(path)? {
+                    make_readonly(&entry?.path())?;
+                }
+            }
+            Ok(())
+        }
+        make_readonly(&live).expect("make the live tree unremovable");
+        for dir in [
+            live.join("refs/gitlawb/issues"),
+            live.join("logs/refs/gitlawb/issues"),
+        ] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+                .expect("restore write where the rollback lands");
+        }
+
+        let shed = close_issue(
+            State(state.clone()),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((owner.to_string(), repo_name.to_string(), prefix.to_string())),
+            axum::http::HeaderMap::new(),
+            crate::rate_limit::PeerAddr(None),
+        )
+        .await;
+        let err = shed.expect_err("a refused publish must not report a closed issue");
+        assert!(
+            err.into_response().status().is_server_error(),
+            "a definite publish refusal must surface as a 5xx"
+        );
+
+        let restored = git_issues::get_issue(&live, full_id).expect("read the full ref");
+        assert_eq!(
+            restored.as_deref(),
+            Some(open_json.as_str()),
+            "the compensator must restore the pre-close content on the FULL ref, \
+             not on refs/gitlawb/issues/{prefix}"
+        );
+        assert_eq!(
+            git_issues::resolve_issue_id(&live, prefix).expect("resolve the prefix"),
+            Some(full_id.to_string()),
+            "no stray refs/gitlawb/issues/{{prefix}} may be minted beside the \
+             canonical ref: the prefix must still resolve to the full id"
+        );
+        let issues = git_issues::list_issues(&live).expect("list issues");
+        assert_eq!(
+            issues.len(),
+            1,
+            "exactly one issue ref may survive the rollback: {issues:?}"
+        );
+
+        // Restore writability so the TempDir can clean itself up.
+        let _ = std::process::Command::new("chmod")
+            .args(["-R", "u+w"])
+            .arg(&live)
+            .output();
+        server.abort();
+    }
+    /// INV-12 ordering: both issue write routes debit the shared write bucket
+    /// AFTER authorize_repo_read, so an exhausted bucket cannot answer 429 to a
+    /// caller the gate must 404 — that status difference would leak the repo's
+    /// existence. The route group carries no outer brake for this reason.
+    #[sqlx::test]
+    async fn an_exhausted_write_bucket_cannot_preempt_the_read_gate(pool: PgPool) {
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.write_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1, std::time::Duration::from_secs(3600));
+        state
+            .db
+            .create_repo(&crate::db::RepoRecord {
+                id: "rid-write-brake-order".to_string(),
+                name: "priv".to_string(),
+                owner_did: "did:key:z6MkWriteBrakeOwner".to_string(),
+                description: None,
+                is_public: false,
+                default_branch: "main".to_string(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                disk_path: "/tmp/write-brake-order".to_string(),
+                forked_from: None,
+                machine_id: None,
+            })
+            .await
+            .unwrap();
+
+        let headers = axum::http::HeaderMap::new();
+        let peer = || crate::rate_limit::PeerAddr(Some("203.0.113.77:5000".parse().unwrap()));
+        let key = crate::rate_limit::client_key(&headers, peer().0, state.push_limiter_trust)
+            .expect("a peer addr yields a brake key");
+        assert!(state.write_rate_limiter.check(&key).await);
+        assert!(
+            !state.write_rate_limiter.check(&key).await,
+            "the shared write bucket is empty for this caller"
+        );
+
+        let stranger = || crate::auth::AuthenticatedDid("did:key:z6MkStranger".to_string());
+        let path = || {
+            (
+                "did:key:z6MkWriteBrakeOwner".to_string(),
+                "priv".to_string(),
+                "1".to_string(),
+            )
+        };
+
+        let res = close_issue(
+            axum::extract::State(state.clone()),
+            axum::Extension(stranger()),
+            axum::extract::Path(path()),
+            headers.clone(),
+            peer(),
+        )
+        .await;
+        assert!(
+            matches!(res, Err(AppError::RepoNotFound(_))),
+            "close on an unreadable repo must reach the read gate, not the empty write bucket: {res:?}"
+        );
+
+        let res = create_issue_comment(
+            axum::extract::State(state),
+            axum::Extension(stranger()),
+            axum::extract::Path(path()),
+            headers,
+            peer(),
+            axum::Json(CreateIssueCommentRequest {
+                body: "x".to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(res, Err(AppError::RepoNotFound(_))),
+            "comment on an unreadable repo must reach the read gate, not the empty write bucket: {res:?}"
+        );
     }
 }

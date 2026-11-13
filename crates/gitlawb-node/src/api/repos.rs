@@ -305,6 +305,24 @@ pub async fn create_repo(
     // Owner is the authenticated agent's DID
     let owner_did = auth.0;
 
+    // Serialize against a concurrent purge of the SAME owner/name. The purge
+    // holds this per-repo advisory lock across its delete-row + remove-dir, so
+    // without taking the same lock here a create could slip into the
+    // row-deleted-but-dir-not-yet-removed window and land a repos row pointing
+    // at a directory the purge then removes (a dangling row). Held across the
+    // existence-check -> init -> create_repo sequence; the guard's Drop frees
+    // the lock on every error path. Drawn from the dedicated lock pool, NOT the
+    // app pool, so a held guard cannot starve the db calls below (an app-pool
+    // lock at max_connections=1 would self-deadlock). A key held past the
+    // bounded wait means a live writer or purge owns it — a retryable 503, not
+    // a create failure.
+    let repo_lock = state
+        .repo_store
+        .lock_repo_blocking(&owner_did, &req.name)
+        .await
+        .map_err(|_| AppError::RepoBusy)?
+        .ok_or(AppError::RepoBusy)?;
+
     // Check it doesn't already exist
     if state.db.get_repo(&owner_did, &req.name).await?.is_some() {
         return Err(AppError::RepoExists(req.name));
@@ -313,9 +331,9 @@ pub async fn create_repo(
     // Request is admissible — spend the proof now, immediately before the write.
     let verified_proof = proof.consume(&state.db).await?;
 
-    let disk_path = state
+    let (disk_path, create_upload) = state
         .repo_store
-        .init(&owner_did, &req.name)
+        .init_handle(&owner_did, &req.name)
         .await
         .map_err(|e| {
             // `{:#}` walks the anyhow chain to the leaf cause; the other git
@@ -340,6 +358,51 @@ pub async fn create_repo(
     };
 
     state.db.create_repo(&record).await?;
+
+    // Keep the initial archive upload inside the creation lock: a purge or
+    // retry that acquires the key after release must not find the row and dir
+    // while the create-only PUT is still in flight. Its OUTCOME also gates the
+    // 201: a failed or fenced upload leaves the row's storage inconsistent, so
+    // roll the create back (row + dir) and surface the error instead of
+    // reporting success.
+    if let Some(upload) = create_upload {
+        let landed = match upload.await {
+            Ok(inner) => inner,
+            Err(e) => Err(anyhow::anyhow!("empty-repo upload task failed: {e}")),
+        };
+        if let Err(e) = landed {
+            tracing::warn!(repo = %req.name, err = %e,
+                "create: initial archive upload failed — rolling back row and dir");
+            let row_deleted = match state.db.delete_repo_by_id(&record.id).await {
+                Ok(_) => true,
+                Err(dbe) => {
+                    tracing::warn!(repo = %req.name, err = %dbe,
+                        "create rollback: could not delete the repo row");
+                    false
+                }
+            };
+            let dir_removed = std::fs::remove_dir_all(&disk_path).is_ok();
+            repo_lock.release().await;
+            let residual = match (row_deleted, dir_removed) {
+                (true, true) => None,
+                (false, true) => Some("the repo row remains"),
+                (true, false) => Some("the on-disk directory remains"),
+                (false, false) => Some("the repo row and on-disk directory both remain"),
+            };
+            return Err(match residual {
+                None => AppError::Git(format!(
+                    "initial archive upload failed; the repo was rolled back: {e}"
+                )),
+                Some(what) => AppError::Git(format!(
+                    "initial archive upload failed and rollback is incomplete: {what}; operator cleanup required: {e}"
+                )),
+            });
+        }
+    }
+
+    // Row + on-disk dir now both exist consistently; the race window is closed,
+    // so release the per-repo lock before the proof recording below.
+    repo_lock.release().await;
 
     // Persist the proof so it can travel with the repo and a mirroring peer can
     // re-verify it (enforce-mode origins only; off/shadow yield no proof here).
@@ -4834,8 +4897,31 @@ pub async fn fork_repo(
     )
     .map_err(|e| AppError::BadRequest(e.to_string()))?;
 
-    // Check no name conflict under the forker's ownership
     let forker_short = crate::db::normalize_owner_key(&forker_did);
+
+    // Ensure source repo is on local disk (downloads from Tigris on cache miss)
+    // BEFORE taking the target lock: a cache-miss acquire takes a nested
+    // lock-pool connection for the source's own namespace, and running it under
+    // the held target lock would pin two lock-pool connections at once.
+    let source_path = state
+        .repo_store
+        .acquire(&source.owner_did, &source.name)
+        .await
+        .map_err(|e| AppError::Git(e.to_string()))?;
+
+    // Serialize against a concurrent purge of the SAME forker/fork_name, the
+    // same advisory lock create_repo takes: held across the conflict check,
+    // clone, durable upload, and row insert so a fork cannot land inside the
+    // purge's delete-row -> remove-dir window. Contention is a retryable 503;
+    // the guard's Drop frees the lock on every error path below.
+    let repo_lock = state
+        .repo_store
+        .lock_repo_blocking(&forker_did, &fork_name)
+        .await
+        .map_err(|_| AppError::RepoBusy)?
+        .ok_or(AppError::RepoBusy)?;
+
+    // Check no name conflict under the forker's ownership
     if state.db.get_repo(forker_short, &fork_name).await?.is_some() {
         return Err(AppError::BadRequest(format!(
             "you already have a repo named {fork_name}"
@@ -4845,21 +4931,47 @@ pub async fn fork_repo(
     // Request is admissible — spend the proof now, immediately before the write.
     let verified_proof = proof.consume(&state.db).await?;
 
-    // Ensure source repo is on local disk (downloads from Tigris on cache miss)
-    let source_path = state
-        .repo_store
-        .acquire(&source.owner_did, &source.name)
-        .await
-        .map_err(|e| AppError::Git(e.to_string()))?;
+    // ONE identity for the whole workflow: the DB row id this request will
+    // insert is also the attempt id stamped into the object's metadata and onto
+    // the disk clone. That is what lets confirmation ask "is my row there" rather
+    // than "is a row there", and lets every cleanup ask "is this still mine"
+    // rather than "does this name resolve". Stamped BEFORE the clone so the
+    // guard's Drop cleans a partial mirror even when the request future is
+    // cancelled mid-clone, and only ever removes the dir this attempt owns.
+    let record_id = Uuid::new_v4().to_string();
+    let attempt = crate::git::publish::PublishAttemptId::from_owned(record_id.clone());
+    let mut clone_guard = ForkCloneGuard::new(disk_path.clone(), attempt.clone());
 
-    // Clone the source repo as a mirror
-    let output = std::process::Command::new("git")
-        .args(fork_clone_args(
-            source_path.to_str().unwrap_or(""),
-            disk_path.to_str().unwrap_or(""),
-        ))
-        .output()
-        .map_err(|e| AppError::Git(format!("git clone --mirror failed: {e}")))?;
+    // Clone the source repo as a mirror, bounded so a wedged clone cannot pin
+    // the held target lock (and its lock-pool connection) indefinitely. Reuses
+    // the served-git ceiling; source_path is local so a normal clone never
+    // approaches it. `kill_on_drop` tears the child down when the timeout drops
+    // the future; the clone guard removes any partial dest on every failure,
+    // timeout, or cancellation path.
+    let clone_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+    let output = match tokio::time::timeout(
+        clone_timeout,
+        tokio::process::Command::new("git")
+            .args(fork_clone_args(
+                source_path.to_str().unwrap_or(""),
+                disk_path.to_str().unwrap_or(""),
+            ))
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => {
+            return Err(AppError::Git(format!("git clone --mirror failed: {e}")));
+        }
+        Err(_elapsed) => {
+            return Err(AppError::Git(format!(
+                "git clone --mirror timed out after {}s for {fork_name}",
+                clone_timeout.as_secs()
+            )));
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -4867,16 +4979,6 @@ pub async fn fork_repo(
             "git clone --mirror failed: {stderr}"
         )));
     }
-
-    // ONE identity for the whole workflow: the DB row id this request will
-    // insert is also the attempt id stamped into the object's metadata and onto
-    // the disk clone. That is what lets confirmation ask "is my row there" rather
-    // than "is a row there", and lets every cleanup ask "is this still mine"
-    // rather than "does this name resolve".
-    let record_id = Uuid::new_v4().to_string();
-    let attempt = crate::git::publish::PublishAttemptId::from_owned(record_id.clone());
-
-    let mut clone_guard = ForkCloneGuard::new(disk_path.clone(), attempt.clone());
 
     // Upload fork to Tigris. Create-only: a refused precondition means an orphan
     // archive already sits under this key (a failed create_repo or another
@@ -5012,6 +5114,7 @@ pub async fn fork_repo(
         match confirm_fork_repo_row(&state.db, &record_id, forker_short, &fork_name).await {
             Ok(ForkRowConfirmation::Ours(committed)) => {
                 clone_guard.disarm();
+                repo_lock.release().await;
                 tracing::warn!(
                     fork = %fork_name,
                     forker = %forker_did,
@@ -5089,6 +5192,8 @@ pub async fn fork_repo(
     // The row is committed: this directory is now the repository, not an
     // attempt's staging area, and nothing may ever compensate it away.
     crate::git::repo_store::release_fork_disk_claim(disk_path.as_path());
+
+    repo_lock.release().await;
 
     // Persist the proof so the fork carries it when it propagates to peers.
     if let Some(p) = verified_proof {
@@ -16197,5 +16302,1002 @@ exit 0
                 "push gate must allow {allowed}"
             );
         }
+    }
+
+    // ── Per-IP write-brake + purge-serialization coverage (#196) ──────────
+
+    // Shared request driver for the per-IP write-brake tests below: build a
+    // request with the given method/uri/headers/body, attach the socket peer as
+    // ConnectInfo (what the IP limiter keys on), send it through the router, and
+    // return the status. Mirrors post_from/post_with in rate_limit.rs.
+    async fn send_from(
+        router: &axum::Router,
+        method: axum::http::Method,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: axum::body::Body,
+        peer: std::net::SocketAddr,
+    ) -> axum::http::StatusCode {
+        use tower::ServiceExt;
+        let mut b = axum::http::Request::builder().method(method).uri(uri);
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        let mut req = b.body(body).unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer));
+        router.clone().oneshot(req).await.unwrap().status()
+    }
+
+    #[sqlx::test]
+    async fn write_route_is_rate_limited_by_ip(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::http::{Method, StatusCode};
+        use std::net::SocketAddr;
+        use std::time::Duration;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        // Tiny write bucket, keyed on the socket peer (no trusted proxy).
+        state.write_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        let peer: SocketAddr = "203.0.113.88:7000".parse().unwrap();
+        // Exhaust this peer's single-request write budget up front.
+        assert!(state.write_rate_limiter.check(&peer.ip().to_string()).await);
+
+        let router = crate::server::build_router(state);
+        // A write_routes sink (star). The IP brake is outermost, so the 429
+        // fires before auth/handler — the path only needs to match.
+        let status = send_from(
+            &router,
+            Method::PUT,
+            "/api/v1/repos/someowner/somerepo/star",
+            &[],
+            Body::empty(),
+            peer,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "a write_routes sink must be IP-throttled before signature verification"
+        );
+    }
+
+    // KTD-1: the write bucket is separate from the creation bucket, so a write
+    // flood must not consume the creation budget (and vice versa).
+    #[sqlx::test]
+    async fn write_flood_does_not_drain_creation_budget(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::http::{Method, StatusCode};
+        use std::net::SocketAddr;
+        use std::time::Duration;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        // Exhaust the write bucket for this peer; leave the creation bucket ample.
+        state.write_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
+        state.create_ip_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1000, Duration::from_secs(60));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        let peer: SocketAddr = "203.0.113.99:7000".parse().unwrap();
+        assert!(state.write_rate_limiter.check(&peer.ip().to_string()).await);
+
+        let router = crate::server::build_router(state);
+
+        // Anchor the test: prove the write bucket is genuinely drained at the
+        // router (a write sink from this peer 429s) so the creation assertion
+        // below cannot pass vacuously on some unrelated non-429 status.
+        assert_eq!(
+            send_from(
+                &router,
+                Method::PUT,
+                "/api/v1/repos/someowner/somerepo/star",
+                &[],
+                Body::empty(),
+                peer,
+            )
+            .await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "write bucket must be drained for this peer (test precondition)"
+        );
+
+        // Creation from the same peer must NOT be 429 — its bucket is untouched.
+        // (It fails later on missing signature; the point is it is not throttled.)
+        let status = send_from(
+            &router,
+            Method::POST,
+            "/api/v1/repos",
+            &[("content-type", "application/json")],
+            Body::from(r#"{"name":"legit","is_public":true}"#),
+            peer,
+        )
+        .await;
+        assert_ne!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "an exhausted write bucket must not throttle repo creation (separate buckets)"
+        );
+    }
+
+    // KTD-5: /graphql POST (the MutationRoot surface) draws from the write bucket.
+    #[sqlx::test]
+    async fn graphql_post_is_rate_limited_by_ip(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::http::{Method, StatusCode};
+        use std::net::SocketAddr;
+        use std::time::Duration;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        state.write_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        let peer: SocketAddr = "203.0.113.111:7000".parse().unwrap();
+        assert!(state.write_rate_limiter.check(&peer.ip().to_string()).await);
+
+        let router = crate::server::build_router(state);
+        let status = send_from(
+            &router,
+            Method::POST,
+            "/graphql",
+            &[("content-type", "application/json")],
+            Body::from(r#"{"query":"{ __typename }"}"#),
+            peer,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "/graphql must be IP-throttled by the write brake"
+        );
+    }
+
+    // Adoption floor: an under-limit write must NOT be throttled. Guards against
+    // an off-by-one that braked the first request (invisible to the 429 tests,
+    // which all pre-exhaust the bucket).
+    #[sqlx::test]
+    async fn under_limit_write_is_not_throttled(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::http::{Method, StatusCode};
+        use std::net::SocketAddr;
+        use std::time::Duration;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        // Ample budget; bucket NOT exhausted.
+        state.write_rate_limiter =
+            crate::rate_limit::RateLimiter::new(100, Duration::from_secs(60));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        let peer: SocketAddr = "203.0.113.150:7000".parse().unwrap();
+
+        let router = crate::server::build_router(state);
+        assert_ne!(
+            send_from(
+                &router,
+                Method::PUT,
+                "/api/v1/repos/someowner/somerepo/star",
+                &[],
+                Body::empty(),
+                peer,
+            )
+            .await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "an under-limit write must pass the brake, not be 429'd"
+        );
+    }
+
+    // GITLAWB_WRITE_RATE_LIMIT=0 disables the brake end-to-end: no write is 429'd
+    // however many arrive from one IP.
+    #[sqlx::test]
+    async fn write_rate_limit_zero_disables_the_brake(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::http::{Method, StatusCode};
+        use std::net::SocketAddr;
+        use std::time::Duration;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        state.write_rate_limiter = crate::rate_limit::RateLimiter::new(0, Duration::from_secs(60));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        let peer: SocketAddr = "203.0.113.151:7000".parse().unwrap();
+
+        let router = crate::server::build_router(state);
+        for _ in 0..5 {
+            assert_ne!(
+                send_from(
+                    &router,
+                    Method::PUT,
+                    "/api/v1/repos/someowner/somerepo/star",
+                    &[],
+                    Body::empty(),
+                    peer,
+                )
+                .await,
+                StatusCode::TOO_MANY_REQUESTS,
+                "a 0 write limit must disable the brake"
+            );
+        }
+    }
+
+    // The task/bounty/profile write groups share the write brake (same
+    // attachment as write_routes); prove each 429s at the route level.
+    #[sqlx::test]
+    async fn task_bounty_profile_writes_are_rate_limited(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::http::{Method, StatusCode};
+        use std::net::SocketAddr;
+        use std::time::Duration;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        state.write_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        let peer: SocketAddr = "203.0.113.152:7000".parse().unwrap();
+        assert!(state.write_rate_limiter.check(&peer.ip().to_string()).await);
+
+        let router = crate::server::build_router(state);
+        for (method, uri) in [
+            (Method::POST, "/api/v1/tasks"),
+            (Method::POST, "/api/v1/repos/o/r/bounties"),
+            (Method::PUT, "/api/v1/profile"),
+        ] {
+            assert_eq!(
+                send_from(
+                    &router,
+                    method,
+                    uri,
+                    &[("content-type", "application/json")],
+                    Body::from("{}"),
+                    peer,
+                )
+                .await,
+                StatusCode::TOO_MANY_REQUESTS,
+                "write group {uri} must be IP-throttled by the write brake"
+            );
+        }
+    }
+
+    // /graphql/ws (subscriptions) is deliberately mounted AFTER the write brake
+    // layer, so it must stay unbraked even when the write bucket is exhausted.
+    #[sqlx::test]
+    async fn graphql_ws_is_not_braked(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::http::{Method, StatusCode};
+        use std::net::SocketAddr;
+        use std::time::Duration;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        state.write_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        let peer: SocketAddr = "203.0.113.153:7000".parse().unwrap();
+        assert!(state.write_rate_limiter.check(&peer.ip().to_string()).await);
+
+        let router = crate::server::build_router(state);
+        // Not a real ws upgrade, so the subscription service rejects it with some
+        // non-429 status; the point is the write brake never sees it.
+        assert_ne!(
+            send_from(
+                &router,
+                Method::GET,
+                "/graphql/ws",
+                &[],
+                Body::empty(),
+                peer
+            )
+            .await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "/graphql/ws must not be behind the write brake"
+        );
+    }
+
+    // Adoption floor, per group: with an un-exhausted bucket, a write to EVERY
+    // braked group passes the brake (reaches auth/handler), not 429. Guards each
+    // group's grant path, not just the star representative.
+    #[sqlx::test]
+    async fn every_write_group_passes_under_limit(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::http::{Method, StatusCode};
+        use std::net::SocketAddr;
+        use std::time::Duration;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        state.write_rate_limiter =
+            crate::rate_limit::RateLimiter::new(100, Duration::from_secs(60));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        let peer: SocketAddr = "203.0.113.160:7000".parse().unwrap();
+
+        let router = crate::server::build_router(state);
+        for (method, uri) in [
+            (Method::PUT, "/api/v1/repos/o/r/star"),
+            (Method::POST, "/graphql"),
+            (Method::POST, "/api/v1/repos/o/r/issues/1/comments"),
+            (Method::POST, "/api/v1/tasks"),
+            (Method::POST, "/api/v1/repos/o/r/bounties"),
+            (Method::PUT, "/api/v1/profile"),
+        ] {
+            assert_ne!(
+                send_from(
+                    &router,
+                    method,
+                    uri,
+                    &[("content-type", "application/json")],
+                    Body::from(r#"{"query":"{ __typename }"}"#),
+                    peer,
+                )
+                .await,
+                StatusCode::TOO_MANY_REQUESTS,
+                "under-limit write to {uri} must pass the brake, not 429"
+            );
+        }
+    }
+
+    // ── U6/R6: create_repo serializes against a same-key purge ───────────────
+
+    // create_repo must take the SAME per-owner/name advisory lock the purge holds
+    // (try_lock_repo / RepoLockGuard), so a create cannot slip into the purge's
+    // delete-row -> [window] -> remove-dir gap and land a repos row pointing at a
+    // directory the purge then removes (a dangling row). Deterministic form of the
+    // race: hold the purge lock, then prove create BLOCKS on it rather than
+    // proceeding into the window — it must not insert its row while the lock is
+    // held, and must complete cleanly (row + on-disk dir both present) once the
+    // lock frees. RED on base (create takes no lock): the row lands while the lock
+    // is held. GREEN after (create serializes on the same key).
+    #[sqlx::test]
+    async fn create_repo_serializes_against_purge_lock(
+        pool_opts: sqlx::postgres::PgPoolOptions,
+        connect_opts: sqlx::postgres::PgConnectOptions,
+    ) {
+        use axum::extract::State;
+        use axum::Extension;
+        use std::time::Duration;
+
+        // Multi-connection pool: while the purge guard pins one connection for the
+        // held lock, create's own try_lock_repo attempt must get a DIFFERENT
+        // connection and observe the advisory lock held (Ok(None) -> it retries),
+        // not merely block on pool exhaustion.
+        let pool = pool_opts
+            .max_connections(5)
+            .connect_with(connect_opts)
+            .await
+            .unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(
+            repos_dir.path().to_path_buf(),
+            pool.clone(),
+        );
+
+        let owner = "did:key:z6MkCreatePurgeRaceAAAAAAAAAAAAAAAAAAAAAAAA";
+        let name = "racerepo";
+
+        // The purge path holds this exact per-repo advisory lock across its
+        // delete-row + remove-dir. Take it via the same helper the purge uses.
+        let purge_guard = state
+            .repo_store
+            .try_lock_repo(owner, name)
+            .await
+            .unwrap()
+            .expect("lock is free before the create");
+
+        // Kick off a create for the SAME owner/name while the purge holds the lock.
+        let state2 = state.clone();
+        let owner2 = owner.to_string();
+        let handle = tokio::spawn(async move {
+            super::create_repo(
+                State(state2),
+                Extension(crate::auth::AuthenticatedDid(owner2)),
+                axum::http::HeaderMap::new(),
+                Json(CreateRepoRequest {
+                    name: name.to_string(),
+                    description: None,
+                    is_public: true,
+                    default_branch: "main".to_string(),
+                }),
+            )
+            .await
+        });
+
+        // While the purge lock is held, create must NOT complete its init+insert.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            state.db.get_repo(owner, name).await.unwrap().is_none(),
+            "create_repo must not insert a repos row while a purge holds the same-key \
+             lock (RED on base: create takes no lock and the row lands in the window)"
+        );
+        assert!(
+            !handle.is_finished(),
+            "create must be blocked on the purge lock, not have completed"
+        );
+
+        // Purge releases; create can now proceed and create cleanly.
+        purge_guard.release().await;
+
+        let created = tokio::time::timeout(Duration::from_secs(8), handle)
+            .await
+            .expect("create should finish once the lock frees")
+            .expect("create task join")
+            .expect("create_repo returns Ok once it wins the lock");
+        assert_eq!(created.0, StatusCode::CREATED);
+
+        // End state is consistent: the row AND its on-disk dir are both present —
+        // never a row pointing at a removed directory.
+        assert!(
+            state.db.get_repo(owner, name).await.unwrap().is_some(),
+            "repos row must be present after the create wins the lock"
+        );
+        let dir = repos_dir
+            .path()
+            .join(owner.replace([':', '/'], "_"))
+            .join(format!("{name}.git"));
+        assert!(
+            dir.exists(),
+            "the created repo's on-disk dir must be present — no dangling row"
+        );
+    }
+
+    // U6 no-regression: with no concurrent purge, create_repo still succeeds and
+    // leaves a consistent row + on-disk dir. Guards against the lock acquisition
+    // wedging the uncontended hot path.
+    #[sqlx::test]
+    async fn create_repo_succeeds_without_lock_contention(
+        pool_opts: sqlx::postgres::PgPoolOptions,
+        connect_opts: sqlx::postgres::PgConnectOptions,
+    ) {
+        use axum::extract::State;
+        use axum::Extension;
+
+        let pool = pool_opts
+            .max_connections(5)
+            .connect_with(connect_opts)
+            .await
+            .unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(
+            repos_dir.path().to_path_buf(),
+            pool.clone(),
+        );
+
+        let owner = "did:key:z6MkCreateNoContendBBBBBBBBBBBBBBBBBBBBBBBB";
+        let name = "solo";
+
+        let created = super::create_repo(
+            State(state.clone()),
+            Extension(crate::auth::AuthenticatedDid(owner.to_string())),
+            axum::http::HeaderMap::new(),
+            Json(CreateRepoRequest {
+                name: name.to_string(),
+                description: None,
+                is_public: true,
+                default_branch: "main".to_string(),
+            }),
+        )
+        .await
+        .expect("uncontended create_repo must succeed");
+        assert_eq!(created.0, StatusCode::CREATED);
+
+        assert!(
+            state.db.get_repo(owner, name).await.unwrap().is_some(),
+            "row present after an uncontended create"
+        );
+        let dir = repos_dir
+            .path()
+            .join(owner.replace([':', '/'], "_"))
+            .join(format!("{name}.git"));
+        assert!(
+            dir.exists(),
+            "on-disk dir present after an uncontended create"
+        );
+    }
+
+    // ── U3/R2/R4: fork tail, guarded span, publish only after durability ─────
+
+    const FORK_SRC_OWNER: &str = "z6forksrcowner";
+    const FORK_SRC_NAME: &str = "forksrc";
+
+    /// Build a state whose repo_store AND config.repos_dir point at `repos_dir`
+    /// (fork_repo computes its clone target from config.repos_dir, so the two
+    /// must agree), seeded with a bare public source repo any caller may fork.
+    async fn fork_test_state(
+        repos_dir: &std::path::Path,
+        repo_store: crate::git::repo_store::RepoStore,
+        pool: sqlx::PgPool,
+    ) -> AppState {
+        let mut state = crate::test_support::test_state(pool).await;
+        state.repo_store = repo_store;
+        let mut cfg = (*state.config).clone();
+        cfg.repos_dir = repos_dir.to_path_buf();
+        state.config = std::sync::Arc::new(cfg);
+
+        let bare = repos_dir
+            .join(FORK_SRC_OWNER) // slug == owner: no ':' or '/' to replace
+            .join(format!("{FORK_SRC_NAME}.git"));
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let out = std::process::Command::new("git")
+            .args(["init", "--bare", "-q", &bare.to_string_lossy()])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git init --bare failed");
+        state
+            .db
+            .upsert_mirror_repo(
+                FORK_SRC_OWNER,
+                FORK_SRC_NAME,
+                &bare.to_string_lossy(),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        state
+    }
+
+    async fn call_fork(
+        state: &AppState,
+        forker: &str,
+        fork_name: &str,
+    ) -> Result<axum::response::Response> {
+        use axum::extract::{Path as AxPath, State};
+        use axum::response::IntoResponse;
+        use axum::Extension;
+        super::fork_repo(
+            State(state.clone()),
+            Extension(crate::auth::AuthenticatedDid(forker.to_string())),
+            AxPath((FORK_SRC_OWNER.to_string(), FORK_SRC_NAME.to_string())),
+            axum::http::HeaderMap::new(),
+            Json(ForkRepoRequest {
+                name: Some(fork_name.to_string()),
+            }),
+        )
+        .await
+        .map(|r| r.into_response())
+    }
+
+    // R2: fork must take the SAME per-owner/name advisory lock on its TARGET
+    // namespace that purge and create hold, so it cannot interleave with a
+    // purge's delete-row + remove-dir (or another creator) on that key.
+    // Deterministic form: hold the target lock, prove the fork BLOCKS (no clone
+    // dir, no repos row) rather than proceeding, then completes cleanly once the
+    // lock frees. RED on base: fork takes no lock and completes in the window.
+    #[sqlx::test]
+    async fn fork_serializes_against_target_namespace_lock(
+        pool_opts: sqlx::postgres::PgPoolOptions,
+        connect_opts: sqlx::postgres::PgConnectOptions,
+    ) {
+        use std::time::Duration;
+
+        // Multi-connection pool: the held guard pins one connection, so the
+        // fork's own lock attempt must get a DIFFERENT one and observe the key
+        // held (Ok(None) -> retry), not merely block on pool exhaustion.
+        let pool = pool_opts
+            .max_connections(5)
+            .connect_with(connect_opts)
+            .await
+            .unwrap();
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        let repo_store = crate::git::repo_store::RepoStore::for_testing(
+            repos_dir.path().to_path_buf(),
+            pool.clone(),
+        );
+        let state = fork_test_state(repos_dir.path(), repo_store, pool).await;
+
+        let forker = "did:key:z6MkForkSerializeAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let fork_name = "serialfork";
+
+        // A purge (or another creator) holds the fork target's advisory lock.
+        let held = state
+            .repo_store
+            .try_lock_repo(forker, fork_name)
+            .await
+            .unwrap()
+            .expect("target lock free before the fork");
+
+        let state2 = state.clone();
+        let forker2 = forker.to_string();
+        let fork_name2 = fork_name.to_string();
+        let handle = tokio::spawn(async move { call_fork(&state2, &forker2, &fork_name2).await });
+
+        // While the target lock is held the fork must make no progress past it.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let clone_dir = store::repo_disk_path(&state.config.repos_dir, forker, fork_name);
+        assert!(
+            state
+                .db
+                .get_repo(forker, fork_name)
+                .await
+                .unwrap()
+                .is_none(),
+            "fork must not insert a repos row while the target-namespace lock is \
+             held (RED on base: fork takes no lock and the row lands in the window)"
+        );
+        assert!(
+            !clone_dir.exists(),
+            "fork must not clone the mirror while the target-namespace lock is held"
+        );
+        assert!(
+            !handle.is_finished(),
+            "fork must be blocked on the target lock, not have completed"
+        );
+
+        held.release().await;
+        let resp = tokio::time::timeout(Duration::from_secs(8), handle)
+            .await
+            .expect("fork should finish once the lock frees")
+            .expect("fork task join")
+            .expect("fork_repo returns Ok once it wins the lock");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert!(
+            state
+                .db
+                .get_repo(forker, fork_name)
+                .await
+                .unwrap()
+                .is_some(),
+            "repos row present after the fork wins the lock"
+        );
+        assert!(clone_dir.exists(), "cloned mirror present after the fork");
+    }
+
+    // KTD-2 trap case (must-not-break negative): a store-less node has nothing
+    // to upload, so fork succeeds exactly as today: "no object store" is
+    // nothing-to-do, never a failed upload. GREEN both before and after the fix.
+    #[sqlx::test]
+    async fn fork_without_object_store_succeeds(pool: sqlx::PgPool) {
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        let repo_store = crate::git::repo_store::RepoStore::for_testing(
+            repos_dir.path().to_path_buf(),
+            pool.clone(),
+        );
+        let state = fork_test_state(repos_dir.path(), repo_store, pool).await;
+
+        let forker = "did:key:z6MkForkNoStoreAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let fork_name = "nostorefork";
+
+        let resp = call_fork(&state, forker, fork_name)
+            .await
+            .expect("a store-less fork must succeed");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert!(
+            state
+                .db
+                .get_repo(forker, fork_name)
+                .await
+                .unwrap()
+                .is_some(),
+            "repos row present after a store-less fork"
+        );
+        let clone_dir = store::repo_disk_path(&state.config.repos_dir, forker, fork_name);
+        assert!(clone_dir.exists(), "cloned mirror present after the fork");
+    }
+
+    // R2: a target lock held past the fork's bounded wait must surface as the
+    // same retryable 503 create_repo returns, with no repos row and no clone
+    // residue. RED on base: fork ignores the lock and completes with a 201.
+    #[sqlx::test]
+    async fn fork_lock_contention_returns_503(
+        pool_opts: sqlx::postgres::PgPoolOptions,
+        connect_opts: sqlx::postgres::PgConnectOptions,
+    ) {
+        use axum::response::IntoResponse;
+
+        let pool = pool_opts
+            .max_connections(5)
+            .connect_with(connect_opts)
+            .await
+            .unwrap();
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        let repo_store = crate::git::repo_store::RepoStore::for_testing(
+            repos_dir.path().to_path_buf(),
+            pool.clone(),
+        );
+        let state = fork_test_state(repos_dir.path(), repo_store, pool).await;
+
+        let forker = "did:key:z6MkForkContendedAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let fork_name = "contendedfork";
+
+        // Held for the whole test: the fork's bounded wait must give up.
+        let held = state
+            .repo_store
+            .try_lock_repo(forker, fork_name)
+            .await
+            .unwrap()
+            .expect("target lock free before the fork");
+
+        let resp = call_fork(&state, forker, fork_name).await;
+        let status = match resp {
+            Ok(r) => r.status(),
+            Err(e) => e.into_response().status(),
+        };
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a target lock held past the bounded wait must 503 like create_repo \
+             (RED on base: fork ignores the lock and returns 201)"
+        );
+        assert!(
+            state
+                .db
+                .get_repo(forker, fork_name)
+                .await
+                .unwrap()
+                .is_none(),
+            "no repos row after a 503'd fork"
+        );
+        let clone_dir = store::repo_disk_path(&state.config.repos_dir, forker, fork_name);
+        assert!(!clone_dir.exists(), "no clone residue after a 503'd fork");
+        held.release().await;
+    }
+
+    // Finding 1: a `git clone --mirror` that exits non-zero after the dest dir
+    // exists must clear that dest and free the lock, so a retry of the same fork
+    // name is not permanently blocked by a leftover half-mirror. Driven by
+    // pre-seeding the dest so the clone fails "destination already exists"
+    // (exit 128, the `!output.status.success()` arm, not the timeout/spawn
+    // arms). RED on base: the arm returns without removing the dest, so the dest
+    // survives and the second fork's clone fails the same way (5xx forever).
+    #[sqlx::test]
+    async fn fork_nonzero_clone_exit_cleans_dest_and_allows_retry(pool: sqlx::PgPool) {
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        let repo_store = crate::git::repo_store::RepoStore::for_testing(
+            repos_dir.path().to_path_buf(),
+            pool.clone(),
+        );
+        let state = fork_test_state(repos_dir.path(), repo_store, pool).await;
+
+        let forker = "did:key:z6MkForkCloneNonzeroAAAAAAAAAAAAAAAAAAAAAA";
+        let fork_name = "nonzerofork";
+
+        // Seed the dest as a non-empty dir so `git clone --mirror` refuses it and
+        // exits 128, standing in for a half-created mirror a prior failed clone
+        // (authz, corrupt source) would leave behind.
+        let clone_dir = store::repo_disk_path(&state.config.repos_dir, forker, fork_name);
+        std::fs::create_dir_all(&clone_dir).unwrap();
+        std::fs::write(clone_dir.join("stale.txt"), b"half-created mirror").unwrap();
+
+        let resp = call_fork(&state, forker, fork_name).await;
+        let status = match resp {
+            Ok(r) => r.status(),
+            Err(e) => {
+                use axum::response::IntoResponse;
+                e.into_response().status()
+            }
+        };
+        assert!(
+            status.is_server_error(),
+            "a non-zero clone exit must fail the fork (5xx); got {status}"
+        );
+        assert!(
+            !clone_dir.exists(),
+            "the leftover dest must be removed after a non-zero clone exit \
+             (RED on base: the !success arm leaves it, blocking every retry)"
+        );
+
+        // The dest is clean and the lock freed, so re-forking the same name now
+        // clones fresh and succeeds.
+        let resp2 = call_fork(&state, forker, fork_name)
+            .await
+            .expect("a retry after the dest is cleaned must succeed");
+        assert_eq!(resp2.status(), StatusCode::CREATED);
+        assert!(
+            state
+                .db
+                .get_repo(forker, fork_name)
+                .await
+                .unwrap()
+                .is_some(),
+            "repos row present after the successful retry"
+        );
+        assert!(clone_dir.exists(), "cloned mirror present after the retry");
+    }
+
+    // create_repo must NOT take its serialization lock from the APP pool. Doing so
+    // pins an app-pool connection in the lock guard while the create's own work
+    // (get_repo / proof.consume / db.create_repo, all on state.db = the app pool)
+    // still needs an app connection. At GITLAWB_DB_MAX_CONNECTIONS=1 (a supported
+    // config) the guard holds the only app connection and get_repo self-deadlocks
+    // (PoolTimedOut -> 500). Locking on the separate write lock_pool instead keeps
+    // the lock and the work on different pools, so a size-1 app pool never wedges.
+    // RED on the app-pool-lock code: create times out -> Err. GREEN after reverting
+    // create to lock on lock_pool.
+    #[sqlx::test]
+    async fn create_repo_does_not_self_deadlock_at_one_app_connection(
+        pool_opts: sqlx::postgres::PgPoolOptions,
+        connect_opts: sqlx::postgres::PgConnectOptions,
+    ) {
+        use axum::extract::State;
+        use axum::Extension;
+        use std::time::Duration;
+
+        // Migrate the per-test DB on a normal pool: `migrate()` pins one connection for
+        // its cross-process advisory lock while applying statements on a second, so it
+        // needs >1 connection and cannot itself run on the size-1 pool under test.
+        let migrate_pool = pool_opts.connect_with(connect_opts.clone()).await.unwrap();
+        let mut state = crate::test_support::test_state(migrate_pool).await;
+
+        // Now point state.db at an APP pool of MAX size 1 on the SAME database, the
+        // minimal supported config (GITLAWB_DB_MAX_CONNECTIONS=1). The schema is
+        // already applied, so this pool only serves create's work (get_repo -> insert).
+        // A short acquire timeout makes the RED case (the lock guard pinning this one
+        // connection while get_repo waits for another) fail fast instead of hanging.
+        let app_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(2))
+            .connect_with(connect_opts.clone())
+            .await
+            .unwrap();
+        state.db = std::sync::Arc::new(crate::db::Db::for_testing(app_pool.clone()));
+
+        // A SEPARATE write lock pool (where create's serialization lock belongs). Its
+        // being separate is the whole point: the lock guard must not draw from the app
+        // pool the create work runs on.
+        let lock_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect_with(connect_opts.clone())
+            .await
+            .unwrap();
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(
+            repos_dir.path().to_path_buf(),
+            lock_pool.clone(),
+        );
+
+        let owner = "did:key:z6MkOneAppConnNoDeadlockDDDDDDDDDDDDDDDDDDDD";
+        let name = "solo";
+        let created = super::create_repo(
+            State(state.clone()),
+            Extension(crate::auth::AuthenticatedDid(owner.to_string())),
+            axum::http::HeaderMap::new(),
+            Json(CreateRepoRequest {
+                name: name.to_string(),
+                description: None,
+                is_public: true,
+                default_branch: "main".to_string(),
+            }),
+        )
+        .await
+        .expect("create must not self-deadlock at app-pool size 1 (lock on lock_pool)");
+        assert_eq!(created.0, StatusCode::CREATED);
+        assert!(
+            state.db.get_repo(owner, name).await.unwrap().is_some(),
+            "row present after a create with a size-1 app pool"
+        );
+    }
+
+    // ── fork durable-write failure semantics on the fenced machinery ──────
+
+    /// Seed `FORK_SRC_OWNER/FORK_SRC_NAME` into the mock so a warm local source
+    /// does not trigger the lazy-migration PUT (which would consume the fault a
+    /// test arms for the fork's own upload).
+    async fn seed_source_archive(mock: &crate::git::repo_store::tests::S3Mock) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bare = dir.path().join("src.git");
+        crate::git::store::init_bare(&bare).unwrap();
+        crate::git::repo_store::tests::mock_tigris(mock)
+            .upload(
+                FORK_SRC_OWNER,
+                FORK_SRC_NAME,
+                &bare,
+                crate::git::tigris::UploadPrecondition::Unconditional,
+            )
+            .await
+            .expect("seeding the source archive");
+    }
+
+    // When the fork's durable upload loses its response WITHOUT committing, the
+    // outcome is unknowable: the fork must fail retryably (5xx), insert no
+    // repos row, and KEEP the local clone — the only copy of a write that may
+    // yet have landed — rather than destroying it.
+    #[sqlx::test]
+    async fn fork_ambiguous_upload_failure_keeps_clone_and_inserts_no_row(pool: sqlx::PgPool) {
+        use crate::git::repo_store::tests as rs_tests;
+
+        let mock = rs_tests::S3Mock::start().await;
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        let repo_store = crate::git::repo_store::RepoStore::for_testing_with_tigris(
+            repos_dir.path().to_path_buf(),
+            pool.clone(),
+            rs_tests::mock_tigris(&mock),
+        );
+        let state = fork_test_state(repos_dir.path(), repo_store, pool).await;
+        seed_source_archive(&mock).await;
+        mock.fail_next_put_after_delivery();
+
+        let forker = "did:key:z6MkForkAmbigUploadAAAAAAAAAAAAAAAAAAAAAAA";
+        let fork_name = "ambigfork";
+        let resp = call_fork(&state, forker, fork_name).await;
+        let status = match resp {
+            Ok(r) => r.status(),
+            Err(e) => axum::response::IntoResponse::into_response(e).status(),
+        };
+        assert!(
+            status.is_server_error(),
+            "an unresolvable durable upload must fail the fork (5xx); got {status}"
+        );
+        assert!(
+            state
+                .db
+                .get_repo(forker, fork_name)
+                .await
+                .unwrap()
+                .is_none(),
+            "no repos row may exist for a fork whose durable upload did not land"
+        );
+        let clone_dir = store::repo_disk_path(&state.config.repos_dir, forker, fork_name);
+        assert!(
+            clone_dir.exists(),
+            "an ambiguous upload keeps the clone for reconciliation — it is the only              copy of a write that may have landed, and must not be destroyed"
+        );
+        mock.shutdown();
+    }
+
+    // A repos-row insert that fails after the archive published must fail the
+    // fork (5xx), leave no row, and compensate the mirror and the archive —
+    // both carry this attempt's stamp, so cleanup removes ONLY this attempt's
+    // work. The decoy row holds the fork's exact disk_path under a different
+    // name, so the fork's own insert violates disk_path's UNIQUE constraint.
+    #[sqlx::test]
+    async fn fork_row_insert_failure_compensates_mirror_and_archive(pool: sqlx::PgPool) {
+        use crate::git::repo_store::tests as rs_tests;
+
+        let mock = rs_tests::S3Mock::start().await;
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        let repo_store = crate::git::repo_store::RepoStore::for_testing_with_tigris(
+            repos_dir.path().to_path_buf(),
+            pool.clone(),
+            rs_tests::mock_tigris(&mock),
+        );
+        let state = fork_test_state(repos_dir.path(), repo_store, pool).await;
+        seed_source_archive(&mock).await;
+
+        let forker = "did:key:z6MkForkInsertFailAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let fork_name = "insertfailfork";
+        let clone_dir = store::repo_disk_path(&state.config.repos_dir, forker, fork_name);
+
+        // Decoy row occupying the fork's exact disk_path under a different
+        // name, so the fork's insert violates the UNIQUE constraint while
+        // get_repo(forker, fork_name) still returns None and the handler
+        // proceeds past its conflict guard.
+        let now = Utc::now();
+        let decoy = crate::db::RepoRecord {
+            id: Uuid::new_v4().to_string(),
+            name: "decoyname".to_string(),
+            owner_did: "did:key:z6MkDecoyOwnerBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: now,
+            updated_at: now,
+            disk_path: clone_dir.to_string_lossy().to_string(),
+            forked_from: None,
+            machine_id: None,
+        };
+        state.db.create_repo(&decoy).await.unwrap();
+
+        let resp = call_fork(&state, forker, fork_name).await;
+        let status = match resp {
+            Ok(r) => r.status(),
+            Err(e) => axum::response::IntoResponse::into_response(e).status(),
+        };
+        assert!(
+            status.is_server_error(),
+            "a row-insert failure must fail the fork (5xx); got {status}"
+        );
+        assert!(
+            state
+                .db
+                .get_repo(forker, fork_name)
+                .await
+                .unwrap()
+                .is_none(),
+            "no fork row may exist after the insert failure"
+        );
+        assert!(
+            !clone_dir.exists(),
+            "the cloned mirror must be removed after the failed insert — the guard              only ever compensates work stamped with this attempt's id"
+        );
+        assert!(
+            mock
+                .object_for(&rs_tests::owner_slug_of(forker), fork_name)
+                .is_none(),
+            "the uploaded fork archive must be deleted after the failed insert — the              attempt-fenced delete removes it because it is this attempt's own work"
+        );
+        mock.shutdown();
     }
 }
