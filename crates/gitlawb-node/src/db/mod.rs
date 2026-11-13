@@ -4137,14 +4137,14 @@ impl Db {
 
     /// `head_sha` freezes the source head the close decided against: a closed
     /// pull request's rollup serves only the stored head, so nothing resolved
-    /// later can stand in for it. A `None` keeps whatever the push path last
-    /// recorded — the same fall-back-to-stored trade `merge_pr` makes when the
-    /// ref cannot be resolved.
+    /// later can stand in for it. It fills an empty head only: a head already
+    /// stored, including one a push wrote after the handler read the row, wins.
+    /// A `None` keeps whatever the push path last recorded.
     pub async fn close_pr(&self, pr_id: &str, head_sha: Option<&str>) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             "UPDATE pull_requests SET status='closed', updated_at=$1, \
-             head_commit=COALESCE($3, head_commit) WHERE id=$2 AND status='open'",
+             head_commit=COALESCE(head_commit, $3) WHERE id=$2 AND status='open'",
         )
         .bind(&now)
         .bind(pr_id)
@@ -12372,6 +12372,30 @@ mod migration_tests {
             db.get_pr("repo-1", 2).await.unwrap().unwrap().head_commit,
             Some(SHA_A.to_string()),
             "an unresolvable close keeps the stored head"
+        );
+    }
+
+    /// The handler reads the pull request before it resolves a fallback head,
+    /// so a push can store a head in between. The fallback fills an empty head
+    /// only; a stored head must win over it.
+    #[sqlx::test]
+    async fn close_pr_fallback_does_not_overwrite_a_head_stored_after_the_read(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        let pr = sample_pr("repo-1", 1);
+        db.create_pr(&pr).await.unwrap();
+        // The handler saw head_commit = NULL and resolved SHA_A; a push then
+        // stored SHA_B before the close statement ran.
+        set_head_directly(&db, &pr.id, SHA_B).await;
+        db.close_pr(&pr.id, Some(SHA_A)).await.unwrap();
+
+        let closed = db.get_pr("repo-1", 1).await.unwrap().unwrap();
+        assert_eq!(closed.status, "closed");
+        assert_eq!(
+            closed.head_commit,
+            Some(SHA_B.to_string()),
+            "a head stored by a concurrent push must survive the close fallback"
         );
     }
 
