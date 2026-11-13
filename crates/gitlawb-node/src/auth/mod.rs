@@ -17,6 +17,53 @@ use crate::state::AppState;
 #[derive(Clone, Debug)]
 pub struct AuthenticatedDid(pub String);
 
+/// The RFC 9421 material this request was actually verified against, injected
+/// alongside [`AuthenticatedDid`] by `require_signature`.
+///
+/// A handler that records a signed claim as history has to store it: the header
+/// values and the canonical signing string are gone once the request ends, and a
+/// stored claim nobody can re-verify is not history. `signing_string` is the exact
+/// byte sequence the Ed25519 verification succeeded over, not a rebuild — a
+/// handler reconstructing it from headers would be verifying a different string
+/// than the middleware did.
+#[derive(Clone, Debug)]
+pub struct SignatureMaterial {
+    /// The `Signature` header value.
+    pub signature: String,
+    /// The `Signature-Input` header value.
+    pub signature_input: String,
+    /// The canonical bytes the signature covered.
+    pub signing_string: String,
+    /// The buffered request body, on the routes that persist it. The signing
+    /// string covers it only through the content-digest, so without these bytes
+    /// a stored claim can be shown to carry *a* valid signature over *some*
+    /// digest and nothing more. Carried here because the body is consumed
+    /// downstream by the extractor and cannot be recovered afterwards.
+    ///
+    /// `Option`, and populated only behind [`PersistsSignedBody`], because a
+    /// route that never stores the body has no use for a second handle to it.
+    /// The unlike-sized field is this one: the three above are header-derived
+    /// and bounded by the server's header limit, while a receive-pack POST
+    /// carries up to GITLAWB_MAX_PACK_BYTES (2 GB by default). `Bytes`, not
+    /// `Vec<u8>`, so the handle the marked routes do take is a refcount bump
+    /// over the buffer the middleware already holds rather than a copy.
+    pub body: Option<axum::body::Bytes>,
+}
+
+/// Marks a route group whose handler persists the signed request body.
+///
+/// Applied as an extension layer OUTSIDE the auth layers, so it is on the
+/// request before [`require_signature`] decides whether to carry the body. A
+/// marker applied inside them is never seen, and the failure is silent: the
+/// handler still compiles, tests that inject material by hand still pass, and
+/// production stores nothing. The status write handler refuses an absent body
+/// for that reason.
+///
+/// A marker rather than a path check because `require_signature` must not learn
+/// which URL persists claims; that knowledge belongs at the route table.
+#[derive(Clone, Copy, Debug)]
+pub struct PersistsSignedBody;
+
 /// A UCAN that passed full chain validation, with the root issuer the chain
 /// rests on. Inserted into request extensions by [`require_ucan_chain`] when
 /// `X-Ucan` is present; absent when the header is.
@@ -375,10 +422,28 @@ async fn verify_signature(limit: usize, request: Request, next: Next) -> Respons
 
     tracing::info!(did = %sig.key_id, "✓ authenticated request");
 
+    // The body travels only where it is stored. On every other signed route the
+    // middleware's handle would keep the buffer alive for the rest of the layer
+    // chain, until the handler's own extractor consumes the request.
+    let body = parts
+        .extensions
+        .get::<PersistsSignedBody>()
+        .map(|_| body_bytes.clone());
+
+    let material = SignatureMaterial {
+        signature: sig_header,
+        signature_input: sig_input,
+        signing_string,
+        body,
+    };
+
     let mut request = Request::from_parts(parts, Body::from(body_bytes));
     request
         .extensions_mut()
         .insert(AuthenticatedDid(sig.key_id.to_string()));
+    // Carry the verified material forward for handlers that persist a signed
+    // claim; none of it can be recovered once the request is gone.
+    request.extensions_mut().insert(material);
     next.run(request).await
 }
 
@@ -796,6 +861,109 @@ mod tests {
             task_read_rate_limiter: RateLimiter::new(1200, Duration::from_secs(3600)),
             git_bin: "git".to_string(),
         }
+    }
+
+    /// Reports what the signature middleware put in `SignatureMaterial.body`,
+    /// so a test can tell "captured" from "deliberately not captured" apart
+    /// from "the middleware never ran".
+    async fn report_body(material: Option<axum::Extension<SignatureMaterial>>) -> String {
+        match material {
+            Some(axum::Extension(m)) => match m.body {
+                Some(bytes) => format!("captured:{}", bytes.len()),
+                None => "absent".to_string(),
+            },
+            None => "no-material".to_string(),
+        }
+    }
+
+    fn signed_post(path: &str, body: &[u8]) -> Request {
+        let kp = Keypair::generate();
+        let signed = gitlawb_core::http_sig::sign_request(&kp, "POST", path, body);
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-digest", signed.content_digest)
+            .header("signature-input", signed.signature_input)
+            .header("signature", signed.signature)
+            .body(axum::body::Body::from(body.to_vec()))
+            .unwrap()
+    }
+
+    /// The body handle travels only on a route that asked for it.
+    ///
+    /// Both arms drive a genuinely signed request through `require_signature`;
+    /// the only difference is the [`PersistsSignedBody`] marker layer. A
+    /// middleware that captured unconditionally would make both arms read
+    /// `captured`, and one that never read the marker would make both read
+    /// `absent`, so the pair pins the decision rather than the mechanism.
+    #[tokio::test]
+    async fn the_body_is_carried_only_when_the_route_marks_itself_as_persisting_it() {
+        let body = br#"{"state":"success"}"#;
+
+        // The marker layer is added AFTER the middleware layer, which is what
+        // makes it the outer of the two and therefore the one that runs first.
+        // This is the same relative position `build_router` uses on the status
+        // write group, where the marker sits outside `add_auth_layers`.
+        let marked = Router::new()
+            .route("/", axum::routing::post(report_body))
+            .layer(middleware::from_fn_with_state(
+                crate::auth::SignatureBodyLimit(65536),
+                require_signature,
+            ))
+            .layer(axum::Extension(PersistsSignedBody));
+        let resp = marked.oneshot(signed_post("/", body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let seen = axum::body::to_bytes(resp.into_body(), 2048).await.unwrap();
+        assert_eq!(
+            String::from_utf8(seen.to_vec()).unwrap(),
+            format!("captured:{}", body.len()),
+            "a route carrying the persist marker must receive the buffered body"
+        );
+
+        let unmarked = Router::new()
+            .route("/", axum::routing::post(report_body))
+            .layer(middleware::from_fn_with_state(
+                crate::auth::SignatureBodyLimit(65536),
+                require_signature,
+            ));
+        let resp = unmarked.oneshot(signed_post("/", body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let seen = axum::body::to_bytes(resp.into_body(), 2048).await.unwrap();
+        assert_eq!(
+            String::from_utf8(seen.to_vec()).unwrap(),
+            "absent",
+            "a signed route that never persists the body must not be handed a handle to it"
+        );
+    }
+
+    /// The marker is read from the request the middleware was given, and the
+    /// request it hands downstream still carries it. Both halves matter: the
+    /// first is the capture decision, the second is that rebuilding the request
+    /// from its parts does not drop extensions a later layer may want.
+    #[tokio::test]
+    async fn the_marker_survives_the_request_rebuild() {
+        async fn report_marker(marker: Option<axum::Extension<PersistsSignedBody>>) -> String {
+            match marker {
+                Some(_) => "marked".to_string(),
+                None => "unmarked".to_string(),
+            }
+        }
+
+        let app = Router::new()
+            .route("/", axum::routing::post(report_marker))
+            .layer(middleware::from_fn_with_state(
+                crate::auth::SignatureBodyLimit(65536),
+                require_signature,
+            ))
+            .layer(axum::Extension(PersistsSignedBody));
+        let resp = app.oneshot(signed_post("/", b"{}")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let seen = axum::body::to_bytes(resp.into_body(), 2048).await.unwrap();
+        assert_eq!(
+            String::from_utf8(seen.to_vec()).unwrap(),
+            "marked",
+            "the marker must reach the handler, so the middleware saw it too"
+        );
     }
 
     #[tokio::test]

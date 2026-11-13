@@ -379,6 +379,16 @@ mod tests {
         );
     }
 
+    /// A 429 does not advertise a retry interval: the status-claim caps behind
+    /// it are per-commit and append-only, so a client honoring a 1s hint would
+    /// retry a request that can never succeed.
+    #[test]
+    fn too_many_requests_carries_no_retry_after() {
+        let resp = AppError::TooManyRequests("x".into()).into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().get("retry-after").is_none());
+    }
+
     /// #226: raw sqlx/DB detail must never appear in the Internal 500 body.
     #[tokio::test]
     async fn internal_error_body_is_opaque() {
