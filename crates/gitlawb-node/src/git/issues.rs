@@ -61,6 +61,58 @@ pub fn create_issue(repo_path: &Path, issue_id: &str, json: &str) -> Result<()> 
     Ok(())
 }
 
+/// Deadline-bounded variant of [`create_issue`] for compensation paths: the
+/// same hash-object + update-ref write, but every git child runs through the
+/// shared bounded runner so a hung git cannot stall the write guard past
+/// `git_service_timeout`.
+pub fn create_issue_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    issue_id: &str,
+    json: &str,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    let out = crate::git::visibility_pack::run_bounded_git(
+        git_bin,
+        &["hash-object", "--stdin", "-w"],
+        repo_path,
+        json.as_bytes(),
+        deadline,
+    )?;
+    let hash = String::from_utf8(out).context("git hash-object output is not valid UTF-8")?;
+    let hash = hash.trim();
+    let ref_name = format!("refs/gitlawb/issues/{issue_id}");
+    crate::git::visibility_pack::run_bounded_git(
+        git_bin,
+        &["update-ref", &ref_name, hash],
+        repo_path,
+        b"",
+        deadline,
+    )?;
+    Ok(())
+}
+
+/// Remove a single issue ref while the write guard still holds the advisory lock,
+/// after a definite publish refusal. Best-effort: a failed delete leaves a
+/// local-only orphan, which is still better than telling the client to retry into a
+/// duplicate id. Not used on `UploadUnknowable`, where the PUT may still land.
+pub fn delete_issue_ref(
+    git_bin: &str,
+    repo_path: &Path,
+    issue_id: &str,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    let ref_name = format!("refs/gitlawb/issues/{issue_id}");
+    crate::git::visibility_pack::run_bounded_git(
+        git_bin,
+        &["update-ref", "-d", &ref_name],
+        repo_path,
+        b"",
+        deadline,
+    )?;
+    Ok(())
+}
+
 /// List all issue refs and return their JSON content.
 pub fn list_issues(repo_path: &Path) -> Result<Vec<String>> {
     // List all refs under refs/gitlawb/issues/
@@ -108,19 +160,22 @@ pub fn list_issues(repo_path: &Path) -> Result<Vec<String>> {
 /// Returns Ok(Some(full_id)) on unique match, Ok(None) if not found,
 /// Err if the prefix is ambiguous (matches more than one issue).
 pub fn resolve_issue_id(repo_path: &Path, id_or_prefix: &str) -> Result<Option<String>> {
-    // Try exact match first — fast path for callers passing the full UUID.
-    let exact_ref = format!("refs/gitlawb/issues/{id_or_prefix}");
-    let check = Command::new("git")
-        .args(["cat-file", "-e", &exact_ref])
-        .current_dir(repo_path)
-        .output()
-        .context("failed to run git cat-file -e")?;
-    if check.status.success() {
-        return Ok(Some(id_or_prefix.to_string()));
+    // The id comes from the request path and is spliced into a git revision and a
+    // for-each-ref pattern below. Issue ids are UUIDs, so accept only ASCII
+    // alphanumerics and '-': anything else (`^{blob}`, `@{0}`, `*`, `/`, `..`) is
+    // revision or glob syntax, never an issue id, and is reported as not found.
+    if id_or_prefix.is_empty()
+        || !id_or_prefix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Ok(None);
     }
 
-    // Prefix search: list all refs that start with the given string.
-    let prefix_glob = format!("refs/gitlawb/issues/{id_or_prefix}*");
+    // List all refs that start with the given string; the glob also matches the exact
+    // ref. The id handed back is always git's own refname, never the request input.
+    let exact_ref = format!("refs/gitlawb/issues/{id_or_prefix}");
+    let prefix_glob = format!("{exact_ref}*");
     let list = Command::new("git")
         .args(["for-each-ref", "--format=%(refname)", &prefix_glob])
         .current_dir(repo_path)
@@ -132,25 +187,44 @@ pub fn resolve_issue_id(repo_path: &Path, id_or_prefix: &str) -> Result<Option<S
     }
 
     let output = String::from_utf8_lossy(&list.stdout);
-    let matches: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
+    let matches: Vec<&str> = output
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
 
-    match matches.len() {
-        0 => Ok(None),
-        1 => {
-            // Strip the "refs/gitlawb/issues/" prefix to get the bare ID.
-            let full_id = matches[0]
-                .trim()
-                .strip_prefix("refs/gitlawb/issues/")
-                .unwrap_or(matches[0].trim())
-                .to_string();
-            Ok(Some(full_id))
+    // An exact id wins over longer ids that share it as a prefix, but only if its
+    // object exists: for-each-ref also lists a ref whose blob is missing, so a
+    // dangling exact ref falls through to the prefix rules below.
+    let exact = match matches.iter().find(|m| **m == exact_ref) {
+        Some(m) => {
+            let check = Command::new("git")
+                .args(["cat-file", "-e", m])
+                .current_dir(repo_path)
+                .output()
+                .context("failed to run git cat-file -e")?;
+            check.status.success().then_some(*m)
         }
-        _ => anyhow::bail!(
-            "ambiguous issue prefix '{}': matches {} issues",
-            id_or_prefix,
-            matches.len()
-        ),
-    }
+        None => None,
+    };
+    let found = match exact {
+        Some(m) => m,
+        None => match matches.as_slice() {
+            [] => return Ok(None),
+            [m] => *m,
+            _ => anyhow::bail!(
+                "ambiguous issue prefix '{}': matches {} issues",
+                id_or_prefix,
+                matches.len()
+            ),
+        },
+    };
+    // Strip the "refs/gitlawb/issues/" prefix to get the bare ID.
+    let full_id = found
+        .strip_prefix("refs/gitlawb/issues/")
+        .unwrap_or(found)
+        .to_string();
+    Ok(Some(full_id))
 }
 
 /// Close an issue by updating its status to "closed" in the git ref.
@@ -235,6 +309,43 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_exact_id_wins_over_longer_id() {
+        let dir = TempDir::new().unwrap();
+        init_repo(&dir);
+        create_issue(dir.path(), "abc12345", r#"{"status":"open"}"#).unwrap();
+        create_issue(dir.path(), "abc12345-0000", r#"{"status":"open"}"#).unwrap();
+        let resolved = resolve_issue_id(dir.path(), "abc12345").unwrap();
+        assert_eq!(resolved, Some("abc12345".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_dangling_exact_id_does_not_win_over_longer_id() {
+        let dir = TempDir::new().unwrap();
+        init_repo(&dir);
+        create_issue(dir.path(), "abc12345", r#"{"status":"open","n":1}"#).unwrap();
+        create_issue(dir.path(), "abc12345-0000", r#"{"status":"open","n":2}"#).unwrap();
+        // Dangle the exact ref: the ref stays listed by for-each-ref, but its blob is gone.
+        let out = Command::new("git")
+            .args(["rev-parse", "refs/gitlawb/issues/abc12345"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let hash = String::from_utf8(out.stdout).unwrap();
+        let hash = hash.trim();
+        std::fs::remove_file(
+            dir.path()
+                .join(".git/objects")
+                .join(&hash[..2])
+                .join(&hash[2..]),
+        )
+        .unwrap();
+
+        let result = resolve_issue_id(dir.path(), "abc12345");
+        assert!(result.unwrap_err().to_string().contains("ambiguous"));
+        assert!(close_issue(dir.path(), "abc12345").is_err());
+    }
+
+    #[test]
     fn test_resolve_prefix_matches_unique() {
         let dir = TempDir::new().unwrap();
         init_repo(&dir);
@@ -247,6 +358,35 @@ mod tests {
         .unwrap();
         let resolved = resolve_issue_id(dir.path(), "abc12345").unwrap();
         assert_eq!(resolved, Some(full_id.to_string()));
+    }
+
+    #[test]
+    fn test_resolve_rejects_revision_syntax() {
+        let dir = TempDir::new().unwrap();
+        init_repo(&dir);
+        let full_id = "abc12345-0000-0000-0000-000000000000";
+        create_issue(
+            dir.path(),
+            full_id,
+            r#"{"id":"abc12345-0000-0000-0000-000000000000","status":"open"}"#,
+        )
+        .unwrap();
+        // Each of these resolves to (or globs over) the issue blob in git, but none
+        // is an issue id, so the lookup must not accept it.
+        for crafted in [
+            "abc12345-0000-0000-0000-000000000000^{blob}",
+            "abc12345-0000-0000-0000-000000000000^{}",
+            "abc12345-0000-0000-0000-000000000000~0",
+            "*",
+            "",
+        ] {
+            assert_eq!(
+                resolve_issue_id(dir.path(), crafted).unwrap(),
+                None,
+                "{crafted:?}"
+            );
+            assert_eq!(get_issue(dir.path(), crafted).unwrap(), None, "{crafted:?}");
+        }
     }
 
     #[test]
@@ -276,6 +416,27 @@ mod tests {
         let result = resolve_issue_id(dir.path(), "abc12345");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("ambiguous"));
+    }
+
+    #[test]
+    fn delete_issue_ref_removes_a_created_ref() {
+        let dir = TempDir::new().unwrap();
+        init_repo(&dir);
+        let full_id = "eee88888-0000-0000-0000-000000000000";
+        create_issue(
+            dir.path(),
+            full_id,
+            r#"{"id":"eee88888-0000-0000-0000-000000000000","status":"open"}"#,
+        )
+        .unwrap();
+        delete_issue_ref(
+            "git",
+            dir.path(),
+            full_id,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        assert_eq!(resolve_issue_id(dir.path(), full_id).unwrap(), None);
     }
 
     #[test]

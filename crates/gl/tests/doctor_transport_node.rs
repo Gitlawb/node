@@ -8,6 +8,50 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+const DID_BODY: &str = r#"{"did":"did:key:z6MkTestNode","version":"0.0.0"}"#;
+
+/// A request-counting HTTP fixture. `handler(hit_index, request_head)` returns the
+/// raw bytes to write back. Runs for the life of the test process, one connection
+/// at a time, which is all these probes need.
+fn serve(handler: impl Fn(usize, &str) -> Vec<u8> + Send + 'static) -> (u16, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+    let port = listener.local_addr().unwrap().port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = hits.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let mut buf = [0u8; 4096];
+            let n = s.read(&mut buf).unwrap_or(0);
+            let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let i = seen.fetch_add(1, Ordering::SeqCst);
+            let _ = s.write_all(&handler(i, &head));
+            let _ = s.flush();
+        }
+    });
+    (port, hits)
+}
+
+fn http(status: &str, extra: &str, body: &[u8]) -> Vec<u8> {
+    let mut out = format!(
+        "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    out.extend_from_slice(body);
+    out
+}
+
+fn did_ok() -> Vec<u8> {
+    http(
+        "200 OK",
+        "Content-Type: application/json\r\n",
+        DID_BODY.as_bytes(),
+    )
+}
 
 /// Substring that marks the divergence clause. Present only when gl and the git
 /// transport resolve different nodes.
@@ -15,8 +59,18 @@ const DIVERGENCE: &str = "git push/clone will use";
 
 struct Run {
     stdout: String,
-    code: Option<i32>,
 }
+
+const PROXY_VARS: [&str; 8] = [
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
+];
 
 impl Run {
     /// The single output line carrying the divergence clause, so an assertion
@@ -27,22 +81,49 @@ impl Run {
 }
 
 fn doctor(env_node: Option<&str>, gl_node: &str) -> Run {
+    doctor_with(env_node, Some(gl_node), &[])
+}
+
+/// `node_flag: None` runs without `--node`, so clap binds `args.node` from the
+/// environment exactly as a user's shell would.
+fn doctor_with(env_node: Option<&str>, node_flag: Option<&str>, extra_env: &[(&str, &str)]) -> Run {
+    // The release lookup goes to a local fixture, so no run reaches api.github.com.
+    // The hit count is asserted below: if the override stops being honored the
+    // request escapes, the fixture sees nothing, and every test here fails.
+    let (release_port, release_hits) = serve(|_, _| http("404 Not Found", "", b"{}"));
     let dir = tempfile::tempdir().unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_gl"));
-    cmd.args(["doctor", "--node", gl_node])
-        .arg("--dir")
+    cmd.arg("doctor");
+    if let Some(n) = node_flag {
+        cmd.args(["--node", n]);
+    }
+    cmd.arg("--dir")
         .arg(dir.path().join("gitlawb"))
-        // Keep the run off the network: doctor also probes iCaptcha and the
-        // GitHub release API, neither of which this test is about.
-        .env("GITLAWB_ICAPTCHA_URL", "http://127.0.0.1:1");
+        .env("GITLAWB_ICAPTCHA_URL", "http://127.0.0.1:1")
+        .env(
+            "GITLAWB_GITHUB_API_URL",
+            format!("http://127.0.0.1:{release_port}"),
+        );
+    for v in PROXY_VARS {
+        cmd.env_remove(v);
+    }
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
     match env_node {
         Some(v) => cmd.env("GITLAWB_NODE", v),
         None => cmd.env_remove("GITLAWB_NODE"),
     };
     let out = cmd.output().unwrap();
+    // Under a configured proxy the lookup goes to the proxy fixture, not this one,
+    // so the fixture-boundary check only applies to the unproxied runs.
+    let proxied = extra_env.iter().any(|(k, _)| *k == "HTTP_PROXY");
+    assert!(
+        proxied || release_hits.load(Ordering::SeqCst) >= 1,
+        "the release lookup never reached the fixture, so it went to the public API"
+    );
     Run {
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-        code: out.status.code(),
     }
 }
 
@@ -190,15 +271,194 @@ fn unset_env_warns_while_a_broken_configured_node_fails() {
     );
 }
 
-/// #357's constraint: doctor must not start failing a stock install just because
-/// it now says more. Nothing pinned this before.
+/// #357's constraint, as it reads once doctor exits non-zero on any Fail-class row:
+/// an unset variable must not contribute one. The run still exits 1 here because
+/// the empty tempdir has no identity, so assert on the rows, not the exit code.
 #[test]
-fn doctor_still_exits_zero() {
+fn an_unset_env_adds_no_failing_row() {
     let r = doctor(None, "http://127.0.0.1:1");
+    let failing: Vec<&str> = r
+        .stdout
+        .lines()
+        .filter(|l| l.trim_start().starts_with('\u{2717}'))
+        .collect();
+    assert!(
+        failing.iter().all(|l| !l.contains("GITLAWB_NODE")),
+        "an unset variable must stay advisory, got failing rows: {failing:?}"
+    );
+    assert!(r.divergence_line().is_some(), "got:\n{}", r.stdout);
+}
+
+/// The suggested fix line printed under "Suggested fixes", or the empty string.
+fn fix_line(r: &Run) -> &str {
+    r.stdout
+        .lines()
+        .find(|l| l.trim_start().starts_with("GITLAWB_NODE:"))
+        .unwrap_or("")
+}
+
+/// A same-origin redirect that re-issues the identical request-target is the one
+/// shape the transport follows, so doctor must follow it too and report the node.
+#[test]
+fn an_identical_target_redirect_is_followed_like_the_transport() {
+    let (port, _) = serve(|i, _| {
+        if i < 2 {
+            http("302 Found", "Location: /\r\n", b"")
+        } else {
+            did_ok()
+        }
+    });
+    let r = doctor(
+        Some(&format!("http://127.0.0.1:{port}")),
+        "http://127.0.0.1:1",
+    );
+    let line = r
+        .divergence_line()
+        .unwrap_or_else(|| panic!("no row:\n{}", r.stdout));
+    assert!(line.contains("(reachable)"), "got: {line}");
+}
+
+/// The transport stops at a redirect to another origin, so a node that redirects
+/// `/` elsewhere is not a working transport and the other origin is never contacted.
+#[test]
+fn a_cross_origin_redirect_is_refused_and_never_contacted() {
+    let (other, other_hits) = serve(|_, _| did_ok());
+    let (port, _) = serve(move |_, _| {
+        http(
+            "302 Found",
+            &format!("Location: http://127.0.0.1:{other}/\r\n"),
+            b"",
+        )
+    });
+    let r = doctor(
+        Some(&format!("http://127.0.0.1:{port}")),
+        "http://127.0.0.1:1",
+    );
+    let line = r
+        .divergence_line()
+        .unwrap_or_else(|| panic!("no row:\n{}", r.stdout));
+    assert!(
+        line.contains("HTTP 302"),
+        "a refused redirect surfaces the 3xx, got: {line}"
+    );
+    assert!(!line.contains("(reachable)"), "got: {line}");
     assert_eq!(
-        r.code,
-        Some(0),
-        "doctor must keep exiting 0, got:\n{}",
-        r.stdout
+        other_hits.load(Ordering::SeqCst),
+        0,
+        "the redirect target was contacted"
+    );
+}
+
+/// Same origin but a different request-target is also refused by the transport.
+#[test]
+fn a_request_target_changing_redirect_is_refused() {
+    let (port, _) = serve(|i, _| {
+        if i == 0 {
+            http("302 Found", "Location: /elsewhere\r\n", b"")
+        } else {
+            did_ok()
+        }
+    });
+    let r = doctor(
+        Some(&format!("http://127.0.0.1:{port}")),
+        "http://127.0.0.1:1",
+    );
+    let line = r
+        .divergence_line()
+        .unwrap_or_else(|| panic!("no row:\n{}", r.stdout));
+    assert!(line.contains("HTTP 302"), "got: {line}");
+}
+
+/// The helper keeps reqwest's environment proxy discovery, so a node that is only
+/// reachable through the configured proxy works for clone/push and must read as
+/// reachable here.
+#[test]
+fn a_node_reachable_only_through_the_configured_proxy_is_reachable() {
+    let (proxy, proxy_hits) = serve(|_, _| did_ok());
+    let r = doctor_with(
+        Some("http://node.invalid:7545"),
+        Some("http://127.0.0.1:1"),
+        &[("HTTP_PROXY", &format!("http://127.0.0.1:{proxy}"))],
+    );
+    let line = r
+        .divergence_line()
+        .unwrap_or_else(|| panic!("no row:\n{}", r.stdout));
+    assert!(line.contains("(reachable)"), "got: {line}");
+    assert!(
+        proxy_hits.load(Ordering::SeqCst) >= 1,
+        "the probe bypassed the proxy"
+    );
+}
+
+/// Loopback is not exempt from a configured proxy for the helper, so a listener
+/// that answers directly but sits behind a dead proxy fails clone/push and must
+/// not read as healthy here.
+#[test]
+fn a_loopback_node_behind_a_dead_proxy_is_not_reported_healthy() {
+    let (node, node_hits) = serve(|_, _| did_ok());
+    let r = doctor_with(
+        Some(&format!("http://127.0.0.1:{node}")),
+        Some("http://127.0.0.1:1"),
+        &[("HTTP_PROXY", "http://127.0.0.1:1")],
+    );
+    let line = r
+        .divergence_line()
+        .unwrap_or_else(|| panic!("no row:\n{}", r.stdout));
+    assert!(line.contains("unreachable"), "got: {line}");
+    assert_eq!(
+        node_hits.load(Ordering::SeqCst),
+        0,
+        "the probe bypassed the proxy"
+    );
+}
+
+/// A valid-looking identity at the head of an oversized body is still an
+/// unbounded read, so it is rejected rather than parsed.
+#[test]
+fn an_oversized_probe_body_is_rejected_not_parsed() {
+    let mut body = String::from(r#"{"did":"did:key:z6MkTestNode","pad":""#);
+    body.push_str(&"A".repeat(2 * 1024 * 1024));
+    body.push_str("\"}");
+    let (port, _) = serve(move |_, _| {
+        http(
+            "200 OK",
+            "Content-Type: application/json\r\n",
+            body.as_bytes(),
+        )
+    });
+    let r = doctor(
+        Some(&format!("http://127.0.0.1:{port}")),
+        "http://127.0.0.1:1",
+    );
+    let line = r
+        .divergence_line()
+        .unwrap_or_else(|| panic!("no row:\n{}", r.stdout));
+    assert!(line.contains("too large"), "got: {line}");
+    assert!(!line.contains("(reachable)"), "got: {line}");
+}
+
+/// Blank GITLAWB_NODE with no `--node`: clap hands doctor the raw blank value, and
+/// the remedy must not reproduce it. It names the public node instead.
+#[test]
+fn a_blank_env_remedy_does_not_reproduce_the_blank_value() {
+    for blank in ["   ", "\t"] {
+        let r = doctor_with(Some(blank), None, &[]);
+        let fix = fix_line(&r);
+        assert!(
+            fix.contains("export GITLAWB_NODE='https://node.twigpine.com'"),
+            "blank {blank:?} must be replaced by a valid target, got: {fix:?}\n{}",
+            r.stdout
+        );
+    }
+}
+
+/// A node value with an apostrophe must not close the quoting and run what follows.
+#[test]
+fn an_apostrophe_in_the_node_value_cannot_break_out_of_the_remedy() {
+    let r = doctor(None, "http://127.0.0.1:1/x'; touch /tmp/pwned; #'");
+    let fix = fix_line(&r);
+    assert!(
+        fix.contains(r#"'http://127.0.0.1:1/x'\''; touch /tmp/pwned; #'\'''"#),
+        "apostrophes must be escaped, got: {fix:?}"
     );
 }

@@ -126,15 +126,55 @@ fn decode_key(b64url: &str) -> Option<VerifyingKey> {
     VerifyingKey::from_bytes(&arr).ok()
 }
 
+/// Upper bound on the iCaptcha `/v1/pubkey` response body. The document is a
+/// handful of keys at most; anything larger is refused rather than buffered
+/// into memory (the unbounded `.json()` read this replaces, #507).
+const KEY_MAX_BODY_BYTES: usize = 8 * 1024;
+
+/// Read at most [`KEY_MAX_BODY_BYTES`] bytes of a key response. Returns `None`
+/// when the body exceeds the cap, so an oversized document is treated as absent
+/// exactly like a network error or a timeout (fail safe, never a partial key).
+async fn read_key_body(mut resp: reqwest::Response) -> Option<Vec<u8>> {
+    let mut buf = Vec::with_capacity(1024);
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let take = (KEY_MAX_BODY_BYTES - buf.len()).min(chunk.len());
+                buf.extend_from_slice(&chunk[..take]);
+                if take < chunk.len() {
+                    return None; // exceeded the cap mid-chunk
+                }
+            }
+            Ok(None) => return Some(buf),
+            Err(_) => return None,
+        }
+    }
+}
+
 async fn fetch_key(url: &str) -> Option<VerifyingKey> {
     let endpoint = format!("{}/v1/pubkey", url.trim_end_matches('/'));
     // Bounded request: a hung /v1/pubkey must never block node startup. On
     // timeout/error we return None and the gate stays inert (fail safe).
+    //
+    // No redirects and a capped body read: the key this fetch produces is the
+    // TRUST ANCHOR for the whole proof gate, so a 3xx must not be allowed to move
+    // where it comes from (anchor substitution / SSRF, matching the node's other
+    // outbound clients — `build_http_client` in main.rs, the sync worker), and
+    // the body is bounded rather than handed to `.json()`'s unbounded buffering.
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .ok()?;
-    let jwks: Jwks = client.get(&endpoint).send().await.ok()?.json().await.ok()?;
+    let resp = client.get(&endpoint).send().await.ok()?;
+    // A non-2xx response body is not a key: with Policy::none() a 3xx is
+    // surfaced rather than followed, but its own body must not be parsed
+    // either, or the redirect would move the anchor after all.
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body = read_key_body(resp).await?;
+    let jwks: Jwks = serde_json::from_slice(&body).ok()?;
     decode_key(&jwks.keys.first()?.x)
 }
 
@@ -646,5 +686,130 @@ mod tests {
         chars[0] = if chars[0] == 'A' { 'B' } else { 'A' };
         let tampered = format!("{}.{}", payload, chars.into_iter().collect::<String>());
         assert!(verify_token(&v, &tampered, SUB, IAT, false).is_err());
+    }
+
+    /// `{"keys":[{"x":"<base64url ed25519 point>"}]}` for the live `PUBKEY_X`.
+    fn jwks_body() -> Vec<u8> {
+        format!(r#"{{"keys":[{{"x":"{PUBKEY_X}"}}]}}"#).into_bytes()
+    }
+
+    /// The no-redirect / bounded-body client still parses a valid JWKS, so the
+    /// hardening did not break the happy path the gate depends on at startup.
+    #[tokio::test]
+    async fn fetch_key_parses_a_valid_jwks() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/v1/pubkey")
+            .with_status(200)
+            .with_header("Content-Type", "application/json")
+            .with_body(jwks_body())
+            .create_async()
+            .await;
+
+        let key = fetch_key(&server.url()).await.expect("valid JWKS parses");
+        assert_eq!(key, decode_key(PUBKEY_X).unwrap());
+    }
+
+    /// A 302 must not move the trust anchor. The redirect target serves a REAL
+    /// key, so following the redirect would make `fetch_key` adopt it; instead
+    /// `Policy::none()` leaves the 302's (non-JWKS) body as the answer → None.
+    #[tokio::test]
+    async fn fetch_key_does_not_follow_a_redirect() {
+        let mut target = mockito::Server::new_async().await;
+        let _t = target
+            .mock("GET", "/v1/pubkey")
+            .expect(0)
+            .with_status(200)
+            .with_header("Content-Type", "application/json")
+            .with_body(jwks_body())
+            .create_async()
+            .await;
+
+        let mut redirector = mockito::Server::new_async().await;
+        // Location points at the target's /v1/pubkey, so a client that DID
+        // follow the redirect would fetch the real key and return Some: the
+        // assertion below only holds while Policy::none() is in place.
+        let _r = redirector
+            .mock("GET", "/v1/pubkey")
+            .with_status(302)
+            .with_header("Location", &format!("{}/v1/pubkey", target.url()))
+            .create_async()
+            .await;
+
+        assert!(
+            fetch_key(&redirector.url()).await.is_none(),
+            "a redirect must not be followed to a host serving a valid key"
+        );
+    }
+
+    /// A body past the cap is refused rather than buffered, so a broken
+    /// endpoint cannot make the node materialize an arbitrarily large document.
+    /// The body is a VALID JWKS (`jwks_body()`) padded with JSON whitespace past
+    /// the cap, so an unbounded read would still parse it; this test only passes
+    /// because the byte cap refuses it.
+    #[tokio::test]
+    async fn fetch_key_rejects_an_oversized_body() {
+        let mut server = mockito::Server::new_async().await;
+        let mut oversized = jwks_body();
+        oversized.resize(KEY_MAX_BODY_BYTES + 1, b' ');
+        let _m = server
+            .mock("GET", "/v1/pubkey")
+            .with_status(200)
+            .with_header("Content-Type", "application/json")
+            .with_body(oversized)
+            .create_async()
+            .await;
+
+        assert!(
+            fetch_key(&server.url()).await.is_none(),
+            "an oversized body must be refused even when it is a valid JWKS"
+        );
+    }
+
+    /// A body of exactly the cap still parses: the contract refuses bodies that
+    /// EXCEED it, not bodies that reach it (the padded JWKS is exactly
+    /// KEY_MAX_BODY_BYTES bytes of otherwise-valid JSON).
+    #[tokio::test]
+    async fn fetch_key_accepts_a_body_at_the_cap() {
+        let mut server = mockito::Server::new_async().await;
+        let mut at_cap = jwks_body();
+        at_cap.resize(KEY_MAX_BODY_BYTES, b' ');
+        let _m = server
+            .mock("GET", "/v1/pubkey")
+            .with_status(200)
+            .with_header("Content-Type", "application/json")
+            .with_body(at_cap)
+            .create_async()
+            .await;
+
+        let key = fetch_key(&server.url()).await.expect("at-cap JWKS parses");
+        assert_eq!(key, decode_key(PUBKEY_X).unwrap());
+    }
+
+    /// A non-2xx response never supplies the anchor, even when its body is a
+    /// perfectly valid JWKS: the redirect pin only stops the hop, and the
+    /// status gate is what stops the 3xx's own body from being adopted.
+    #[tokio::test]
+    async fn fetch_key_rejects_a_non_success_status() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/v1/pubkey")
+            .with_status(500)
+            .with_header("Content-Type", "application/json")
+            .with_body(jwks_body())
+            .create_async()
+            .await;
+
+        assert!(
+            fetch_key(&server.url()).await.is_none(),
+            "a non-2xx body must not be adopted as the anchor even when it parses"
+        );
+    }
+
+    /// An unreachable endpoint is the same fail-safe None as every other fetch
+    /// error: the gate stays inert rather than the node failing to start.
+    #[tokio::test]
+    async fn fetch_key_returns_none_when_the_endpoint_is_unreachable() {
+        assert!(fetch_key("http://127.0.0.1:1").await.is_none());
     }
 }

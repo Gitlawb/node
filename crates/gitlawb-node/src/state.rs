@@ -21,6 +21,19 @@ const SCAN_TOKEN_KEY_SALT: &[u8] = b"gitlawb/hkdf-salt/ipfs-scan-token";
 /// front) and needs no migration, no config, and no change to this function.
 const SCAN_TOKEN_KEY_INFO: &[u8] = b"gitlawb/ipfs-scan-token/v1";
 
+/// HKDF salt for [`AppState::derive_webhook_secret_key`]. A constant, not a
+/// secret: the confidentiality of the derived key rests on the node's private
+/// seed being the input keying material, exactly as for the scan-token key.
+const WEBHOOK_SECRET_KEY_SALT: &[u8] = b"gitlawb/hkdf-salt/webhook-secret";
+
+/// HKDF `info` for [`AppState::derive_webhook_secret_key`]: the domain
+/// separation from the scan-token key that shares the same input keying
+/// material. Unlike the scan-token key, bumping the version is NOT a safe
+/// rotation: sealed secrets persist, `open` has no old-key fallback, and a new
+/// version renders every stored ciphertext permanently unopenable until a
+/// re-seal path exists.
+const WEBHOOK_SECRET_KEY_INFO: &[u8] = b"gitlawb/webhook-secret/v1";
+
 #[derive(Clone, Debug)]
 pub struct RefUpdateBroadcast {
     pub repo: String,
@@ -59,6 +72,11 @@ pub struct AppState {
     pub task_event_tx: tokio::sync::broadcast::Sender<TaskEventBroadcast>,
     /// GraphQL schema (queries + mutations + subscriptions)
     pub graphql_schema: Arc<crate::graphql::GitlawbSchema>,
+    pub graphql_ws_schema: Arc<crate::graphql::GitlawbWsSchema>,
+    /// MAC key for task-list continuation tokens, derived from the node
+    /// keypair seed. Held here (and handed to the GraphQL schema) so REST and
+    /// GraphQL mint and accept the same tokens.
+    pub task_cursor_key: crate::api::task_cursor::TaskCursorKey,
     /// Fly.io machine ID — used for fly-replay routing in multi-machine deployments
     pub machine_id: Option<String>,
     /// Centralized repo storage: local disk cache + optional Tigris backend
@@ -75,10 +93,29 @@ pub struct AppState {
     /// resolved client IP is what actually stops a single-source flood (same
     /// rationale as `push_rate_limiter`). Keyed by `push_limiter_trust`.
     pub create_ip_rate_limiter: RateLimiter,
+    /// Per-client-IP rate limiter for the authenticated write surface that is
+    /// not repo/agent creation: issue/PR comments, labels, stars, merges,
+    /// protect/unprotect, replicas, webhook create/delete, visibility (its GET
+    /// shares the group), tasks, bounties, profile, and every HTTP `/graphql`
+    /// request (queries and the playground GET as well as mutations; the
+    /// WebSocket route is excluded). Issue comment and issue close debit it in
+    /// the handler after the read gate, not via router middleware; close also
+    /// draws on `close_issue_rate_limiter` and spends neither bucket when
+    /// either refuses. Separate bucket from `create_ip_rate_limiter`
+    /// (its own budget, per the `sync_trigger`/`peer_write` precedent) so a
+    /// write flood cannot drain the creation budget and vice versa. Per-DID is
+    /// deliberately NOT paired here: a DID farm never trips it, and busy
+    /// legitimate agents would false-positive. `GITLAWB_WRITE_RATE_LIMIT`
+    /// overrides the default, 0 disables. Keyed by `push_limiter_trust`.
+    pub write_rate_limiter: RateLimiter,
     /// Per-client-IP rate limiter for git-receive-pack. Per-DID limits cannot
     /// brake a push flood from a DID farm (one throwaway DID per repo), so the
     /// push path throttles on the resolved client IP instead.
     pub push_rate_limiter: RateLimiter,
+    /// Per-client-IP rate limiter for `close_issue`'s pre-lock snapshot path.
+    /// Distinct from `push_rate_limiter` so a flood of close attempts cannot
+    /// drain the receive-pack budget for the same source IP.
+    pub close_issue_rate_limiter: RateLimiter,
     /// Per-client-IP ROUTE brake for `GET /ipfs/{cid}`: charged ONCE per request by the
     /// `rate_limit_by_ip` middleware (server.rs), never inside the handler. It bounds
     /// request RATE (the "requests per hour" contract of `GITLAWB_IPFS_RATE_LIMIT`) on
@@ -165,6 +202,11 @@ pub struct AppState {
     /// already has on disk, so derivation is also the smaller mechanism. Rotation is a
     /// bump of the version in [`SCAN_TOKEN_KEY_INFO`].
     pub ipfs_scan_token_key: Arc<[u8; 32]>,
+    /// Key sealing webhook HMAC secrets at rest (#506), derived from the node's
+    /// persistent identity by [`AppState::derive_webhook_secret_key`]. The
+    /// webhook delivery path opens a secret with it only at signing time; the
+    /// `webhooks.secret` column stores the ciphertext (see `webhook_secret`).
+    pub webhook_secret_key: Arc<[u8; 32]>,
     /// Hard ceiling on the byte size of an object `GET /ipfs/{cid}` will buffer and
     /// serve (default `api::ipfs::MAX_SERVED_OBJECT_BYTES`). The serve reads via a
     /// blocking `git cat-file` and buffers the whole object; without a bound a large
@@ -186,6 +228,9 @@ pub struct AppState {
     /// sink as trigger and accepts unsigned requests from known peers, so it is
     /// braked too; each peer's distinct IP gets its own bucket.
     pub peer_write_rate_limiter: RateLimiter,
+    /// Per-client-IP federation budget: 12 requests per minute, with at most
+    /// 10,000 tracked source keys. Shared by router instances and swept below.
+    pub federated_rate_limiter: RateLimiter,
     /// Process-wide graceful-shutdown signal. Sending `true` causes every
     /// task that holds a `watch::Receiver` to exit at its next await point.
     /// Used by:
@@ -319,6 +364,16 @@ pub struct AppState {
     /// (`with_default_max_keys`, reject-before-insert) so a source-key farm cannot grow
     /// it (INV-15).
     pub git_ipfs_walk_per_caller: crate::rate_limit::PerCallerConcurrency,
+    /// Per-client-IP rate limiter for the task read routes. `GET /api/v1/tasks`
+    /// and `GET /api/v1/tasks/{id}` are anonymously reachable and run the #268
+    /// visibility gate (a task lookup plus deduped-repo and visibility-rule
+    /// queries) before returning the opaque 404, so an unauthenticated prober
+    /// costs the node real work per request whether or not anything is visible.
+    /// Keyed on the resolved client IP via `push_limiter_trust`. Layered on
+    /// `task_read_routes` via `rate_limit_by_ip`.
+    /// The same per-IP hourly budget applies to GraphQL `tasks` / `task`
+    /// queries and WebSocket task queries via `TaskReadBrake`.
+    pub task_read_rate_limiter: RateLimiter,
     /// The `git` executable the served-git withheld-blob walk spawns. Production is
     /// `"git"` (resolved via PATH); injectable so a fake `git` can drive the walk's
     /// process-group teardown in handler tests without mutating the process-global
@@ -331,21 +386,6 @@ impl AppState {
     /// initial value matches the current state.
     pub fn subscribe_shutdown(&self) -> tokio::sync::watch::Receiver<bool> {
         self.shutdown_tx.subscribe()
-    }
-
-    /// Sweep expired entries from every per-IP/DID rate limiter. Driven by the
-    /// periodic cleanup task so a bounded limiter's key map sheds stale entries
-    /// instead of sitting near its cap until an inline capacity sweep reclaims
-    /// them. Every limiter on the state is swept here; adding a new limiter means
-    /// adding it to this list.
-    pub(crate) async fn sweep_rate_limiters(&self) {
-        self.rate_limiter.cleanup().await;
-        self.create_ip_rate_limiter.cleanup().await;
-        self.push_rate_limiter.cleanup().await;
-        self.ipfs_rate_limiter.cleanup().await;
-        self.ipfs_work_rate_limiter.cleanup().await;
-        self.sync_trigger_rate_limiter.cleanup().await;
-        self.peer_write_rate_limiter.cleanup().await;
     }
 
     /// Trigger graceful shutdown. Idempotent — calling more than once
@@ -367,6 +407,26 @@ impl AppState {
     #[allow(dead_code)] // used by tests and any future handler that wants to short-circuit
     pub fn is_shutting_down(&self) -> bool {
         *self.shutdown_tx.borrow()
+    }
+
+    /// Reclaim expired entries from EVERY rate limiter. Single source of truth for
+    /// the periodic cleanup loop (main.rs), co-located with the limiter fields so a
+    /// newly-added limiter is cleaned here rather than silently omitted from a
+    /// hand-maintained list in main() (H2: `write_rate_limiter` was the omitted
+    /// one). Every limiter field above MUST be swept here; the guard test
+    /// `cleanup_rate_limiters_reaps_the_write_limiter` fails if it is not.
+    pub(crate) async fn cleanup_rate_limiters(&self) {
+        self.rate_limiter.cleanup().await;
+        self.create_ip_rate_limiter.cleanup().await;
+        self.write_rate_limiter.cleanup().await;
+        self.push_rate_limiter.cleanup().await;
+        self.close_issue_rate_limiter.cleanup().await;
+        self.ipfs_rate_limiter.cleanup().await;
+        self.ipfs_work_rate_limiter.cleanup().await;
+        self.sync_trigger_rate_limiter.cleanup().await;
+        self.peer_write_rate_limiter.cleanup().await;
+        self.task_read_rate_limiter.cleanup().await;
+        self.federated_rate_limiter.cleanup().await;
     }
 
     /// Legacy-probe budget wired from the `GITLAWB_IPFS_MAX_LEGACY_PROBES` operator
@@ -407,20 +467,48 @@ impl AppState {
     ///     identity, the token format, or any caller, so rotation is a constant change
     ///     rather than a fork of this derivation.
     pub(crate) fn derive_scan_token_key(keypair: &Keypair) -> [u8; 32] {
+        Self::hkdf_sha256(
+            SCAN_TOKEN_KEY_SALT,
+            SCAN_TOKEN_KEY_INFO,
+            keypair.to_seed().as_slice(),
+        )
+    }
+
+    /// Derive the at-rest webhook-secret sealing key from the node identity.
+    ///
+    /// Same HKDF construction as [`AppState::derive_scan_token_key`] under its
+    /// own [`WEBHOOK_SECRET_KEY_INFO`]/[`WEBHOOK_SECRET_KEY_SALT`] pair, so it
+    /// is derived (a restart re-derives the same key, and old secrets remain
+    /// readable) yet domain-separated from the signing key and the scan-token
+    /// key. The doc on [`SCAN_TOKEN_KEY_INFO`] argues why derivation (not a
+    /// boot-random key) is the right trade: the secret's confidentiality still
+    /// rests on the node's private seed. Rotation is NOT a version bump here,
+    /// unlike for the scan-token key: [`WEBHOOK_SECRET_KEY_INFO`] explains that
+    /// bumping renders every stored ciphertext unopenable until a re-seal path
+    /// exists.
+    pub(crate) fn derive_webhook_secret_key(keypair: &Keypair) -> [u8; 32] {
+        Self::hkdf_sha256(
+            WEBHOOK_SECRET_KEY_SALT,
+            WEBHOOK_SECRET_KEY_INFO,
+            keypair.to_seed().as_slice(),
+        )
+    }
+
+    /// HKDF-Extract-then-Expand (RFC 5869) over the node seed: PRK =
+    /// HMAC(salt, ikm), then one expand block T(1) = HMAC(PRK, info || 0x01).
+    /// One 32-byte output needs exactly one block of SHA-256, so there is no
+    /// counter loop to get wrong. Salt and info are the caller's domain
+    /// separation; shared by every identity-derived key in this module.
+    fn hkdf_sha256(salt: &[u8], info: &[u8], ikm: &[u8]) -> [u8; 32] {
         use hmac::{Hmac, Mac};
         type HmacSha256 = Hmac<sha2::Sha256>;
 
-        let seed = keypair.to_seed();
-        // HKDF-Extract: PRK = HMAC(salt, ikm).
-        let mut extract =
-            HmacSha256::new_from_slice(SCAN_TOKEN_KEY_SALT).expect("HMAC takes a key of any size");
-        extract.update(seed.as_slice());
+        let mut extract = HmacSha256::new_from_slice(salt).expect("HMAC takes a key of any size");
+        extract.update(ikm);
         let prk = extract.finalize().into_bytes();
-        // HKDF-Expand, one block: T(1) = HMAC(PRK, info || 0x01). One 32-byte output
-        // needs exactly one block of SHA-256, so there is no counter loop to get wrong.
         let mut expand =
             HmacSha256::new_from_slice(prk.as_slice()).expect("HMAC takes a key of any size");
-        expand.update(SCAN_TOKEN_KEY_INFO);
+        expand.update(info);
         expand.update(&[0x01]);
         expand.finalize().into_bytes().into()
     }
@@ -1199,6 +1287,35 @@ mod repo_identity_key_tests {
         assert_eq!(
             repo_identity_key("did:web:example.com:alice", "r"),
             repo_identity_key("did:web:example.com/alice", "r"),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// H2 guard: the write-surface limiter must be reaped by the shared cleanup
+    /// routine. Seeds a reclaimable entry into `write_rate_limiter` and asserts
+    /// `cleanup_rate_limiters` removes it. Goes RED if `write_rate_limiter` is
+    /// dropped from `cleanup_rate_limiters` — the exact H2 omission, now guarded.
+    #[tokio::test]
+    async fn cleanup_rate_limiters_reaps_the_write_limiter() {
+        let state = crate::test_support::test_state_lazy();
+        state
+            .write_rate_limiter
+            .insert_reclaimable_for_test("some-ip")
+            .await;
+        assert_eq!(
+            state.write_rate_limiter.tracked_keys().await,
+            1,
+            "precondition: the reclaimable entry is tracked"
+        );
+
+        state.cleanup_rate_limiters().await;
+
+        assert_eq!(
+            state.write_rate_limiter.tracked_keys().await,
+            0,
+            "write_rate_limiter must be reaped by cleanup_rate_limiters (H2)"
         );
     }
 }

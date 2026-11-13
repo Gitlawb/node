@@ -6,29 +6,24 @@ use axum::Json;
 use crate::auth::AuthenticatedDid;
 use crate::error::{AppError, Result};
 use crate::state::AppState;
-use crate::visibility::{visibility_check, Decision};
 
 /// GET /api/v1/repos/{owner}/{repo}/encrypted-blobs
 /// Returns [{oid, cid}] for every encrypted blob in the repo, to any caller who
 /// can read the repo. Not recipient-scoped: recipient identities are not stored,
 /// so access control here is repo readability and decryption is gated by the
 /// envelope crypto (only a real recipient can open an envelope).
+///
+/// Quarantined repos are opaque 404 via [`crate::api::authorize_repo_read`] —
+/// same as issues/changelogs — so a public-but-quarantined mirror cannot leak
+/// its encrypted blob index.
 pub async fn list_encrypted_blobs(
     State(state): State<AppState>,
     auth: Option<Extension<AuthenticatedDid>>,
     Path((owner, repo)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
-    let rules = state.db.list_visibility_rules(&record.id).await?;
-    if visibility_check(&rules, record.is_public, &record.owner_did, caller, "/") == Decision::Deny
-    {
-        return Err(AppError::RepoNotFound(format!("{owner}/{repo}")));
-    }
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, caller, "/").await?;
     let rows = state.db.list_all_encrypted_blobs(&record.id).await?;
     let blobs: Vec<_> = rows
         .into_iter()
@@ -45,17 +40,9 @@ pub async fn get_encrypted_blob(
     auth: Option<Extension<AuthenticatedDid>>,
     Path((owner, repo, oid)): Path<(String, String, String)>,
 ) -> Result<Vec<u8>> {
-    let record = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
-    let rules = state.db.list_visibility_rules(&record.id).await?;
-    if visibility_check(&rules, record.is_public, &record.owner_did, caller, "/") == Decision::Deny
-    {
-        return Err(AppError::RepoNotFound(format!("{owner}/{repo}/{oid}")));
-    }
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, caller, "/").await?;
     let cid = state
         .db
         .encrypted_blob_cid(&record.id, &oid)
@@ -81,17 +68,9 @@ pub async fn replicate_encrypted_blobs(
     auth: Option<Extension<AuthenticatedDid>>,
     Path((owner, repo)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
-    let rules = state.db.list_visibility_rules(&record.id).await?;
-    if visibility_check(&rules, record.is_public, &record.owner_did, caller, "/") == Decision::Deny
-    {
-        return Err(AppError::RepoNotFound(format!("{owner}/{repo}")));
-    }
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, caller, "/").await?;
     let rows = state.db.list_all_encrypted_blobs(&record.id).await?;
     let blobs: Vec<_> = rows
         .into_iter()

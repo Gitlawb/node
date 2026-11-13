@@ -50,6 +50,17 @@ pub async fn create_pr(
     let target_branch = req
         .target_branch
         .unwrap_or_else(|| record.default_branch.clone());
+
+    // Validate both refs before they are stored, since both are later
+    // interpolated into git argv (git diff / worktree add / merge). Validate the
+    // RESOLVED target, not just a caller-supplied one: create_repo also gates
+    // default_branch, but validating here as well means a PR can never feed the
+    // git sink an unchecked ref even if a default was poisoned by an older row
+    // or a future path that skips create_repo's gate.
+    crate::api::validate_git_ref_with_git(&state.git_bin, &req.source_branch)
+        .map_err(crate::api::map_git_ref_validation_error)?;
+    crate::api::validate_git_ref_with_git(&state.git_bin, &target_branch)
+        .map_err(crate::api::map_git_ref_validation_error)?;
     let number = state.db.next_pr_number(&record.id).await?;
     let now = Utc::now().to_rfc3339();
 
@@ -84,6 +95,7 @@ pub async fn create_pr(
     webhooks::fire_event(
         std::sync::Arc::clone(&state.db),
         std::sync::Arc::clone(&state.http_client),
+        std::sync::Arc::clone(&state.webhook_secret_key),
         &record.id,
         "pull_request.opened",
         serde_json::json!({
@@ -188,11 +200,8 @@ pub async fn merge_pr(
     Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, name, number)): Path<(String, String, i64)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, Some(auth.0.as_str()), "/").await?;
 
     // Owner-only merge (N7). Merging writes the served tree, so this is the same
     // trust boundary as owner-only push; it subsumes branch protection (a
@@ -209,9 +218,6 @@ pub async fn merge_pr(
         return Err(AppError::BadRequest(format!("PR is already {}", pr.status)));
     }
 
-    // Shed 503 + Retry-After on an exhausted write-lock POOL instead of a generic
-    // git 500 (#173 F1). Merging holds no admission permit, so it reaches the pool
-    // unthrottled; reuse the push handler's mapping so the two cannot drift.
     let guard = state
         .repo_store
         .acquire_write(&record.owner_did, &record.name)
@@ -219,6 +225,19 @@ pub async fn merge_pr(
         .map_err(|e| crate::api::repos::acquire_write_app_error(&e, &name))?;
     let disk_path = guard.path().to_path_buf();
     let merger_did = auth.0;
+
+    // Snapshot the target ref's pre-merge OID so a refused durable upload can
+    // rewind the local merge, mirroring the close_issue / create_issue
+    // compensating pattern. A read failure or an absent ref (a first-commit
+    // merge onto an unborn branch) yields no rollback closure: the merge still
+    // applies and a refused publish still surfaces as 5xx.
+    let target_ref = format!("refs/heads/{}", pr.target_branch);
+    let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+    let prior_tip = store::read_ref_bounded(&state.git_bin, &disk_path, &target_ref, git_timeout)
+        .await
+        .ok()
+        .flatten();
+
     let merge_result = store::merge_branch(
         &disk_path,
         &pr.target_branch,
@@ -228,7 +247,30 @@ pub async fn merge_pr(
     );
 
     // Always release the advisory lock — even on error; upload to Tigris only on success.
-    guard.release(merge_result.is_ok()).await;
+    // Short-circuit on a refused publish before the PR is marked merged and
+    // before the webhook fires. Both are irreversible announcements of a merge
+    // commit that only exists on this node's disk.
+    let release_result = match (merge_result.is_ok(), prior_tip) {
+        (true, Some(tip)) => {
+            let git_bin = state.git_bin.clone();
+            let deadline = std::time::Instant::now() + git_timeout;
+            guard
+                .release_compensating(true, move |path| {
+                    crate::git::visibility_pack::run_bounded_git(
+                        &git_bin,
+                        &["update-ref", &target_ref, &tip],
+                        path,
+                        b"",
+                        deadline,
+                    )
+                    .map(|_| ())
+                })
+                .await
+                .into_result()
+        }
+        _ => guard.release(merge_result.is_ok()).await.into_result(),
+    };
+    release_result?;
 
     let merge_sha = merge_result.map_err(|e| AppError::Git(e.to_string()))?;
 
@@ -238,6 +280,7 @@ pub async fn merge_pr(
     webhooks::fire_event(
         std::sync::Arc::clone(&state.db),
         std::sync::Arc::clone(&state.http_client),
+        std::sync::Arc::clone(&state.webhook_secret_key),
         &record.id,
         "pull_request.merged",
         serde_json::json!({
@@ -263,11 +306,8 @@ pub async fn close_pr(
     Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, name, number)): Path<(String, String, i64)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, Some(auth.0.as_str()), "/").await?;
 
     let pr = state
         .db
@@ -289,6 +329,7 @@ pub async fn close_pr(
     webhooks::fire_event(
         std::sync::Arc::clone(&state.db),
         std::sync::Arc::clone(&state.http_client),
+        std::sync::Arc::clone(&state.webhook_secret_key),
         &record.id,
         "pull_request.closed",
         serde_json::json!({
@@ -339,6 +380,7 @@ pub async fn create_review(
     webhooks::fire_event(
         std::sync::Arc::clone(&state.db),
         std::sync::Arc::clone(&state.http_client),
+        std::sync::Arc::clone(&state.webhook_secret_key),
         &record.id,
         "pull_request.reviewed",
         serde_json::json!({
@@ -428,12 +470,138 @@ pub async fn list_comments(
     Ok(Json(serde_json::json!({ "comments": comments })))
 }
 
-/// #173 F1 follow-up: `merge_pr` reaches `acquire_write` holding NO admission permit
-/// (unlike the push handler, which is capped by the git-push semaphore), so it is one
-/// of the callers most likely to meet an exhausted write-lock POOL under load. An
-/// exhausted pool is a capacity signal, so the merge must shed 503 + Retry-After
-/// (`AppError::Overloaded`) the way the push handler does, not report the generic
-/// 500 git error that says nothing about retrying.
+#[cfg(test)]
+mod merge_rollback_tests {
+    use super::*;
+    use axum::response::IntoResponse;
+    use sqlx::PgPool;
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(["-C", &*dir.to_string_lossy()])
+            .args([
+                "-c",
+                "user.name=merge-rollback-test",
+                "-c",
+                "user.email=merge-rollback-test@example.com",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Build a bare repo whose `main` and `feature` refs diverge: one root
+    /// commit on main, one commit on feature, so merge_branch creates a real
+    /// merge commit that a refused publish must rewind.
+    fn seeded_merge_repo(dir: &std::path::Path) -> (String, String) {
+        crate::git::store::init_bare(dir).expect("bare repo");
+        let empty_tree = git(dir, &["mktree"]);
+        let root = git(dir, &["commit-tree", &empty_tree, "-m", "root"]);
+        git(dir, &["update-ref", "refs/heads/main", &root]);
+        let tip2 = git(
+            dir,
+            &["commit-tree", &empty_tree, "-m", "feature", "-p", &root],
+        );
+        git(dir, &["update-ref", "refs/heads/feature", &tip2]);
+        (root, tip2)
+    }
+
+    /// On a definite publish refusal, the local merge commit must be rewound:
+    /// the client got a 5xx, so the repo cannot show a merge the mirror never
+    /// learned about (same contract create_issue's rollback enforces).
+    #[sqlx::test]
+    async fn merge_pr_rewinds_local_merge_when_publish_refuses(pool: PgPool) {
+        // Endpoint that answers HEAD with an etag but refuses every write.
+        let app = axum::Router::new().route(
+            "/{*key}",
+            axum::routing::any(|method: axum::http::Method| async move {
+                if method == axum::http::Method::HEAD {
+                    let mut resp = axum::http::StatusCode::OK.into_response();
+                    resp.headers_mut()
+                        .insert("etag", axum::http::HeaderValue::from_static("\"gen-1\""));
+                    resp
+                } else {
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let owner = "did:key:zMERGEROLLBACKAAAAAAAAAAAAAAAAAAAAAAAA";
+        let repo_name = "rollback-merge";
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let disk = tempfile::TempDir::new().unwrap();
+        let repo_path = disk.path().join("repo.git");
+        let (main_tip, _feature_tip) = seeded_merge_repo(&repo_path);
+
+        let mut seeded = crate::db::RepoRecord {
+            id: Uuid::new_v4().to_string(),
+            name: repo_name.to_string(),
+            owner_did: owner.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            disk_path: String::new(),
+            forked_from: None,
+            machine_id: None,
+        };
+        seeded.disk_path = repo_path.to_string_lossy().to_string();
+        let repo_id = seeded.id.clone();
+        state.db.create_repo(&seeded).await.expect("seed repo");
+        let now = Utc::now().to_rfc3339();
+        state
+            .db
+            .create_pr(&PullRequest {
+                id: Uuid::new_v4().to_string(),
+                repo_id,
+                number: 1,
+                title: "rb".to_string(),
+                body: None,
+                author_did: owner.to_string(),
+                source_branch: "feature".to_string(),
+                target_branch: "main".to_string(),
+                status: "open".to_string(),
+                merged_by_did: None,
+                merged_at: None,
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .await
+            .expect("seed PR");
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing_with_tigris(
+            disk.path().to_path_buf(),
+            crate::git::repo_store::build_lock_pool(&pool, 2, std::time::Duration::from_secs(1)),
+            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint),
+        );
+
+        let res = merge_pr(
+            State(state),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((owner.to_string(), repo_name.to_string(), 1)),
+        )
+        .await;
+        assert!(res.is_err(), "a refused publish must surface an error");
+
+        let tip_after = git(&repo_path, &["rev-parse", "refs/heads/main"]);
+        assert_eq!(
+            tip_after, main_tip,
+            "a refused publish must rewind the local merge to the pre-merge tip"
+        );
+    }
+}
+
+/// #173 F1 follow-up: merge holds no admission permit, so an exhausted write-lock
+/// pool must shed 503 + Retry-After.
 #[cfg(test)]
 mod lock_pool_shed_tests {
     use super::*;
@@ -457,20 +625,15 @@ mod lock_pool_shed_tests {
         }
     }
 
-    /// RED-before/GREEN-after for `merge_pr`. Both directions: the shed while the only
-    /// lock-pool connection is held by a guard on a DIFFERENT repo (so this is pool
-    /// capacity, not advisory-lock contention on this repo), and the must-not case
-    /// once that connection is back.
     #[sqlx::test]
     async fn merge_pr_lock_pool_exhaustion_sheds_503_not_500(pool: PgPool) {
         let owner = "did:key:zMERGELOCKPOOLOWNERAAAAAAAAAAAAAAAAAAAAA";
         let mut state = crate::test_support::test_state(pool.clone()).await;
-        // One lock-pool connection with a short checkout timeout, so a single held
-        // guard exhausts it promptly rather than at the pool default.
         state.repo_store = crate::git::repo_store::RepoStore::new(
             std::path::PathBuf::from("/tmp/gitlawb-pulls-lockpool"),
             None,
             crate::git::repo_store::build_lock_pool(&pool, 1, std::time::Duration::from_secs(1)),
+            std::time::Duration::from_secs(300),
         );
 
         let repo = seed_repo(owner, "lp-merge");
@@ -524,9 +687,7 @@ mod lock_pool_shed_tests {
             "merge_pr: a capacity shed must tell the client when to retry"
         );
 
-        // MUST-NOT: with the pool free again the merge is not shed as capacity (it
-        // fails later on the nonexistent on-disk repo, which is a git 500).
-        held.release(false).await;
+        let _ = held.release(false).await;
         let admitted = merge_pr(
             State(state.clone()),
             Extension(AuthenticatedDid(owner.to_string())),
