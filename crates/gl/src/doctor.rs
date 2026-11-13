@@ -13,7 +13,9 @@ use anyhow::Result;
 use clap::Args;
 use std::path::PathBuf;
 
-use crate::http::NodeClient;
+use gitlawb_core::resolve_transport_node;
+
+use crate::http::{sanitize_node_msg, NodeClient};
 
 const PUBLIC_NODE: &str = "https://node.twigpine.com";
 const GITHUB_API_BASE: &str = "https://api.github.com";
@@ -183,9 +185,47 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
     }
 
     // ── 3. GITLAWB_NODE env var ───────────────────────────────────────────
-    checks.push(gitlawb_node_env_check(
-        std::env::var("GITLAWB_NODE").ok().as_deref(),
-    ));
+    // The node `git clone` / `git push` will contact is not always the node `gl`
+    // contacts: `--node` defaults to the public node and an explicit flag outranks
+    // the environment, so the two diverge whenever the variable is unset, blank, or
+    // overridden. Probing only `gl`'s node is what let doctor greenlight an install
+    // whose transport was dead, so resolve the transport's node through the same
+    // function the helper uses and report on that one.
+    let env_node = std::env::var("GITLAWB_NODE").ok();
+    let transport_node = resolve_transport_node(env_node.as_deref());
+    let gl_node = sanitize_node_msg(&args.node);
+
+    if transport_node == args.node {
+        // gl and the transport agree, so one row covers both.
+        checks.push(gitlawb_node_env_check(Some(&gl_node)));
+    } else {
+        let verdict = probe_transport(&transport_node).await;
+        let detail = format!(
+            "git push/clone will use {} ({}); gl targets {gl_node}",
+            sanitize_node_msg(&transport_node),
+            verdict.detail
+        );
+        // The remedy is shell input, so it is built from the canonical value and
+        // quoted for the shell. The display string above is capped and stripped for
+        // the terminal, which is a different encoding and must not be reused here.
+        let fix = format!(
+            "export GITLAWB_NODE={}",
+            shell_single_quote(&recovery_target(&args.node))
+        );
+        // Tiering follows who chose the broken value. An unset variable on a stock
+        // install is advisory: `gl` works, only `git push`/`git clone` do not, and
+        // #357 requires that install to keep exiting 0. A variable the user set to
+        // something unusable is a real misconfiguration.
+        let env_was_set = env_node
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|v| !v.is_empty());
+        if verdict.usable || !env_was_set {
+            checks.push(Check::warn("GITLAWB_NODE", detail, fix));
+        } else {
+            checks.push(Check::fail("GITLAWB_NODE", detail, fix));
+        }
+    }
 
     // ── 4. Node connectivity ──────────────────────────────────────────────
     // GITLAWB_NODE="" binds args.node to "" through clap, and check 3 groups
@@ -301,7 +341,13 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
 
     // ── 7. Version up to date ─────────────────────────────────────────────
     let current = env!("CARGO_PKG_VERSION");
-    checks.push(check_version(current, GITHUB_API_BASE).await);
+    // Production uses the real endpoint; the override exists so the subprocess tests
+    // can route the release lookup to a local fixture instead of the public API.
+    let github_api = std::env::var("GITLAWB_GITHUB_API_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| GITHUB_API_BASE.to_string());
+    checks.push(check_version(current, &github_api).await);
 
     // ── Render ────────────────────────────────────────────────────────────
     for check in &checks {
@@ -351,6 +397,98 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Outcome of probing the node the git transport will use.
+struct TransportVerdict {
+    /// True only when the endpoint identified itself as a gitlawb node. A bare 200
+    /// is not enough: any local service answering on that port would otherwise be
+    /// reported as a working transport, which is the false green this check exists
+    /// to catch.
+    usable: bool,
+    detail: String,
+}
+
+/// Cap on the root document the probe reads. A gitlawb node's `/` is a few hundred
+/// bytes of identity; anything near this size is not one.
+const PROBE_BODY_CAP: usize = 16 * 1024;
+
+/// Quote `s` as one POSIX shell word. Single quotes are the only construct that
+/// needs care inside single quotes: close, emit an escaped quote, reopen.
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// The value the remedy tells the user to export, taken from the normalized node
+/// (blank means the public node, as for the connectivity probe) and not truncated.
+/// A value carrying terminal control characters is not something to hand back for
+/// pasting, so the public node stands in for it.
+fn recovery_target(node: &str) -> String {
+    let target = effective_node_url(node).trim();
+    if gitlawb_core::sanitize::strip_terminal_controls(target) == target {
+        target.to_string()
+    } else {
+        PUBLIC_NODE.to_string()
+    }
+}
+
+/// Probe `url` and describe what is actually there.
+///
+/// This models the git helper, so it takes the helper's network policy: the shared
+/// same-origin redirect decision and chain bound, and reqwest's default environment
+/// proxy discovery (the helper does not opt out of it either, so a node reachable
+/// only through the configured proxy is reachable here, and a loopback node behind a
+/// dead proxy is not). It is deliberately not `NodeClient`, because it must not
+/// inherit the 30s request timeout, which stalls every stock `gl doctor` run behind
+/// a hung listener, and it sends no credentials.
+async fn probe_transport(url: &str) -> TransportVerdict {
+    let client = match reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::custom(
+            crate::http::same_origin_redirect,
+        ))
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return TransportVerdict {
+                usable: false,
+                detail: format!("probe failed: {}", sanitize_node_msg(&e.to_string())),
+            }
+        }
+    };
+    let target = format!("{}/", url.trim_end_matches('/'));
+    match client.get(&target).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let body = crate::http::read_body_capped(resp, PROBE_BODY_CAP).await;
+            if body.truncated || body.read_failed {
+                return TransportVerdict {
+                    usable: false,
+                    detail: "response too large or incomplete for a gitlawb node".to_string(),
+                };
+            }
+            let info = serde_json::from_str::<serde_json::Value>(&body.text).unwrap_or_default();
+            if info["did"].as_str().is_some() {
+                TransportVerdict {
+                    usable: true,
+                    detail: "reachable".to_string(),
+                }
+            } else {
+                TransportVerdict {
+                    usable: false,
+                    detail: "something is listening but it is not a gitlawb node".to_string(),
+                }
+            }
+        }
+        Ok(resp) => TransportVerdict {
+            usable: false,
+            detail: format!("returned HTTP {}", resp.status()),
+        },
+        Err(e) => TransportVerdict {
+            usable: false,
+            detail: format!("unreachable: {}", sanitize_node_msg(&e.to_string())),
+        },
+    }
 }
 
 /// Classify the `GITLAWB_NODE` env var for `gl doctor`. Extracted so unit
@@ -564,6 +702,49 @@ fn is_newer(latest: &str, current: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The quoted word must reach a real shell as exactly one value and run nothing
+    /// else, for the inputs that break naive single-quoting.
+    #[test]
+    fn shell_single_quote_round_trips_through_sh() {
+        let marker = std::env::temp_dir().join(format!("gl-doctor-quote-{}", std::process::id()));
+        let cases = [
+            "plain".to_string(),
+            "it's".to_string(),
+            "x'; touch MARK; #'".to_string(),
+            "has space and $HOME `id` $(id) ;|&".to_string(),
+            "'".to_string(),
+            "https://example.com/".to_string() + &"a".repeat(500),
+        ];
+        for value in cases {
+            let value = value.replace("MARK", marker.to_str().unwrap());
+            let script = format!("X={}; printf %s \"$X\"", shell_single_quote(&value));
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                value,
+                "round trip failed for {value:?}"
+            );
+            assert!(!marker.exists(), "quoting let a command run for {value:?}");
+        }
+    }
+
+    #[test]
+    fn recovery_target_uses_normalized_state_and_keeps_the_full_value() {
+        assert_eq!(recovery_target(""), PUBLIC_NODE);
+        assert_eq!(recovery_target("   "), PUBLIC_NODE);
+        assert_eq!(recovery_target("  http://h:1  "), "http://h:1");
+        // Control characters are rejected, not stripped into a different value.
+        assert_eq!(recovery_target("http://h:1/\u{1b}[31m"), PUBLIC_NODE);
+        assert_eq!(recovery_target("http://h:1/\u{202e}"), PUBLIC_NODE);
+        // Longer than the 200 character display cap, still whole.
+        let long = format!("http://h:1/{}", "a".repeat(300));
+        assert_eq!(recovery_target(&long), long);
+    }
+
     use super::*;
 
     fn fake_home(zshrc: Option<&str>, with_omz_git: bool) -> tempfile::TempDir {

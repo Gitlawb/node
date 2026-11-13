@@ -40,7 +40,9 @@ const TOTAL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// consulting the policy, so on the first redirect `previous.len()` is already 1, and
 /// `>=` would permit `MAX_REDIRECTS - 1` follows. `Policy::limited(max)` refuses at
 /// `previous.len() > max`, and matching it is the point of reusing its value.
-fn same_origin_redirect(attempt: reqwest::redirect::Attempt<'_>) -> reqwest::redirect::Action {
+pub(crate) fn same_origin_redirect(
+    attempt: reqwest::redirect::Attempt<'_>,
+) -> reqwest::redirect::Action {
     let Some(previous) = attempt.previous().last() else {
         // No previous URL to compare against. Unreachable through reqwest, which
         // pushes the redirecting URL before consulting the policy, but the safe
