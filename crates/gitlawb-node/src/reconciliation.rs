@@ -4343,10 +4343,18 @@ mod tests {
         let blob_a = repo_on_disk.git(&["rev-parse", "HEAD:a.txt"]);
         let blob_b = repo_on_disk.git(&["rev-parse", "HEAD:b.txt"]);
         let blob_c = repo_on_disk.git(&["rev-parse", "HEAD:c.txt"]);
-        let commit = repo_on_disk.git(&["rev-parse", "HEAD"]);
-        let tree = repo_on_disk.git(&["rev-parse", "HEAD^{tree}"]);
-        let mut all = [blob_a.clone(), blob_b.clone(), blob_c.clone(), commit, tree];
+        // Every object the sweep can plan, not just HEAD's: the three commits
+        // and three trees are all reachable, and an earlier commit's id changes
+        // with the commit timestamp. Sorting only HEAD's commit, tree and blobs
+        // picked the wrong "first" whenever an earlier commit sorted below them.
+        let mut all: Vec<String> = repo_on_disk
+            .git(&["rev-list", "--objects", "--all"])
+            .lines()
+            .filter_map(|l| l.split_whitespace().next())
+            .map(str::to_string)
+            .collect();
         all.sort();
+        assert_eq!(all.len(), 9, "3 commits + 3 trees + 3 blobs");
         let first = all[0].clone();
 
         let owner = "did:key:zAbortCursorOwner";
