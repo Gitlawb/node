@@ -187,6 +187,12 @@ where
     F: std::future::Future<Output = Result<T>>,
 {
     let left = deadline.saturating_duration_since(Instant::now());
+    // `timeout` polls the inner future once before it looks at the timer, so a zero
+    // remainder would still let a future that is ready on its first poll (a fast local
+    // query) return a value. A spent deadline must not start the work at all.
+    if left.is_zero() {
+        return Err(BoundedDbError::Elapsed);
+    }
     match tokio::time::timeout(left, fut).await {
         Ok(Ok(v)) => Ok(v),
         Ok(Err(e)) => Err(BoundedDbError::Db(e)),
@@ -3433,14 +3439,42 @@ mod tests {
         );
     }
 
+    /// A spent deadline must return the elapsed arm WITHOUT polling the future.
+    ///
+    /// `tokio::time::timeout` polls the inner future before it checks the timer, so a
+    /// future that is ready on its first poll wins a zero-length timeout. The 30s sleep
+    /// in `db_bounded_elapsed_deadline_errors_promptly` never hits that, so the
+    /// poll-first path is pinned here with a future that is ready at once and records
+    /// whether it was polled.
+    #[tokio::test]
+    async fn db_bounded_spent_deadline_does_not_poll_a_ready_future() {
+        let spent = Instant::now() - Duration::from_secs(5);
+        let polled = std::sync::atomic::AtomicBool::new(false);
+        let out: Result<u8, BoundedDbError> = db_bounded(spent, async {
+            polled.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(7u8)
+        })
+        .await;
+
+        assert!(
+            matches!(out, Err(BoundedDbError::Elapsed)),
+            "a spent deadline must yield the timeout arm even for a ready future: {out:?}"
+        );
+        assert!(
+            !polled.load(std::sync::atomic::Ordering::SeqCst),
+            "a spent deadline must not start the wrapped work"
+        );
+    }
+
     /// U5 (#173): the elapsed arm of the discovery record leaves neither row behind.
     ///
     /// What this proves and what it does NOT: it shows the wrapper composition
     /// (`db_bounded` over `retry_db_record` over `record_discovered_pin_source`) returns
     /// promptly and cleanly on the elapsed arm with a healthy pool, so the call site's
     /// "definitely did not land" reading is not contradicted here. It is NOT evidence of
-    /// transactionality: a spent deadline reduces to `timeout(0, fut)`, the future never
-    /// starts, and "neither row landed" would hold just as well for two separate calls.
+    /// transactionality: `db_bounded` returns on a spent deadline before polling, the
+    /// future never starts, and "neither row landed" would hold just as well for two
+    /// separate calls.
     /// It kills no mutation. The atomicity property is proven by
     /// `sweep_discovery_failed_marker_does_not_strand_public_copy` and its mutations
     /// alone.
