@@ -76,6 +76,7 @@ pub async fn create_pr(
         status: "open".to_string(),
         merged_by_did: None,
         merged_at: None,
+        head_commit: None,
         created_at: now.clone(),
         updated_at: now,
     };
@@ -226,6 +227,15 @@ pub async fn merge_pr(
     let disk_path = guard.path().to_path_buf();
     let merger_did = auth.0;
 
+    // The source head this merge is about to consume, read under the write lock.
+    // The PR row above was loaded before the lock, so a push landing in between
+    // already moved the branch and the row's own `head_commit` is stale; the
+    // value frozen on the merged PR has to be what was merged. `None` when the
+    // ref cannot be resolved, which leaves whatever the push path last stored.
+    let merged_source_head =
+        store::read_ref(&disk_path, &store::local_branch_ref(&pr.source_branch))
+            .ok()
+            .flatten();
     // Snapshot the target ref's pre-merge OID so a refused durable upload can
     // rewind the local merge, mirroring the close_issue / create_issue
     // compensating pattern. A read failure or an absent ref (a first-commit
@@ -274,7 +284,10 @@ pub async fn merge_pr(
 
     let merge_sha = merge_result.map_err(|e| AppError::Git(e.to_string()))?;
 
-    state.db.merge_pr(&pr.id, &merger_did).await?;
+    state
+        .db
+        .merge_pr(&pr.id, &merger_did, merged_source_head.as_deref())
+        .await?;
     let _ = state.db.touch_repo(&record.id).await;
 
     webhooks::fire_event(
@@ -324,7 +337,36 @@ pub async fn close_pr(
         ));
     }
 
-    state.db.close_pr(&pr.id).await?;
+    // Same refusal merge_pr gives, before the head is resolved: a repeated close
+    // must not store the branch's current tip on a historical pull request.
+    if pr.status != "open" {
+        return Err(AppError::BadRequest(format!("PR is already {}", pr.status)));
+    }
+
+    // Freeze the head this close decided against, the same snapshot merge_pr
+    // takes on its path: a closed pull request's rollup serves only the stored
+    // head, so a PR closed before its first status read would report
+    // head_resolved=false forever. The recorded push for the branch is the
+    // canonical answer; the disk read covers a push whose event write failed.
+    // A failed lookup fails the close, leaving the pull request open to retry:
+    // it must not read as an absent head. An unresolvable head keeps whatever
+    // the push path last stored.
+    let branch_ref = store::local_branch_ref(&pr.source_branch);
+    let closed_head = if pr.head_commit.is_some() {
+        None
+    } else {
+        state
+            .db
+            .latest_push_sha_for_ref(&record.id, &branch_ref)
+            .await?
+            .or_else(|| {
+                store::read_ref(std::path::Path::new(&record.disk_path), &branch_ref)
+                    .ok()
+                    .flatten()
+            })
+            .map(|sha| sha.to_ascii_lowercase())
+    };
+    state.db.close_pr(&pr.id, closed_head.as_deref()).await?;
 
     webhooks::fire_event(
         std::sync::Arc::clone(&state.db),
@@ -471,6 +513,243 @@ pub async fn list_comments(
 }
 
 #[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Method, StatusCode};
+    use axum::routing::post;
+    use axum::Router;
+    use std::process::Command;
+    use tower::ServiceExt;
+
+    const OWNER_DID: &str = "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
+    const STALE_SHA: &str = "9999999999999999999999999999999999999999";
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A bare repo with `main` and a `feature` branch one commit ahead.
+    /// Returns the bare path and the real `feature` tip.
+    fn bare_repo_with_feature(
+        root: &std::path::Path,
+        owner_slug: &str,
+    ) -> (std::path::PathBuf, String) {
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        git(&work, &["init", "-q", "-b", "main", "."]);
+        std::fs::write(work.join("a.txt"), "one").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-qm", "one"]);
+        git(&work, &["checkout", "-qb", "feature"]);
+        std::fs::write(work.join("b.txt"), "two").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-qm", "two"]);
+        git(&work, &["checkout", "-q", "main"]);
+
+        let bare_dir = root.join(owner_slug);
+        std::fs::create_dir_all(&bare_dir).unwrap();
+        let bare = bare_dir.join("demo.git");
+        git(
+            root,
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        );
+
+        let tip = Command::new("git")
+            .args(["rev-parse", "refs/heads/feature"])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+        let tip = String::from_utf8_lossy(&tip.stdout).trim().to_string();
+        assert_eq!(tip.len(), 40, "feature tip must resolve");
+        (bare, tip)
+    }
+
+    /// Merging freezes the stored head at the source commit the merge actually
+    /// consumed. The PR row is loaded before the write lock is taken, so a push
+    /// that lands in between leaves the row's own `head_commit` stale; seeding a
+    /// value that matches nothing on disk stands in for that race, and the
+    /// merged PR must still come out pointing at the real `feature` tip.
+    #[sqlx::test]
+    async fn merge_stamps_the_source_head_it_merged_over_a_racing_value(pool: sqlx::PgPool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let owner_slug = OWNER_DID.replace([':', '/'], "_");
+        let (bare, feature_tip) = bare_repo_with_feature(tmp.path(), &owner_slug);
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.repo_store =
+            crate::git::repo_store::RepoStore::for_testing(tmp.path().to_path_buf(), pool);
+
+        let now = Utc::now();
+        let repo = crate::db::RepoRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "demo".into(),
+            owner_did: OWNER_DID.into(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: now,
+            updated_at: now,
+            disk_path: bare.to_string_lossy().into_owned(),
+            forked_from: None,
+            machine_id: None,
+        };
+        state.db.create_repo(&repo).await.unwrap();
+
+        let pr = PullRequest {
+            id: Uuid::new_v4().to_string(),
+            repo_id: repo.id.clone(),
+            number: 1,
+            title: "add b".into(),
+            body: None,
+            author_did: OWNER_DID.into(),
+            source_branch: "feature".into(),
+            target_branch: "main".into(),
+            status: "open".into(),
+            merged_by_did: None,
+            merged_at: None,
+            head_commit: None,
+            created_at: now.to_rfc3339(),
+            updated_at: now.to_rfc3339(),
+        };
+        state.db.create_pr(&pr).await.unwrap();
+        // The stale value the racing push scenario leaves on the row.
+        state
+            .db
+            .set_open_pr_heads(&repo.id, "feature", STALE_SHA)
+            .await
+            .unwrap();
+
+        let db = state.db.clone();
+        let app = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/merge",
+                post(merge_pr),
+            )
+            .with_state(state);
+
+        let response = app
+            .oneshot(crate::test_support::signed_request_as(
+                OWNER_DID,
+                Method::POST,
+                "/api/v1/repos/z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH/demo/pulls/1/merge",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let merged = db.get_pr(&repo.id, 1).await.unwrap().unwrap();
+        assert_eq!(merged.status, "merged");
+        assert_eq!(
+            merged.head_commit,
+            Some(feature_tip),
+            "the merge must stamp the source head it consumed, not the racing value"
+        );
+    }
+
+    /// A failed head lookup is not an absent head. With the push-event table
+    /// unreadable, the close must fail while the pull request is still open, so
+    /// the caller can retry. Closing with a NULL head would leave the rollup
+    /// unresolved for good, since a closed pull request serves only the stored
+    /// head. The branch exists on disk, so a swallowed error would also close
+    /// successfully through the disk fallback: that is the case this pins.
+    #[sqlx::test]
+    async fn close_fails_open_when_the_head_lookup_errors(pool: sqlx::PgPool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let owner_slug = OWNER_DID.replace([':', '/'], "_");
+        let (bare, _tip) = bare_repo_with_feature(tmp.path(), &owner_slug);
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.repo_store =
+            crate::git::repo_store::RepoStore::for_testing(tmp.path().to_path_buf(), pool.clone());
+
+        let now = Utc::now();
+        let repo = crate::db::RepoRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "demo".into(),
+            owner_did: OWNER_DID.into(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: now,
+            updated_at: now,
+            disk_path: bare.to_string_lossy().into_owned(),
+            forked_from: None,
+            machine_id: None,
+        };
+        state.db.create_repo(&repo).await.unwrap();
+        let pr = PullRequest {
+            id: Uuid::new_v4().to_string(),
+            repo_id: repo.id.clone(),
+            number: 1,
+            title: "add b".into(),
+            body: None,
+            author_did: OWNER_DID.into(),
+            source_branch: "feature".into(),
+            target_branch: "main".into(),
+            status: "open".into(),
+            merged_by_did: None,
+            merged_at: None,
+            head_commit: None,
+            created_at: now.to_rfc3339(),
+            updated_at: now.to_rfc3339(),
+        };
+        state.db.create_pr(&pr).await.unwrap();
+
+        sqlx::query("ALTER TABLE repo_push_events RENAME TO repo_push_events_gone")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let db = state.db.clone();
+        let app = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/close",
+                post(close_pr),
+            )
+            .with_state(state);
+        let response = app
+            .oneshot(crate::test_support::signed_request_as(
+                OWNER_DID,
+                Method::POST,
+                "/api/v1/repos/z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH/demo/pulls/1/close",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+
+        assert!(
+            response.status().is_server_error(),
+            "a failed head lookup must fail the close, got {}",
+            response.status()
+        );
+        let after = db.get_pr(&repo.id, 1).await.unwrap().unwrap();
+        assert_eq!(after.status, "open", "the pull request must stay open");
+        assert_eq!(after.head_commit, None);
+    }
+}
+
+#[cfg(test)]
 mod merge_rollback_tests {
     use super::*;
     use axum::response::IntoResponse;
@@ -573,6 +852,7 @@ mod merge_rollback_tests {
                 status: "open".to_string(),
                 merged_by_did: None,
                 merged_at: None,
+                head_commit: None,
                 created_at: now.clone(),
                 updated_at: now,
             })
@@ -643,6 +923,7 @@ mod lock_pool_shed_tests {
         state
             .db
             .create_pr(&PullRequest {
+                head_commit: None,
                 id: Uuid::new_v4().to_string(),
                 repo_id: repo_id.clone(),
                 number: 1,

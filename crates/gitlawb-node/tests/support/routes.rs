@@ -234,6 +234,23 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             id_source: IdSource::Fixed,
             anon_read: AnonRead::Deny404,
         },
+        // create_status: signed non-owner on a public repo passes the read
+        // gate and hits `require_repo_owner` — a plain owner-gate 403. The
+        // body is a minimal valid claim (the request is body-bound signed, so
+        // the probe's RFC-9421 content-digest coverage is load-bearing: a
+        // signer that did not cover the body would 400 before the gate).
+        Row {
+            method: "POST",
+            path: "/api/v1/repos/{owner}/{repo}/statuses/{sha}",
+            gate: GateClass::OwnerGate,
+            handler: "status::create_status",
+            body: Some(r#"{"state":"pending","context":"ci/build"}"#),
+            needs: NO_ENTITY,
+            reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
         // #195 (F1): close_pr / close_issue are owner-OR-author gates (pulls.rs:276,
         // issues.rs:255). A plain OwnerGate tests only the owner arm, so reverting
         // the author arm is invisible. MultiPrincipalGate drives BOTH arms.
@@ -779,6 +796,50 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             handler: "pulls::list_comments",
             body: None,
             needs: &["priv_pr"],
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        // pull_request_status: the seeded PRIVATE PR #1 is the reach target, so
+        // the owner twin gets a 200 rollup, not the absent-entity 404 the gate's
+        // own existence-hiding would make indistinguishable.
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/pulls/{number}/status",
+            gate: GateClass::ReadGate,
+            handler: "status::pull_request_status",
+            body: None,
+            needs: &["priv_pr"],
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        // commit_status / list_repo_push_events: repo-scoped optional-auth reads
+        // whose deny is the repo's own existence-hiding 404. Neither needs a
+        // seeded entity — a status rollup over zero claims and an empty
+        // push-event page are both valid 2xx responses, so the owner twin
+        // proving the gate is the repo lookup, not the data.
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/commits/{sha}/status",
+            gate: GateClass::ReadGate,
+            handler: "status::commit_status",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/push-events",
+            gate: GateClass::ReadGate,
+            handler: "events::list_repo_push_events",
+            body: None,
+            needs: NO_ENTITY,
             reach: Reach::ReaderReads,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
